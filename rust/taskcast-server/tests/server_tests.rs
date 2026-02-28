@@ -1,13 +1,15 @@
 use std::sync::Arc;
 
+use axum::response::IntoResponse;
 use axum_test::http::HeaderValue;
 use axum_test::TestServer;
 use jsonwebtoken::{encode, EncodingKey, Header};
 use serde_json::json;
 use taskcast_core::{
-    MemoryBroadcastProvider, MemoryShortTermStore, TaskEngine, TaskEngineOptions,
+    EngineError, Level, MemoryBroadcastProvider, MemoryShortTermStore, TaskEngine,
+    TaskEngineOptions, TaskStatus,
 };
-use taskcast_server::{create_app, AuthMode, JwtConfig};
+use taskcast_server::{create_app, AppError, AuthMode, JwtConfig, WebhookDelivery};
 
 fn make_engine() -> Arc<TaskEngine> {
     Arc::new(TaskEngine::new(TaskEngineOptions {
@@ -659,4 +661,467 @@ async fn full_task_lifecycle() {
     let events = body.as_array().unwrap();
     // 2 status events (running, completed) + 2 progress events
     assert_eq!(events.len(), 4);
+}
+
+// ─── SSE: GET /tasks/:taskId/events ──────────────────────────────────────────
+
+#[tokio::test]
+async fn sse_returns_404_for_missing_task() {
+    let (_engine, server) = make_no_auth_server();
+
+    let response = server.get("/tasks/nonexistent/events").await;
+    response.assert_status(axum_test::http::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn sse_returns_403_when_jwt_scope_insufficient() {
+    let (_engine, server) = make_jwt_server();
+
+    // Token with only task:create scope (no event:subscribe)
+    let token = make_token(json!({
+        "sub": "user",
+        "scope": ["task:create"],
+        "taskIds": "*",
+        "exp": 9999999999u64
+    }));
+
+    // Create task first
+    server
+        .post("/tasks")
+        .add_header(
+            axum_test::http::header::AUTHORIZATION,
+            bearer_header(&token),
+        )
+        .json(&json!({ "id": "sse-forbidden" }))
+        .await;
+
+    // Try to subscribe (requires event:subscribe)
+    let response = server
+        .get("/tasks/sse-forbidden/events")
+        .add_header(
+            axum_test::http::header::AUTHORIZATION,
+            bearer_header(&token),
+        )
+        .await;
+
+    response.assert_status(axum_test::http::StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn sse_replays_history_for_terminal_task() {
+    let (_engine, server) = make_no_auth_server();
+
+    // Create task, transition to running, publish events, complete
+    server
+        .post("/tasks")
+        .json(&json!({ "id": "sse-terminal" }))
+        .await;
+    server
+        .patch("/tasks/sse-terminal/status")
+        .json(&json!({ "status": "running" }))
+        .await;
+    server
+        .post("/tasks/sse-terminal/events")
+        .json(&json!({ "type": "progress", "level": "info", "data": { "p": 50 } }))
+        .await;
+    server
+        .patch("/tasks/sse-terminal/status")
+        .json(&json!({ "status": "completed", "result": { "ok": true } }))
+        .await;
+
+    // Connect to SSE — for terminal tasks, it should replay all history
+    // and send a done event, then close the stream.
+    let response = server.get("/tasks/sse-terminal/events").await;
+    response.assert_status(axum_test::http::StatusCode::OK);
+
+    let text = response.text();
+    // Should contain taskcast.event lines from history replay
+    assert!(text.contains("event: taskcast.event"), "should have event lines");
+    // Should contain a done event because task is already terminal
+    assert!(text.contains("event: taskcast.done"), "should have done event");
+    assert!(text.contains("completed"), "done reason should be completed");
+}
+
+#[tokio::test]
+async fn sse_wraps_events_in_envelope_by_default() {
+    let (_engine, server) = make_no_auth_server();
+
+    server
+        .post("/tasks")
+        .json(&json!({ "id": "sse-wrap" }))
+        .await;
+    server
+        .patch("/tasks/sse-wrap/status")
+        .json(&json!({ "status": "running" }))
+        .await;
+    server
+        .post("/tasks/sse-wrap/events")
+        .json(&json!({ "type": "log", "level": "info", "data": "hello" }))
+        .await;
+    server
+        .patch("/tasks/sse-wrap/status")
+        .json(&json!({ "status": "completed" }))
+        .await;
+
+    let response = server.get("/tasks/sse-wrap/events").await;
+    let text = response.text();
+
+    // Envelope should contain filteredIndex and rawIndex fields
+    assert!(text.contains("filteredIndex"), "envelope should have filteredIndex");
+    assert!(text.contains("rawIndex"), "envelope should have rawIndex");
+    assert!(text.contains("eventId"), "envelope should have eventId");
+}
+
+#[tokio::test]
+async fn sse_unwrap_mode_sends_raw_events() {
+    let (_engine, server) = make_no_auth_server();
+
+    server
+        .post("/tasks")
+        .json(&json!({ "id": "sse-nowrap" }))
+        .await;
+    server
+        .patch("/tasks/sse-nowrap/status")
+        .json(&json!({ "status": "running" }))
+        .await;
+    server
+        .post("/tasks/sse-nowrap/events")
+        .json(&json!({ "type": "log", "level": "info", "data": "test" }))
+        .await;
+    server
+        .patch("/tasks/sse-nowrap/status")
+        .json(&json!({ "status": "completed" }))
+        .await;
+
+    let response = server
+        .get("/tasks/sse-nowrap/events")
+        .add_query_param("wrap", "false")
+        .await;
+    let text = response.text();
+
+    // Raw events have taskId but NOT filteredIndex
+    assert!(text.contains("taskId"), "raw event should have taskId");
+    assert!(!text.contains("filteredIndex"), "raw event should NOT have filteredIndex");
+}
+
+#[tokio::test]
+async fn sse_type_filter_only_returns_matching_events() {
+    let (_engine, server) = make_no_auth_server();
+
+    server
+        .post("/tasks")
+        .json(&json!({ "id": "sse-filter" }))
+        .await;
+    server
+        .patch("/tasks/sse-filter/status")
+        .json(&json!({ "status": "running" }))
+        .await;
+    server
+        .post("/tasks/sse-filter/events")
+        .json(&json!([
+            { "type": "progress", "level": "info", "data": { "p": 25 } },
+            { "type": "log", "level": "debug", "data": "debug msg" },
+            { "type": "progress", "level": "info", "data": { "p": 75 } }
+        ]))
+        .await;
+    server
+        .patch("/tasks/sse-filter/status")
+        .json(&json!({ "status": "completed" }))
+        .await;
+
+    // Filter only "progress" type events
+    let response = server
+        .get("/tasks/sse-filter/events")
+        .add_query_param("types", "progress")
+        .add_query_param("wrap", "false")
+        .await;
+    let text = response.text();
+
+    // Count occurrences of "taskcast.event"
+    let event_count = text.matches("event: taskcast.event").count();
+    // Should have 2 progress events (not the log or status events)
+    assert_eq!(event_count, 2, "should only see 2 progress events, got text:\n{text}");
+    assert!(!text.contains("debug msg"), "log event should be filtered out");
+}
+
+#[tokio::test]
+async fn sse_since_index_skips_replayed_events() {
+    let (_engine, server) = make_no_auth_server();
+
+    server
+        .post("/tasks")
+        .json(&json!({ "id": "sse-since" }))
+        .await;
+    server
+        .patch("/tasks/sse-since/status")
+        .json(&json!({ "status": "running" }))
+        .await;
+    // index 0 = status event from transition
+    // index 1, 2, 3 = three progress events
+    server
+        .post("/tasks/sse-since/events")
+        .json(&json!([
+            { "type": "progress", "level": "info", "data": { "step": 1 } },
+            { "type": "progress", "level": "info", "data": { "step": 2 } },
+            { "type": "progress", "level": "info", "data": { "step": 3 } }
+        ]))
+        .await;
+    server
+        .patch("/tasks/sse-since/status")
+        .json(&json!({ "status": "completed" }))
+        .await;
+
+    // Request SSE with since.index=2 (should skip events at index 0,1,2)
+    let response = server
+        .get("/tasks/sse-since/events")
+        .add_query_param("since.index", "2")
+        .add_query_param("wrap", "false")
+        .await;
+    let text = response.text();
+
+    // Should only replay events with index > 2 (index 3 = step 3, index 4 = completed status)
+    let event_count = text.matches("event: taskcast.event").count();
+    assert_eq!(event_count, 2, "should have 2 events after since.index=2, got:\n{text}");
+}
+
+// ─── Error Response Format Tests ─────────────────────────────────────────────
+
+#[test]
+fn app_error_bad_request_returns_400_json() {
+    let error = AppError::BadRequest("invalid input".to_string());
+    let response = error.into_response();
+    assert_eq!(response.status(), axum_test::http::StatusCode::BAD_REQUEST);
+}
+
+#[test]
+fn app_error_not_found_returns_404_json() {
+    let error = AppError::NotFound("task missing".to_string());
+    let response = error.into_response();
+    assert_eq!(response.status(), axum_test::http::StatusCode::NOT_FOUND);
+}
+
+#[test]
+fn app_error_forbidden_returns_403_json() {
+    let error = AppError::Forbidden;
+    let response = error.into_response();
+    assert_eq!(response.status(), axum_test::http::StatusCode::FORBIDDEN);
+}
+
+#[test]
+fn app_error_missing_token_returns_401_json() {
+    let error = AppError::MissingToken;
+    let response = error.into_response();
+    assert_eq!(response.status(), axum_test::http::StatusCode::UNAUTHORIZED);
+}
+
+#[test]
+fn app_error_invalid_token_returns_401_json() {
+    let error = AppError::InvalidToken;
+    let response = error.into_response();
+    assert_eq!(response.status(), axum_test::http::StatusCode::UNAUTHORIZED);
+}
+
+#[test]
+fn app_error_engine_task_not_found_returns_404() {
+    let error = AppError::Engine(EngineError::TaskNotFound("t1".to_string()));
+    let response = error.into_response();
+    assert_eq!(response.status(), axum_test::http::StatusCode::NOT_FOUND);
+}
+
+#[test]
+fn app_error_engine_invalid_transition_returns_400() {
+    let error = AppError::Engine(EngineError::InvalidTransition {
+        from: TaskStatus::Pending,
+        to: TaskStatus::Completed,
+    });
+    let response = error.into_response();
+    assert_eq!(response.status(), axum_test::http::StatusCode::BAD_REQUEST);
+}
+
+#[test]
+fn app_error_engine_task_terminal_returns_400() {
+    let error = AppError::Engine(EngineError::TaskTerminal(TaskStatus::Completed));
+    let response = error.into_response();
+    assert_eq!(response.status(), axum_test::http::StatusCode::BAD_REQUEST);
+}
+
+#[test]
+fn app_error_engine_store_error_returns_500() {
+    let store_err: Box<dyn std::error::Error + Send + Sync> =
+        Box::new(std::io::Error::new(std::io::ErrorKind::Other, "db error"));
+    let error = AppError::Engine(EngineError::Store(store_err));
+    let response = error.into_response();
+    assert_eq!(
+        response.status(),
+        axum_test::http::StatusCode::INTERNAL_SERVER_ERROR
+    );
+}
+
+// ─── Webhook Delivery Tests ──────────────────────────────────────────────────
+
+#[tokio::test]
+async fn webhook_delivery_sends_to_mock_server() {
+    use axum::{routing::post as axum_post, Router};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    let call_count = Arc::new(AtomicU32::new(0));
+    let count_clone = Arc::clone(&call_count);
+
+    let mock_app = Router::new().route(
+        "/hook",
+        axum_post(move || async move {
+            count_clone.fetch_add(1, Ordering::SeqCst);
+            axum_test::http::StatusCode::OK
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, mock_app).await.unwrap();
+    });
+
+    let delivery = WebhookDelivery::new();
+    let event = taskcast_core::TaskEvent {
+        id: "evt_01".to_string(),
+        task_id: "task_01".to_string(),
+        index: 0,
+        timestamp: 1700000000000.0,
+        r#type: "progress".to_string(),
+        level: Level::Info,
+        data: json!({ "percent": 50 }),
+        series_id: None,
+        series_mode: None,
+    };
+    let config = taskcast_core::WebhookConfig {
+        url: format!("http://{addr}/hook"),
+        filter: None,
+        secret: Some("test-secret".to_string()),
+        wrap: None,
+        retry: Some(taskcast_core::RetryConfig {
+            retries: 0,
+            backoff: taskcast_core::BackoffStrategy::Fixed,
+            initial_delay_ms: 100,
+            max_delay_ms: 100,
+            timeout_ms: 5000,
+        }),
+    };
+
+    let result = delivery.send(&event, &config).await;
+    assert!(result.is_ok());
+    assert_eq!(call_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn webhook_delivery_retries_on_failure() {
+    use axum::{routing::post as axum_post, Router};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    let call_count = Arc::new(AtomicU32::new(0));
+    let count_clone = Arc::clone(&call_count);
+
+    // Mock server that always returns 500
+    let mock_app = Router::new().route(
+        "/hook",
+        axum_post(move || async move {
+            count_clone.fetch_add(1, Ordering::SeqCst);
+            axum_test::http::StatusCode::INTERNAL_SERVER_ERROR
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, mock_app).await.unwrap();
+    });
+
+    let delivery = WebhookDelivery::new();
+    let event = taskcast_core::TaskEvent {
+        id: "evt_02".to_string(),
+        task_id: "task_02".to_string(),
+        index: 0,
+        timestamp: 1700000000000.0,
+        r#type: "log".to_string(),
+        level: Level::Info,
+        data: json!(null),
+        series_id: None,
+        series_mode: None,
+    };
+    let config = taskcast_core::WebhookConfig {
+        url: format!("http://{addr}/hook"),
+        filter: None,
+        secret: None,
+        wrap: None,
+        retry: Some(taskcast_core::RetryConfig {
+            retries: 2,
+            backoff: taskcast_core::BackoffStrategy::Fixed,
+            initial_delay_ms: 10, // fast retries for test
+            max_delay_ms: 10,
+            timeout_ms: 5000,
+        }),
+    };
+
+    let result = delivery.send(&event, &config).await;
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(err.to_string().contains("3 attempts")); // 1 initial + 2 retries
+    assert_eq!(call_count.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn webhook_delivery_succeeds_on_retry() {
+    use axum::{routing::post as axum_post, Router};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    let call_count = Arc::new(AtomicU32::new(0));
+    let count_clone = Arc::clone(&call_count);
+
+    // Mock server that fails first 2 times, then succeeds
+    let mock_app = Router::new().route(
+        "/hook",
+        axum_post(move || async move {
+            let count = count_clone.fetch_add(1, Ordering::SeqCst);
+            if count < 2 {
+                axum_test::http::StatusCode::INTERNAL_SERVER_ERROR
+            } else {
+                axum_test::http::StatusCode::OK
+            }
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, mock_app).await.unwrap();
+    });
+
+    let delivery = WebhookDelivery::new();
+    let event = taskcast_core::TaskEvent {
+        id: "evt_03".to_string(),
+        task_id: "task_03".to_string(),
+        index: 0,
+        timestamp: 1700000000000.0,
+        r#type: "progress".to_string(),
+        level: Level::Info,
+        data: json!({ "step": 1 }),
+        series_id: None,
+        series_mode: None,
+    };
+    let config = taskcast_core::WebhookConfig {
+        url: format!("http://{addr}/hook"),
+        filter: None,
+        secret: None,
+        wrap: None,
+        retry: Some(taskcast_core::RetryConfig {
+            retries: 3,
+            backoff: taskcast_core::BackoffStrategy::Fixed,
+            initial_delay_ms: 10,
+            max_delay_ms: 10,
+            timeout_ms: 5000,
+        }),
+    };
+
+    let result = delivery.send(&event, &config).await;
+    assert!(result.is_ok());
+    assert_eq!(call_count.load(Ordering::SeqCst), 3); // 2 failures + 1 success
 }

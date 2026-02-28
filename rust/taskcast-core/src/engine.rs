@@ -868,4 +868,190 @@ mod tests {
         assert_eq!(types[0], "taskcast:status");
         assert_eq!(types[1], "progress");
     }
+
+    // ─── Concurrency ────────────────────────────────────────────────────
+
+    fn make_shared_engine() -> Arc<TaskEngine> {
+        Arc::new(make_engine())
+    }
+
+    #[tokio::test]
+    async fn concurrent_publish_event_maintains_unique_monotonic_indices() {
+        let engine = make_shared_engine();
+        let task = engine.create_task(CreateTaskInput::default()).await.unwrap();
+        engine
+            .transition_task(&task.id, TaskStatus::Running, None)
+            .await
+            .unwrap();
+
+        let count = 50;
+        let mut handles = Vec::new();
+        for i in 0..count {
+            let engine = Arc::clone(&engine);
+            let task_id = task.id.clone();
+            handles.push(tokio::spawn(async move {
+                engine
+                    .publish_event(
+                        &task_id,
+                        PublishEventInput {
+                            r#type: "parallel".to_string(),
+                            level: Level::Info,
+                            data: serde_json::json!({ "i": i }),
+                            series_id: None,
+                            series_mode: None,
+                        },
+                    )
+                    .await
+                    .unwrap()
+            }));
+        }
+
+        let events: Vec<_> = futures::future::join_all(handles)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        let mut indices: Vec<u64> = events.iter().map(|e| e.index).collect();
+        indices.sort();
+
+        // All indices must be unique
+        assert_eq!(
+            std::collections::HashSet::<u64>::from_iter(indices.iter().copied()).len(),
+            count,
+            "all indices must be unique"
+        );
+        // Must span exactly `count` consecutive values (transition takes index 0)
+        let min = *indices.first().unwrap();
+        let max = *indices.last().unwrap();
+        assert_eq!(max - min, (count - 1) as u64, "indices must be consecutive");
+    }
+
+    #[tokio::test]
+    async fn concurrent_status_transitions_final_state_is_consistent() {
+        let engine = make_shared_engine();
+        let task = engine.create_task(CreateTaskInput::default()).await.unwrap();
+        engine
+            .transition_task(&task.id, TaskStatus::Running, None)
+            .await
+            .unwrap();
+
+        // 20 concurrent attempts to complete the same task
+        let mut handles = Vec::new();
+        for _ in 0..20 {
+            let engine = Arc::clone(&engine);
+            let task_id = task.id.clone();
+            handles.push(tokio::spawn(async move {
+                engine
+                    .transition_task(&task_id, TaskStatus::Completed, None)
+                    .await
+            }));
+        }
+
+        let results: Vec<_> = futures::future::join_all(handles).await;
+        let succeeded = results
+            .iter()
+            .filter(|r| r.as_ref().map(|r| r.is_ok()).unwrap_or(false))
+            .count();
+
+        // At least one must succeed
+        assert!(succeeded >= 1, "at least one transition must succeed");
+
+        // Final state must be terminal
+        let final_task = engine.get_task(&task.id).await.unwrap().unwrap();
+        assert_eq!(final_task.status, TaskStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn concurrent_create_task_all_get_unique_ids() {
+        let engine = make_shared_engine();
+        let count = 100;
+
+        let mut handles = Vec::new();
+        for _ in 0..count {
+            let engine = Arc::clone(&engine);
+            handles.push(tokio::spawn(async move {
+                engine.create_task(CreateTaskInput::default()).await.unwrap()
+            }));
+        }
+
+        let tasks: Vec<_> = futures::future::join_all(handles)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        let ids: std::collections::HashSet<_> = tasks.iter().map(|t| t.id.clone()).collect();
+        assert_eq!(ids.len(), count, "all task IDs must be unique");
+    }
+
+    #[tokio::test]
+    async fn concurrent_subscribers_all_receive_all_events_in_order() {
+        let broadcast = Arc::new(MemoryBroadcastProvider::new());
+        let engine = Arc::new(make_engine_with_broadcast(Arc::clone(&broadcast)));
+        let task = engine.create_task(CreateTaskInput::default()).await.unwrap();
+        engine
+            .transition_task(&task.id, TaskStatus::Running, None)
+            .await
+            .unwrap();
+
+        let subscriber_count = 20;
+        let event_count = 100;
+
+        // Set up subscribers
+        let received: Vec<Arc<std::sync::Mutex<Vec<String>>>> = (0..subscriber_count)
+            .map(|_| Arc::new(std::sync::Mutex::new(Vec::new())))
+            .collect();
+
+        let mut unsubs = Vec::new();
+        for arr in &received {
+            let arr = Arc::clone(arr);
+            let unsub = broadcast
+                .subscribe(
+                    &task.id,
+                    Box::new(move |event| {
+                        if event.r#type != "taskcast:status" {
+                            arr.lock().unwrap().push(event.id.clone());
+                        }
+                    }),
+                )
+                .await;
+            unsubs.push(unsub);
+        }
+
+        // Publish events sequentially (engine guarantees ordering)
+        let mut published_ids = Vec::new();
+        for i in 0..event_count {
+            let event = engine
+                .publish_event(
+                    &task.id,
+                    PublishEventInput {
+                        r#type: "load.test".to_string(),
+                        level: Level::Info,
+                        data: serde_json::json!({ "seq": i }),
+                        series_id: None,
+                        series_mode: None,
+                    },
+                )
+                .await
+                .unwrap();
+            published_ids.push(event.id);
+        }
+
+        // All subscribers should have received all events in correct order
+        for (i, arr) in received.iter().enumerate() {
+            let ids = arr.lock().unwrap();
+            assert_eq!(
+                ids.len(),
+                event_count,
+                "subscriber {i} received {} events, expected {event_count}",
+                ids.len()
+            );
+            assert_eq!(*ids, published_ids, "subscriber {i} received events in wrong order");
+        }
+
+        for unsub in unsubs {
+            unsub();
+        }
+    }
 }
