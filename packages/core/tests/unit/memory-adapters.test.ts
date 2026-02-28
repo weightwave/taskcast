@@ -91,6 +91,53 @@ describe('MemoryShortTermStore', () => {
     expect(events.map((e) => e.index)).toEqual([3, 4])
   })
 
+  it('getEvents with since.id NOT found returns full list', async () => {
+    const store = new MemoryShortTermStore()
+    for (let i = 0; i < 3; i++) await store.appendEvent('task-1', makeEvent(i))
+    // idx < 0 branch: id not found → return all events
+    const events = await store.getEvents('task-1', { since: { id: 'nonexistent-id' } })
+    expect(events.map((e) => e.index)).toEqual([0, 1, 2])
+  })
+
+  it('getEvents with since.id FOUND returns events after that id', async () => {
+    const store = new MemoryShortTermStore()
+    for (let i = 0; i < 5; i++) await store.appendEvent('task-1', makeEvent(i))
+    // idx >= 0 branch: 'evt-2' found → return events after it
+    const events = await store.getEvents('task-1', { since: { id: 'evt-2' } })
+    expect(events.map((e) => e.index)).toEqual([3, 4])
+  })
+
+  it('getEvents with limit slices result', async () => {
+    const store = new MemoryShortTermStore()
+    for (let i = 0; i < 5; i++) await store.appendEvent('task-1', makeEvent(i))
+    const events = await store.getEvents('task-1', { limit: 2 })
+    expect(events).toHaveLength(2)
+    expect(events[0]?.index).toBe(0)
+    expect(events[1]?.index).toBe(1)
+  })
+
+  it('getEvents returns empty list when no events for taskId', async () => {
+    const store = new MemoryShortTermStore()
+    // taskId has no events at all (tests the ?? [] branch)
+    const events = await store.getEvents('task-with-no-events')
+    expect(events).toEqual([])
+  })
+
+  it('setTTL is a no-op and does not throw', async () => {
+    const store = new MemoryShortTermStore()
+    await expect(store.setTTL('task-1', 60)).resolves.toBeUndefined()
+  })
+
+  it('replaceLastSeriesEvent appends event when no previous series event exists', async () => {
+    const store = new MemoryShortTermStore()
+    const event = makeEvent(0)
+    // prev is null: should append to events list
+    await store.replaceLastSeriesEvent('task-1', 's1', event)
+    const events = await store.getEvents('task-1')
+    expect(events).toHaveLength(1)
+    expect(events[0]?.id).toBe(event.id)
+  })
+
   it('getSeriesLatest returns null when no series', async () => {
     const store = new MemoryShortTermStore()
     expect(await store.getSeriesLatest('task-1', 's1')).toBeNull()

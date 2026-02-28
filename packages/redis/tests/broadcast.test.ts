@@ -112,4 +112,92 @@ describe('RedisBroadcastProvider', () => {
     expect(received).toHaveLength(1)
     pub.disconnect(); sub.disconnect()
   })
+
+  it('ignores malformed (non-JSON) messages on the channel', async () => {
+    const pub = new Redis(redisUrl)
+    const sub = new Redis(redisUrl)
+    const provider = new RedisBroadcastProvider(pub, sub)
+
+    const received: TaskEvent[] = []
+    provider.subscribe('task-1', (e) => received.push(e))
+    await new Promise((r) => setTimeout(r, 100))
+
+    // Publish a raw malformed message directly via Redis to trigger the catch branch
+    await pub.publish('taskcast:task:task-1', 'not-valid-json{{{{')
+    await new Promise((r) => setTimeout(r, 100))
+
+    // No events should have been delivered (error was swallowed)
+    expect(received).toHaveLength(0)
+    pub.disconnect()
+    sub.disconnect()
+  })
+
+  it('delivers message when channel does not start with prefix (raw channel name used as taskId)', async () => {
+    const pub = new Redis(redisUrl)
+    const sub = new Redis(redisUrl)
+    const provider = new RedisBroadcastProvider(pub, sub)
+
+    const received: TaskEvent[] = []
+    // Subscribe using a taskId, which gets subscribed as 'taskcast:task:task-raw'
+    // We'll simulate the message handler receiving a channel WITHOUT the prefix
+    // by accessing the private sub event emitter directly
+    provider.subscribe('task-raw', (e) => received.push(e))
+    await new Promise((r) => setTimeout(r, 100))
+
+    // Now manually emit a message event on sub with a channel that does NOT start with the prefix
+    // This exercises the `: channel` branch in the message handler
+    const event = makeEvent()
+    // Emit a fake Redis message event where channel has no prefix match
+    ;(sub as unknown as { emit: (event: string, ...args: unknown[]) => void }).emit(
+      'message',
+      'task-raw', // does not start with 'taskcast:task:'
+      JSON.stringify(event),
+    )
+    await new Promise((r) => setTimeout(r, 10))
+
+    expect(received).toHaveLength(1)
+    pub.disconnect()
+    sub.disconnect()
+  })
+
+  it('ignores messages on channels with no registered handlers', async () => {
+    const pub = new Redis(redisUrl)
+    const sub = new Redis(redisUrl)
+    const provider = new RedisBroadcastProvider(pub, sub)
+
+    // Subscribe to task-1 then unsubscribe to clear handlers
+    const unsub = provider.subscribe('task-1', () => {})
+    unsub()
+    await new Promise((r) => setTimeout(r, 100))
+
+    // Manually emit a message for a channel with no handlers (handlers map is empty)
+    // This exercises the `if (!handlers) return` branch
+    ;(sub as unknown as { emit: (event: string, ...args: unknown[]) => void }).emit(
+      'message',
+      'taskcast:task:task-1',
+      JSON.stringify(makeEvent()),
+    )
+    await new Promise((r) => setTimeout(r, 10))
+    // No error thrown, handler is not in the map → silently returns
+    pub.disconnect()
+    sub.disconnect()
+  })
+
+  it('calling unsubscribe twice is safe (set not found guard)', async () => {
+    const pub = new Redis(redisUrl)
+    const sub = new Redis(redisUrl)
+    const provider = new RedisBroadcastProvider(pub, sub)
+
+    const received: TaskEvent[] = []
+    const unsub = provider.subscribe('task-1', (e) => received.push(e))
+    await new Promise((r) => setTimeout(r, 100))
+
+    // Call unsub once — this deletes the set when it becomes empty
+    unsub()
+    // Call unsub again — this exercises the `if (!set) return` defensive branch
+    unsub()
+
+    pub.disconnect()
+    sub.disconnect()
+  })
 })

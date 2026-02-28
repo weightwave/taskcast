@@ -90,6 +90,20 @@ describe('RedisShortTermStore - events', () => {
     const events = await store.getEvents('task-1', { since: { id: 'evt-2' } })
     expect(events.map((e) => e.index)).toEqual([3, 4])
   })
+
+  it('returns full list when since.id is not found', async () => {
+    for (let i = 0; i < 3; i++) await store.appendEvent('task-1', makeEvent(i))
+    // idx < 0 branch: id not found → return all events
+    const events = await store.getEvents('task-1', { since: { id: 'nonexistent-id' } })
+    expect(events.map((e) => e.index)).toEqual([0, 1, 2])
+  })
+
+  it('applies limit to results', async () => {
+    for (let i = 0; i < 5; i++) await store.appendEvent('task-1', makeEvent(i))
+    const events = await store.getEvents('task-1', { limit: 2 })
+    expect(events).toHaveLength(2)
+    expect(events[0]?.index).toBe(0)
+  })
 })
 
 describe('RedisShortTermStore - series', () => {
@@ -157,6 +171,24 @@ describe('RedisShortTermStore - replaceLastSeriesEvent', () => {
     // The list should have exactly 1 event (replaced, not appended)
     expect(events).toHaveLength(1)
     expect(events[0]?.id).toBe('evt-updated')
+    const latest = await store.getSeriesLatest('task-1', 's1')
+    expect(latest?.id).toBe('evt-updated')
+  })
+
+  it('handles malformed JSON entries in the events list gracefully when replacing', async () => {
+    // Insert a malformed JSON entry directly via redis, then a valid event
+    // When replaceLastSeriesEvent scans for prev.id, it should skip malformed entries (catch block)
+    const first = makeEvent(0)
+    // Manually push a malformed JSON entry directly into the events list
+    await redis.rpush('taskcast:events:task-1', 'not-valid-json')
+    // Then push a valid event and track it as the series latest
+    await store.appendEvent('task-1', first)
+    await store.setSeriesLatest('task-1', 's1', first)
+
+    const second = { ...makeEvent(1), id: 'evt-updated' }
+    // replaceLastSeriesEvent should not throw even though there's a malformed entry
+    await store.replaceLastSeriesEvent('task-1', 's1', second)
+
     const latest = await store.getSeriesLatest('task-1', 's1')
     expect(latest?.id).toBe('evt-updated')
   })

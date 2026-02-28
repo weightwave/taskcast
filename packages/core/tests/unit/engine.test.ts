@@ -1,12 +1,23 @@
 import { describe, it, expect, vi } from 'vitest'
 import { TaskEngine } from '../../src/engine.js'
 import { MemoryBroadcastProvider, MemoryShortTermStore } from '../../src/memory-adapters.js'
+import type { LongTermStore } from '../../src/types.js'
 
 function makeEngine() {
   const store = new MemoryShortTermStore()
   const broadcast = new MemoryBroadcastProvider()
   const engine = new TaskEngine({ shortTerm: store, broadcast })
   return { engine, store, broadcast }
+}
+
+function makeLongTermStore(overrides: Partial<LongTermStore> = {}): LongTermStore {
+  return {
+    saveTask: vi.fn().mockResolvedValue(undefined),
+    getTask: vi.fn().mockResolvedValue(null),
+    saveEvent: vi.fn().mockResolvedValue(undefined),
+    getEvents: vi.fn().mockResolvedValue([]),
+    ...overrides,
+  }
 }
 
 describe('TaskEngine.createTask', () => {
@@ -23,6 +34,39 @@ describe('TaskEngine.createTask', () => {
     const { engine } = makeEngine()
     const task = await engine.createTask({ id: 'my-task-id' })
     expect(task.id).toBe('my-task-id')
+  })
+
+  it('creates a task with all optional fields including authConfig', async () => {
+    const { engine } = makeEngine()
+    const authConfig = { token: 'secret' }
+    const task = await engine.createTask({
+      type: 'test',
+      params: { key: 'val' },
+      metadata: { source: 'unit' },
+      webhooks: [],
+      cleanup: { rules: [] },
+      authConfig,
+    })
+    expect(task.authConfig).toEqual(authConfig)
+    expect(task.type).toBe('test')
+  })
+
+  it('saves to longTerm when configured', async () => {
+    const store = new MemoryShortTermStore()
+    const broadcast = new MemoryBroadcastProvider()
+    const longTerm = makeLongTermStore()
+    const engine = new TaskEngine({ shortTerm: store, broadcast, longTerm })
+    const task = await engine.createTask({ type: 'test' })
+    expect(longTerm.saveTask).toHaveBeenCalledWith(expect.objectContaining({ id: task.id }))
+  })
+
+  it('calls setTTL on shortTerm when ttl is provided', async () => {
+    const store = new MemoryShortTermStore()
+    const broadcast = new MemoryBroadcastProvider()
+    const setTTLSpy = vi.spyOn(store, 'setTTL')
+    const engine = new TaskEngine({ shortTerm: store, broadcast })
+    const task = await engine.createTask({ ttl: 300 })
+    expect(setTTLSpy).toHaveBeenCalledWith(task.id, 300)
   })
 })
 
@@ -64,6 +108,63 @@ describe('TaskEngine.transitionTask', () => {
     const updated = await store.getTask(task.id)
     expect(updated?.completedAt).toBeGreaterThan(0)
   })
+
+  it('saves to longTerm on transition', async () => {
+    const store = new MemoryShortTermStore()
+    const broadcast = new MemoryBroadcastProvider()
+    const longTerm = makeLongTermStore()
+    const engine = new TaskEngine({ shortTerm: store, broadcast, longTerm })
+    const task = await engine.createTask({})
+    vi.mocked(longTerm.saveTask).mockClear()
+    await engine.transitionTask(task.id, 'running')
+    expect(longTerm.saveTask).toHaveBeenCalledWith(expect.objectContaining({ status: 'running' }))
+  })
+
+  it('calls onTaskTimeout hook when transitioning to timeout', async () => {
+    const onTaskTimeout = vi.fn()
+    const store = new MemoryShortTermStore()
+    const broadcast = new MemoryBroadcastProvider()
+    const engine = new TaskEngine({ shortTerm: store, broadcast, hooks: { onTaskTimeout } })
+    const task = await engine.createTask({})
+    await engine.transitionTask(task.id, 'running')
+    await engine.transitionTask(task.id, 'timeout')
+    expect(onTaskTimeout).toHaveBeenCalledWith(expect.objectContaining({ id: task.id, status: 'timeout' }))
+  })
+
+  it('calls onTaskFailed hook with error when transitioning to failed WITH error', async () => {
+    const onTaskFailed = vi.fn()
+    const store = new MemoryShortTermStore()
+    const broadcast = new MemoryBroadcastProvider()
+    const engine = new TaskEngine({ shortTerm: store, broadcast, hooks: { onTaskFailed } })
+    const task = await engine.createTask({})
+    await engine.transitionTask(task.id, 'running')
+    const error = { message: 'something went wrong', code: 'ERR_TEST' }
+    await engine.transitionTask(task.id, 'failed', { error })
+    expect(onTaskFailed).toHaveBeenCalledWith(
+      expect.objectContaining({ id: task.id, status: 'failed' }),
+      error,
+    )
+  })
+
+  it('does NOT call onTaskFailed when transitioning to failed WITHOUT error', async () => {
+    const onTaskFailed = vi.fn()
+    const store = new MemoryShortTermStore()
+    const broadcast = new MemoryBroadcastProvider()
+    const engine = new TaskEngine({ shortTerm: store, broadcast, hooks: { onTaskFailed } })
+    const task = await engine.createTask({})
+    await engine.transitionTask(task.id, 'running')
+    await engine.transitionTask(task.id, 'failed')
+    expect(onTaskFailed).not.toHaveBeenCalled()
+  })
+
+  it('stores result in task when payload.result is provided', async () => {
+    const { engine, store } = makeEngine()
+    const task = await engine.createTask({})
+    await engine.transitionTask(task.id, 'running')
+    await engine.transitionTask(task.id, 'completed', { result: { answer: 42 } })
+    const updated = await store.getTask(task.id)
+    expect(updated?.result).toEqual({ answer: 42 })
+  })
 })
 
 describe('TaskEngine.publishEvent', () => {
@@ -88,6 +189,30 @@ describe('TaskEngine.publishEvent', () => {
     expect(received).toHaveLength(1)
   })
 
+  it('throws when task not found in publishEvent', async () => {
+    const { engine } = makeEngine()
+    await expect(
+      engine.publishEvent('missing-task', { type: 'x', level: 'info', data: null })
+    ).rejects.toThrow(/not found/i)
+  })
+
+  it('publishes event with seriesId and seriesMode', async () => {
+    const { engine, store } = makeEngine()
+    const task = await engine.createTask({})
+    await engine.transitionTask(task.id, 'running')
+    await engine.publishEvent(task.id, {
+      type: 'llm.delta',
+      level: 'info',
+      data: { text: 'hello' },
+      seriesId: 's1',
+      seriesMode: 'accumulate',
+    })
+    const events = await store.getEvents(task.id)
+    const userEvents = events.filter((e) => e.type !== 'taskcast:status')
+    expect(userEvents[0]?.seriesId).toBe('s1')
+    expect(userEvents[0]?.seriesMode).toBe('accumulate')
+  })
+
   it('assigns monotonically increasing index', async () => {
     const { engine, store } = makeEngine()
     const task = await engine.createTask({})
@@ -108,6 +233,37 @@ describe('TaskEngine.publishEvent', () => {
       engine.publishEvent(task.id, { type: 'x', level: 'info', data: null })
     ).rejects.toThrow(/terminal/i)
   })
+
+  it('saves event to longTerm when configured', async () => {
+    const store = new MemoryShortTermStore()
+    const broadcast = new MemoryBroadcastProvider()
+    const longTerm = makeLongTermStore()
+    const engine = new TaskEngine({ shortTerm: store, broadcast, longTerm })
+    const task = await engine.createTask({})
+    await engine.transitionTask(task.id, 'running')
+    await engine.publishEvent(task.id, { type: 'llm.delta', level: 'info', data: { text: 'hi' } })
+    // saveEvent is fire-and-forget so flush microtasks
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(longTerm.saveEvent).toHaveBeenCalled()
+  })
+
+  it('calls onEventDropped hook when longTerm saveEvent rejects', async () => {
+    const onEventDropped = vi.fn()
+    const store = new MemoryShortTermStore()
+    const broadcast = new MemoryBroadcastProvider()
+    const longTerm = makeLongTermStore({
+      saveEvent: vi.fn().mockRejectedValue(new Error('storage unavailable')),
+    })
+    const engine = new TaskEngine({ shortTerm: store, broadcast, longTerm, hooks: { onEventDropped } })
+    const task = await engine.createTask({})
+    await engine.transitionTask(task.id, 'running')
+    await engine.publishEvent(task.id, { type: 'llm.delta', level: 'info', data: null })
+    // flush microtasks for the fire-and-forget .catch
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(onEventDropped).toHaveBeenCalled()
+  })
 })
 
 describe('TaskEngine.getTask', () => {
@@ -121,6 +277,25 @@ describe('TaskEngine.getTask', () => {
     const task = await engine.createTask({ type: 'test' })
     const found = await engine.getTask(task.id)
     expect(found?.id).toBe(task.id)
+  })
+
+  it('falls back to longTerm when shortTerm returns null', async () => {
+    const store = new MemoryShortTermStore()
+    const broadcast = new MemoryBroadcastProvider()
+    const fallbackTask = {
+      id: 'archived-task',
+      status: 'completed' as const,
+      createdAt: 0,
+      updatedAt: 1000,
+      completedAt: 1000,
+    }
+    const longTerm = makeLongTermStore({
+      getTask: vi.fn().mockResolvedValue(fallbackTask),
+    })
+    const engine = new TaskEngine({ shortTerm: store, broadcast, longTerm })
+    const found = await engine.getTask('archived-task')
+    expect(found).toEqual(fallbackTask)
+    expect(longTerm.getTask).toHaveBeenCalledWith('archived-task')
   })
 })
 

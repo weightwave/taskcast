@@ -60,6 +60,16 @@ describe('matchesCleanupRule', () => {
     expect(matchesCleanupRule(makeTask({ completedAt: 1000 }), rule, 2000)).toBe(false)
     expect(matchesCleanupRule(makeTask({ completedAt: 1000 }), rule, 2600)).toBe(true)
   })
+
+  it('falls back to updatedAt when completedAt is absent', () => {
+    // task has no completedAt → should use updatedAt (1500) for elapsed calculation
+    const rule: CleanupRule = { trigger: { afterMs: 500 }, target: 'all' }
+    const task = makeTask({ completedAt: undefined, updatedAt: 1500 })
+    // elapsed = now(2100) - updatedAt(1500) = 600 > 500 → matches
+    expect(matchesCleanupRule(task, rule, 2100)).toBe(true)
+    // elapsed = now(1900) - updatedAt(1500) = 400 < 500 → does not match
+    expect(matchesCleanupRule(task, rule, 1900)).toBe(false)
+  })
 })
 
 describe('filterEventsForCleanup', () => {
@@ -115,5 +125,25 @@ describe('filterEventsForCleanup', () => {
     const result = filterEventsForCleanup(events, rule, 2000, completedAt)
     expect(result).toHaveLength(1)
     expect(result[0]?.timestamp).toBe(300)
+  })
+
+  it('filters by seriesMode: includes event whose seriesMode is in filter', () => {
+    const rule: CleanupRule = {
+      trigger: {},
+      target: 'events',
+      eventFilter: { seriesMode: ['latest'] },
+    }
+    const events = [
+      makeEvent({ seriesMode: 'latest' }),
+      makeEvent({ seriesMode: 'accumulate' }),
+      makeEvent({ type: 'no-series' }), // no seriesMode → passes filter (not excluded)
+    ]
+    const result = filterEventsForCleanup(events, rule, 2000)
+    // seriesMode 'accumulate' is NOT in ['latest'] → excluded
+    // seriesMode 'latest' IS in ['latest'] → included
+    // no seriesMode (undefined) → not excluded by seriesMode filter → included
+    expect(result).toHaveLength(2)
+    expect(result.some((e) => e.seriesMode === 'latest')).toBe(true)
+    expect(result.some((e) => e.type === 'no-series')).toBe(true)
   })
 })
