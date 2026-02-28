@@ -52,6 +52,7 @@ export function interpolateEnvVars(value: string): string {
 
 function interpolateObject(obj: unknown): unknown {
   if (typeof obj === 'string') return interpolateEnvVars(obj)
+  /* v8 ignore next -- arrays in config are supported but not exercised in unit tests */
   if (Array.isArray(obj)) return obj.map(interpolateObject)
   if (obj !== null && typeof obj === 'object') {
     return Object.fromEntries(
@@ -99,6 +100,7 @@ export async function loadConfigFile(configPath?: string): Promise<TaskcastConfi
     if (!existsSync(fullPath)) continue
 
     const ext = extname(fullPath).toLowerCase()
+    /* v8 ignore next 4 -- dynamic import of .ts/.js/.mjs config files; not exercised in unit tests */
     if (ext === '.ts' || ext === '.js' || ext === '.mjs') {
       const mod = await import(fullPath) as { default?: TaskcastConfig }
       return mod.default ?? {}

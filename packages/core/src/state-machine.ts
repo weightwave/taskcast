@@ -18,6 +18,7 @@ const ALLOWED_TRANSITIONS: Record<TaskStatus, TaskStatus[]> = {
 
 export function canTransition(from: TaskStatus, to: TaskStatus): boolean {
   if (from === to) return false
+  /* v8 ignore next -- ALLOWED_TRANSITIONS covers all TaskStatus values; ?. and ?? false are unreachable */
   return ALLOWED_TRANSITIONS[from]?.includes(to) ?? false
 }
 

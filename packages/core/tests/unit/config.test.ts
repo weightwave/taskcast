@@ -29,6 +29,12 @@ describe('parseConfig - JSON', () => {
     expect(config.port).toBe(3721)
     expect(config.auth?.mode).toBe('none')
   })
+
+  it('coerces string port to number when JSON port is a quoted string', () => {
+    const json = JSON.stringify({ port: '8080' })
+    const config = parseConfig(json, 'json')
+    expect(config.port).toBe(8080)
+  })
 })
 
 describe('parseConfig - YAML', () => {
