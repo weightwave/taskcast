@@ -1,0 +1,16 @@
+{
+  "name": "taskcast",
+  "private": true,
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "build": "pnpm -r build",
+    "lint": "tsc -b"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.0",
+    "@vitest/coverage-v8": "^2.1.0"
+  }
+}
