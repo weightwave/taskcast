@@ -60,7 +60,7 @@ export function useTaskEvents(
     return () => {
       cancelled = true
     }
-  }, [taskId, opts.baseUrl, opts.token, enabled])
+  }, [taskId, opts.baseUrl, opts.token, opts.fetch, enabled])
 
   return { events, isDone, doneReason, error }
 }
