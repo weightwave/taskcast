@@ -72,7 +72,9 @@ export function parseConfig(content: string, format: 'json' | 'yaml'): TaskcastC
   const config = interpolateObject(raw) as TaskcastConfig
   // Coerce port to number if it's a string (from env var interpolation)
   if (typeof config.port === 'string') {
-    config.port = parseInt(config.port, 10)
+    const n = parseInt(config.port, 10)
+    if (!isNaN(n)) config.port = n
+    else delete (config as Record<string, unknown>)['port']
   }
   return config
 }
