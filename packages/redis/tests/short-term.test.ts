@@ -83,6 +83,13 @@ describe('RedisShortTermStore - events', () => {
     const events = await store.getEvents('task-1', { since: { timestamp: 1002 } })
     expect(events.map((e) => e.index)).toEqual([3, 4])
   })
+
+  it('filters events by since.id', async () => {
+    for (let i = 0; i < 5; i++) await store.appendEvent('task-1', makeEvent(i))
+    // since.id = 'evt-2' means return events AFTER evt-2
+    const events = await store.getEvents('task-1', { since: { id: 'evt-2' } })
+    expect(events.map((e) => e.index)).toEqual([3, 4])
+  })
 })
 
 describe('RedisShortTermStore - series', () => {
@@ -95,5 +102,47 @@ describe('RedisShortTermStore - series', () => {
 
   it('returns null for missing series', async () => {
     expect(await store.getSeriesLatest('task-1', 'missing')).toBeNull()
+  })
+})
+
+describe('RedisShortTermStore - TTL', () => {
+  it('setTTL sets expiry on task and events keys', async () => {
+    await store.saveTask(makeTask())
+    await store.appendEvent('task-1', makeEvent(0))
+    await store.setSeriesLatest('task-1', 's1', makeEvent(0))
+    await store.setTTL('task-1', 60)
+    const taskTtl = await redis.ttl('taskcast:task:task-1')
+    const eventsTtl = await redis.ttl('taskcast:events:task-1')
+    const seriesTtl = await redis.ttl('taskcast:series:task-1:s1')
+    expect(taskTtl).toBeGreaterThan(0)
+    expect(eventsTtl).toBeGreaterThan(0)
+    expect(seriesTtl).toBeGreaterThan(0)
+  })
+})
+
+describe('RedisShortTermStore - replaceLastSeriesEvent', () => {
+  it('appends event when no previous series event exists', async () => {
+    const event = makeEvent(0)
+    await store.replaceLastSeriesEvent('task-1', 's1', event)
+    const events = await store.getEvents('task-1')
+    expect(events).toHaveLength(1)
+    expect(events[0]?.id).toBe(event.id)
+    const latest = await store.getSeriesLatest('task-1', 's1')
+    expect(latest?.id).toBe(event.id)
+  })
+
+  it('replaces previous series event in the list', async () => {
+    const first = makeEvent(0)
+    const second = { ...makeEvent(1), id: 'evt-updated' }
+    // First event is appended and tracked as series latest
+    await store.replaceLastSeriesEvent('task-1', 's1', first)
+    // Second call should replace first in the event list
+    await store.replaceLastSeriesEvent('task-1', 's1', second)
+    const events = await store.getEvents('task-1')
+    // The list should have exactly 1 event (replaced, not appended)
+    expect(events).toHaveLength(1)
+    expect(events[0]?.id).toBe('evt-updated')
+    const latest = await store.getSeriesLatest('task-1', 's1')
+    expect(latest?.id).toBe('evt-updated')
   })
 })

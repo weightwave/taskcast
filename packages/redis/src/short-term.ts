@@ -6,6 +6,7 @@ const KEY = {
   events: (id: string) => `taskcast:events:${id}`,
   seriesLatest: (taskId: string, seriesId: string) =>
     `taskcast:series:${taskId}:${seriesId}`,
+  seriesIds: (taskId: string) => `taskcast:seriesIds:${taskId}`,
 }
 
 export class RedisShortTermStore implements ShortTermStore {
@@ -45,6 +46,14 @@ export class RedisShortTermStore implements ShortTermStore {
   async setTTL(taskId: string, ttlSeconds: number): Promise<void> {
     await this.redis.expire(KEY.task(taskId), ttlSeconds)
     await this.redis.expire(KEY.events(taskId), ttlSeconds)
+
+    const seriesIds = await this.redis.smembers(KEY.seriesIds(taskId))
+    const pipeline = this.redis.pipeline()
+    for (const sid of seriesIds) {
+      pipeline.expire(KEY.seriesLatest(taskId, sid), ttlSeconds)
+    }
+    pipeline.expire(KEY.seriesIds(taskId), ttlSeconds)
+    await pipeline.exec()
   }
 
   async getSeriesLatest(taskId: string, seriesId: string): Promise<TaskEvent | null> {
@@ -54,6 +63,7 @@ export class RedisShortTermStore implements ShortTermStore {
 
   async setSeriesLatest(taskId: string, seriesId: string, event: TaskEvent): Promise<void> {
     await this.redis.set(KEY.seriesLatest(taskId, seriesId), JSON.stringify(event))
+    await this.redis.sadd(KEY.seriesIds(taskId), seriesId)
   }
 
   async replaceLastSeriesEvent(taskId: string, seriesId: string, event: TaskEvent): Promise<void> {
