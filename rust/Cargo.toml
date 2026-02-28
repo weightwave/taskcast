@@ -11,3 +11,6 @@ tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 thiserror = "2"
 ulid = { version = "1", features = ["serde"] }
+serde_yaml = "0.9"
+regex = "1"
+tempfile = "3"
