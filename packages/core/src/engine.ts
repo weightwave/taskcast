@@ -47,16 +47,16 @@ export class TaskEngine {
     const now = Date.now()
     const task: Task = {
       id: input.id ?? ulid(),
-      type: input.type,
       status: 'pending',
-      params: input.params,
-      metadata: input.metadata,
       createdAt: now,
       updatedAt: now,
-      ttl: input.ttl,
-      webhooks: input.webhooks,
-      cleanup: input.cleanup,
-      authConfig: input.authConfig,
+      ...(input.type !== undefined && { type: input.type }),
+      ...(input.params !== undefined && { params: input.params }),
+      ...(input.metadata !== undefined && { metadata: input.metadata }),
+      ...(input.ttl !== undefined && { ttl: input.ttl }),
+      ...(input.webhooks !== undefined && { webhooks: input.webhooks }),
+      ...(input.cleanup !== undefined && { cleanup: input.cleanup }),
+      ...(input.authConfig !== undefined && { authConfig: input.authConfig }),
     }
     await this.opts.shortTerm.saveTask(task)
     if (this.opts.longTerm) await this.opts.longTerm.saveTask(task)
@@ -82,13 +82,16 @@ export class TaskEngine {
     }
 
     const now = Date.now()
+    const newResult = payload?.result ?? task.result
+    const newError = payload?.error ?? task.error
+    const newCompletedAt = isTerminal(to) ? now : task.completedAt
     const updated: Task = {
       ...task,
       status: to,
       updatedAt: now,
-      completedAt: isTerminal(to) ? now : task.completedAt,
-      result: payload?.result ?? task.result,
-      error: payload?.error ?? task.error,
+      ...(newCompletedAt !== undefined && { completedAt: newCompletedAt }),
+      ...(newResult !== undefined && { result: newResult }),
+      ...(newError !== undefined && { error: newError }),
     }
 
     await this.opts.shortTerm.saveTask(updated)
@@ -138,8 +141,8 @@ export class TaskEngine {
       type: input.type,
       level: input.level,
       data: input.data,
-      seriesId: input.seriesId,
-      seriesMode: input.seriesMode,
+      ...(input.seriesId !== undefined && { seriesId: input.seriesId }),
+      ...(input.seriesMode !== undefined && { seriesMode: input.seriesMode }),
     }
 
     const event = await processSeries(raw, this.opts.shortTerm)

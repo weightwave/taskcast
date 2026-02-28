@@ -1,2 +1,7 @@
-// Public API - populated as modules are added
-export const VERSION = '0.1.0'
+export * from './types.js'
+export * from './state-machine.js'
+export * from './filter.js'
+export * from './series.js'
+export * from './cleanup.js'
+export * from './memory-adapters.js'
+export * from './engine.js'

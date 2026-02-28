@@ -75,7 +75,14 @@ export class MemoryShortTermStore implements ShortTermStore {
     if (prev) {
       const taskEvents = this.events.get(taskId)
       if (taskEvents) {
-        const idx = taskEvents.findLastIndex((e) => e.id === prev.id)
+        // Find the last index manually (findLastIndex requires ES2023+)
+        let idx = -1
+        for (let i = taskEvents.length - 1; i >= 0; i--) {
+          if (taskEvents[i]?.id === prev.id) {
+            idx = i
+            break
+          }
+        }
         if (idx >= 0) taskEvents[idx] = { ...event }
       }
     } else {
