@@ -28,7 +28,7 @@ program
   .action(async (options: { config?: string; port: string }) => {
     const fileConfig = await loadConfigFile(options.config)
 
-    const port = Number(process.env['TASKCAST_PORT'] ?? options.port ?? fileConfig.port ?? 3721)
+    const port = Number(options.port ?? fileConfig.port ?? 3721)
     const redisUrl = process.env['TASKCAST_REDIS_URL'] ?? fileConfig.adapters?.broadcast?.url
     const postgresUrl = process.env['TASKCAST_POSTGRES_URL'] ?? fileConfig.adapters?.longTerm?.url
 
