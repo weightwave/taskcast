@@ -15,5 +15,5 @@ export interface PostgresAdapterOptions {
 
 export function createPostgresAdapter(options: PostgresAdapterOptions): PostgresLongTermStore {
   const sql = postgres(options.url, { ssl: options.ssl ? 'require' : false })
-  return new PostgresLongTermStore(sql, { prefix: options.prefix })
+  return new PostgresLongTermStore(sql, options.prefix !== undefined ? { prefix: options.prefix } : {})
 }

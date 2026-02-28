@@ -1,5 +1,15 @@
 import type postgres from 'postgres'
-import type { Task, TaskEvent, LongTermStore, EventQueryOptions } from '@taskcast/core'
+import type {
+  Task,
+  TaskEvent,
+  LongTermStore,
+  EventQueryOptions,
+  TaskError,
+  TaskAuthConfig,
+  WebhookConfig,
+  CleanupRule,
+  SeriesMode,
+} from '@taskcast/core'
 
 function makeTableNames(prefix: string) {
   return {
@@ -27,13 +37,13 @@ export class PostgresLongTermStore implements LongTermStore {
         auth_config, webhooks, cleanup, created_at, updated_at, completed_at, ttl
       ) VALUES (
         ${task.id}, ${task.type ?? null}, ${task.status},
-        ${task.params ? this.sql.json(task.params) : null},
-        ${task.result ? this.sql.json(task.result) : null},
-        ${task.error ? this.sql.json(task.error) : null},
-        ${task.metadata ? this.sql.json(task.metadata) : null},
-        ${task.authConfig ? this.sql.json(task.authConfig) : null},
-        ${task.webhooks ? this.sql.json(task.webhooks) : null},
-        ${task.cleanup ? this.sql.json(task.cleanup) : null},
+        ${task.params ? this.sql.json(task.params as never) : null},
+        ${task.result ? this.sql.json(task.result as never) : null},
+        ${task.error ? this.sql.json(task.error as never) : null},
+        ${task.metadata ? this.sql.json(task.metadata as never) : null},
+        ${task.authConfig ? this.sql.json(task.authConfig as never) : null},
+        ${task.webhooks ? this.sql.json(task.webhooks as never) : null},
+        ${task.cleanup ? this.sql.json(task.cleanup as never) : null},
         ${task.createdAt}, ${task.updatedAt},
         ${task.completedAt ?? null}, ${task.ttl ?? null}
       )
@@ -65,7 +75,7 @@ export class PostgresLongTermStore implements LongTermStore {
       ) VALUES (
         ${event.id}, ${event.taskId}, ${event.index}, ${event.timestamp},
         ${event.type}, ${event.level},
-        ${event.data ? this.sql.json(event.data as Record<string, unknown>) : null},
+        ${event.data ? this.sql.json(event.data as never) : null},
         ${event.seriesId ?? null}, ${event.seriesMode ?? null}
       )
       ON CONFLICT (id) DO NOTHING
@@ -115,26 +125,29 @@ export class PostgresLongTermStore implements LongTermStore {
   }
 
   private _rowToTask(row: postgres.Row): Task {
-    return {
+    // Build using mutable assignment to satisfy exactOptionalPropertyTypes
+    const task: Task = {
       id: row['id'] as string,
-      type: (row['type'] as string | null) ?? undefined,
       status: row['status'] as Task['status'],
-      params: (row['params'] as Record<string, unknown> | null) ?? undefined,
-      result: (row['result'] as Record<string, unknown> | null) ?? undefined,
-      error: (row['error'] as Task['error'] | null) ?? undefined,
-      metadata: (row['metadata'] as Record<string, unknown> | null) ?? undefined,
-      authConfig: (row['auth_config'] as Task['authConfig'] | null) ?? undefined,
-      webhooks: (row['webhooks'] as Task['webhooks'] | null) ?? undefined,
-      cleanup: (row['cleanup'] as Task['cleanup'] | null) ?? undefined,
       createdAt: row['created_at'] as number,
       updatedAt: row['updated_at'] as number,
-      completedAt: (row['completed_at'] as number | null) ?? undefined,
-      ttl: (row['ttl'] as number | null) ?? undefined,
     }
+    if (row['type'] != null) task.type = row['type'] as string
+    if (row['params'] != null) task.params = row['params'] as Record<string, unknown>
+    if (row['result'] != null) task.result = row['result'] as Record<string, unknown>
+    if (row['error'] != null) task.error = row['error'] as TaskError
+    if (row['metadata'] != null) task.metadata = row['metadata'] as Record<string, unknown>
+    if (row['auth_config'] != null) task.authConfig = row['auth_config'] as TaskAuthConfig
+    if (row['webhooks'] != null) task.webhooks = row['webhooks'] as WebhookConfig[]
+    if (row['cleanup'] != null) task.cleanup = row['cleanup'] as { rules: CleanupRule[] }
+    if (row['completed_at'] != null) task.completedAt = row['completed_at'] as number
+    if (row['ttl'] != null) task.ttl = row['ttl'] as number
+    return task
   }
 
   private _rowToEvent(row: postgres.Row): TaskEvent {
-    return {
+    // Build using mutable assignment to satisfy exactOptionalPropertyTypes
+    const event: TaskEvent = {
       id: row['id'] as string,
       taskId: row['task_id'] as string,
       index: row['idx'] as number,
@@ -142,8 +155,9 @@ export class PostgresLongTermStore implements LongTermStore {
       type: row['type'] as string,
       level: row['level'] as TaskEvent['level'],
       data: (row['data'] as unknown) ?? null,
-      seriesId: (row['series_id'] as string | null) ?? undefined,
-      seriesMode: (row['series_mode'] as TaskEvent['seriesMode'] | null) ?? undefined,
     }
+    if (row['series_id'] != null) event.seriesId = row['series_id'] as string
+    if (row['series_mode'] != null) event.seriesMode = row['series_mode'] as SeriesMode
+    return event
   }
 }
