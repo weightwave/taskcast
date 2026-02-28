@@ -6,7 +6,7 @@ use axum::Router;
 use taskcast_core::TaskEngine;
 
 use crate::auth::{auth_middleware, AuthMode};
-use crate::routes::tasks;
+use crate::routes::{sse, tasks};
 
 /// Shared application state available to all handlers.
 #[derive(Clone)]
@@ -23,7 +23,7 @@ pub fn create_app(engine: Arc<TaskEngine>, auth_mode: AuthMode) -> Router {
         .route("/", post(tasks::create_task))
         .route("/{task_id}", get(tasks::get_task))
         .route("/{task_id}/status", patch(tasks::transition_task))
-        .route("/{task_id}/events", post(tasks::publish_events))
+        .route("/{task_id}/events", post(tasks::publish_events).get(sse::sse_events))
         .route("/{task_id}/events/history", get(tasks::get_event_history))
         .with_state(Arc::clone(&engine));
 
