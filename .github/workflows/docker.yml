@@ -19,7 +19,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: taskcast/taskcast
+          images: mwr1998/taskcast
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}

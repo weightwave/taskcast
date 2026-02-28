@@ -1,6 +1,10 @@
 {
   "name": "@taskcast/server",
   "version": "0.1.0",
+  "files": [
+    "dist",
+    "LICENSE"
+  ],
   "type": "module",
   "exports": {
     ".": {
@@ -20,8 +24,12 @@
     "zod": "^3.23.0"
   },
   "devDependencies": {
+    "@hono/node-server": "^1.19.9",
+    "@taskcast/redis": "workspace:*",
+    "@vitest/coverage-v8": "^2.1.0",
+    "ioredis": "^5.4.0",
+    "testcontainers": "^10.13.0",
     "typescript": "^5.7.0",
-    "vitest": "^2.1.0",
-    "@vitest/coverage-v8": "^2.1.0"
+    "vitest": "^2.1.0"
   }
 }

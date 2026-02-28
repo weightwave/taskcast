@@ -1,6 +1,10 @@
 {
   "name": "@taskcast/cli",
   "version": "0.1.0",
+  "files": [
+    "dist",
+    "LICENSE"
+  ],
   "type": "module",
   "bin": {
     "taskcast": "./dist/index.js"

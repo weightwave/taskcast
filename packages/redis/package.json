@@ -1,6 +1,10 @@
 {
   "name": "@taskcast/redis",
   "version": "0.1.0",
+  "files": [
+    "dist",
+    "LICENSE"
+  ],
   "type": "module",
   "exports": {
     ".": {
