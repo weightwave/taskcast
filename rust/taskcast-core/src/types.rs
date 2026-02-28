@@ -98,11 +98,8 @@ pub enum BackoffStrategy {
 pub struct RetryConfig {
     pub retries: u32,
     pub backoff: BackoffStrategy,
-    #[serde(rename = "initialDelayMs")]
     pub initial_delay_ms: u64,
-    #[serde(rename = "maxDelayMs")]
     pub max_delay_ms: u64,
-    #[serde(rename = "timeoutMs")]
     pub timeout_ms: u64,
 }
 
@@ -194,15 +191,13 @@ pub struct Task {
     pub error: Option<TaskError>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<HashMap<String, serde_json::Value>>,
-    #[serde(rename = "createdAt")]
     pub created_at: f64,
-    #[serde(rename = "updatedAt")]
     pub updated_at: f64,
-    #[serde(rename = "completedAt", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ttl: Option<u64>,
-    #[serde(rename = "authConfig", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_config: Option<TaskAuthConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub webhooks: Option<Vec<WebhookConfig>>,
@@ -216,37 +211,32 @@ pub struct Task {
 #[serde(rename_all = "camelCase")]
 pub struct TaskEvent {
     pub id: String,
-    #[serde(rename = "taskId")]
     pub task_id: String,
     pub index: u64,
     pub timestamp: f64,
     pub r#type: String,
     pub level: Level,
     pub data: serde_json::Value,
-    #[serde(rename = "seriesId", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub series_id: Option<String>,
-    #[serde(rename = "seriesMode", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub series_mode: Option<SeriesMode>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SSEEnvelope {
-    #[serde(rename = "filteredIndex")]
     pub filtered_index: u64,
-    #[serde(rename = "rawIndex")]
     pub raw_index: u64,
-    #[serde(rename = "eventId")]
     pub event_id: String,
-    #[serde(rename = "taskId")]
     pub task_id: String,
     pub r#type: String,
     pub timestamp: f64,
     pub level: Level,
     pub data: serde_json::Value,
-    #[serde(rename = "seriesId", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub series_id: Option<String>,
-    #[serde(rename = "seriesMode", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub series_mode: Option<SeriesMode>,
 }
 
@@ -272,7 +262,7 @@ pub struct SubscribeFilter {
     pub types: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub levels: Option<Vec<Level>>,
-    #[serde(rename = "includeStatus", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub include_status: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wrap: Option<bool>,
@@ -325,7 +315,7 @@ pub trait LongTermStore: Send + Sync {
 #[serde(rename_all = "camelCase")]
 pub struct ErrorContext {
     pub operation: String,
-    #[serde(rename = "taskId", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
 }
 
