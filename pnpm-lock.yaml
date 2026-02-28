@@ -86,6 +86,15 @@ importers:
       '@vitest/coverage-v8':
         specifier: ^2.1.0
         version: 2.1.9(vitest@2.1.9(@types/node@25.3.2)(jsdom@25.0.1))
+      ioredis:
+        specifier: ^5.4.0
+        version: 5.10.0
+      postgres:
+        specifier: ^3.4.5
+        version: 3.4.8
+      testcontainers:
+        specifier: ^10.13.0
+        version: 10.28.0
       typescript:
         specifier: ^5.7.0
         version: 5.9.3

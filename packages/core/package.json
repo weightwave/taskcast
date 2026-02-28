@@ -14,14 +14,17 @@
     "test:watch": "vitest"
   },
   "dependencies": {
+    "js-yaml": "^4.1.0",
     "ulidx": "^2.3.0",
-    "zod": "^3.23.0",
-    "js-yaml": "^4.1.0"
+    "zod": "^3.23.0"
   },
   "devDependencies": {
-    "typescript": "^5.7.0",
-    "vitest": "^2.1.0",
+    "@types/js-yaml": "^4.0.9",
     "@vitest/coverage-v8": "^2.1.0",
-    "@types/js-yaml": "^4.0.9"
+    "ioredis": "^5.4.0",
+    "postgres": "^3.4.5",
+    "testcontainers": "^10.13.0",
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.0"
   }
 }
