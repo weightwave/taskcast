@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "taskcast-core",
+    "taskcast-server",
 ]
 
 [workspace.dependencies]

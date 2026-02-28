@@ -1,0 +1,20 @@
+[package]
+name = "taskcast-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+taskcast-core = { path = "../taskcast-core" }
+axum = { version = "0.8", features = ["macros"] }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors"] }
+jsonwebtoken = "9"
+http = "1"
+thiserror = { workspace = true }
+
+[dev-dependencies]
+axum-test = "19"
+tempfile = { workspace = true }
