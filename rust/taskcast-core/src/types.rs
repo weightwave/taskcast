@@ -299,6 +299,7 @@ pub trait ShortTermStore: Send + Sync {
     async fn get_series_latest(&self, task_id: &str, series_id: &str) -> Result<Option<TaskEvent>, Box<dyn std::error::Error + Send + Sync>>;
     async fn set_series_latest(&self, task_id: &str, series_id: &str, event: TaskEvent) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
     async fn replace_last_series_event(&self, task_id: &str, series_id: &str, event: TaskEvent) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn next_index(&self, task_id: &str) -> Result<u64, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 #[async_trait]

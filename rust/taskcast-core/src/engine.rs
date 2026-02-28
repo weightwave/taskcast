@@ -2,8 +2,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tokio::sync::RwLock;
-
 use crate::series::process_series;
 use crate::state_machine::{can_transition, is_terminal};
 use crate::types::{
@@ -71,7 +69,6 @@ pub struct TaskEngine {
     broadcast: Arc<dyn BroadcastProvider>,
     long_term: Option<Arc<dyn LongTermStore>>,
     hooks: Option<Arc<dyn TaskcastHooks>>,
-    index_counters: RwLock<HashMap<String, u64>>,
 }
 
 impl TaskEngine {
@@ -81,7 +78,6 @@ impl TaskEngine {
             broadcast: opts.broadcast,
             long_term: opts.long_term,
             hooks: opts.hooks,
-            index_counters: RwLock::new(HashMap::new()),
         }
     }
 
@@ -232,7 +228,7 @@ impl TaskEngine {
         task_id: &str,
         input: PublishEventInput,
     ) -> Result<TaskEvent, EngineError> {
-        let index = self.next_index(task_id).await;
+        let index = self.short_term.next_index(task_id).await?;
         let raw = TaskEvent {
             id: ulid::Ulid::new().to_string(),
             task_id: task_id.to_string(),
@@ -268,13 +264,6 @@ impl TaskEngine {
         Ok(event)
     }
 
-    async fn next_index(&self, task_id: &str) -> u64 {
-        let mut counters = self.index_counters.write().await;
-        let counter = counters.entry(task_id.to_string()).or_insert(0);
-        let index = *counter;
-        *counter += 1;
-        index
-    }
 }
 
 fn now_millis() -> f64 {

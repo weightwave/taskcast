@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
@@ -81,6 +82,7 @@ pub struct MemoryShortTermStore {
     tasks: RwLock<HashMap<String, Task>>,
     events: RwLock<HashMap<String, Vec<TaskEvent>>>,
     series_latest: RwLock<HashMap<String, TaskEvent>>,
+    index_counters: RwLock<HashMap<String, Arc<AtomicU64>>>,
 }
 
 impl MemoryShortTermStore {
@@ -89,6 +91,7 @@ impl MemoryShortTermStore {
             tasks: RwLock::new(HashMap::new()),
             events: RwLock::new(HashMap::new()),
             series_latest: RwLock::new(HashMap::new()),
+            index_counters: RwLock::new(HashMap::new()),
         }
     }
 }
@@ -228,6 +231,20 @@ impl ShortTermStore for MemoryShortTermStore {
         let mut series = self.series_latest.write().unwrap();
         series.insert(key, event);
         Ok(())
+    }
+
+    async fn next_index(
+        &self,
+        task_id: &str,
+    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        let counter = {
+            let mut counters = self.index_counters.write().unwrap();
+            counters
+                .entry(task_id.to_string())
+                .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+                .clone()
+        };
+        Ok(counter.fetch_add(1, Ordering::SeqCst))
     }
 }
 
