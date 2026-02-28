@@ -39,13 +39,6 @@ export interface CreateTaskInput {
 }
 
 export class TaskEngine {
-  // NOTE: Index counters are per-instance in-memory only.
-  // If multiple TaskEngine instances share the same ShortTermStore,
-  // or after a server restart, indices will restart from 0.
-  // This is acceptable for single-instance use; distributed scenarios
-  // should implement index hydration from the store on startup.
-  private indexCounters = new Map<string, number>()
-
   constructor(private opts: TaskEngineOptions) {}
 
   async createTask(input: CreateTaskInput): Promise<Task> {
@@ -137,7 +130,7 @@ export class TaskEngine {
   }
 
   private async _emit(taskId: string, input: PublishEventInput): Promise<TaskEvent> {
-    const index = this._nextIndex(taskId)
+    const index = await this.opts.shortTerm.nextIndex(taskId)
     const raw: TaskEvent = {
       id: ulid(),
       taskId,
@@ -163,10 +156,4 @@ export class TaskEngine {
     return event
   }
 
-  private _nextIndex(taskId: string): number {
-    const current = this.indexCounters.get(taskId) ?? -1
-    const next = current + 1
-    this.indexCounters.set(taskId, next)
-    return next
-  }
 }

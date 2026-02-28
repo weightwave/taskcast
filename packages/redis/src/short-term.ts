@@ -5,6 +5,7 @@ function makeKeys(prefix: string) {
   return {
     task: (id: string) => `${prefix}:task:${id}`,
     events: (id: string) => `${prefix}:events:${id}`,
+    idx: (id: string) => `${prefix}:idx:${id}`,
     seriesLatest: (taskId: string, seriesId: string) => `${prefix}:series:${taskId}:${seriesId}`,
     seriesIds: (taskId: string) => `${prefix}:seriesIds:${taskId}`,
   }
@@ -28,6 +29,11 @@ export class RedisShortTermStore implements ShortTermStore {
   async getTask(taskId: string): Promise<Task | null> {
     const raw = await this.redis.get(this.KEY.task(taskId))
     return raw ? (JSON.parse(raw) as Task) : null
+  }
+
+  async nextIndex(taskId: string): Promise<number> {
+    // INCR is atomic — safe across multiple instances sharing the same Redis
+    return (await this.redis.incr(this.KEY.idx(taskId))) - 1
   }
 
   async appendEvent(taskId: string, event: TaskEvent): Promise<void> {
@@ -55,6 +61,7 @@ export class RedisShortTermStore implements ShortTermStore {
   async setTTL(taskId: string, ttlSeconds: number): Promise<void> {
     await this.redis.expire(this.KEY.task(taskId), ttlSeconds)
     await this.redis.expire(this.KEY.events(taskId), ttlSeconds)
+    await this.redis.expire(this.KEY.idx(taskId), ttlSeconds)
 
     const seriesIds = await this.redis.smembers(this.KEY.seriesIds(taskId))
     const pipeline = this.redis.pipeline()

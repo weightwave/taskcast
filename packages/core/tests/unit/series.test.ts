@@ -16,6 +16,7 @@ const makeEvent = (overrides: Partial<TaskEvent> = {}): TaskEvent => ({
 const makeStore = (latestEvent?: TaskEvent): ShortTermStore => ({
   saveTask: vi.fn(),
   getTask: vi.fn(),
+  nextIndex: vi.fn(),
   appendEvent: vi.fn(),
   getEvents: vi.fn(),
   setTTL: vi.fn(),

@@ -117,13 +117,14 @@ describe('Redis concurrent fan-out', () => {
   let container: StartedTestContainer
   let engine: TaskEngine
   let pub: Redis, sub: Redis, store: Redis
+  let redisUrl: string
 
   beforeAll(async () => {
     container = await new GenericContainer('redis:7-alpine').withExposedPorts(6379).start()
-    const url = `redis://localhost:${container.getMappedPort(6379)}`
-    pub = new Redis(url)
-    sub = new Redis(url)
-    store = new Redis(url)
+    redisUrl = `redis://localhost:${container.getMappedPort(6379)}`
+    pub = new Redis(redisUrl)
+    sub = new Redis(redisUrl)
+    store = new Redis(redisUrl)
     engine = new TaskEngine({
       broadcast: new RedisBroadcastProvider(pub, sub),
       shortTerm: new RedisShortTermStore(store),
@@ -167,5 +168,42 @@ describe('Redis concurrent fan-out', () => {
       expect(receivedCounts[i]).toBe(EVENT_COUNT)
     }
     unsubs.forEach((u) => u())
+  })
+
+  it('two engine instances sharing Redis produce no duplicate event indices', async () => {
+    // Regression test: before moving nextIndex() into ShortTermStore, each TaskEngine
+    // kept its own in-memory indexCounters map. Under a multi-instance load-balanced
+    // setup (stress test found 37/60 collisions), instance A and instance B would both
+    // start at 0, yielding duplicate indices for the same task. Redis INCR is atomic,
+    // so distributing the counter into RedisShortTermStore.nextIndex() fixes this.
+    const pub2 = new Redis(redisUrl)
+    const sub2 = new Redis(redisUrl)
+    const store2 = new Redis(redisUrl)
+    const engine2 = new TaskEngine({
+      broadcast: new RedisBroadcastProvider(pub2, sub2),
+      shortTerm: new RedisShortTermStore(store2),
+    })
+
+    try {
+      const task = await engine.createTask({})
+      await engine.transitionTask(task.id, 'running')
+
+      const EVENT_COUNT = 30
+
+      // Interleave publishes from both instances concurrently
+      const events = await Promise.all([
+        ...Array.from({ length: EVENT_COUNT }, (_, i) =>
+          engine.publishEvent(task.id, { type: 'inst1', level: 'info', data: { i } })
+        ),
+        ...Array.from({ length: EVENT_COUNT }, (_, i) =>
+          engine2.publishEvent(task.id, { type: 'inst2', level: 'info', data: { i } })
+        ),
+      ])
+
+      const indices = events.map((e) => e.index)
+      expect(new Set(indices).size).toBe(EVENT_COUNT * 2) // all unique
+    } finally {
+      pub2.disconnect(); sub2.disconnect(); store2.disconnect()
+    }
   })
 })

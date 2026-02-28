@@ -26,6 +26,7 @@ export class MemoryShortTermStore implements ShortTermStore {
   private tasks = new Map<string, Task>()
   private events = new Map<string, TaskEvent[]>()
   private seriesLatest = new Map<string, TaskEvent>()
+  private indexCounters = new Map<string, number>()
 
   async saveTask(task: Task): Promise<void> {
     this.tasks.set(task.id, { ...task })
@@ -33,6 +34,13 @@ export class MemoryShortTermStore implements ShortTermStore {
 
   async getTask(taskId: string): Promise<Task | null> {
     return this.tasks.get(taskId) ?? null
+  }
+
+  async nextIndex(taskId: string): Promise<number> {
+    const current = this.indexCounters.get(taskId) ?? -1
+    const next = current + 1
+    this.indexCounters.set(taskId, next)
+    return next
   }
 
   async appendEvent(taskId: string, event: TaskEvent): Promise<void> {

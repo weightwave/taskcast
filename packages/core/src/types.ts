@@ -146,6 +146,8 @@ export interface BroadcastProvider {
 export interface ShortTermStore {
   saveTask(task: Task): Promise<void>
   getTask(taskId: string): Promise<Task | null>
+  /** Atomically allocates the next event index for a task. */
+  nextIndex(taskId: string): Promise<number>
   appendEvent(taskId: string, event: TaskEvent): Promise<void>
   getEvents(taskId: string, opts?: EventQueryOptions): Promise<TaskEvent[]>
   setTTL(taskId: string, ttlSeconds: number): Promise<void>

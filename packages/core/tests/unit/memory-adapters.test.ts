@@ -66,6 +66,20 @@ describe('MemoryShortTermStore', () => {
     expect(await store.getTask('missing')).toBeNull()
   })
 
+  it('nextIndex returns monotonically increasing values starting from 0', async () => {
+    const store = new MemoryShortTermStore()
+    expect(await store.nextIndex('task-1')).toBe(0)
+    expect(await store.nextIndex('task-1')).toBe(1)
+    expect(await store.nextIndex('task-1')).toBe(2)
+  })
+
+  it('nextIndex counters are independent per taskId', async () => {
+    const store = new MemoryShortTermStore()
+    expect(await store.nextIndex('task-a')).toBe(0)
+    expect(await store.nextIndex('task-b')).toBe(0)
+    expect(await store.nextIndex('task-a')).toBe(1)
+  })
+
   it('appends events in order', async () => {
     const store = new MemoryShortTermStore()
     await store.appendEvent('task-1', makeEvent(0))

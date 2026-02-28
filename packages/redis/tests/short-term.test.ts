@@ -61,6 +61,40 @@ describe('RedisShortTermStore - task', () => {
   })
 })
 
+describe('RedisShortTermStore - nextIndex', () => {
+  it('returns 0-based monotonically increasing values', async () => {
+    expect(await store.nextIndex('task-1')).toBe(0)
+    expect(await store.nextIndex('task-1')).toBe(1)
+    expect(await store.nextIndex('task-1')).toBe(2)
+  })
+
+  it('counters are independent per taskId', async () => {
+    expect(await store.nextIndex('task-a')).toBe(0)
+    expect(await store.nextIndex('task-b')).toBe(0)
+    expect(await store.nextIndex('task-a')).toBe(1)
+  })
+
+  it('setTTL expires the idx key', async () => {
+    await store.nextIndex('task-1')
+    await store.setTTL('task-1', 60)
+    const ttl = await redis.ttl('taskcast:idx:task-1')
+    expect(ttl).toBeGreaterThan(0)
+  })
+
+  it('30 concurrent nextIndex calls return all unique values (INCR atomicity)', async () => {
+    // Regression test: per-instance in-memory counters caused duplicate indices
+    // when multiple engine instances published to the same task. Redis INCR is
+    // atomic, so concurrent calls must produce 30 distinct 0-based values.
+    const CONCURRENCY = 30
+    const indices = await Promise.all(
+      Array.from({ length: CONCURRENCY }, () => store.nextIndex('task-concurrent'))
+    )
+    expect(new Set(indices).size).toBe(CONCURRENCY)
+    expect(Math.min(...indices)).toBe(0)
+    expect(Math.max(...indices)).toBe(CONCURRENCY - 1)
+  })
+})
+
 describe('RedisShortTermStore - events', () => {
   it('appends events in order', async () => {
     await store.appendEvent('task-1', makeEvent(0))
