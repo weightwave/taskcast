@@ -1,0 +1,31 @@
+{
+  "name": "@taskcast/sentry",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@taskcast/core": "workspace:*"
+  },
+  "peerDependencies": {
+    "@sentry/node": ">=8.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@sentry/node": { "optional": true }
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.0",
+    "@vitest/coverage-v8": "^2.1.0",
+    "@sentry/node": "^8.42.0"
+  }
+}
