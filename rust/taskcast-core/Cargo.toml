@@ -9,3 +9,6 @@ serde_json = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 ulid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
