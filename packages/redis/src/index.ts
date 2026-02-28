@@ -1,1 +1,1 @@
-export {}
+export { RedisBroadcastProvider } from './broadcast.js'
