@@ -1,0 +1,13 @@
+[package]
+name = "taskcast-redis"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+taskcast-core = { path = "../taskcast-core" }
+redis = { version = "0.27", features = ["tokio-comp", "aio"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+futures-util = "0.3"

@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+    "taskcast-cli",
+    "taskcast-core",
+    "taskcast-postgres",
+    "taskcast-redis",
+    "taskcast-server",
+]
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+thiserror = "2"
+ulid = { version = "1", features = ["serde"] }
+serde_yaml = "0.9"
+regex = "1"
+tempfile = "3"
