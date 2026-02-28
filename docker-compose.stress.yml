@@ -1,0 +1,72 @@
+# Multi-instance load-balanced stress test environment
+# Usage: docker compose -f docker-compose.stress.yml up -d --wait
+name: taskcast-stress
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: redis-server --save "" --appendonly no  # no persistence = faster
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 1s
+      timeout: 1s
+      retries: 30
+
+  taskcast1:
+    build: .
+    environment:
+      TASKCAST_REDIS_URL: redis://redis:6379
+      TASKCAST_PORT: "3721"
+      TASKCAST_LOG_LEVEL: "warn"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3721/health | grep -q ok"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  taskcast2:
+    build: .
+    environment:
+      TASKCAST_REDIS_URL: redis://redis:6379
+      TASKCAST_PORT: "3721"
+      TASKCAST_LOG_LEVEL: "warn"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3721/health | grep -q ok"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  taskcast3:
+    build: .
+    environment:
+      TASKCAST_REDIS_URL: redis://redis:6379
+      TASKCAST_PORT: "3721"
+      TASKCAST_LOG_LEVEL: "warn"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3721/health | grep -q ok"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  lb:
+    image: nginx:1.27-alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx.stress.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      taskcast1:
+        condition: service_healthy
+      taskcast2:
+        condition: service_healthy
+      taskcast3:
+        condition: service_healthy

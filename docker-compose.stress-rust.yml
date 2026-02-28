@@ -1,0 +1,79 @@
+# Multi-instance load-balanced stress test environment — Rust build
+#
+# Same service names as docker-compose.stress.yml so nginx.stress.conf is reused as-is.
+# Run sequentially (not simultaneously) with the Node.js stack — both expose port 8080.
+#
+# Usage:
+#   docker compose -f docker-compose.stress-rust.yml build
+#   docker compose -f docker-compose.stress-rust.yml up -d --wait
+#   npx tsx scripts/stress.ts
+#   docker compose -f docker-compose.stress-rust.yml down
+name: taskcast-stress-rust
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: redis-server --save "" --appendonly no  # no persistence = faster
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 1s
+      timeout: 1s
+      retries: 30
+
+  taskcast1:
+    build:
+      context: ./rust
+    environment:
+      TASKCAST_REDIS_URL: redis://redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      # debian:bookworm-slim includes bash (required priority package)
+      # /dev/tcp is a bash built-in — no external tools needed
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/3721' 2>/dev/null"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  taskcast2:
+    build:
+      context: ./rust
+    environment:
+      TASKCAST_REDIS_URL: redis://redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/3721' 2>/dev/null"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  taskcast3:
+    build:
+      context: ./rust
+    environment:
+      TASKCAST_REDIS_URL: redis://redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/3721' 2>/dev/null"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  lb:
+    image: nginx:1.27-alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx.stress.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      taskcast1:
+        condition: service_healthy
+      taskcast2:
+        condition: service_healthy
+      taskcast3:
+        condition: service_healthy
