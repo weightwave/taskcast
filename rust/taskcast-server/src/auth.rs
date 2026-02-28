@@ -153,7 +153,12 @@ fn decode_jwt(token: &str, config: &JwtConfig) -> Result<AuthContext, jsonwebtok
     let key = if let Some(ref secret) = config.secret {
         DecodingKey::from_secret(secret.as_bytes())
     } else if let Some(ref public_key) = config.public_key {
-        DecodingKey::from_rsa_pem(public_key.as_bytes())?
+        match config.algorithm {
+            Algorithm::ES256 | Algorithm::ES384 => {
+                DecodingKey::from_ec_pem(public_key.as_bytes())?
+            }
+            _ => DecodingKey::from_rsa_pem(public_key.as_bytes())?,
+        }
     } else {
         return Err(jsonwebtoken::errors::Error::from(
             jsonwebtoken::errors::ErrorKind::InvalidKeyFormat,
