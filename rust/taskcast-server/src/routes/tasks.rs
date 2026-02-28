@@ -8,8 +8,8 @@ use axum::Extension;
 use serde::Deserialize;
 use serde_json::json;
 use taskcast_core::{
-    CreateTaskInput, EngineError, EventQueryOptions, Level, PublishEventInput, SeriesMode,
-    SinceCursor, TaskEngine, TaskError, TaskStatus,
+    CleanupConfig, CreateTaskInput, EngineError, EventQueryOptions, Level, PublishEventInput,
+    SeriesMode, SinceCursor, TaskAuthConfig, TaskEngine, TaskError, TaskStatus, WebhookConfig,
 };
 
 use crate::auth::{check_scope, AuthContext};
@@ -25,6 +25,9 @@ pub struct CreateTaskBody {
     pub params: Option<HashMap<String, serde_json::Value>>,
     pub metadata: Option<HashMap<String, serde_json::Value>>,
     pub ttl: Option<u64>,
+    pub webhooks: Option<Vec<WebhookConfig>>,
+    pub cleanup: Option<CleanupConfig>,
+    pub auth_config: Option<TaskAuthConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -91,7 +94,9 @@ pub async fn create_task(
         params: body.params,
         metadata: body.metadata,
         ttl: body.ttl,
-        ..Default::default()
+        webhooks: body.webhooks,
+        cleanup: body.cleanup,
+        auth_config: body.auth_config,
     };
 
     let task = engine.create_task(input).await?;

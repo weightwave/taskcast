@@ -17,6 +17,11 @@ struct TableNames {
 
 impl TableNames {
     fn new(prefix: &str) -> Self {
+        // Validate prefix to prevent SQL injection — only allow alphanumeric + underscore
+        assert!(
+            !prefix.is_empty() && prefix.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+            "Table prefix must be non-empty and contain only alphanumeric characters or underscores, got: {prefix:?}"
+        );
         Self {
             tasks: format!("{prefix}_tasks"),
             events: format!("{prefix}_events"),
@@ -313,27 +318,29 @@ impl LongTermStore for PostgresLongTermStore {
         let since = opts.as_ref().and_then(|o| o.since.as_ref());
         let limit = opts.as_ref().and_then(|o| o.limit);
 
-        let limit_clause = limit
-            .map(|l| format!("LIMIT {l}"))
-            .unwrap_or_default();
+        // Use a bind parameter for LIMIT to prevent SQL injection.
+        // When no limit is specified, use a very large value (i.e. effectively unlimited).
+        let limit_val = limit.map(|l| l as i64).unwrap_or(i64::MAX);
 
         let rows = if let Some(since) = since {
             if let Some(index) = since.index {
                 let sql = format!(
-                    "SELECT * FROM {events_table} WHERE task_id = $1 AND idx > $2 ORDER BY idx ASC {limit_clause}"
+                    "SELECT * FROM {events_table} WHERE task_id = $1 AND idx > $2 ORDER BY idx ASC LIMIT $3"
                 );
                 sqlx::query(&sql)
                     .bind(task_id)
                     .bind(index as i32)
+                    .bind(limit_val)
                     .fetch_all(&self.pool)
                     .await?
             } else if let Some(timestamp) = since.timestamp {
                 let sql = format!(
-                    "SELECT * FROM {events_table} WHERE task_id = $1 AND timestamp > $2 ORDER BY idx ASC {limit_clause}"
+                    "SELECT * FROM {events_table} WHERE task_id = $1 AND timestamp > $2 ORDER BY idx ASC LIMIT $3"
                 );
                 sqlx::query(&sql)
                     .bind(task_id)
                     .bind(timestamp as i64)
+                    .bind(limit_val)
                     .fetch_all(&self.pool)
                     .await?
             } else if let Some(ref id) = since.id {
@@ -350,29 +357,32 @@ impl LongTermStore for PostgresLongTermStore {
                     .unwrap_or(-1);
 
                 let sql = format!(
-                    "SELECT * FROM {events_table} WHERE task_id = $1 AND idx > $2 ORDER BY idx ASC {limit_clause}"
+                    "SELECT * FROM {events_table} WHERE task_id = $1 AND idx > $2 ORDER BY idx ASC LIMIT $3"
                 );
                 sqlx::query(&sql)
                     .bind(task_id)
                     .bind(anchor_idx)
+                    .bind(limit_val)
                     .fetch_all(&self.pool)
                     .await?
             } else {
                 // since exists but has no usable cursor fields
                 let sql = format!(
-                    "SELECT * FROM {events_table} WHERE task_id = $1 ORDER BY idx ASC {limit_clause}"
+                    "SELECT * FROM {events_table} WHERE task_id = $1 ORDER BY idx ASC LIMIT $2"
                 );
                 sqlx::query(&sql)
                     .bind(task_id)
+                    .bind(limit_val)
                     .fetch_all(&self.pool)
                     .await?
             }
         } else {
             let sql = format!(
-                "SELECT * FROM {events_table} WHERE task_id = $1 ORDER BY idx ASC {limit_clause}"
+                "SELECT * FROM {events_table} WHERE task_id = $1 ORDER BY idx ASC LIMIT $2"
             );
             sqlx::query(&sql)
                 .bind(task_id)
+                .bind(limit_val)
                 .fetch_all(&self.pool)
                 .await?
         };
@@ -401,10 +411,15 @@ mod tests {
     }
 
     #[test]
-    fn table_names_with_empty_prefix() {
-        let tables = TableNames::new("");
-        assert_eq!(tables.tasks, "_tasks");
-        assert_eq!(tables.events, "_events");
+    #[should_panic(expected = "Table prefix must be non-empty")]
+    fn table_names_with_empty_prefix_panics() {
+        TableNames::new("");
+    }
+
+    #[test]
+    #[should_panic(expected = "Table prefix must be non-empty")]
+    fn table_names_with_sql_injection_panics() {
+        TableNames::new("foo; DROP TABLE");
     }
 
     #[test]

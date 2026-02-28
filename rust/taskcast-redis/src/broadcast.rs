@@ -127,26 +127,19 @@ impl BroadcastProvider for RedisBroadcastProvider {
         Box::new(move || {
             let handlers = Arc::clone(&handlers);
             let channel = channel.clone();
-            // Spawn a blocking task to clean up the handler.
             // The unsubscribe closure is synchronous per the trait, so we
-            // spawn a thread to do the async cleanup.
-            let _ = std::thread::spawn(move || {
-                let rt = tokio::runtime::Handle::try_current();
-                if let Ok(handle) = rt {
-                    handle.block_on(async {
-                        let mut handlers = handlers.write().await;
-                        if let Some(task_handlers) = handlers.get_mut(&channel) {
-                            task_handlers.retain(|h| {
-                                (Arc::as_ptr(h) as *const () as usize) != handler_addr
-                            });
-                            if task_handlers.is_empty() {
-                                handlers.remove(&channel);
-                            }
-                        }
+            // spawn a tokio task to do the async cleanup.
+            tokio::spawn(async move {
+                let mut handlers = handlers.write().await;
+                if let Some(task_handlers) = handlers.get_mut(&channel) {
+                    task_handlers.retain(|h| {
+                        (Arc::as_ptr(h) as *const () as usize) != handler_addr
                     });
+                    if task_handlers.is_empty() {
+                        handlers.remove(&channel);
+                    }
                 }
-            })
-            .join();
+            });
         })
     }
 }
