@@ -225,15 +225,13 @@ pub fn parse_config(content: &str, format: ConfigFormat) -> Result<TaskcastConfi
 /// If parsing fails, remove the port field entirely.
 fn coerce_port(mut value: serde_json::Value) -> serde_json::Value {
     if let serde_json::Value::Object(ref mut map) = value {
-        if let Some(port_val) = map.get("port") {
-            if let serde_json::Value::String(s) = port_val {
-                match s.parse::<u64>() {
-                    Ok(n) => {
-                        map.insert("port".to_string(), serde_json::Value::Number(n.into()));
-                    }
-                    Err(_) => {
-                        map.remove("port");
-                    }
+        if let Some(serde_json::Value::String(s)) = map.get("port") {
+            match s.parse::<u64>() {
+                Ok(n) => {
+                    map.insert("port".to_string(), serde_json::Value::Number(n.into()));
+                }
+                Err(_) => {
+                    map.remove("port");
                 }
             }
         }
