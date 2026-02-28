@@ -1,0 +1,12 @@
+[package]
+name = "taskcast-postgres"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+taskcast-core = { path = "../taskcast-core" }
+sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "json"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
