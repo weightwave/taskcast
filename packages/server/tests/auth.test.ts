@@ -118,3 +118,37 @@ describe('checkScope', () => {
     expect(checkScope(auth, 'event:subscribe', 'task-abc')).toBe(true)
   })
 })
+
+describe('auth middleware - mode: custom', () => {
+  it('calls custom middleware and sets auth context', async () => {
+    const config: AuthConfig = {
+      mode: 'custom',
+      middleware: async (_req) => ({
+        taskIds: ['task-1'],
+        scope: ['event:subscribe' as const],
+      }),
+    }
+    const app = new Hono()
+    app.use('*', createAuthMiddleware(config))
+    app.get('/test', (c) => {
+      const auth = c.get('auth')
+      return c.json({ taskIds: auth.taskIds })
+    })
+    const res = await app.request('/test')
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.taskIds).toEqual(['task-1'])
+  })
+
+  it('returns 401 when custom middleware returns null', async () => {
+    const config: AuthConfig = {
+      mode: 'custom',
+      middleware: async (_req) => null,
+    }
+    const app = new Hono()
+    app.use('*', createAuthMiddleware(config))
+    app.get('/test', (c) => c.json({ ok: true }))
+    const res = await app.request('/test')
+    expect(res.status).toBe(401)
+  })
+})

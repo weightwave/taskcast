@@ -123,3 +123,41 @@ describe('POST /tasks/:taskId/events', () => {
     expect(body).toHaveLength(2)
   })
 })
+
+describe('GET /tasks/:taskId/events/history', () => {
+  it('returns all events by default', async () => {
+    const { app, engine } = makeApp()
+    const task = await engine.createTask({})
+    await engine.transitionTask(task.id, 'running')
+    await engine.publishEvent(task.id, { type: 'llm.delta', level: 'info', data: { text: 'test' } })
+
+    const res = await app.request(`/tasks/${task.id}/events/history`)
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(Array.isArray(body)).toBe(true)
+    expect(body.length).toBeGreaterThan(0)
+  })
+
+  it('returns 404 for unknown task', async () => {
+    const { app } = makeApp()
+    const res = await app.request('/tasks/nonexistent/events/history')
+    expect(res.status).toBe(404)
+  })
+
+  it('filters by since.index query param', async () => {
+    const { app, engine } = makeApp()
+    const task = await engine.createTask({})
+    await engine.transitionTask(task.id, 'running')
+    await engine.publishEvent(task.id, { type: 'a', level: 'info', data: null })
+    await engine.publishEvent(task.id, { type: 'b', level: 'info', data: null })
+
+    // since.index=1 means return events with raw index > 1
+    // running transition emits taskcast:status (index=0), then 'a' (index=1), then 'b' (index=2)
+    const res = await app.request(`/tasks/${task.id}/events/history?since.index=1`)
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    const types = body.map((e: { type: string }) => e.type)
+    expect(types).toContain('b')
+    expect(types).not.toContain('a')
+  })
+})
