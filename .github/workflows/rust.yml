@@ -1,0 +1,97 @@
+name: Rust
+
+on:
+  push:
+    branches: [main, feature/*]
+    paths:
+      - 'rust/**'
+      - '.github/workflows/rust.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'rust/**'
+      - '.github/workflows/rust.yml'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Check & Clippy
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Check
+        run: cargo check --workspace
+      - name: Clippy
+        run: cargo clippy --workspace -- -D warnings
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Run tests
+        run: cargo test --workspace
+
+  build:
+    name: Build Release
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Build release
+        run: cargo build --release -p taskcast-cli
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: taskcast-linux-x86_64
+          path: rust/target/release/taskcast
+
+  integration:
+    name: Integration Tests
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - name: Install Node dependencies
+        run: pnpm install
+      - name: Build TypeScript packages
+        run: pnpm -r build
+      - name: Download Rust binary
+        uses: actions/download-artifact@v4
+        with:
+          name: taskcast-linux-x86_64
+          path: rust/target/release/
+      - name: Make binary executable
+        run: chmod +x rust/target/release/taskcast
+      - name: Run integration tests
+        run: bash rust/tests/integration.sh
