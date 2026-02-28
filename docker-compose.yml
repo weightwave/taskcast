@@ -1,0 +1,50 @@
+services:
+  taskcast:
+    build: .
+    ports:
+      - "${TASKCAST_PORT:-3721}:3721"
+    environment:
+      - TASKCAST_REDIS_URL=${TASKCAST_REDIS_URL:-}
+      - TASKCAST_POSTGRES_URL=${TASKCAST_POSTGRES_URL:-}
+      - TASKCAST_AUTH_MODE=${TASKCAST_AUTH_MODE:-none}
+      - TASKCAST_JWT_SECRET=${TASKCAST_JWT_SECRET:-}
+      - TASKCAST_LOG_LEVEL=${TASKCAST_LOG_LEVEL:-info}
+    depends_on:
+      redis:
+        condition: service_started
+        required: false
+      postgres:
+        condition: service_healthy
+        required: false
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    profiles: [redis, full]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    profiles: [full]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-taskcast}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-taskcast}
+      POSTGRES_DB: ${POSTGRES_DB:-taskcast}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U taskcast"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  redis-data:
+  pg-data:

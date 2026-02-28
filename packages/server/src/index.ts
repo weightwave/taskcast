@@ -22,6 +22,7 @@ export interface TaskcastServerOptions {
  */
 export function createTaskcastApp(opts: TaskcastServerOptions): Hono {
   const app = new Hono()
+  app.get('/health', (c) => c.json({ ok: true }))
   app.use('*', createAuthMiddleware(opts.auth ?? { mode: 'none' }))
   app.route('/tasks', createTasksRouter(opts.engine))
   app.route('/tasks', createSSERouter(opts.engine))
