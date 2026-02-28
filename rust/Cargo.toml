@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "taskcast-cli",
     "taskcast-core",
     "taskcast-postgres",
     "taskcast-redis",
