@@ -135,6 +135,31 @@ describe('Error handling with non-JSON body', () => {
     const client = new TaskcastServerClient({ baseUrl: 'http://taskcast', fetch })
     await expect(client.getTask('task-1')).rejects.toThrow('HTTP 500')
   })
+
+  it('falls back to "HTTP 404" when JSON body has no .error field', async () => {
+    const fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ code: 'not_found' }), {
+        status: 404,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    )
+    const client = new TaskcastServerClient({ baseUrl: 'http://taskcast', fetch })
+    await expect(client.getTask('missing')).rejects.toThrow('HTTP 404')
+  })
+})
+
+describe('TaskcastServerClient.transitionTask with payload', () => {
+  it('includes result and error fields in request body', async () => {
+    const fetch = makeFetch([{ status: 200, body: { id: 'task-1', status: 'done' } }])
+    const client = new TaskcastServerClient({ baseUrl: 'http://taskcast', fetch })
+
+    const result = { answer: 42 }
+    const error = { code: 'timeout', message: 'timed out' }
+    await client.transitionTask('task-1', 'done', { result, error })
+
+    const [, opts] = fetch.mock.calls[0]!
+    expect(JSON.parse(opts.body)).toEqual({ status: 'done', result, error })
+  })
 })
 
 describe('TaskcastServerClient re-exported from index', () => {

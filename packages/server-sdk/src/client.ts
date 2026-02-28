@@ -1,4 +1,4 @@
-import type { Task, TaskEvent, TaskStatus, TaskAuthConfig, WebhookConfig, CleanupRule, SeriesMode } from '@taskcast/core'
+import type { Task, TaskEvent, TaskStatus, TaskAuthConfig, WebhookConfig, CleanupRule, SeriesMode, SinceCursor, TaskError } from '@taskcast/core'
 
 export type CreateTaskInput = Pick<Partial<Task>, 'type' | 'params' | 'result' | 'metadata' | 'ttl' | 'authConfig' | 'webhooks' | 'cleanup'>
 
@@ -30,7 +30,7 @@ export class TaskcastServerClient {
   }
 
   async createTask(input: CreateTaskInput): Promise<Task> {
-    return this._request<Task>('POST', '/tasks', input, 201)
+    return this._request<Task>('POST', '/tasks', input)
   }
 
   async getTask(taskId: string): Promise<Task> {
@@ -40,7 +40,7 @@ export class TaskcastServerClient {
   async transitionTask(
     taskId: string,
     status: TaskStatus,
-    payload?: { result?: Task['result']; error?: Task['error'] },
+    payload?: { result?: Record<string, unknown>; error?: TaskError },
   ): Promise<Task> {
     return this._request<Task>('PATCH', `/tasks/${taskId}/status`, {
       status,
@@ -49,16 +49,16 @@ export class TaskcastServerClient {
   }
 
   async publishEvent(taskId: string, input: PublishEventInput): Promise<TaskEvent> {
-    return this._request<TaskEvent>('POST', `/tasks/${taskId}/events`, input, 201)
+    return this._request<TaskEvent>('POST', `/tasks/${taskId}/events`, input)
   }
 
   async publishEvents(taskId: string, inputs: PublishEventInput[]): Promise<TaskEvent[]> {
-    return this._request<TaskEvent[]>('POST', `/tasks/${taskId}/events`, inputs, 201)
+    return this._request<TaskEvent[]>('POST', `/tasks/${taskId}/events`, inputs)
   }
 
   async getHistory(
     taskId: string,
-    opts?: { since?: { id?: string; index?: number; timestamp?: number } },
+    opts?: { since?: SinceCursor },
   ): Promise<TaskEvent[]> {
     const params = new URLSearchParams()
     if (opts?.since?.id) params.set('since.id', opts.since.id)
@@ -73,11 +73,12 @@ export class TaskcastServerClient {
     method: string,
     path: string,
     body?: unknown,
-    expectedStatus = 200,
   ): Promise<T> {
     const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
       Accept: 'application/json',
+    }
+    if (body !== undefined) {
+      headers['Content-Type'] = 'application/json'
     }
     if (this.token) headers['Authorization'] = `Bearer ${this.token}`
 
