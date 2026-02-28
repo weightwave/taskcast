@@ -152,3 +152,94 @@ describe('auth middleware - mode: custom', () => {
     expect(res.status).toBe(401)
   })
 })
+
+describe('auth middleware - mode: jwt with issuer/audience', () => {
+  it('accepts token with matching issuer and audience', async () => {
+    const secret = new TextEncoder().encode('test-secret-that-is-long-enough')
+    const token = await new SignJWT({ taskIds: '*', scope: ['*'] })
+      .setProtectedHeader({ alg: 'HS256' })
+      .setIssuer('my-issuer')
+      .setAudience('my-audience')
+      .setExpirationTime('1h')
+      .sign(secret)
+    const config: AuthConfig = {
+      mode: 'jwt',
+      jwt: {
+        algorithm: 'HS256',
+        secret: 'test-secret-that-is-long-enough',
+        issuer: 'my-issuer',
+        audience: 'my-audience',
+      },
+    }
+    const app = new Hono()
+    app.use('*', createAuthMiddleware(config))
+    app.get('/test', (c) => c.json({ ok: true }))
+    const res = await app.request('/test', {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+    expect(res.status).toBe(200)
+  })
+
+  it('rejects token with wrong issuer', async () => {
+    const secret = new TextEncoder().encode('test-secret-that-is-long-enough')
+    const token = await new SignJWT({ taskIds: '*', scope: ['*'] })
+      .setProtectedHeader({ alg: 'HS256' })
+      .setIssuer('wrong-issuer')
+      .setExpirationTime('1h')
+      .sign(secret)
+    const config: AuthConfig = {
+      mode: 'jwt',
+      jwt: {
+        algorithm: 'HS256',
+        secret: 'test-secret-that-is-long-enough',
+        issuer: 'my-issuer',
+      },
+    }
+    const app = new Hono()
+    app.use('*', createAuthMiddleware(config))
+    app.get('/test', (c) => c.json({ ok: true }))
+    const res = await app.request('/test', {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+    expect(res.status).toBe(401)
+  })
+})
+
+describe('auth middleware - mode: jwt with sub claim', () => {
+  it('sets sub on auth context when present in token', async () => {
+    const secret = new TextEncoder().encode('test-secret-that-is-long-enough')
+    const token = await new SignJWT({ taskIds: '*', scope: ['*'] })
+      .setProtectedHeader({ alg: 'HS256' })
+      .setSubject('user-123')
+      .setExpirationTime('1h')
+      .sign(secret)
+    const config: AuthConfig = {
+      mode: 'jwt',
+      jwt: { algorithm: 'HS256', secret: 'test-secret-that-is-long-enough' },
+    }
+    const app = new Hono()
+    app.use('*', createAuthMiddleware(config))
+    app.get('/test', (c) => {
+      const auth = c.get('auth')
+      return c.json({ sub: auth.sub })
+    })
+    const res = await app.request('/test', {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.sub).toBe('user-123')
+  })
+})
+
+describe('auth middleware - fallthrough to 401', () => {
+  it('returns 401 when mode is jwt but no jwt config provided', async () => {
+    // mode is jwt but jwt property is missing - falls through to 401
+    const config = { mode: 'jwt' as const }
+    const app = new Hono()
+    app.use('*', createAuthMiddleware(config))
+    app.get('/test', (c) => c.json({ ok: true }))
+    const res = await app.request('/test')
+    expect(res.status).toBe(401)
+  })
+})

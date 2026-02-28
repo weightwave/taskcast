@@ -134,3 +134,106 @@ describe('PostgresLongTermStore - custom prefix', () => {
     await sql.unsafe('DROP TABLE IF EXISTS myapp_events, myapp_tasks')
   })
 })
+
+describe('PostgresLongTermStore - since.id cursor', () => {
+  it('filters events by since.id', async () => {
+    await store.saveTask(makeTask())
+    for (let i = 0; i < 4; i++) await store.saveEvent(makeEvent('task-1', i))
+    // Get the anchor event (index=1) and filter since it
+    const all = await store.getEvents('task-1')
+    const anchor = all[1]! // index=1
+    const events = await store.getEvents('task-1', { since: { id: anchor.id } })
+    // Should return events with index > 1
+    expect(events.map((e) => e.index)).toEqual([2, 3])
+  })
+
+  it('returns all events when since.id not found', async () => {
+    await store.saveTask(makeTask())
+    for (let i = 0; i < 3; i++) await store.saveEvent(makeEvent('task-1', i))
+    // Nonexistent id results in anchorIdx=-1, so all events returned
+    const events = await store.getEvents('task-1', { since: { id: 'nonexistent-id' } })
+    expect(events).toHaveLength(3)
+  })
+})
+
+describe('PostgresLongTermStore - limit parameter', () => {
+  it('limits results when limit is specified with no since', async () => {
+    await store.saveTask(makeTask())
+    for (let i = 0; i < 5; i++) await store.saveEvent(makeEvent('task-1', i))
+    const events = await store.getEvents('task-1', { limit: 2 })
+    expect(events).toHaveLength(2)
+  })
+
+  it('limits results when limit is specified with since.index', async () => {
+    await store.saveTask(makeTask())
+    for (let i = 0; i < 5; i++) await store.saveEvent(makeEvent('task-1', i))
+    const events = await store.getEvents('task-1', { since: { index: 1 }, limit: 2 })
+    expect(events).toHaveLength(2)
+    expect(events[0]?.index).toBe(2)
+  })
+
+  it('limits results when limit is specified with since.timestamp', async () => {
+    await store.saveTask(makeTask())
+    for (let i = 0; i < 5; i++) await store.saveEvent(makeEvent('task-1', i))
+    const events = await store.getEvents('task-1', { since: { timestamp: 1001 }, limit: 2 })
+    expect(events).toHaveLength(2)
+  })
+
+  it('limits results when limit is specified with since.id', async () => {
+    await store.saveTask(makeTask())
+    for (let i = 0; i < 5; i++) await store.saveEvent(makeEvent('task-1', i))
+    const all = await store.getEvents('task-1')
+    const anchor = all[0]!
+    const events = await store.getEvents('task-1', { since: { id: anchor.id }, limit: 2 })
+    expect(events).toHaveLength(2)
+    expect(events[0]?.index).toBe(1)
+  })
+})
+
+describe('PostgresLongTermStore - full task fields', () => {
+  it('saves and retrieves task with all optional fields', async () => {
+    const fullTask: Task = {
+      id: 'full-task',
+      type: 'llm.chat',
+      status: 'completed',
+      params: { prompt: 'test' },
+      result: { answer: 42 },
+      error: { message: 'oops', code: 'ERR_TEST' },
+      metadata: { userId: 'u1' },
+      authConfig: { mode: 'jwt' } as never,
+      webhooks: [{ url: 'https://example.com/hook' }] as never,
+      cleanup: { rules: [] },
+      createdAt: 1000,
+      updatedAt: 2000,
+      completedAt: 2000,
+      ttl: 86400,
+    }
+    await store.saveTask(fullTask)
+    const task = await store.getTask('full-task')
+    expect(task?.type).toBe('llm.chat')
+    expect(task?.result).toEqual({ answer: 42 })
+    expect(task?.error?.code).toBe('ERR_TEST')
+    expect(Number(task?.completedAt)).toBe(2000)
+    expect(Number(task?.ttl)).toBe(86400)
+  })
+
+  it('saves and retrieves event with seriesId and seriesMode', async () => {
+    await store.saveTask(makeTask())
+    const event: TaskEvent = {
+      id: 'evt-series',
+      taskId: 'task-1',
+      index: 99,
+      timestamp: 9999,
+      type: 'chunk',
+      level: 'info',
+      data: null,
+      seriesId: 'series-1',
+      seriesMode: 'accumulate',
+    }
+    await store.saveEvent(event)
+    const events = await store.getEvents('task-1')
+    const found = events.find((e) => e.id === 'evt-series')
+    expect(found?.seriesId).toBe('series-1')
+    expect(found?.seriesMode).toBe('accumulate')
+  })
+})

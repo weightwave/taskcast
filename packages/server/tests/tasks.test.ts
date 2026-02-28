@@ -160,4 +160,136 @@ describe('GET /tasks/:taskId/events/history', () => {
     expect(types).toContain('b')
     expect(types).not.toContain('a')
   })
+
+  it('filters by since.timestamp query param', async () => {
+    const { app, engine } = makeApp()
+    const task = await engine.createTask({})
+    await engine.transitionTask(task.id, 'running')
+    await engine.publishEvent(task.id, { type: 'early', level: 'info', data: null })
+    await engine.publishEvent(task.id, { type: 'late', level: 'info', data: null })
+
+    // Use timestamp=0 to get all events (all events have timestamp > 0)
+    const res = await app.request(`/tasks/${task.id}/events/history?since.timestamp=0`)
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    const types = body.map((e: { type: string }) => e.type)
+    // All events should be included since their timestamps are > 0
+    expect(types).toContain('early')
+    expect(types).toContain('late')
+  })
+
+  it('filters by since.id query param', async () => {
+    const { app, engine } = makeApp()
+    const task = await engine.createTask({})
+    await engine.transitionTask(task.id, 'running')
+    const evt = await engine.publishEvent(task.id, { type: 'first', level: 'info', data: null })
+    await engine.publishEvent(task.id, { type: 'second', level: 'info', data: null })
+
+    const res = await app.request(`/tasks/${task.id}/events/history?since.id=${evt.id}`)
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    const types = body.map((e: { type: string }) => e.type)
+    expect(types).toContain('second')
+    expect(types).not.toContain('first')
+  })
+})
+
+describe('PATCH /tasks/:taskId/status - error payload', () => {
+  it('transitions task with error payload including code and details', async () => {
+    const { app, engine } = makeApp()
+    const task = await engine.createTask({})
+    await engine.transitionTask(task.id, 'running')
+    const res = await app.request(`/tasks/${task.id}/status`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        status: 'failed',
+        error: { message: 'Something went wrong', code: 'ERR_OOPS', details: { retryable: true } },
+      }),
+    })
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.status).toBe('failed')
+    expect(body.error?.code).toBe('ERR_OOPS')
+    expect(body.error?.details).toEqual({ retryable: true })
+  })
+
+  it('returns 404 when task not found in transition', async () => {
+    const { app } = makeApp()
+    const res = await app.request('/tasks/no-such-task/status', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: 'running' }),
+    })
+    expect(res.status).toBe(404)
+  })
+
+  it('returns 400 for invalid status schema', async () => {
+    const { app, engine } = makeApp()
+    const task = await engine.createTask({})
+    const res = await app.request(`/tasks/${task.id}/status`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: 'invalid-state' }),
+    })
+    expect(res.status).toBe(400)
+  })
+})
+
+describe('POST /tasks/:taskId/events - error handling', () => {
+  it('returns 404 when publishing event to nonexistent task', async () => {
+    const { app } = makeApp()
+    const res = await app.request('/tasks/no-such-task/events', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'test', level: 'info', data: null }),
+    })
+    expect(res.status).toBe(404)
+  })
+
+  it('returns 400 for invalid event schema', async () => {
+    const { app, engine } = makeApp()
+    const task = await engine.createTask({})
+    const res = await app.request(`/tasks/${task.id}/events`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'test', level: 'not-a-level', data: null }),
+    })
+    expect(res.status).toBe(400)
+  })
+
+  it('returns 400 when publishing event to task in terminal state', async () => {
+    const { app, engine } = makeApp()
+    const task = await engine.createTask({})
+    await engine.transitionTask(task.id, 'running')
+    await engine.transitionTask(task.id, 'completed')
+    // Task is completed (terminal), publishing should fail with 400
+    const res = await app.request(`/tasks/${task.id}/events`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'test', level: 'info', data: null }),
+    })
+    expect(res.status).toBe(400)
+  })
+
+  it('publishes event with seriesId and seriesMode', async () => {
+    const { app, engine } = makeApp()
+    const task = await engine.createTask({})
+    await engine.transitionTask(task.id, 'running')
+    const res = await app.request(`/tasks/${task.id}/events`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        type: 'llm.chunk',
+        level: 'info',
+        data: { text: 'hello' },
+        seriesId: 'series-1',
+        seriesMode: 'accumulate',
+      }),
+    })
+    expect(res.status).toBe(201)
+    const body = await res.json()
+    expect(body.seriesId).toBe('series-1')
+    expect(body.seriesMode).toBe('accumulate')
+  })
 })
