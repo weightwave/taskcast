@@ -120,6 +120,21 @@ describe('RedisShortTermStore - TTL', () => {
   })
 })
 
+describe('RedisShortTermStore - custom prefix', () => {
+  it('uses custom prefix for keys', async () => {
+    const customStore = new RedisShortTermStore(redis, { prefix: 'myapp' })
+    await customStore.saveTask(makeTask('t1'))
+    // The task should be under 'myapp:task:t1', not 'taskcast:task:t1'
+    const raw = await redis.get('myapp:task:t1')
+    expect(raw).not.toBeNull()
+    const defaultRaw = await redis.get('taskcast:task:t1')
+    expect(defaultRaw).toBeNull()
+    // Retrieve through store
+    const task = await customStore.getTask('t1')
+    expect(task?.id).toBe('t1')
+  })
+})
+
 describe('RedisShortTermStore - replaceLastSeriesEvent', () => {
   it('appends event when no previous series event exists', async () => {
     const event = makeEvent(0)

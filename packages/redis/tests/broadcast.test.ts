@@ -75,6 +75,24 @@ describe('RedisBroadcastProvider', () => {
     pub.disconnect(); sub1.disconnect(); sub2.disconnect()
   })
 
+  it('uses custom prefix for channels', async () => {
+    const pub = new Redis(redisUrl)
+    const sub = new Redis(redisUrl)
+    const provider = new RedisBroadcastProvider(pub, sub, { prefix: 'myapp' })
+
+    const received: TaskEvent[] = []
+    const unsub = provider.subscribe('task-1', (e) => received.push(e))
+    await new Promise((r) => setTimeout(r, 100))
+
+    await provider.publish('task-1', makeEvent())
+    await new Promise((r) => setTimeout(r, 100))
+
+    expect(received).toHaveLength(1)
+    unsub()
+    pub.disconnect()
+    sub.disconnect()
+  })
+
   it('unsubscribe stops delivery', async () => {
     const pub = new Redis(redisUrl)
     const sub = new Redis(redisUrl)
