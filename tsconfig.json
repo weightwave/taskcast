@@ -1,0 +1,14 @@
+{
+  "files": [],
+  "references": [
+    { "path": "packages/core" },
+    { "path": "packages/server" },
+    { "path": "packages/server-sdk" },
+    { "path": "packages/client" },
+    { "path": "packages/react" },
+    { "path": "packages/cli" },
+    { "path": "packages/redis" },
+    { "path": "packages/postgres" },
+    { "path": "packages/sentry" }
+  ]
+}
