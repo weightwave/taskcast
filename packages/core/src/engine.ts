@@ -39,6 +39,11 @@ export interface CreateTaskInput {
 }
 
 export class TaskEngine {
+  // NOTE: Index counters are per-instance in-memory only.
+  // If multiple TaskEngine instances share the same ShortTermStore,
+  // or after a server restart, indices will restart from 0.
+  // This is acceptable for single-instance use; distributed scenarios
+  // should implement index hydration from the store on startup.
   private indexCounters = new Map<string, number>()
 
   constructor(private opts: TaskEngineOptions) {}

@@ -19,8 +19,12 @@ export async function processSeries(
     let merged = event
 
     if (prev !== null) {
-      const prevData = prev.data as Record<string, unknown>
-      const newData = event.data as Record<string, unknown>
+      const prevData = (typeof prev.data === 'object' && prev.data !== null)
+        ? prev.data as Record<string, unknown>
+        : {}
+      const newData = (typeof event.data === 'object' && event.data !== null)
+        ? event.data as Record<string, unknown>
+        : {}
       if (typeof prevData['text'] === 'string' && typeof newData['text'] === 'string') {
         merged = {
           ...event,

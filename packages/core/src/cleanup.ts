@@ -1,16 +1,15 @@
 import { matchesType } from './filter.js'
-import type { Task, TaskEvent, CleanupRule } from './types.js'
-
-const TERMINAL_STATUSES = ['completed', 'failed', 'timeout', 'cancelled']
+import { isTerminal } from './state-machine.js'
+import type { Task, TaskEvent, CleanupRule, TaskStatus } from './types.js'
 
 export function matchesCleanupRule(
   task: Task,
   rule: CleanupRule,
   now: number,
 ): boolean {
-  if (!TERMINAL_STATUSES.includes(task.status)) return false
+  if (!isTerminal(task.status)) return false
 
-  if (rule.match?.status && !rule.match.status.includes(task.status as never)) {
+  if (rule.match?.status && !rule.match.status.includes(task.status)) {
     return false
   }
 
