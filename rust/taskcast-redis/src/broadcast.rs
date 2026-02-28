@@ -40,9 +40,18 @@ impl RedisBroadcastProvider {
 
         // Spawn background listener that reads from the PubSub connection
         // and dispatches to local handlers.
+        //
+        // We use PSUBSCRIBE with a wildcard pattern so a single subscription
+        // covers all task channels without needing per-task SUBSCRIBE calls.
         let handlers_clone = Arc::clone(&handlers);
         let prefix_clone = channel_prefix.clone();
         tokio::spawn(async move {
+            let pattern = format!("{prefix_clone}*");
+            if let Err(e) = sub_conn.psubscribe(&pattern).await {
+                eprintln!("[taskcast] Redis PSUBSCRIBE failed for pattern {pattern}: {e}");
+                return;
+            }
+
             let mut stream = sub_conn.on_message();
 
             while let Some(msg) = stream.next().await {

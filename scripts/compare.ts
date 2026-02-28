@@ -100,8 +100,16 @@ interface DockerStats { cpuAvgPct: number; memPeakMb: number }
 
 async function sampleDockerStats(nameFilter: string): Promise<{ cpu: number; memMb: number }> {
   try {
+    // docker stats does not support --filter; use docker ps to get matching container IDs first
+    const { stdout: ids } = await execAsync(
+      `docker ps --filter "name=${nameFilter}" -q`,
+      { timeout: 3000 },
+    )
+    const containerIds = ids.trim()
+    if (!containerIds) return { cpu: 0, memMb: 0 }
+
     const { stdout } = await execAsync(
-      `docker stats --no-stream --format "{{.CPUPerc}}\t{{.MemUsage}}" --filter "name=${nameFilter}"`,
+      `docker stats --no-stream --format "{{.CPUPerc}}\t{{.MemUsage}}" ${containerIds.split('\n').join(' ')}`,
       { timeout: 5000 },
     )
     let totalCpu = 0
