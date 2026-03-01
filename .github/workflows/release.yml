@@ -13,10 +13,17 @@ permissions:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
 
+env:
+  DOCKER_IMAGE: mwr1998/taskcast-rs
+
 jobs:
+  # ── npm publish via changesets ────────────────────────────────────────────
   release:
     runs-on: ubuntu-latest
     environment: npm
+    outputs:
+      published: ${{ steps.changesets.outputs.published }}
+      publishedPackages: ${{ steps.changesets.outputs.publishedPackages }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -44,6 +51,7 @@ jobs:
         run: pnpm test
 
       - name: Create Release PR or Publish
+        id: changesets
         uses: changesets/action@v1
         with:
           publish: pnpm ci:publish
@@ -52,3 +60,214 @@ jobs:
           createGithubReleases: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ── Extract version from changesets output ────────────────────────────────
+  get-version:
+    needs: release
+    if: needs.release.outputs.published == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.extract.outputs.version }}
+    steps:
+      - name: Extract version
+        id: extract
+        run: |
+          VERSION=$(echo '${{ needs.release.outputs.publishedPackages }}' \
+            | jq -r '.[] | select(.name == "@taskcast/cli") | .version')
+          if [ -z "$VERSION" ]; then
+            echo "ERROR: @taskcast/cli not found in published packages" >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+  # ── Rust binary builds (5 platforms, native runners) ──────────────────────
+  rust-build:
+    needs: get-version
+    if: needs.get-version.outputs.version != ''
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    env:
+      VERSION: ${{ needs.get-version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Sync Rust version
+        shell: bash
+        run: bash scripts/sync-rust-version.sh
+
+      - name: Build
+        working-directory: rust
+        run: cargo build --release -p taskcast-cli --target ${{ matrix.target }}
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          ARCHIVE="taskcast-v${VERSION}-${{ matrix.target }}.tar.gz"
+          tar -czf "$ARCHIVE" -C "rust/target/${{ matrix.target }}/release" taskcast
+          echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $Archive = "taskcast-v${{ env.VERSION }}-${{ matrix.target }}.zip"
+          Compress-Archive -Path "rust/target/${{ matrix.target }}/release/taskcast.exe" -DestinationPath $Archive
+          echo "ARCHIVE=$Archive" >> $env:GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+
+  # ── Docker builds (2 platforms, native runners) ───────────────────────────
+  docker-build:
+    needs: get-version
+    if: needs.get-version.outputs.version != ''
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            platform: linux/amd64
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Sync Rust version
+        run: bash scripts/sync-rust-version.sh
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to DockerHub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.DOCKER_IMAGE }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ./rust
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.DOCKER_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,scope=${{ matrix.platform }},mode=max
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-digest-${{ matrix.runner }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+
+  # ── Docker manifest merge ─────────────────────────────────────────────────
+  docker-merge:
+    needs: [get-version, docker-build]
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.get-version.outputs.version }}
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: docker-digest-*
+          path: /tmp/digests
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to DockerHub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          MINOR=$(echo "$VERSION" | cut -d. -f1-2)
+          docker buildx imagetools create \
+            -t "$DOCKER_IMAGE:$VERSION" \
+            -t "$DOCKER_IMAGE:$MINOR" \
+            -t "$DOCKER_IMAGE:latest" \
+            $(printf "$DOCKER_IMAGE@sha256:%s " *)
+
+      - name: Inspect image
+        run: docker buildx imagetools inspect ${{ env.DOCKER_IMAGE }}:${{ env.VERSION }}
+
+  # ── Attach binaries to GitHub Release ─────────────────────────────────────
+  attach-binaries:
+    needs: [get-version, rust-build]
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.get-version.outputs.version }}
+    steps:
+      - name: Download all binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          path: /tmp/binaries
+          merge-multiple: true
+
+      - name: Attach to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "v${{ env.VERSION }}"
+          files: /tmp/binaries/*
+          fail_on_unmatched_files: true

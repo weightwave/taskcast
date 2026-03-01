@@ -28,11 +28,14 @@ pnpm changeset version  # Bump versions (CI does this)
 pnpm ci:publish         # Build + publish (CI does this)
 ```
 
-All 9 packages use **fixed versioning** — every release bumps all packages to the same version.
+All 9 packages use **fixed versioning** — every release bumps all packages to the same version. Rust binaries share the same version number.
 
 When you merge a PR that contains `.changeset/*.md` files, CI will:
 1. Open a "Release Packages" PR that bumps versions and generates changelogs
-2. When that PR is merged, CI publishes to npm
+2. When that PR is merged, CI publishes to npm, then:
+   - Builds Rust binaries for 5 platforms (linux/macOS amd64+arm64, Windows) and attaches to GitHub Release
+   - Builds and pushes multi-arch Docker image (`mwr1998/taskcast-rs`) to DockerHub
+3. Rust `Cargo.toml` versions are synced at CI time via `scripts/sync-rust-version.sh` (not committed)
 
 ## Package Map
 
