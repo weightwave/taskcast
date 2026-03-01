@@ -1,0 +1,22 @@
+{
+  "$schema": "https://unpkg.com/@changesets/config@3.1.1/schema.json",
+  "changelog": "@changesets/cli/changelog",
+  "commit": false,
+  "fixed": [
+    [
+      "@taskcast/core",
+      "@taskcast/server",
+      "@taskcast/server-sdk",
+      "@taskcast/client",
+      "@taskcast/react",
+      "@taskcast/cli",
+      "@taskcast/redis",
+      "@taskcast/postgres",
+      "@taskcast/sentry"
+    ]
+  ],
+  "access": "public",
+  "baseBranch": "main",
+  "updateInternalDependencies": "patch",
+  "ignore": []
+}
