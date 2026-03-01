@@ -190,11 +190,12 @@ export class PostgresLongTermStore implements LongTermStore {
 
   private _rowToTask(row: postgres.Row): Task {
     // Build using mutable assignment to satisfy exactOptionalPropertyTypes
+    // Note: PostgreSQL BIGINT comes back as string from postgres.js, so we use Number() for numeric columns
     const task: Task = {
       id: row['id'] as string,
       status: row['status'] as Task['status'],
-      createdAt: row['created_at'] as number,
-      updatedAt: row['updated_at'] as number,
+      createdAt: Number(row['created_at']),
+      updatedAt: Number(row['updated_at']),
     }
     if (row['type'] != null) task.type = row['type'] as string
     if (row['params'] != null) task.params = row['params'] as Record<string, unknown>
@@ -204,11 +205,11 @@ export class PostgresLongTermStore implements LongTermStore {
     if (row['auth_config'] != null) task.authConfig = row['auth_config'] as TaskAuthConfig
     if (row['webhooks'] != null) task.webhooks = row['webhooks'] as WebhookConfig[]
     if (row['cleanup'] != null) task.cleanup = row['cleanup'] as { rules: CleanupRule[] }
-    if (row['completed_at'] != null) task.completedAt = row['completed_at'] as number
-    if (row['ttl'] != null) task.ttl = row['ttl'] as number
+    if (row['completed_at'] != null) task.completedAt = Number(row['completed_at'])
+    if (row['ttl'] != null) task.ttl = Number(row['ttl'])
     if (row['tags'] != null) task.tags = row['tags'] as string[]
     if (row['assign_mode'] != null) task.assignMode = row['assign_mode'] as AssignMode
-    if (row['cost'] != null) task.cost = row['cost'] as number
+    if (row['cost'] != null) task.cost = Number(row['cost'])
     if (row['assigned_worker'] != null) task.assignedWorker = row['assigned_worker'] as string
     if (row['disconnect_policy'] != null) task.disconnectPolicy = row['disconnect_policy'] as DisconnectPolicy
     return task
@@ -219,8 +220,8 @@ export class PostgresLongTermStore implements LongTermStore {
     const event: TaskEvent = {
       id: row['id'] as string,
       taskId: row['task_id'] as string,
-      index: row['idx'] as number,
-      timestamp: row['timestamp'] as number,
+      index: Number(row['idx']),
+      timestamp: Number(row['timestamp']),
       type: row['type'] as string,
       level: row['level'] as TaskEvent['level'],
       data: (row['data'] as unknown) ?? null,
@@ -234,7 +235,7 @@ export class PostgresLongTermStore implements LongTermStore {
     const event: WorkerAuditEvent = {
       id: row['id'] as string,
       workerId: row['worker_id'] as string,
-      timestamp: row['timestamp'] as number,
+      timestamp: Number(row['timestamp']),
       action: row['action'] as WorkerAuditEvent['action'],
     }
     if (row['data'] != null) event.data = row['data'] as Record<string, unknown>
