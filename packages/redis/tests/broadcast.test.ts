@@ -6,6 +6,13 @@ import type { TaskEvent } from '@taskcast/core'
 
 let container: StartedTestContainer
 let redisUrl: string
+const clients: Redis[] = []
+
+function createClient(): Redis {
+  const c = new Redis(redisUrl)
+  clients.push(c)
+  return c
+}
 
 beforeAll(async () => {
   container = await new GenericContainer('redis:7-alpine')
@@ -15,6 +22,7 @@ beforeAll(async () => {
 }, 60000)
 
 afterAll(async () => {
+  await Promise.all(clients.map((c) => c.quit().catch(() => {})))
   await container?.stop()
 })
 
@@ -30,8 +38,8 @@ const makeEvent = (): TaskEvent => ({
 
 describe('RedisBroadcastProvider', () => {
   it('delivers published events to subscribers', async () => {
-    const pub = new Redis(redisUrl)
-    const sub = new Redis(redisUrl)
+    const pub = createClient()
+    const sub = createClient()
     const provider = new RedisBroadcastProvider(pub, sub)
 
     const received: TaskEvent[] = []
@@ -48,16 +56,14 @@ describe('RedisBroadcastProvider', () => {
     expect(received[0]?.type).toBe('llm.delta')
 
     unsub()
-    pub.disconnect()
-    sub.disconnect()
   })
 
   it('multiple subscribers on same channel all receive events', async () => {
-    const pub = new Redis(redisUrl)
-    const sub1 = new Redis(redisUrl)
-    const sub2 = new Redis(redisUrl)
+    const pub = createClient()
+    const sub1 = createClient()
+    const sub2 = createClient()
     const p1 = new RedisBroadcastProvider(pub, sub1)
-    const p2 = new RedisBroadcastProvider(new Redis(redisUrl), sub2)
+    const p2 = new RedisBroadcastProvider(createClient(), sub2)
 
     const r1: TaskEvent[] = []
     const r2: TaskEvent[] = []
@@ -72,12 +78,11 @@ describe('RedisBroadcastProvider', () => {
     expect(r2).toHaveLength(1)
 
     u1(); u2()
-    pub.disconnect(); sub1.disconnect(); sub2.disconnect()
   })
 
   it('uses custom prefix for channels', async () => {
-    const pub = new Redis(redisUrl)
-    const sub = new Redis(redisUrl)
+    const pub = createClient()
+    const sub = createClient()
     const provider = new RedisBroadcastProvider(pub, sub, { prefix: 'myapp' })
 
     const received: TaskEvent[] = []
@@ -89,13 +94,11 @@ describe('RedisBroadcastProvider', () => {
 
     expect(received).toHaveLength(1)
     unsub()
-    pub.disconnect()
-    sub.disconnect()
   })
 
   it('unsubscribe stops delivery', async () => {
-    const pub = new Redis(redisUrl)
-    const sub = new Redis(redisUrl)
+    const pub = createClient()
+    const sub = createClient()
     const provider = new RedisBroadcastProvider(pub, sub)
 
     const received: TaskEvent[] = []
@@ -110,12 +113,11 @@ describe('RedisBroadcastProvider', () => {
     await new Promise((r) => setTimeout(r, 100))
 
     expect(received).toHaveLength(1)
-    pub.disconnect(); sub.disconnect()
   })
 
   it('ignores malformed (non-JSON) messages on the channel', async () => {
-    const pub = new Redis(redisUrl)
-    const sub = new Redis(redisUrl)
+    const pub = createClient()
+    const sub = createClient()
     const provider = new RedisBroadcastProvider(pub, sub)
 
     const received: TaskEvent[] = []
@@ -128,13 +130,11 @@ describe('RedisBroadcastProvider', () => {
 
     // No events should have been delivered (error was swallowed)
     expect(received).toHaveLength(0)
-    pub.disconnect()
-    sub.disconnect()
   })
 
   it('delivers message when channel does not start with prefix (raw channel name used as taskId)', async () => {
-    const pub = new Redis(redisUrl)
-    const sub = new Redis(redisUrl)
+    const pub = createClient()
+    const sub = createClient()
     const provider = new RedisBroadcastProvider(pub, sub)
 
     const received: TaskEvent[] = []
@@ -156,13 +156,11 @@ describe('RedisBroadcastProvider', () => {
     await new Promise((r) => setTimeout(r, 10))
 
     expect(received).toHaveLength(1)
-    pub.disconnect()
-    sub.disconnect()
   })
 
   it('ignores messages on channels with no registered handlers', async () => {
-    const pub = new Redis(redisUrl)
-    const sub = new Redis(redisUrl)
+    const pub = createClient()
+    const sub = createClient()
     const provider = new RedisBroadcastProvider(pub, sub)
 
     // Subscribe to task-1 then unsubscribe to clear handlers
@@ -179,13 +177,11 @@ describe('RedisBroadcastProvider', () => {
     )
     await new Promise((r) => setTimeout(r, 10))
     // No error thrown, handler is not in the map → silently returns
-    pub.disconnect()
-    sub.disconnect()
   })
 
   it('calling unsubscribe twice is safe (set not found guard)', async () => {
-    const pub = new Redis(redisUrl)
-    const sub = new Redis(redisUrl)
+    const pub = createClient()
+    const sub = createClient()
     const provider = new RedisBroadcastProvider(pub, sub)
 
     const received: TaskEvent[] = []
@@ -196,8 +192,5 @@ describe('RedisBroadcastProvider', () => {
     unsub()
     // Call unsub again — this exercises the `if (!set) return` defensive branch
     unsub()
-
-    pub.disconnect()
-    sub.disconnect()
   })
 })
