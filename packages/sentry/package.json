@@ -1,6 +1,6 @@
 {
   "name": "@taskcast/sentry",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "files": [
     "dist",
     "LICENSE"
@@ -24,7 +24,9 @@
     "@sentry/node": ">=8.0.0"
   },
   "peerDependenciesMeta": {
-    "@sentry/node": { "optional": true }
+    "@sentry/node": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "typescript": "^5.7.0",

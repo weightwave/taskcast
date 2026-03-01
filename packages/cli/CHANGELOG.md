@@ -1,0 +1,12 @@
+# @taskcast/cli
+
+## 0.1.1
+
+### Patch Changes
+
+- 5085c69: fix: resolve workspace:\* references in published packages
+- Updated dependencies [5085c69]
+  - @taskcast/core@0.1.1
+  - @taskcast/server@0.1.1
+  - @taskcast/redis@0.1.1
+  - @taskcast/postgres@0.1.1
