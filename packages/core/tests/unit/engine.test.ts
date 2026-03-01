@@ -68,6 +68,45 @@ describe('TaskEngine.createTask', () => {
     const task = await engine.createTask({ ttl: 300 })
     expect(setTTLSpy).toHaveBeenCalledWith(task.id, 300)
   })
+
+  it('persists tags, assignMode, cost, disconnectPolicy', async () => {
+    const { engine, store } = makeEngine()
+    const task = await engine.createTask({
+      tags: ['gpu', 'high-priority'],
+      assignMode: 'pull',
+      cost: 3,
+      disconnectPolicy: 'reassign',
+    })
+    expect(task.tags).toEqual(['gpu', 'high-priority'])
+    expect(task.assignMode).toBe('pull')
+    expect(task.cost).toBe(3)
+    expect(task.disconnectPolicy).toBe('reassign')
+
+    const stored = await store.getTask(task.id)
+    expect(stored?.tags).toEqual(['gpu', 'high-priority'])
+    expect(stored?.assignMode).toBe('pull')
+    expect(stored?.cost).toBe(3)
+    expect(stored?.disconnectPolicy).toBe('reassign')
+  })
+
+  it('omits undefined worker fields', async () => {
+    const { engine } = makeEngine()
+    const task = await engine.createTask({ type: 'test' })
+    expect(task).not.toHaveProperty('tags')
+    expect(task).not.toHaveProperty('assignMode')
+    expect(task).not.toHaveProperty('cost')
+    expect(task).not.toHaveProperty('disconnectPolicy')
+  })
+
+  it('calls onTaskCreated hook after task creation', async () => {
+    const onTaskCreated = vi.fn()
+    const store = new MemoryShortTermStore()
+    const broadcast = new MemoryBroadcastProvider()
+    const engine = new TaskEngine({ shortTerm: store, broadcast, hooks: { onTaskCreated } })
+    const task = await engine.createTask({ type: 'test' })
+    expect(onTaskCreated).toHaveBeenCalledOnce()
+    expect(onTaskCreated).toHaveBeenCalledWith(expect.objectContaining({ id: task.id, status: 'pending' }))
+  })
 })
 
 describe('TaskEngine.transitionTask', () => {
@@ -164,6 +203,31 @@ describe('TaskEngine.transitionTask', () => {
     await engine.transitionTask(task.id, 'completed', { result: { answer: 42 } })
     const updated = await store.getTask(task.id)
     expect(updated?.result).toEqual({ answer: 42 })
+  })
+
+  it('calls onTaskTransitioned hook with correct old and new status', async () => {
+    const onTaskTransitioned = vi.fn()
+    const store = new MemoryShortTermStore()
+    const broadcast = new MemoryBroadcastProvider()
+    const engine = new TaskEngine({ shortTerm: store, broadcast, hooks: { onTaskTransitioned } })
+    const task = await engine.createTask({})
+
+    await engine.transitionTask(task.id, 'running')
+    expect(onTaskTransitioned).toHaveBeenCalledOnce()
+    expect(onTaskTransitioned).toHaveBeenCalledWith(
+      expect.objectContaining({ id: task.id, status: 'running' }),
+      'pending',
+      'running',
+    )
+
+    onTaskTransitioned.mockClear()
+    await engine.transitionTask(task.id, 'completed')
+    expect(onTaskTransitioned).toHaveBeenCalledOnce()
+    expect(onTaskTransitioned).toHaveBeenCalledWith(
+      expect.objectContaining({ id: task.id, status: 'completed' }),
+      'running',
+      'completed',
+    )
   })
 })
 

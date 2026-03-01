@@ -46,6 +46,10 @@ export interface CreateTaskInput {
   webhooks?: Task['webhooks']
   cleanup?: Task['cleanup']
   authConfig?: Task['authConfig']
+  tags?: string[]
+  assignMode?: Task['assignMode']
+  cost?: number
+  disconnectPolicy?: Task['disconnectPolicy']
 }
 
 export class TaskEngine {
@@ -85,10 +89,15 @@ export class TaskEngine {
       ...(input.webhooks !== undefined && { webhooks: input.webhooks }),
       ...(input.cleanup !== undefined && { cleanup: input.cleanup }),
       ...(input.authConfig !== undefined && { authConfig: input.authConfig }),
+      ...(input.tags !== undefined && { tags: input.tags }),
+      ...(input.assignMode !== undefined && { assignMode: input.assignMode }),
+      ...(input.cost !== undefined && { cost: input.cost }),
+      ...(input.disconnectPolicy !== undefined && { disconnectPolicy: input.disconnectPolicy }),
     }
     await this.shortTermStore.saveTask(task)
     if (this.longTermStore) await this.longTermStore.saveTask(task)
     if (task.ttl) await this.shortTermStore.setTTL(task.id, task.ttl)
+    this.hooks?.onTaskCreated?.(task)
     return task
   }
 
@@ -137,6 +146,8 @@ export class TaskEngine {
     if (to === 'timeout') {
       this.hooks?.onTaskTimeout?.(updated)
     }
+
+    this.hooks?.onTaskTransitioned?.(updated, task.status, to)
 
     return updated
   }
