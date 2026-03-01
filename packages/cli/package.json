@@ -1,9 +1,21 @@
 {
   "name": "@taskcast/cli",
   "version": "0.1.1",
+  "description": "Standalone Taskcast server CLI — run with npx taskcast.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/weightwave/taskcast.git",
+    "directory": "packages/cli"
+  },
+  "homepage": "https://github.com/weightwave/taskcast/tree/main/packages/cli#readme",
+  "bugs": {
+    "url": "https://github.com/weightwave/taskcast/issues"
+  },
+  "license": "MIT",
   "files": [
     "dist",
-    "LICENSE"
+    "LICENSE",
+    "README.md"
   ],
   "type": "module",
   "bin": {
@@ -14,6 +26,9 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     }
+  },
+  "publishConfig": {
+    "provenance": true
   },
   "scripts": {
     "build": "tsc",
