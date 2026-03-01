@@ -20,6 +20,20 @@ Run a single package's tests:
 cd packages/core && pnpm test
 ```
 
+### Release Workflow
+
+```bash
+pnpm changeset          # Create a changeset (run before PR)
+pnpm changeset version  # Bump versions (CI does this)
+pnpm ci:publish         # Build + publish (CI does this)
+```
+
+All 9 packages use **fixed versioning** — every release bumps all packages to the same version.
+
+When you merge a PR that contains `.changeset/*.md` files, CI will:
+1. Open a "Release Packages" PR that bumps versions and generates changelogs
+2. When that PR is merged, CI publishes to npm
+
 ## Package Map
 
 | Package | Path | Purpose |
