@@ -15,7 +15,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start the taskcast server (default)
+    /// Start the taskcast server in foreground (default)
     Start {
         /// Config file path
         #[arg(short, long)]
@@ -24,6 +24,12 @@ enum Commands {
         #[arg(short, long, default_value = "3721")]
         port: u16,
     },
+    /// Start the server as a background service (not yet implemented)
+    Daemon,
+    /// Stop the background service (not yet implemented)
+    Stop,
+    /// Show server status (not yet implemented)
+    Status,
 }
 
 #[tokio::main]
@@ -146,6 +152,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await?;
             println!("[taskcast] Server started on http://localhost:{port}");
             axum::serve(listener, app).await?;
+        }
+        Commands::Daemon => {
+            eprintln!("[taskcast] daemon mode is not yet implemented, use `taskcast start` for foreground mode");
+            std::process::exit(1);
+        }
+        Commands::Stop => {
+            eprintln!("[taskcast] stop is not yet implemented");
+            std::process::exit(1);
+        }
+        Commands::Status => {
+            eprintln!("[taskcast] status is not yet implemented");
+            std::process::exit(1);
         }
     }
 

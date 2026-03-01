@@ -10,17 +10,30 @@ npx taskcast
 
 The server starts on port `3721` by default.
 
-## Options
+## Commands
 
 ```
-Usage: taskcast [options] [command]
+Usage: taskcast [command] [options]
 
 Commands:
-  start           Start the Taskcast server (default)
+  start           Start the Taskcast server in foreground (default)
+  daemon          Start as a background service (not yet implemented)
+  stop            Stop the background service (not yet implemented)
+  status          Show server status (not yet implemented)
 
 Options:
-  -c, --config    Path to config file
-  -p, --port      Server port (default: 3721)
+  -V, --version   Show version
+  -h, --help      Show help
+```
+
+### `taskcast start`
+
+Start the server in foreground mode. This is the default command — `taskcast` is equivalent to `taskcast start`.
+
+```
+Options:
+  -c, --config <path>   Path to config file
+  -p, --port <port>     Server port (default: 3721)
 ```
 
 ## Configuration
@@ -28,7 +41,7 @@ Options:
 ### Config File
 
 ```bash
-npx taskcast -p 8080 -c taskcast.config.yaml
+npx taskcast start -p 8080 -c taskcast.config.yaml
 ```
 
 Taskcast searches for config files in the current directory:
