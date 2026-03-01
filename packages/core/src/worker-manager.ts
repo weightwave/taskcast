@@ -52,6 +52,7 @@ export interface WorkerUpdate {
   weight?: number
   capacity?: number
   matchRule?: WorkerMatchRule
+  status?: 'draining'
 }
 
 // ─── Dispatch / Claim / Decline ─────────────────────────────────────────────
@@ -149,6 +150,7 @@ export class WorkerManager {
     if (update.weight !== undefined) worker.weight = update.weight
     if (update.capacity !== undefined) worker.capacity = update.capacity
     if (update.matchRule !== undefined) worker.matchRule = update.matchRule
+    if (update.status !== undefined) worker.status = update.status
 
     await this.shortTerm.saveWorker(worker)
     return worker
