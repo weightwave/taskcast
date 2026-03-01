@@ -1,6 +1,6 @@
 {
   "name": "@taskcast/core",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Task engine, state machine, filtering, series merging. Zero HTTP deps.",
   "repository": {
     "type": "git",
