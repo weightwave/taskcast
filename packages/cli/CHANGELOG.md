@@ -1,5 +1,15 @@
 # @taskcast/cli
 
+## 0.1.2
+
+### Patch Changes
+
+- Updated dependencies [987c9df]
+  - @taskcast/core@0.1.2
+  - @taskcast/postgres@0.1.2
+  - @taskcast/redis@0.1.2
+  - @taskcast/server@0.1.2
+
 ## 0.1.1
 
 ### Patch Changes
