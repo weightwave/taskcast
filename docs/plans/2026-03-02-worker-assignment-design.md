@@ -304,6 +304,7 @@ interface WorkerAuditEvent {
   timestamp: number
   action: 'connected' | 'disconnected' | 'updated' | 'task_assigned'
          | 'task_declined' | 'task_reclaimed' | 'draining' | 'heartbeat_timeout'
+         | 'pull_request'   // worker attempted a pull (matched or not)
   data?: Record<string, unknown>
 }
 ```
