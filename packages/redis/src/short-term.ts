@@ -1,13 +1,27 @@
 import type { Redis } from 'ioredis'
-import type { Task, TaskEvent, ShortTermStore, EventQueryOptions } from '@taskcast/core'
+import type {
+  Task,
+  TaskEvent,
+  ShortTermStore,
+  EventQueryOptions,
+  TaskFilter,
+  Worker,
+  WorkerFilter,
+  WorkerAssignment,
+} from '@taskcast/core'
 
 function makeKeys(prefix: string) {
   return {
     task: (id: string) => `${prefix}:task:${id}`,
+    taskSet: `${prefix}:tasks`,
     events: (id: string) => `${prefix}:events:${id}`,
     idx: (id: string) => `${prefix}:idx:${id}`,
     seriesLatest: (taskId: string, seriesId: string) => `${prefix}:series:${taskId}:${seriesId}`,
     seriesIds: (taskId: string) => `${prefix}:seriesIds:${taskId}`,
+    worker: (id: string) => `${prefix}:worker:${id}`,
+    workerSet: `${prefix}:workers`,
+    assignment: (taskId: string) => `${prefix}:assignment:${taskId}`,
+    workerAssignments: (workerId: string) => `${prefix}:workerAssignments:${workerId}`,
   }
 }
 
@@ -24,6 +38,7 @@ export class RedisShortTermStore implements ShortTermStore {
 
   async saveTask(task: Task): Promise<void> {
     await this.redis.set(this.KEY.task(task.id), JSON.stringify(task))
+    await this.redis.sadd(this.KEY.taskSet, task.id)
   }
 
   async getTask(taskId: string): Promise<Task | null> {
@@ -105,5 +120,154 @@ export class RedisShortTermStore implements ShortTermStore {
       await this.appendEvent(taskId, event)
     }
     await this.setSeriesLatest(taskId, seriesId, event)
+  }
+
+  // Task query
+  async listTasks(filter: TaskFilter): Promise<Task[]> {
+    const taskIds = await this.redis.smembers(this.KEY.taskSet)
+    if (taskIds.length === 0) return []
+
+    const pipeline = this.redis.pipeline()
+    for (const id of taskIds) {
+      pipeline.get(this.KEY.task(id))
+    }
+    const results = await pipeline.exec()
+
+    let tasks: Task[] = []
+    if (results) {
+      for (const [err, raw] of results) {
+        if (!err && typeof raw === 'string') {
+          tasks.push(JSON.parse(raw) as Task)
+        }
+      }
+    }
+
+    if (filter.status?.length) {
+      tasks = tasks.filter((t) => filter.status!.includes(t.status))
+    }
+    if (filter.types?.length) {
+      tasks = tasks.filter((t) => t.type !== undefined && filter.types!.includes(t.type))
+    }
+    if (filter.tags) {
+      const { all, any, none } = filter.tags
+      tasks = tasks.filter((t) => {
+        const taskTags = t.tags ?? []
+        if (all && !all.every((tag) => taskTags.includes(tag))) return false
+        if (any && !any.some((tag) => taskTags.includes(tag))) return false
+        if (none && none.some((tag) => taskTags.includes(tag))) return false
+        return true
+      })
+    }
+    if (filter.assignMode?.length) {
+      tasks = tasks.filter((t) => t.assignMode !== undefined && filter.assignMode!.includes(t.assignMode))
+    }
+    if (filter.excludeTaskIds?.length) {
+      const excluded = new Set(filter.excludeTaskIds)
+      tasks = tasks.filter((t) => !excluded.has(t.id))
+    }
+    if (filter.limit !== undefined) {
+      tasks = tasks.slice(0, filter.limit)
+    }
+
+    return tasks
+  }
+
+  // Worker state
+  async saveWorker(worker: Worker): Promise<void> {
+    await this.redis.set(this.KEY.worker(worker.id), JSON.stringify(worker))
+    await this.redis.sadd(this.KEY.workerSet, worker.id)
+  }
+
+  async getWorker(workerId: string): Promise<Worker | null> {
+    const raw = await this.redis.get(this.KEY.worker(workerId))
+    return raw ? (JSON.parse(raw) as Worker) : null
+  }
+
+  async listWorkers(filter?: WorkerFilter): Promise<Worker[]> {
+    const workerIds = await this.redis.smembers(this.KEY.workerSet)
+    if (workerIds.length === 0) return []
+
+    const pipeline = this.redis.pipeline()
+    for (const id of workerIds) {
+      pipeline.get(this.KEY.worker(id))
+    }
+    const results = await pipeline.exec()
+
+    let workers: Worker[] = []
+    if (results) {
+      for (const [err, raw] of results) {
+        if (!err && typeof raw === 'string') {
+          workers.push(JSON.parse(raw) as Worker)
+        }
+      }
+    }
+
+    if (filter?.status?.length) {
+      workers = workers.filter((w) => filter.status!.includes(w.status))
+    }
+    if (filter?.connectionMode?.length) {
+      workers = workers.filter((w) => filter.connectionMode!.includes(w.connectionMode))
+    }
+
+    return workers
+  }
+
+  async deleteWorker(workerId: string): Promise<void> {
+    await this.redis.del(this.KEY.worker(workerId))
+    await this.redis.srem(this.KEY.workerSet, workerId)
+  }
+
+  // Atomic claim
+  async claimTask(taskId: string, workerId: string, cost: number): Promise<boolean> {
+    const task = await this.getTask(taskId)
+    if (!task || (task.status !== 'pending' && task.status !== 'assigned')) return false
+
+    task.status = 'assigned'
+    task.assignedWorker = workerId
+    task.cost = cost
+    task.updatedAt = Date.now()
+    await this.saveTask(task)
+    return true
+  }
+
+  // Worker assignments
+  async addAssignment(assignment: WorkerAssignment): Promise<void> {
+    await this.redis.set(this.KEY.assignment(assignment.taskId), JSON.stringify(assignment))
+    await this.redis.sadd(this.KEY.workerAssignments(assignment.workerId), assignment.taskId)
+  }
+
+  async removeAssignment(taskId: string): Promise<void> {
+    const raw = await this.redis.get(this.KEY.assignment(taskId))
+    if (raw) {
+      const assignment = JSON.parse(raw) as WorkerAssignment
+      await this.redis.srem(this.KEY.workerAssignments(assignment.workerId), taskId)
+    }
+    await this.redis.del(this.KEY.assignment(taskId))
+  }
+
+  async getWorkerAssignments(workerId: string): Promise<WorkerAssignment[]> {
+    const taskIds = await this.redis.smembers(this.KEY.workerAssignments(workerId))
+    if (taskIds.length === 0) return []
+
+    const pipeline = this.redis.pipeline()
+    for (const id of taskIds) {
+      pipeline.get(this.KEY.assignment(id))
+    }
+    const results = await pipeline.exec()
+
+    const assignments: WorkerAssignment[] = []
+    if (results) {
+      for (const [err, raw] of results) {
+        if (!err && typeof raw === 'string') {
+          assignments.push(JSON.parse(raw) as WorkerAssignment)
+        }
+      }
+    }
+    return assignments
+  }
+
+  async getTaskAssignment(taskId: string): Promise<WorkerAssignment | null> {
+    const raw = await this.redis.get(this.KEY.assignment(taskId))
+    return raw ? (JSON.parse(raw) as WorkerAssignment) : null
   }
 }

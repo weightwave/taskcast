@@ -9,12 +9,14 @@ import type {
   WebhookConfig,
   CleanupRule,
   SeriesMode,
+  WorkerAuditEvent,
 } from '@taskcast/core'
 
 function makeTableNames(prefix: string) {
   return {
     tasks: `${prefix}_tasks`,
     events: `${prefix}_events`,
+    workerEvents: `${prefix}_worker_events`,
   }
 }
 
@@ -124,6 +126,55 @@ export class PostgresLongTermStore implements LongTermStore {
     return rows.map((r) => this._rowToEvent(r))
   }
 
+  async saveWorkerEvent(event: WorkerAuditEvent): Promise<void> {
+    const t = this.tables.workerEvents
+    await this.sql`
+      INSERT INTO ${this.sql(t)} (
+        id, worker_id, timestamp, action, data
+      ) VALUES (
+        ${event.id}, ${event.workerId}, ${event.timestamp},
+        ${event.action},
+        ${event.data ? this.sql.json(event.data as never) : null}
+      )
+      ON CONFLICT (id) DO NOTHING
+    `
+  }
+
+  async getWorkerEvents(workerId: string, opts?: EventQueryOptions): Promise<WorkerAuditEvent[]> {
+    const t = this.tables.workerEvents
+    const since = opts?.since
+
+    let rows: postgres.RowList<postgres.Row[]>
+    if (since?.timestamp !== undefined) {
+      rows = await this.sql`
+        SELECT * FROM ${this.sql(t)}
+        WHERE worker_id = ${workerId} AND timestamp > ${since.timestamp}
+        ORDER BY timestamp ASC
+        ${opts?.limit ? this.sql`LIMIT ${opts.limit}` : this.sql``}
+      `
+    } else if (since?.id) {
+      const anchor = await this.sql`
+        SELECT timestamp FROM ${this.sql(t)} WHERE id = ${since.id}
+      `
+      const anchorTs = (anchor[0]?.['timestamp'] as number | undefined) ?? 0
+      rows = await this.sql`
+        SELECT * FROM ${this.sql(t)}
+        WHERE worker_id = ${workerId} AND timestamp > ${anchorTs}
+        ORDER BY timestamp ASC
+        ${opts?.limit ? this.sql`LIMIT ${opts.limit}` : this.sql``}
+      `
+    } else {
+      rows = await this.sql`
+        SELECT * FROM ${this.sql(t)}
+        WHERE worker_id = ${workerId}
+        ORDER BY timestamp ASC
+        ${opts?.limit ? this.sql`LIMIT ${opts.limit}` : this.sql``}
+      `
+    }
+
+    return rows.map((r) => this._rowToWorkerEvent(r))
+  }
+
   private _rowToTask(row: postgres.Row): Task {
     // Build using mutable assignment to satisfy exactOptionalPropertyTypes
     const task: Task = {
@@ -158,6 +209,17 @@ export class PostgresLongTermStore implements LongTermStore {
     }
     if (row['series_id'] != null) event.seriesId = row['series_id'] as string
     if (row['series_mode'] != null) event.seriesMode = row['series_mode'] as SeriesMode
+    return event
+  }
+
+  private _rowToWorkerEvent(row: postgres.Row): WorkerAuditEvent {
+    const event: WorkerAuditEvent = {
+      id: row['id'] as string,
+      workerId: row['worker_id'] as string,
+      timestamp: row['timestamp'] as number,
+      action: row['action'] as WorkerAuditEvent['action'],
+    }
+    if (row['data'] != null) event.data = row['data'] as Record<string, unknown>
     return event
   }
 }

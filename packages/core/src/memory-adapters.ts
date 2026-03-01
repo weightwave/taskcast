@@ -1,4 +1,14 @@
-import type { Task, TaskEvent, BroadcastProvider, ShortTermStore, EventQueryOptions } from './types.js'
+import type {
+  Task,
+  TaskEvent,
+  BroadcastProvider,
+  ShortTermStore,
+  EventQueryOptions,
+  TaskFilter,
+  Worker,
+  WorkerFilter,
+  WorkerAssignment,
+} from './types.js'
 
 export class MemoryBroadcastProvider implements BroadcastProvider {
   private listeners = new Map<string, Set<(event: TaskEvent) => void>>()
@@ -27,6 +37,8 @@ export class MemoryShortTermStore implements ShortTermStore {
   private events = new Map<string, TaskEvent[]>()
   private seriesLatest = new Map<string, TaskEvent>()
   private indexCounters = new Map<string, number>()
+  private workers = new Map<string, Worker>()
+  private assignments = new Map<string, WorkerAssignment>()
 
   async saveTask(task: Task): Promise<void> {
     this.tasks.set(task.id, { ...task })
@@ -97,5 +109,94 @@ export class MemoryShortTermStore implements ShortTermStore {
       await this.appendEvent(taskId, event)
     }
     this.seriesLatest.set(key, { ...event })
+  }
+
+  // Task query
+  async listTasks(filter: TaskFilter): Promise<Task[]> {
+    let tasks = Array.from(this.tasks.values())
+
+    if (filter.status?.length) {
+      tasks = tasks.filter((t) => filter.status!.includes(t.status))
+    }
+    if (filter.types?.length) {
+      tasks = tasks.filter((t) => t.type !== undefined && filter.types!.includes(t.type))
+    }
+    if (filter.tags) {
+      const { all, any, none } = filter.tags
+      tasks = tasks.filter((t) => {
+        const taskTags = t.tags ?? []
+        if (all && !all.every((tag) => taskTags.includes(tag))) return false
+        if (any && !any.some((tag) => taskTags.includes(tag))) return false
+        if (none && none.some((tag) => taskTags.includes(tag))) return false
+        return true
+      })
+    }
+    if (filter.assignMode?.length) {
+      tasks = tasks.filter((t) => t.assignMode !== undefined && filter.assignMode!.includes(t.assignMode))
+    }
+    if (filter.excludeTaskIds?.length) {
+      const excluded = new Set(filter.excludeTaskIds)
+      tasks = tasks.filter((t) => !excluded.has(t.id))
+    }
+    if (filter.limit !== undefined) {
+      tasks = tasks.slice(0, filter.limit)
+    }
+
+    return tasks
+  }
+
+  // Worker state
+  async saveWorker(worker: Worker): Promise<void> {
+    this.workers.set(worker.id, { ...worker })
+  }
+
+  async getWorker(workerId: string): Promise<Worker | null> {
+    return this.workers.get(workerId) ?? null
+  }
+
+  async listWorkers(filter?: WorkerFilter): Promise<Worker[]> {
+    let workers = Array.from(this.workers.values())
+
+    if (filter?.status?.length) {
+      workers = workers.filter((w) => filter.status!.includes(w.status))
+    }
+    if (filter?.connectionMode?.length) {
+      workers = workers.filter((w) => filter.connectionMode!.includes(w.connectionMode))
+    }
+
+    return workers
+  }
+
+  async deleteWorker(workerId: string): Promise<void> {
+    this.workers.delete(workerId)
+  }
+
+  // Atomic claim
+  async claimTask(taskId: string, workerId: string, cost: number): Promise<boolean> {
+    const task = this.tasks.get(taskId)
+    if (!task || (task.status !== 'pending' && task.status !== 'assigned')) return false
+
+    task.status = 'assigned'
+    task.assignedWorker = workerId
+    task.cost = cost
+    task.updatedAt = Date.now()
+    return true
+  }
+
+  // Worker assignments
+  async addAssignment(assignment: WorkerAssignment): Promise<void> {
+    this.assignments.set(assignment.taskId, { ...assignment })
+  }
+
+  async removeAssignment(taskId: string): Promise<void> {
+    this.assignments.delete(taskId)
+  }
+
+  async getWorkerAssignments(workerId: string): Promise<WorkerAssignment[]> {
+    return Array.from(this.assignments.values()).filter((a) => a.workerId === workerId)
+  }
+
+  async getTaskAssignment(taskId: string): Promise<WorkerAssignment | null> {
+    return this.assignments.get(taskId) ?? null
   }
 }
