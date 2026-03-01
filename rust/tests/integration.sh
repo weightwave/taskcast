@@ -2,10 +2,13 @@
 set -euo pipefail
 
 PORT=3799
-BINARY="./target/release/taskcast"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+RUST_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+ROOT_DIR="$(cd "$RUST_DIR/.." && pwd)"
+BINARY="$RUST_DIR/target/release/taskcast"
 
 echo "=== Building Rust binary ==="
-cd "$(dirname "$0")/.."
+cd "$RUST_DIR"
 cargo build --release -p taskcast-cli
 
 echo "=== Starting Rust server on port $PORT ==="
@@ -35,7 +38,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo "=== Running integration tests ==="
-cd "$(dirname "$0")/../.."
+cd "$ROOT_DIR"
 
 # Run the integration test
 TASKCAST_TEST_URL="http://localhost:$PORT" npx vitest run --config rust/tests/vitest.config.ts --reporter=verbose
