@@ -232,6 +232,134 @@ describe('auth middleware - mode: jwt with sub claim', () => {
   })
 })
 
+describe('auth middleware - mode: jwt with jti claim', () => {
+  it('sets jti on auth context when present in token', async () => {
+    const secret = new TextEncoder().encode('test-secret-that-is-long-enough')
+    const token = await new SignJWT({ taskIds: '*', scope: ['*'] })
+      .setProtectedHeader({ alg: 'HS256' })
+      .setJti('unique-token-id-123')
+      .setExpirationTime('1h')
+      .sign(secret)
+    const config: AuthConfig = {
+      mode: 'jwt',
+      jwt: { algorithm: 'HS256', secret: 'test-secret-that-is-long-enough' },
+    }
+    const app = new Hono()
+    app.use('*', createAuthMiddleware(config))
+    app.get('/test', (c) => {
+      const auth = c.get('auth')
+      return c.json({ jti: auth.jti })
+    })
+    const res = await app.request('/test', {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.jti).toBe('unique-token-id-123')
+  })
+
+  it('leaves jti undefined when not in token', async () => {
+    const secret = new TextEncoder().encode('test-secret-that-is-long-enough')
+    const token = await makeJwt(secret, { taskIds: '*', scope: ['*'] })
+    const config: AuthConfig = {
+      mode: 'jwt',
+      jwt: { algorithm: 'HS256', secret: 'test-secret-that-is-long-enough' },
+    }
+    const app = new Hono()
+    app.use('*', createAuthMiddleware(config))
+    app.get('/test', (c) => {
+      const auth = c.get('auth')
+      return c.json({ jti: auth.jti ?? null })
+    })
+    const res = await app.request('/test', {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.jti).toBeNull()
+  })
+})
+
+describe('auth middleware - mode: jwt with workerId claim', () => {
+  it('sets workerId on auth context when present in token', async () => {
+    const secret = new TextEncoder().encode('test-secret-that-is-long-enough')
+    const token = await makeJwt(secret, {
+      taskIds: '*',
+      scope: ['worker:connect'],
+      workerId: 'worker-abc',
+    })
+    const config: AuthConfig = {
+      mode: 'jwt',
+      jwt: { algorithm: 'HS256', secret: 'test-secret-that-is-long-enough' },
+    }
+    const app = new Hono()
+    app.use('*', createAuthMiddleware(config))
+    app.get('/test', (c) => {
+      const auth = c.get('auth')
+      return c.json({ workerId: auth.workerId })
+    })
+    const res = await app.request('/test', {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.workerId).toBe('worker-abc')
+  })
+
+  it('leaves workerId undefined when not in token', async () => {
+    const secret = new TextEncoder().encode('test-secret-that-is-long-enough')
+    const token = await makeJwt(secret, { taskIds: '*', scope: ['*'] })
+    const config: AuthConfig = {
+      mode: 'jwt',
+      jwt: { algorithm: 'HS256', secret: 'test-secret-that-is-long-enough' },
+    }
+    const app = new Hono()
+    app.use('*', createAuthMiddleware(config))
+    app.get('/test', (c) => {
+      const auth = c.get('auth')
+      return c.json({ workerId: auth.workerId ?? null })
+    })
+    const res = await app.request('/test', {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.workerId).toBeNull()
+  })
+})
+
+describe('auth middleware - mode: jwt with both jti and workerId claims', () => {
+  it('sets both jti and workerId on auth context', async () => {
+    const secret = new TextEncoder().encode('test-secret-that-is-long-enough')
+    const token = await new SignJWT({
+      taskIds: '*',
+      scope: ['worker:connect'],
+      workerId: 'worker-xyz',
+    })
+      .setProtectedHeader({ alg: 'HS256' })
+      .setJti('token-id-456')
+      .setExpirationTime('1h')
+      .sign(secret)
+    const config: AuthConfig = {
+      mode: 'jwt',
+      jwt: { algorithm: 'HS256', secret: 'test-secret-that-is-long-enough' },
+    }
+    const app = new Hono()
+    app.use('*', createAuthMiddleware(config))
+    app.get('/test', (c) => {
+      const auth = c.get('auth')
+      return c.json({ jti: auth.jti, workerId: auth.workerId })
+    })
+    const res = await app.request('/test', {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.jti).toBe('token-id-456')
+    expect(body.workerId).toBe('worker-xyz')
+  })
+})
+
 describe('auth middleware - fallthrough to 401', () => {
   it('returns 401 when mode is jwt but no jwt config provided', async () => {
     // mode is jwt but jwt property is missing - falls through to 401

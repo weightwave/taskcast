@@ -2,17 +2,20 @@ export { createAuthMiddleware, checkScope } from './auth.js'
 export type { AuthConfig, AuthContext, JWTConfig } from './auth.js'
 export { createTasksRouter } from './routes/tasks.js'
 export { createSSERouter } from './routes/sse.js'
+export { createWorkersRouter } from './routes/workers.js'
 export { WebhookDelivery } from './webhook.js'
 
 import { Hono } from 'hono'
 import { createAuthMiddleware } from './auth.js'
 import { createTasksRouter } from './routes/tasks.js'
 import { createSSERouter } from './routes/sse.js'
+import { createWorkersRouter } from './routes/workers.js'
 import type { AuthConfig } from './auth.js'
-import type { TaskEngine } from '@taskcast/core'
+import type { TaskEngine, WorkerManager } from '@taskcast/core'
 
 export interface TaskcastServerOptions {
   engine: TaskEngine
+  workerManager?: WorkerManager
   auth?: AuthConfig
 }
 
@@ -26,5 +29,8 @@ export function createTaskcastApp(opts: TaskcastServerOptions): Hono {
   app.use('*', createAuthMiddleware(opts.auth ?? { mode: 'none' }))
   app.route('/tasks', createTasksRouter(opts.engine))
   app.route('/tasks', createSSERouter(opts.engine))
+  if (opts.workerManager) {
+    app.route('/workers', createWorkersRouter(opts.workerManager, opts.engine))
+  }
   return app
 }

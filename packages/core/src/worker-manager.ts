@@ -1,9 +1,11 @@
 import { ulid } from 'ulidx'
 import type {
   Task,
+  TaskEvent,
   Worker,
   WorkerFilter,
   WorkerAssignment,
+  WorkerAuditEvent,
   BroadcastProvider,
   ShortTermStore,
   LongTermStore,
@@ -83,6 +85,32 @@ export class WorkerManager {
     if (opts.hooks) this.hooks = opts.hooks
   }
 
+  // ─── Audit Helpers ──────────────────────────────────────────────────────
+
+  private async emitTaskAudit(taskId: string, action: string, extra?: Record<string, unknown>): Promise<void> {
+    try {
+      await this.opts.engine.publishEvent(taskId, {
+        type: 'taskcast:audit',
+        level: 'info',
+        data: { action, ...extra },
+      })
+    } catch {
+      // Task may be in terminal state or not found; audit is best-effort
+    }
+  }
+
+  private emitWorkerAudit(action: WorkerAuditEvent['action'], workerId: string, data?: Record<string, unknown>): void {
+    if (!this.opts.longTerm) return
+    const event: WorkerAuditEvent = {
+      id: ulid(),
+      workerId,
+      timestamp: Date.now(),
+      action,
+      ...(data !== undefined && { data }),
+    }
+    this.opts.longTerm.saveWorkerEvent(event).catch(() => {})
+  }
+
   // ─── Worker Registration & Lifecycle ────────────────────────────────────
 
   async registerWorker(config: WorkerRegistration): Promise<Worker> {
@@ -100,6 +128,7 @@ export class WorkerManager {
       ...(config.metadata !== undefined && { metadata: config.metadata }),
     }
     await this.shortTerm.saveWorker(worker)
+    this.emitWorkerAudit('connected', worker.id)
     this.hooks?.onWorkerConnected?.(worker)
     return worker
   }
@@ -108,6 +137,7 @@ export class WorkerManager {
     const worker = await this.shortTerm.getWorker(workerId)
     await this.shortTerm.deleteWorker(workerId)
     if (worker) {
+      this.emitWorkerAudit('disconnected', workerId, { reason: 'unregistered' })
       this.hooks?.onWorkerDisconnected?.(worker, 'unregistered')
     }
   }
@@ -197,6 +227,10 @@ export class WorkerManager {
     const updatedTask = (await this.shortTerm.getTask(taskId))!
     if (this.longTerm) await this.longTerm.saveTask(updatedTask)
 
+    // Emit audit events for the claim
+    this.emitWorkerAudit('task_assigned', workerId, { taskId })
+    await this.emitTaskAudit(taskId, 'assigned', { workerId })
+
     // Create assignment record
     const assignment: WorkerAssignment = {
       taskId,
@@ -240,6 +274,11 @@ export class WorkerManager {
     // Transition task back to pending
     await this.engine.transitionTask(taskId, 'pending')
 
+    // Emit audit events for the decline
+    const blacklisted = opts?.blacklist ?? false
+    this.emitWorkerAudit('task_declined', workerId, { taskId })
+    await this.emitTaskAudit(taskId, 'declined', { workerId, blacklisted })
+
     // Clear assignedWorker
     const task = await this.engine.getTask(taskId)
     if (task) {
@@ -257,7 +296,7 @@ export class WorkerManager {
       if (this.longTerm) await this.longTerm.saveTask(task)
 
       if (worker) {
-        this.hooks?.onTaskDeclined?.(task, worker, opts?.blacklist ?? false)
+        this.hooks?.onTaskDeclined?.(task, worker, blacklisted)
       }
     }
   }
@@ -266,5 +305,101 @@ export class WorkerManager {
 
   async getWorkerTasks(workerId: string): Promise<WorkerAssignment[]> {
     return this.shortTerm.getWorkerAssignments(workerId)
+  }
+
+  // ─── Pull Mode (Long-Poll) ─────────────────────────────────────────────
+
+  async waitForTask(workerId: string, signal?: AbortSignal): Promise<Task> {
+    const worker = await this.shortTerm.getWorker(workerId)
+    if (!worker) throw new Error(`Worker not found: ${workerId}`)
+
+    // Check if already aborted
+    if (signal?.aborted) {
+      throw new Error('aborted')
+    }
+
+    // Check existing pending pull tasks
+    const pendingTasks = await this.shortTerm.listTasks({ status: ['pending'], assignMode: ['pull'] })
+    const blacklist = new Set<string>()
+    for (const task of pendingTasks) {
+      const taskBlacklist = (task.metadata?._blacklistedWorkers as string[] | undefined) ?? []
+      if (taskBlacklist.includes(workerId)) continue
+      if (!matchesWorkerRule(task, worker.matchRule)) continue
+      const taskCost = task.cost ?? 1
+      if (worker.usedSlots + taskCost > worker.capacity) continue
+
+      const result = await this.claimTask(task.id, workerId)
+      if (result.success) {
+        this.emitWorkerAudit('pull_request', workerId, { matched: true, taskId: task.id })
+        const claimed = await this.engine.getTask(task.id)
+        return claimed!
+      }
+    }
+
+    // Wait for a new task notification via broadcast
+    return new Promise<Task>((resolve, reject) => {
+      let unsubscribe: (() => void) | undefined
+
+      const cleanup = () => {
+        unsubscribe?.()
+        signal?.removeEventListener('abort', onAbort)
+      }
+
+      const onAbort = () => {
+        cleanup()
+        this.emitWorkerAudit('pull_request', workerId, { matched: false })
+        reject(new Error('aborted'))
+      }
+
+      if (signal) {
+        signal.addEventListener('abort', onAbort)
+      }
+
+      unsubscribe = this.opts.broadcast.subscribe('taskcast:worker:new-task', async (event: TaskEvent) => {
+        const taskId = event.data as string
+        try {
+          // Re-fetch the worker to get current state
+          const currentWorker = await this.shortTerm.getWorker(workerId)
+          if (!currentWorker) {
+            cleanup()
+            reject(new Error(`Worker not found: ${workerId}`))
+            return
+          }
+
+          const task = await this.engine.getTask(taskId)
+          if (!task || task.status !== 'pending') return
+          if (task.assignMode !== 'pull') return
+
+          const taskBlacklist = (task.metadata?._blacklistedWorkers as string[] | undefined) ?? []
+          if (taskBlacklist.includes(workerId)) return
+          if (!matchesWorkerRule(task, currentWorker.matchRule)) return
+          const taskCost = task.cost ?? 1
+          if (currentWorker.usedSlots + taskCost > currentWorker.capacity) return
+
+          const result = await this.claimTask(taskId, workerId)
+          if (result.success) {
+            cleanup()
+            this.emitWorkerAudit('pull_request', workerId, { matched: true, taskId })
+            const claimed = await this.engine.getTask(taskId)
+            resolve(claimed!)
+          }
+        } catch {
+          // Ignore errors from individual task checks
+        }
+      })
+    })
+  }
+
+  async notifyNewTask(taskId: string): Promise<void> {
+    const event: TaskEvent = {
+      id: ulid(),
+      taskId: 'system',
+      index: 0,
+      timestamp: Date.now(),
+      type: 'taskcast:worker:new-task',
+      level: 'info',
+      data: taskId,
+    }
+    await this.opts.broadcast.publish('taskcast:worker:new-task', event)
   }
 }

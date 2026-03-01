@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { TaskEngine } from '../../src/engine.js'
 import { MemoryBroadcastProvider, MemoryShortTermStore } from '../../src/memory-adapters.js'
 import { WorkerManager } from '../../src/worker-manager.js'
-import type { TaskcastHooks, Worker } from '../../src/types.js'
+import type { TaskcastHooks, Worker, LongTermStore } from '../../src/types.js'
 import type { WorkerRegistration } from '../../src/worker-manager.js'
 
 function makeSetup(hooks?: TaskcastHooks) {
@@ -730,6 +730,340 @@ describe('WorkerManager — Dispatch, Claim & Decline', () => {
       const { manager } = makeSetup()
       const assignments = await manager.getWorkerTasks('unknown')
       expect(assignments).toEqual([])
+    })
+  })
+})
+
+// ─── Pull Mode — waitForTask & notifyNewTask (Task 5.1) ──────────────────
+
+describe('WorkerManager — Pull Mode', () => {
+  describe('waitForTask', () => {
+    it('resolves immediately if pending pull task exists', async () => {
+      const { manager, engine } = makeSetup()
+      const worker = await manager.registerWorker({
+        ...defaultRegistration,
+        id: 'w1',
+        connectionMode: 'pull',
+      })
+
+      // Create a pending pull task
+      const task = await engine.createTask({ type: 'test', assignMode: 'pull' })
+
+      const result = await manager.waitForTask(worker.id)
+      expect(result.id).toBe(task.id)
+      expect(result.status).toBe('assigned')
+    })
+
+    it('resolves when matching task is notified', async () => {
+      const { manager, engine } = makeSetup()
+      const worker = await manager.registerWorker({
+        ...defaultRegistration,
+        id: 'w1',
+        connectionMode: 'pull',
+      })
+
+      // No existing tasks — start waiting, then create and notify
+      const waitPromise = manager.waitForTask(worker.id)
+
+      // Small delay to let the subscription establish
+      await new Promise((r) => setTimeout(r, 10))
+
+      const task = await engine.createTask({ type: 'test', assignMode: 'pull' })
+      await manager.notifyNewTask(task.id)
+
+      const result = await waitPromise
+      expect(result.id).toBe(task.id)
+      expect(result.status).toBe('assigned')
+    })
+
+    it('can be aborted', async () => {
+      const { manager } = makeSetup()
+      await manager.registerWorker({
+        ...defaultRegistration,
+        id: 'w1',
+        connectionMode: 'pull',
+      })
+
+      const controller = new AbortController()
+
+      const waitPromise = manager.waitForTask('w1', controller.signal)
+
+      // Small delay, then abort
+      await new Promise((r) => setTimeout(r, 10))
+      controller.abort()
+
+      await expect(waitPromise).rejects.toThrow('aborted')
+    })
+
+    it('throws for unknown worker', async () => {
+      const { manager } = makeSetup()
+      await expect(manager.waitForTask('unknown')).rejects.toThrow('Worker not found')
+    })
+
+    it('throws immediately if signal already aborted', async () => {
+      const { manager } = makeSetup()
+      await manager.registerWorker({
+        ...defaultRegistration,
+        id: 'w1',
+        connectionMode: 'pull',
+      })
+
+      const controller = new AbortController()
+      controller.abort()
+
+      await expect(manager.waitForTask('w1', controller.signal)).rejects.toThrow('aborted')
+    })
+
+    it('skips tasks that do not match worker rule', async () => {
+      const { manager, engine } = makeSetup()
+      await manager.registerWorker({
+        ...defaultRegistration,
+        id: 'w1',
+        connectionMode: 'pull',
+        matchRule: { taskTypes: ['gpu.*'] },
+      })
+
+      // Create a task that doesn't match the worker's rule
+      await engine.createTask({ type: 'cpu.inference', assignMode: 'pull' })
+
+      const controller = new AbortController()
+      const timeout = setTimeout(() => controller.abort(), 50)
+
+      await expect(manager.waitForTask('w1', controller.signal)).rejects.toThrow('aborted')
+      clearTimeout(timeout)
+    })
+
+    it('skips blacklisted tasks', async () => {
+      const { manager, engine } = makeSetup()
+      await manager.registerWorker({
+        ...defaultRegistration,
+        id: 'w1',
+        connectionMode: 'pull',
+      })
+
+      // Create a task where w1 is blacklisted
+      await engine.createTask({
+        type: 'test',
+        assignMode: 'pull',
+        metadata: { _blacklistedWorkers: ['w1'] },
+      })
+
+      const controller = new AbortController()
+      const timeout = setTimeout(() => controller.abort(), 50)
+
+      await expect(manager.waitForTask('w1', controller.signal)).rejects.toThrow('aborted')
+      clearTimeout(timeout)
+    })
+
+    it('skips non-pull tasks when notified', async () => {
+      const { manager, engine } = makeSetup()
+      await manager.registerWorker({
+        ...defaultRegistration,
+        id: 'w1',
+        connectionMode: 'pull',
+      })
+
+      const controller = new AbortController()
+      const waitPromise = manager.waitForTask('w1', controller.signal)
+
+      await new Promise((r) => setTimeout(r, 10))
+
+      // Create an external task and notify — should not match
+      const task = await engine.createTask({ type: 'test', assignMode: 'external' })
+      await manager.notifyNewTask(task.id)
+
+      // Wait a bit, then abort since it shouldn't have resolved
+      await new Promise((r) => setTimeout(r, 20))
+      controller.abort()
+
+      await expect(waitPromise).rejects.toThrow('aborted')
+    })
+  })
+
+  describe('notifyNewTask', () => {
+    it('publishes to broadcast channel', async () => {
+      const { manager, broadcast } = makeSetup()
+      const publishSpy = vi.spyOn(broadcast, 'publish')
+
+      await manager.notifyNewTask('task-123')
+
+      expect(publishSpy).toHaveBeenCalledOnce()
+      expect(publishSpy).toHaveBeenCalledWith(
+        'taskcast:worker:new-task',
+        expect.objectContaining({
+          taskId: 'system',
+          type: 'taskcast:worker:new-task',
+          data: 'task-123',
+        }),
+      )
+    })
+  })
+})
+
+// ─── Audit Events (Task 7.1) ─────────────────────────────────────────────
+
+describe('WorkerManager — Audit Events', () => {
+  function makeLongTermMock(): LongTermStore {
+    return {
+      saveTask: vi.fn().mockResolvedValue(undefined),
+      getTask: vi.fn().mockResolvedValue(null),
+      saveEvent: vi.fn().mockResolvedValue(undefined),
+      getEvents: vi.fn().mockResolvedValue([]),
+      saveWorkerEvent: vi.fn().mockResolvedValue(undefined),
+      getWorkerEvents: vi.fn().mockResolvedValue([]),
+    }
+  }
+
+  function makeSetupWithLongTerm(hooks?: TaskcastHooks) {
+    const store = new MemoryShortTermStore()
+    const broadcast = new MemoryBroadcastProvider()
+    const longTerm = makeLongTermMock()
+    const engine = new TaskEngine({ shortTerm: store, broadcast, longTerm, hooks })
+    const manager = new WorkerManager({ engine, shortTerm: store, broadcast, longTerm, hooks })
+    return { store, broadcast, engine, manager, longTerm }
+  }
+
+  describe('task audit events', () => {
+    it('emits taskcast:audit event on claim', async () => {
+      const { manager, engine, store } = makeSetupWithLongTerm()
+      const worker = await manager.registerWorker(defaultRegistration)
+      const task = await engine.createTask({ type: 'test' })
+
+      await manager.claimTask(task.id, worker.id)
+
+      const events = await store.getEvents(task.id)
+      const auditEvents = events.filter((e) => e.type === 'taskcast:audit')
+      expect(auditEvents.length).toBeGreaterThanOrEqual(1)
+      const assignedAudit = auditEvents.find(
+        (e) => (e.data as Record<string, unknown>).action === 'assigned',
+      )
+      expect(assignedAudit).toBeDefined()
+      expect((assignedAudit!.data as Record<string, unknown>).workerId).toBe(worker.id)
+    })
+
+    it('emits taskcast:audit event on decline', async () => {
+      const { manager, engine, store } = makeSetupWithLongTerm()
+      const worker = await manager.registerWorker({ ...defaultRegistration, capacity: 5 })
+      const task = await engine.createTask({ type: 'test', cost: 1 })
+
+      await manager.claimTask(task.id, worker.id)
+      await manager.declineTask(task.id, worker.id, { blacklist: true })
+
+      const events = await store.getEvents(task.id)
+      const auditEvents = events.filter((e) => e.type === 'taskcast:audit')
+      const declinedAudit = auditEvents.find(
+        (e) => (e.data as Record<string, unknown>).action === 'declined',
+      )
+      expect(declinedAudit).toBeDefined()
+      expect((declinedAudit!.data as Record<string, unknown>).workerId).toBe(worker.id)
+      expect((declinedAudit!.data as Record<string, unknown>).blacklisted).toBe(true)
+    })
+  })
+
+  describe('worker audit events', () => {
+    it('emits worker audit event to longTerm on register', async () => {
+      const { manager, longTerm } = makeSetupWithLongTerm()
+      const worker = await manager.registerWorker(defaultRegistration)
+
+      // Allow async saveWorkerEvent to settle
+      await new Promise((r) => setTimeout(r, 10))
+
+      expect(longTerm.saveWorkerEvent).toHaveBeenCalledWith(
+        expect.objectContaining({
+          workerId: worker.id,
+          action: 'connected',
+        }),
+      )
+    })
+
+    it('emits worker audit event on unregister', async () => {
+      const { manager, longTerm } = makeSetupWithLongTerm()
+      const worker = await manager.registerWorker(defaultRegistration)
+      vi.mocked(longTerm.saveWorkerEvent).mockClear()
+
+      await manager.unregisterWorker(worker.id)
+
+      // Allow async saveWorkerEvent to settle
+      await new Promise((r) => setTimeout(r, 10))
+
+      expect(longTerm.saveWorkerEvent).toHaveBeenCalledWith(
+        expect.objectContaining({
+          workerId: worker.id,
+          action: 'disconnected',
+          data: { reason: 'unregistered' },
+        }),
+      )
+    })
+
+    it('emits task_assigned worker audit event on claim', async () => {
+      const { manager, engine, longTerm } = makeSetupWithLongTerm()
+      const worker = await manager.registerWorker(defaultRegistration)
+      const task = await engine.createTask({ type: 'test' })
+      vi.mocked(longTerm.saveWorkerEvent).mockClear()
+
+      await manager.claimTask(task.id, worker.id)
+
+      // Allow async saveWorkerEvent to settle
+      await new Promise((r) => setTimeout(r, 10))
+
+      expect(longTerm.saveWorkerEvent).toHaveBeenCalledWith(
+        expect.objectContaining({
+          workerId: worker.id,
+          action: 'task_assigned',
+          data: { taskId: task.id },
+        }),
+      )
+    })
+
+    it('emits task_declined worker audit event on decline', async () => {
+      const { manager, engine, longTerm } = makeSetupWithLongTerm()
+      const worker = await manager.registerWorker({ ...defaultRegistration, capacity: 5 })
+      const task = await engine.createTask({ type: 'test', cost: 1 })
+      await manager.claimTask(task.id, worker.id)
+      vi.mocked(longTerm.saveWorkerEvent).mockClear()
+
+      await manager.declineTask(task.id, worker.id)
+
+      // Allow async saveWorkerEvent to settle
+      await new Promise((r) => setTimeout(r, 10))
+
+      expect(longTerm.saveWorkerEvent).toHaveBeenCalledWith(
+        expect.objectContaining({
+          workerId: worker.id,
+          action: 'task_declined',
+          data: { taskId: task.id },
+        }),
+      )
+    })
+
+    it('emits pull_request audit event', async () => {
+      const { manager, engine, longTerm } = makeSetupWithLongTerm()
+      const worker = await manager.registerWorker({
+        ...defaultRegistration,
+        id: 'w1',
+        connectionMode: 'pull',
+      })
+      const task = await engine.createTask({ type: 'test', assignMode: 'pull' })
+      vi.mocked(longTerm.saveWorkerEvent).mockClear()
+
+      await manager.waitForTask('w1')
+
+      // Allow async saveWorkerEvent to settle
+      await new Promise((r) => setTimeout(r, 10))
+
+      expect(longTerm.saveWorkerEvent).toHaveBeenCalledWith(
+        expect.objectContaining({
+          workerId: 'w1',
+          action: 'pull_request',
+          data: expect.objectContaining({ matched: true, taskId: task.id }),
+        }),
+      )
+    })
+
+    it('does not emit worker audit events without longTerm', async () => {
+      const { manager } = makeSetup()
+      // registerWorker should not throw without longTerm
+      await expect(manager.registerWorker(defaultRegistration)).resolves.not.toThrow()
     })
   })
 })
