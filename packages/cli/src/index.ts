@@ -22,7 +22,7 @@ program
 
 program
   .command('start', { isDefault: true })
-  .description('Start the taskcast server')
+  .description('Start the taskcast server in foreground (default)')
   .option('-c, --config <path>', 'config file path')
   .option('-p, --port <port>', 'port to listen on', '3721')
   .action(async (options: { config?: string; port: string }) => {
@@ -68,6 +68,30 @@ program
     serve({ fetch: app.fetch, port }, () => {
       console.log(`[taskcast] Server started on http://localhost:${port}`)
     })
+  })
+
+program
+  .command('daemon')
+  .description('Start the server as a background service (not yet implemented)')
+  .action(() => {
+    console.error('[taskcast] daemon mode is not yet implemented, use `taskcast start` for foreground mode')
+    process.exit(1)
+  })
+
+program
+  .command('stop')
+  .description('Stop the background service (not yet implemented)')
+  .action(() => {
+    console.error('[taskcast] stop is not yet implemented')
+    process.exit(1)
+  })
+
+program
+  .command('status')
+  .description('Show server status (not yet implemented)')
+  .action(() => {
+    console.error('[taskcast] status is not yet implemented')
+    process.exit(1)
   })
 
 program.parse()
