@@ -10,6 +10,8 @@ import type {
   CleanupRule,
   SeriesMode,
   WorkerAuditEvent,
+  AssignMode,
+  DisconnectPolicy,
 } from '@taskcast/core'
 
 function makeTableNames(prefix: string) {
@@ -36,7 +38,8 @@ export class PostgresLongTermStore implements LongTermStore {
     await this.sql`
       INSERT INTO ${this.sql(t)} (
         id, type, status, params, result, error, metadata,
-        auth_config, webhooks, cleanup, created_at, updated_at, completed_at, ttl
+        auth_config, webhooks, cleanup, created_at, updated_at, completed_at, ttl,
+        tags, assign_mode, cost, assigned_worker, disconnect_policy
       ) VALUES (
         ${task.id}, ${task.type ?? null}, ${task.status},
         ${task.params ? this.sql.json(task.params as never) : null},
@@ -47,7 +50,12 @@ export class PostgresLongTermStore implements LongTermStore {
         ${task.webhooks ? this.sql.json(task.webhooks as never) : null},
         ${task.cleanup ? this.sql.json(task.cleanup as never) : null},
         ${task.createdAt}, ${task.updatedAt},
-        ${task.completedAt ?? null}, ${task.ttl ?? null}
+        ${task.completedAt ?? null}, ${task.ttl ?? null},
+        ${task.tags ? this.sql.json(task.tags as never) : null},
+        ${task.assignMode ?? null},
+        ${task.cost ?? null},
+        ${task.assignedWorker ?? null},
+        ${task.disconnectPolicy ?? null}
       )
       ON CONFLICT (id) DO UPDATE SET
         status = EXCLUDED.status,
@@ -55,7 +63,12 @@ export class PostgresLongTermStore implements LongTermStore {
         error = EXCLUDED.error,
         metadata = EXCLUDED.metadata,
         updated_at = EXCLUDED.updated_at,
-        completed_at = EXCLUDED.completed_at
+        completed_at = EXCLUDED.completed_at,
+        tags = EXCLUDED.tags,
+        assign_mode = EXCLUDED.assign_mode,
+        cost = EXCLUDED.cost,
+        assigned_worker = EXCLUDED.assigned_worker,
+        disconnect_policy = EXCLUDED.disconnect_policy
     `
   }
 
@@ -193,6 +206,11 @@ export class PostgresLongTermStore implements LongTermStore {
     if (row['cleanup'] != null) task.cleanup = row['cleanup'] as { rules: CleanupRule[] }
     if (row['completed_at'] != null) task.completedAt = row['completed_at'] as number
     if (row['ttl'] != null) task.ttl = row['ttl'] as number
+    if (row['tags'] != null) task.tags = row['tags'] as string[]
+    if (row['assign_mode'] != null) task.assignMode = row['assign_mode'] as AssignMode
+    if (row['cost'] != null) task.cost = row['cost'] as number
+    if (row['assigned_worker'] != null) task.assignedWorker = row['assigned_worker'] as string
+    if (row['disconnect_policy'] != null) task.disconnectPolicy = row['disconnect_policy'] as DisconnectPolicy
     return task
   }
 

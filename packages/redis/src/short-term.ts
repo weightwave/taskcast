@@ -217,17 +217,45 @@ export class RedisShortTermStore implements ShortTermStore {
     await this.redis.srem(this.KEY.workerSet, workerId)
   }
 
-  // Atomic claim
-  async claimTask(taskId: string, workerId: string, cost: number): Promise<boolean> {
-    const task = await this.getTask(taskId)
-    if (!task || (task.status !== 'pending' && task.status !== 'assigned')) return false
+  // Atomic claim — uses a Lua script so the read-check-write is a single Redis command.
+  // This prevents two workers racing to claim the same task.
+  private static CLAIM_LUA = `
+    local taskJson = redis.call('GET', KEYS[1])
+    if not taskJson then return 0 end
+
+    local task = cjson.decode(taskJson)
+    if task.status ~= 'pending' and task.status ~= 'assigned' then return 0 end
+
+    local workerJson = redis.call('GET', KEYS[2])
+    if not workerJson then return 0 end
+
+    local worker = cjson.decode(workerJson)
+    local cost = tonumber(ARGV[1])
+    if worker.usedSlots + cost > worker.capacity then return 0 end
+
+    worker.usedSlots = worker.usedSlots + cost
+    redis.call('SET', KEYS[2], cjson.encode(worker))
 
     task.status = 'assigned'
-    task.assignedWorker = workerId
+    task.assignedWorker = ARGV[2]
     task.cost = cost
-    task.updatedAt = Date.now()
-    await this.saveTask(task)
-    return true
+    task.updatedAt = tonumber(ARGV[3])
+    redis.call('SET', KEYS[1], cjson.encode(task))
+
+    return 1
+  `
+
+  async claimTask(taskId: string, workerId: string, cost: number): Promise<boolean> {
+    const result = await this.redis.eval(
+      RedisShortTermStore.CLAIM_LUA,
+      2,
+      this.KEY.task(taskId),
+      this.KEY.worker(workerId),
+      String(cost),
+      workerId,
+      String(Date.now()),
+    )
+    return result === 1
   }
 
   // Worker assignments

@@ -171,7 +171,8 @@ export class MemoryShortTermStore implements ShortTermStore {
     this.workers.delete(workerId)
   }
 
-  // Atomic claim
+  // Atomic claim — single-threaded JS makes this safe without locking.
+  // The Redis adapter uses a Lua script for the same guarantee across processes.
   async claimTask(taskId: string, workerId: string, cost: number): Promise<boolean> {
     const task = this.tasks.get(taskId)
     if (!task || (task.status !== 'pending' && task.status !== 'assigned')) return false

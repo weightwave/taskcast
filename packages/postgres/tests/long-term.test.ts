@@ -23,12 +23,17 @@ beforeAll(async () => {
   sql = postgres(connUri)
   store = new PostgresLongTermStore(sql)
 
-  // Run migration
-  const migration = readFileSync(
+  // Run migrations
+  const migration001 = readFileSync(
     join(import.meta.dirname, '../migrations/001_initial.sql'),
-    'utf8'
+    'utf8',
   )
-  await sql.unsafe(migration)
+  await sql.unsafe(migration001)
+  const migration002 = readFileSync(
+    join(import.meta.dirname, '../migrations/002_workers.sql'),
+    'utf8',
+  )
+  await sql.unsafe(migration002)
 }, 120000)
 
 afterAll(async () => {
