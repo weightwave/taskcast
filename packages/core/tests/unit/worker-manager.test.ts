@@ -1067,3 +1067,145 @@ describe('WorkerManager — Audit Events', () => {
     })
   })
 })
+
+// ─── Uncovered Edge Cases ────────────────────────────────────────────────────
+
+describe('WorkerManager — emitTaskAudit catch block', () => {
+  it('silently catches when publishEvent throws (best-effort audit)', async () => {
+    const { manager, engine } = makeSetup()
+    const worker = await manager.registerWorker(defaultRegistration)
+    const task = await engine.createTask({ type: 'test' })
+
+    // Make publishEvent throw to trigger the catch block in emitTaskAudit
+    const publishSpy = vi.spyOn(engine, 'publishEvent').mockRejectedValueOnce(
+      new Error('Cannot publish to task in terminal status: completed'),
+    )
+
+    // claimTask calls emitTaskAudit which will hit the catch block
+    const result = await manager.claimTask(task.id, worker.id)
+    // claimTask should still succeed — audit is best-effort
+    expect(result.success).toBe(true)
+    expect(publishSpy).toHaveBeenCalled()
+
+    publishSpy.mockRestore()
+  })
+})
+
+describe('WorkerManager — claimTask concurrent modification failure', () => {
+  it('returns failure when shortTerm.claimTask returns false', async () => {
+    const store = new MemoryShortTermStore()
+    const broadcast = new MemoryBroadcastProvider()
+    const engine = new TaskEngine({ shortTerm: store, broadcast })
+    const manager = new WorkerManager({ engine, shortTerm: store, broadcast })
+
+    const worker = await manager.registerWorker(defaultRegistration)
+    const task = await engine.createTask({ type: 'test' })
+
+    // Mock claimTask to return false, simulating concurrent modification
+    const claimSpy = vi.spyOn(store, 'claimTask').mockResolvedValueOnce(false)
+
+    const result = await manager.claimTask(task.id, worker.id)
+    expect(result.success).toBe(false)
+    expect(result.reason).toContain('concurrent modification')
+
+    claimSpy.mockRestore()
+  })
+})
+
+describe('WorkerManager — waitForTask broadcast edge cases', () => {
+  it('rejects when worker is deleted during broadcast wait', async () => {
+    const { manager, engine, store } = makeSetup()
+    await manager.registerWorker({
+      ...defaultRegistration,
+      id: 'w1',
+      connectionMode: 'pull',
+    })
+
+    // No existing pending pull tasks, so it will enter the broadcast wait
+    const waitPromise = manager.waitForTask('w1')
+
+    // Wait for subscription to establish
+    await new Promise((r) => setTimeout(r, 10))
+
+    // Delete the worker while it's waiting
+    await store.deleteWorker('w1')
+
+    // Notify a new task — the handler will re-fetch the worker and find it gone
+    const task = await engine.createTask({ type: 'test', assignMode: 'pull' })
+    await manager.notifyNewTask(task.id)
+
+    await expect(waitPromise).rejects.toThrow('Worker not found: w1')
+  })
+
+  it('catches errors thrown in the broadcast handler', async () => {
+    const store = new MemoryShortTermStore()
+    const broadcast = new MemoryBroadcastProvider()
+    const engine = new TaskEngine({ shortTerm: store, broadcast })
+    const manager = new WorkerManager({ engine, shortTerm: store, broadcast })
+
+    await manager.registerWorker({
+      ...defaultRegistration,
+      id: 'w1',
+      connectionMode: 'pull',
+    })
+
+    // Start waiting
+    const controller = new AbortController()
+    const waitPromise = manager.waitForTask('w1', controller.signal)
+
+    // Wait for subscription to establish
+    await new Promise((r) => setTimeout(r, 10))
+
+    // Make getWorker throw an error to trigger the catch block at line 390
+    const getWorkerSpy = vi.spyOn(store, 'getWorker').mockRejectedValueOnce(
+      new Error('store connection lost'),
+    )
+
+    // Notify a new task — the handler will try getWorker, which throws
+    const task = await engine.createTask({ type: 'test', assignMode: 'pull' })
+    await manager.notifyNewTask(task.id)
+
+    // Wait for the error to be caught (silently)
+    await new Promise((r) => setTimeout(r, 20))
+
+    // The promise should still be pending since the error was caught
+    // Abort to clean up
+    controller.abort()
+
+    await expect(waitPromise).rejects.toThrow('aborted')
+
+    getWorkerSpy.mockRestore()
+  })
+})
+
+describe('WorkerManager — declineTask with longTerm', () => {
+  it('saves task to longTerm when configured', async () => {
+    const store = new MemoryShortTermStore()
+    const broadcast = new MemoryBroadcastProvider()
+    const longTerm: LongTermStore = {
+      saveTask: vi.fn().mockResolvedValue(undefined),
+      getTask: vi.fn().mockResolvedValue(null),
+      saveEvent: vi.fn().mockResolvedValue(undefined),
+      getEvents: vi.fn().mockResolvedValue([]),
+      saveWorkerEvent: vi.fn().mockResolvedValue(undefined),
+      getWorkerEvents: vi.fn().mockResolvedValue([]),
+    }
+    const engine = new TaskEngine({ shortTerm: store, broadcast, longTerm })
+    const manager = new WorkerManager({ engine, shortTerm: store, broadcast, longTerm })
+
+    const worker = await manager.registerWorker({ ...defaultRegistration, capacity: 5 })
+    const task = await engine.createTask({ type: 'test', cost: 1 })
+    await manager.claimTask(task.id, worker.id)
+
+    vi.mocked(longTerm.saveTask).mockClear()
+
+    await manager.declineTask(task.id, worker.id)
+
+    // declineTask should call longTerm.saveTask to persist the declined task
+    expect(longTerm.saveTask).toHaveBeenCalled()
+    const savedTask = vi.mocked(longTerm.saveTask).mock.calls.find(
+      (call) => (call[0] as { id: string }).id === task.id && (call[0] as { status: string }).status === 'pending'
+    )
+    expect(savedTask).toBeDefined()
+  })
+})
