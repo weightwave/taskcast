@@ -118,6 +118,14 @@ pub async fn delete_worker(
         return Err(AppError::Forbidden);
     }
 
+    let worker = manager
+        .get_worker(&worker_id)
+        .await
+        .map_err(manager_error)?;
+    if worker.is_none() {
+        return Err(AppError::NotFound(format!("Worker {}", worker_id)));
+    }
+
     manager
         .unregister_worker(&worker_id)
         .await

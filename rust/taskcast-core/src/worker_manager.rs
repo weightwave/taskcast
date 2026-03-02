@@ -600,8 +600,6 @@ impl WorkerManager {
         let engine = Arc::clone(&self.engine);
         let worker_id_owned = worker_id.to_string();
         let worker_match_rule = worker.match_rule.clone();
-        let worker_used_slots = worker.used_slots;
-        let worker_capacity = worker.capacity;
         let tx_clone = Arc::clone(&tx);
 
         let unsub = self
@@ -637,8 +635,12 @@ impl WorkerManager {
                         if !matches_worker_rule(&task, &rule) {
                             return;
                         }
+                        // Re-fetch worker to get current capacity (avoid stale data)
+                        let Ok(Some(current_worker)) = short_term.get_worker(&wid).await else {
+                            return;
+                        };
                         let task_cost = task.cost.unwrap_or(1);
-                        if worker_used_slots + task_cost > worker_capacity {
+                        if current_worker.used_slots + task_cost > current_worker.capacity {
                             return;
                         }
 

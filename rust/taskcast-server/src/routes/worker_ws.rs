@@ -225,7 +225,7 @@ async fn handle_socket(mut socket: WebSocket, manager: Arc<WorkerManager>, _auth
                 }
             }
 
-            ClientMessage::Accept { task_id } | ClientMessage::Claim { task_id } => {
+            ClientMessage::Accept { task_id } => {
                 if let Some(ref wid) = worker_id {
                     match manager.claim_task(&task_id, wid).await {
                         Ok(ClaimResult::Claimed) => {
@@ -240,17 +240,55 @@ async fn handle_socket(mut socket: WebSocket, manager: Arc<WorkerManager>, _auth
                         Ok(ClaimResult::Failed { reason }) => {
                             let _ = send_message(
                                 &mut socket,
-                                &ServerMessage::Claimed {
-                                    task_id: task_id.clone(),
-                                    success: false,
-                                },
-                            )
-                            .await;
-                            let _ = send_message(
-                                &mut socket,
                                 &ServerMessage::Error {
                                     message: reason,
                                     code: Some("CLAIM_FAILED".to_string()),
+                                },
+                            )
+                            .await;
+                        }
+                        Err(e) => {
+                            let _ = send_message(
+                                &mut socket,
+                                &ServerMessage::Error {
+                                    message: e.to_string(),
+                                    code: Some("CLAIM_ERROR".to_string()),
+                                },
+                            )
+                            .await;
+                        }
+                    }
+                } else {
+                    let _ = send_message(
+                        &mut socket,
+                        &ServerMessage::Error {
+                            message: "Not registered".to_string(),
+                            code: Some("NOT_REGISTERED".to_string()),
+                        },
+                    )
+                    .await;
+                }
+            }
+
+            ClientMessage::Claim { task_id } => {
+                if let Some(ref wid) = worker_id {
+                    match manager.claim_task(&task_id, wid).await {
+                        Ok(ClaimResult::Claimed) => {
+                            let _ = send_message(
+                                &mut socket,
+                                &ServerMessage::Claimed {
+                                    task_id: task_id.clone(),
+                                    success: true,
+                                },
+                            )
+                            .await;
+                        }
+                        Ok(ClaimResult::Failed { .. }) => {
+                            let _ = send_message(
+                                &mut socket,
+                                &ServerMessage::Claimed {
+                                    task_id: task_id.clone(),
+                                    success: false,
                                 },
                             )
                             .await;

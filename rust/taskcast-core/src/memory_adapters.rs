@@ -360,23 +360,21 @@ impl ShortTermStore for MemoryShortTermStore {
         worker_id: &str,
         cost: u32,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-        let mut tasks = self.tasks.write().unwrap();
-        let workers = self.workers.read().unwrap();
+        // Phase 1: Check worker capacity (read lock only, then release)
+        let worker_ok = {
+            let workers = self.workers.read().unwrap();
+            matches!(workers.get(worker_id), Some(w) if w.used_slots + cost <= w.capacity)
+        };
+        if !worker_ok {
+            return Ok(false);
+        }
 
-        let task = match tasks.get(task_id) {
+        // Phase 2: Update task (write lock only)
+        let mut tasks = self.tasks.write().unwrap();
+        let task = match tasks.get_mut(task_id) {
             Some(t) if t.status == TaskStatus::Pending || t.status == TaskStatus::Assigned => t,
             _ => return Ok(false),
         };
-
-        let worker = match workers.get(worker_id) {
-            Some(w) if w.used_slots + cost <= w.capacity => w,
-            _ => return Ok(false),
-        };
-        // Drop the workers read lock before we need it again
-        drop(workers);
-
-        // Update task atomically
-        let task = tasks.get_mut(task_id).unwrap();
         task.status = TaskStatus::Assigned;
         task.assigned_worker = Some(worker_id.to_string());
         task.cost = Some(cost);
