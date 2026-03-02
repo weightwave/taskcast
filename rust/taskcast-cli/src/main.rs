@@ -235,7 +235,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             // 8. Create and serve app
-            let app = taskcast_server::create_app(engine, auth_mode);
+            let app = taskcast_server::create_app(engine, auth_mode, None);
             let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await?;
             println!("[taskcast] Server started on http://localhost:{port}");
             axum::serve(listener, app).await?;
