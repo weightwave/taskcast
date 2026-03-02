@@ -49,6 +49,7 @@ When you merge a PR that contains `.changeset/*.md` files, CI will:
 | `@taskcast/cli` | `packages/cli` | `npx taskcast` standalone server |
 | `@taskcast/redis` | `packages/redis` | Redis broadcast + short-term store adapters |
 | `@taskcast/postgres` | `packages/postgres` | PostgreSQL long-term store adapter |
+| `@taskcast/sqlite` | `packages/sqlite` | SQLite local storage adapter (ShortTermStore + LongTermStore) |
 | `@taskcast/sentry` | `packages/sentry` | Sentry error monitoring hooks |
 
 ## Key Files

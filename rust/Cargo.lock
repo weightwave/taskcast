@@ -2818,6 +2818,7 @@ dependencies = [
  "taskcast-postgres",
  "taskcast-redis",
  "taskcast-server",
+ "taskcast-sqlite",
  "tokio",
 ]
 
