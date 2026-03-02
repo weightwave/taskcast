@@ -8,10 +8,11 @@ import {
   MemoryBroadcastProvider,
   MemoryShortTermStore,
 } from '@taskcast/core'
-import type { BroadcastProvider, ShortTermStore } from '@taskcast/core'
+import type { BroadcastProvider, ShortTermStore, LongTermStore } from '@taskcast/core'
 import { createTaskcastApp } from '@taskcast/server'
 import { createRedisAdapters } from '@taskcast/redis'
 import { PostgresLongTermStore } from '@taskcast/postgres'
+import { createSqliteAdapters } from '@taskcast/sqlite'
 
 const program = new Command()
 
@@ -25,7 +26,9 @@ program
   .description('Start the taskcast server in foreground (default)')
   .option('-c, --config <path>', 'config file path')
   .option('-p, --port <port>', 'port to listen on', '3721')
-  .action(async (options: { config?: string; port: string }) => {
+  .option('-s, --storage <type>', 'storage backend: memory | redis | sqlite', 'memory')
+  .option('--db-path <path>', 'SQLite database file path (default: ./taskcast.db)')
+  .action(async (options: { config?: string; port: string; storage?: string; dbPath?: string }) => {
     const fileConfig = await loadConfigFile(options.config)
 
     const port = Number(options.port ?? fileConfig.port ?? 3721)
@@ -34,12 +37,21 @@ program
 
     let shortTerm: ShortTermStore
     let broadcast: BroadcastProvider
-    let longTerm: InstanceType<typeof PostgresLongTermStore> | undefined
+    let longTerm: LongTermStore | undefined
 
-    if (redisUrl) {
-      const pubClient = new Redis(redisUrl)
-      const subClient = new Redis(redisUrl)
-      const storeClient = new Redis(redisUrl)
+    const storage = options.storage ?? process.env['TASKCAST_STORAGE'] ?? (redisUrl ? 'redis' : 'memory')
+
+    if (storage === 'sqlite') {
+      const sqliteOpts = options.dbPath ? { path: options.dbPath } : {}
+      const adapters = createSqliteAdapters(sqliteOpts)
+      broadcast = new MemoryBroadcastProvider()
+      shortTerm = adapters.shortTerm
+      longTerm = adapters.longTerm
+      console.log(`[taskcast] Using SQLite storage at ${options.dbPath ?? './taskcast.db'}`)
+    } else if (storage === 'redis' || redisUrl) {
+      const pubClient = new Redis(redisUrl!)
+      const subClient = new Redis(redisUrl!)
+      const storeClient = new Redis(redisUrl!)
       const adapters = createRedisAdapters(pubClient, subClient, storeClient)
       broadcast = adapters.broadcast
       shortTerm = adapters.shortTerm
@@ -49,7 +61,7 @@ program
       shortTerm = new MemoryShortTermStore()
     }
 
-    if (postgresUrl) {
+    if (storage !== 'sqlite' && postgresUrl) {
       const sql = postgres(postgresUrl)
       longTerm = new PostgresLongTermStore(sql)
     }
