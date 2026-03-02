@@ -1,1 +1,1 @@
-// SQLite adapter — implementation coming in subsequent tasks
+export { SqliteShortTermStore } from './short-term.js'
