@@ -18,6 +18,8 @@ const client = new TaskcastClient({
   token: 'your-jwt-token', // optional
 })
 
+const taskId = 'task-123' // replace with your actual task ID
+
 await client.subscribe(taskId, {
   filter: {
     types: ['llm.*'],

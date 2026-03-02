@@ -73,9 +73,9 @@ import Redis from 'ioredis'
 const pub = new Redis(process.env.REDIS_URL!)
 const sub = new Redis(process.env.REDIS_URL!)
 const store = new Redis(process.env.REDIS_URL!)
-const { broadcast, shortTerm } = createRedisAdapters(pub, sub, store)
+const { broadcast, shortTermStore } = createRedisAdapters(pub, sub, store)
 
-const engine = new TaskEngine({ broadcast, shortTermStore: shortTerm })
+const engine = new TaskEngine({ broadcast, shortTermStore })
 ```
 
 ### With PostgreSQL long-term storage:
@@ -83,8 +83,8 @@ const engine = new TaskEngine({ broadcast, shortTermStore: shortTerm })
 ```typescript
 import { createPostgresAdapter } from '@taskcast/postgres'
 
-const longTerm = await createPostgresAdapter({ url: process.env.DATABASE_URL! })
-const engine = new TaskEngine({ broadcast, shortTermStore: shortTerm, longTermStore: longTerm })
+const longTermStore = await createPostgresAdapter({ url: process.env.DATABASE_URL! })
+const engine = new TaskEngine({ broadcast, shortTermStore, longTermStore })
 ```
 
 ### With JWT authentication:
@@ -217,7 +217,7 @@ await taskcast.transitionTask(task.id, 'completed', { result: { output: 'Hi!' } 
 POST   /tasks                       Create task
 GET    /tasks/:taskId               Get task status
 PATCH  /tasks/:taskId/status        Transition status
-DELETE /tasks/:taskId               Delete task
+DELETE /tasks/:taskId               Delete task (planned)
 POST   /tasks/:taskId/events        Publish event(s)
 GET    /tasks/:taskId/events        SSE subscribe
 GET    /tasks/:taskId/events/history Query history

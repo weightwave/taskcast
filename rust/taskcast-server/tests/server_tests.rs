@@ -13,9 +13,9 @@ use taskcast_server::{create_app, AppError, AuthMode, JwtConfig, WebhookDelivery
 
 fn make_engine() -> Arc<TaskEngine> {
     Arc::new(TaskEngine::new(TaskEngineOptions {
-        short_term: Arc::new(MemoryShortTermStore::new()),
+        short_term_store: Arc::new(MemoryShortTermStore::new()),
         broadcast: Arc::new(MemoryBroadcastProvider::new()),
-        long_term: None,
+        long_term_store: None,
         hooks: None,
     }))
 }

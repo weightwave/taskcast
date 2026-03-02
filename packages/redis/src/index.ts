@@ -30,6 +30,6 @@ export function createRedisAdapters(
 ) {
   return {
     broadcast: new RedisBroadcastProvider(pubClient, subClient, options),
-    shortTerm: new RedisShortTermStore(storeClient, options),
+    shortTermStore: new RedisShortTermStore(storeClient, options),
   }
 }

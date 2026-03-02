@@ -236,6 +236,55 @@ describe('PATCH /tasks/:taskId/status - error payload', () => {
   })
 })
 
+describe('PATCH /tasks/:taskId/status – suspended states', () => {
+  it('transitions running → paused with reason', async () => {
+    const { app, engine } = makeApp()
+    const task = await engine.createTask({})
+    await engine.transitionTask(task.id, 'running')
+    const taskId = task.id
+    const res = await app.request(`/tasks/${taskId}/status`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: 'paused', reason: 'User requested' }),
+    })
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.status).toBe('paused')
+    expect(body.reason).toBe('User requested')
+  })
+
+  it('transitions running → blocked with resumeAfterMs', async () => {
+    const { app, engine } = makeApp()
+    const task = await engine.createTask({})
+    await engine.transitionTask(task.id, 'running')
+    const taskId = task.id
+    const res = await app.request(`/tasks/${taskId}/status`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: 'blocked', reason: 'Waiting approval', resumeAfterMs: 30000 }),
+    })
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.status).toBe('blocked')
+    expect(body.resumeAt).toBeDefined()
+  })
+
+  it('allows ttl override on transition', async () => {
+    const { app, engine } = makeApp()
+    const task = await engine.createTask({})
+    await engine.transitionTask(task.id, 'running')
+    const taskId = task.id
+    const res = await app.request(`/tasks/${taskId}/status`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: 'blocked', ttl: 1800 }),
+    })
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.ttl).toBe(1800)
+  })
+})
+
 describe('POST /tasks/:taskId/events - error handling', () => {
   it('returns 404 when publishing event to nonexistent task', async () => {
     const { app } = makeApp()

@@ -70,10 +70,10 @@ pub struct JwtConfig {
 pub struct AdaptersConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub broadcast: Option<AdapterEntry>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub short_term: Option<AdapterEntry>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub long_term: Option<AdapterEntry>,
+    #[serde(alias = "shortTerm", skip_serializing_if = "Option::is_none")]
+    pub short_term_store: Option<AdapterEntry>,
+    #[serde(alias = "longTerm", skip_serializing_if = "Option::is_none")]
+    pub long_term_store: Option<AdapterEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -411,9 +411,9 @@ mod tests {
             adapters.broadcast.as_ref().unwrap().url,
             Some("redis://localhost:6379".to_string())
         );
-        assert_eq!(adapters.short_term.as_ref().unwrap().provider, "memory");
-        assert_eq!(adapters.short_term.as_ref().unwrap().url, None);
-        assert_eq!(adapters.long_term.as_ref().unwrap().provider, "postgres");
+        assert_eq!(adapters.short_term_store.as_ref().unwrap().provider, "memory");
+        assert_eq!(adapters.short_term_store.as_ref().unwrap().url, None);
+        assert_eq!(adapters.long_term_store.as_ref().unwrap().provider, "postgres");
     }
 
     #[test]

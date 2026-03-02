@@ -7,7 +7,7 @@ import type { AuthContext } from '../src/auth.js'
 function makeApp() {
   const store = new MemoryShortTermStore()
   const broadcast = new MemoryBroadcastProvider()
-  const engine = new TaskEngine({ shortTerm: store, broadcast })
+  const engine = new TaskEngine({ shortTermStore: store, broadcast })
   const app = new Hono()
   app.use('*', async (c, next) => {
     const auth: AuthContext = { taskIds: '*', scope: ['*'] }
@@ -181,7 +181,7 @@ describe('GET /tasks/:taskId/events (SSE)', () => {
   it('returns 403 when auth scope is insufficient', async () => {
     const store = new (await import('@taskcast/core')).MemoryShortTermStore()
     const broadcast = new (await import('@taskcast/core')).MemoryBroadcastProvider()
-    const engine = new (await import('@taskcast/core')).TaskEngine({ shortTerm: store, broadcast })
+    const engine = new (await import('@taskcast/core')).TaskEngine({ shortTermStore: store, broadcast })
     const app = new Hono()
     app.use('*', async (c, next) => {
       // No event:subscribe scope

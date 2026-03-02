@@ -10,7 +10,7 @@ pnpm add @taskcast/react @taskcast/client @taskcast/core react
 
 ## Usage
 
-```typescript
+```tsx
 import { useTaskEvents } from '@taskcast/react'
 
 function TaskStream({ taskId }: { taskId: string }) {
@@ -39,10 +39,10 @@ Returns:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `events` | `TaskEventEnvelope[]` | Accumulated events |
+| `events` | `SSEEnvelope[]` | Accumulated events |
 | `isDone` | `boolean` | Whether the task has reached a terminal state |
-| `doneReason` | `string \| undefined` | Terminal status (`completed`, `failed`, etc.) |
-| `error` | `Error \| undefined` | Connection or parse errors |
+| `doneReason` | `string \| null` | Terminal status (`completed`, `failed`, etc.) |
+| `error` | `Error \| null` | Connection or parse errors |
 
 ## Part of Taskcast
 

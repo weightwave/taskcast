@@ -15,11 +15,11 @@ import { TaskEngine } from '@taskcast/core'
 import { createRedisAdapters } from '@taskcast/redis'
 import Redis from 'ioredis'
 
-const { broadcast, shortTermStore } = createRedisAdapters({
-  pubClient: new Redis(process.env.REDIS_URL),
-  subClient: new Redis(process.env.REDIS_URL),
-  storeClient: new Redis(process.env.REDIS_URL),
-})
+const pubClient = new Redis(process.env.REDIS_URL)
+const subClient = new Redis(process.env.REDIS_URL)
+const storeClient = new Redis(process.env.REDIS_URL)
+
+const { broadcast, shortTermStore } = createRedisAdapters(pubClient, subClient, storeClient)
 
 const engine = new TaskEngine({
   broadcast,

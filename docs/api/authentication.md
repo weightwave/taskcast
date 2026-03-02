@@ -136,7 +136,7 @@ interface TaskcastJWTPayload {
 | Scope | Description | Endpoints |
 |-------|-------------|-----------|
 | `task:create` | Create a task | `POST /tasks` |
-| `task:manage` | Change task status, delete a task | `PATCH /tasks/:id/status`, `DELETE /tasks/:id` |
+| `task:manage` | Change task status, delete a task | `PATCH /tasks/:id/status`, `DELETE /tasks/:id` (planned) |
 | `event:publish` | Publish events to a task | `POST /tasks/:id/events` |
 | `event:subscribe` | Subscribe to a task's SSE stream | `GET /tasks/:id/events` |
 | `event:history` | Query event history | `GET /tasks/:id/events/history` |

@@ -136,7 +136,7 @@ interface TaskcastJWTPayload {
 | Scope | 说明 | 涉及端点 |
 |-------|------|----------|
 | `task:create` | 创建任务 | `POST /tasks` |
-| `task:manage` | 更改任务状态、删除任务 | `PATCH /tasks/:id/status`, `DELETE /tasks/:id` |
+| `task:manage` | 更改任务状态、删除任务 | `PATCH /tasks/:id/status`, `DELETE /tasks/:id` (planned) |
 | `event:publish` | 向任务发布事件 | `POST /tasks/:id/events` |
 | `event:subscribe` | 订阅任务 SSE 流 | `GET /tasks/:id/events` |
 | `event:history` | 查询事件历史 | `GET /tasks/:id/events/history` |

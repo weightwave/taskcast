@@ -35,9 +35,9 @@ program
     const redisUrl = process.env['TASKCAST_REDIS_URL'] ?? fileConfig.adapters?.broadcast?.url
     const postgresUrl = process.env['TASKCAST_POSTGRES_URL'] ?? fileConfig.adapters?.longTerm?.url
 
-    let shortTerm: ShortTermStore
+    let shortTermStore: ShortTermStore
     let broadcast: BroadcastProvider
-    let longTerm: LongTermStore | undefined
+    let longTermStore: LongTermStore | undefined
 
     const storage = options.storage ?? process.env['TASKCAST_STORAGE'] ?? (redisUrl ? 'redis' : 'memory')
 
@@ -45,8 +45,8 @@ program
       const sqliteOpts = options.dbPath ? { path: options.dbPath } : {}
       const adapters = createSqliteAdapters(sqliteOpts)
       broadcast = new MemoryBroadcastProvider()
-      shortTerm = adapters.shortTerm
-      longTerm = adapters.longTerm
+      shortTermStore = adapters.shortTerm
+      longTermStore = adapters.longTerm
       console.log(`[taskcast] Using SQLite storage at ${options.dbPath ?? './taskcast.db'}`)
     } else if (storage === 'redis' || redisUrl) {
       const pubClient = new Redis(redisUrl!)
@@ -54,20 +54,20 @@ program
       const storeClient = new Redis(redisUrl!)
       const adapters = createRedisAdapters(pubClient, subClient, storeClient)
       broadcast = adapters.broadcast
-      shortTerm = adapters.shortTerm
+      shortTermStore = adapters.shortTermStore
     } else {
       console.warn('[taskcast] No TASKCAST_REDIS_URL configured — using in-memory adapters')
       broadcast = new MemoryBroadcastProvider()
-      shortTerm = new MemoryShortTermStore()
+      shortTermStore = new MemoryShortTermStore()
     }
 
     if (storage !== 'sqlite' && postgresUrl) {
       const sql = postgres(postgresUrl)
-      longTerm = new PostgresLongTermStore(sql)
+      longTermStore = new PostgresLongTermStore(sql)
     }
 
-    const engineOpts: ConstructorParameters<typeof TaskEngine>[0] = { shortTerm, broadcast }
-    if (longTerm !== undefined) engineOpts.longTerm = longTerm
+    const engineOpts: ConstructorParameters<typeof TaskEngine>[0] = { shortTermStore, broadcast }
+    if (longTermStore !== undefined) engineOpts.longTermStore = longTermStore
     const engine = new TaskEngine(engineOpts)
 
     const authMode = (process.env['TASKCAST_AUTH_MODE'] ?? fileConfig.auth?.mode ?? 'none') as 'none' | 'jwt'

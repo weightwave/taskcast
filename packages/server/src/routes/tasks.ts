@@ -61,19 +61,28 @@ export function createTasksRouter(engine: TaskEngine) {
 
     const body = await c.req.json()
     const schema = z.object({
-      status: z.enum(['running', 'completed', 'failed', 'timeout', 'cancelled']),
+      status: z.enum(['running', 'paused', 'blocked', 'completed', 'failed', 'timeout', 'cancelled']),
       result: z.record(z.unknown()).optional(),
       error: z.object({
         code: z.string().optional(),
         message: z.string(),
         details: z.record(z.unknown()).optional(),
       }).optional(),
+      reason: z.string().optional(),
+      ttl: z.number().int().positive().optional(),
+      resumeAfterMs: z.number().int().positive().optional(),
     })
     const parsed = schema.safeParse(body)
     if (!parsed.success) return c.json({ error: parsed.error.flatten() }, 400)
 
     try {
-      const payload: { result?: Record<string, unknown>; error?: TaskError } = {}
+      const payload: {
+        result?: Record<string, unknown>
+        error?: TaskError
+        reason?: string
+        ttl?: number
+        resumeAfterMs?: number
+      } = {}
       if (parsed.data.result !== undefined) payload.result = parsed.data.result
       if (parsed.data.error !== undefined) {
         const e = parsed.data.error
@@ -82,6 +91,9 @@ export function createTasksRouter(engine: TaskEngine) {
         if (e.details !== undefined) taskError.details = e.details
         payload.error = taskError
       }
+      if (parsed.data.reason !== undefined) payload.reason = parsed.data.reason
+      if (parsed.data.ttl !== undefined) payload.ttl = parsed.data.ttl
+      if (parsed.data.resumeAfterMs !== undefined) payload.resumeAfterMs = parsed.data.resumeAfterMs
       const task = await engine.transitionTask(taskId, parsed.data.status, payload)
       return c.json(task)
     } catch (err) {
