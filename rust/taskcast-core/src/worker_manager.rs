@@ -132,6 +132,10 @@ impl WorkerManager {
         }
     }
 
+    pub fn heartbeat_interval_ms(&self) -> u64 {
+        self.defaults.heartbeat_interval_ms.unwrap_or(30_000)
+    }
+
     // ─── Audit Helpers ──────────────────────────────────────────────────
 
     async fn emit_task_audit(
@@ -404,10 +408,9 @@ impl WorkerManager {
         };
         self.short_term.add_assignment(assignment).await?;
 
-        // Update worker status
+        // Update worker status (used_slots already updated by claim_task)
         let worker = self.short_term.get_worker(worker_id).await?;
         if let Some(mut worker) = worker {
-            worker.used_slots += cost;
             worker.status = if worker.used_slots >= worker.capacity {
                 WorkerStatus::Busy
             } else {

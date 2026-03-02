@@ -86,6 +86,10 @@ export class WorkerManager {
     if (opts.hooks) this.hooks = opts.hooks
   }
 
+  get heartbeatIntervalMs(): number {
+    return this.opts.defaults?.heartbeatIntervalMs ?? 30_000
+  }
+
   // ─── Audit Helpers ──────────────────────────────────────────────────────
 
   private async emitTaskAudit(taskId: string, action: string, extra?: Record<string, unknown>): Promise<void> {
@@ -243,10 +247,9 @@ export class WorkerManager {
     }
     await this.shortTerm.addAssignment(assignment)
 
-    // Update worker status
+    // Update worker status (usedSlots already updated by claimTask)
     const worker = await this.shortTerm.getWorker(workerId)
     if (worker) {
-      worker.usedSlots += cost
       worker.status = worker.usedSlots >= worker.capacity ? 'busy' : 'idle'
       await this.shortTerm.saveWorker(worker)
 

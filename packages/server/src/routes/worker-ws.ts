@@ -31,6 +31,7 @@ function toSummary(task: Task): TaskSummary {
 export class WorkerWSHandler {
   private workerId: string | null = null
   private pendingOffers = new Map<string, Task>()
+  private pingTimer: ReturnType<typeof setInterval> | null = null
 
   constructor(
     private manager: WorkerManager,
@@ -91,8 +92,16 @@ export class WorkerWSHandler {
   }
 
   async handleDisconnect(): Promise<void> {
+    this.stopPingTimer()
     if (this.workerId) {
       await this.manager.unregisterWorker(this.workerId)
+    }
+  }
+
+  stopPingTimer(): void {
+    if (this.pingTimer) {
+      clearInterval(this.pingTimer)
+      this.pingTimer = null
     }
   }
 
@@ -109,6 +118,7 @@ export class WorkerWSHandler {
     const worker = await this.manager.registerWorker(reg)
     this.workerId = worker.id
     this.send({ type: 'registered', workerId: worker.id })
+    this.startPingTimer()
   }
 
   private async handleUpdate(msg: Record<string, unknown>): Promise<void> {
@@ -160,6 +170,14 @@ export class WorkerWSHandler {
   }
 
   // ─── Helpers ──────────────────────────────────────────────────────────
+
+  private startPingTimer(): void {
+    this.stopPingTimer()
+    const intervalMs = this.manager.heartbeatIntervalMs
+    this.pingTimer = setInterval(() => {
+      this.send({ type: 'ping' })
+    }, intervalMs)
+  }
 
   private requireRegistered(): boolean {
     if (!this.workerId) {

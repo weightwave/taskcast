@@ -30,6 +30,25 @@ pub struct TaskcastConfig {
 pub struct WorkersConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub defaults: Option<WorkerDefaultsConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerDefaultsConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assign_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heartbeat_interval_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heartbeat_timeout_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offer_timeout_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disconnect_policy: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disconnect_grace_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

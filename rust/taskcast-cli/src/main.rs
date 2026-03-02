@@ -247,6 +247,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let worker_manager = if workers_enabled {
                 println!("[taskcast] Worker assignment system enabled");
+
+                let mut wm_defaults = taskcast_core::worker_manager::WorkerManagerDefaults::default();
+                if let Some(ref cfg_defaults) = file_config.workers.as_ref().and_then(|w| w.defaults.as_ref()) {
+                    if let Some(v) = cfg_defaults.heartbeat_interval_ms {
+                        wm_defaults.heartbeat_interval_ms = Some(v);
+                    }
+                    if let Some(v) = cfg_defaults.heartbeat_timeout_ms {
+                        wm_defaults.heartbeat_timeout_ms = Some(v);
+                    }
+                    if let Some(v) = cfg_defaults.offer_timeout_ms {
+                        wm_defaults.offer_timeout_ms = Some(v);
+                    }
+                    if let Some(v) = cfg_defaults.disconnect_grace_ms {
+                        wm_defaults.disconnect_grace_ms = Some(v);
+                    }
+                    if let Some(ref mode) = cfg_defaults.assign_mode {
+                        wm_defaults.assign_mode = match mode.as_str() {
+                            "pull" => Some(taskcast_core::AssignMode::Pull),
+                            "ws-offer" => Some(taskcast_core::AssignMode::WsOffer),
+                            "ws-race" => Some(taskcast_core::AssignMode::WsRace),
+                            _ => Some(taskcast_core::AssignMode::External),
+                        };
+                    }
+                    if let Some(ref policy) = cfg_defaults.disconnect_policy {
+                        wm_defaults.disconnect_policy = match policy.as_str() {
+                            "mark" => Some(taskcast_core::DisconnectPolicy::Mark),
+                            "fail" => Some(taskcast_core::DisconnectPolicy::Fail),
+                            _ => Some(taskcast_core::DisconnectPolicy::Reassign),
+                        };
+                    }
+                }
+
                 Some(Arc::new(taskcast_core::worker_manager::WorkerManager::new(
                     taskcast_core::worker_manager::WorkerManagerOptions {
                         engine: Arc::clone(&engine),
@@ -254,7 +286,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         broadcast: broadcast_for_wm,
                         long_term: long_term_for_wm,
                         hooks: None,
-                        defaults: Some(taskcast_core::worker_manager::WorkerManagerDefaults::default()),
+                        defaults: Some(wm_defaults),
                     },
                 )))
             } else {

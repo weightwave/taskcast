@@ -373,6 +373,7 @@ describe('MemoryShortTermStore.workers', () => {
 describe('MemoryShortTermStore.claimTask', () => {
   it('successfully claims a pending task', async () => {
     const store = new MemoryShortTermStore()
+    await store.saveWorker(makeWorker({ id: 'w1', capacity: 10 }))
     await store.saveTask(makeTask({ id: 't1', status: 'pending' }))
     const result = await store.claimTask('t1', 'w1', 2)
     expect(result).toBe(true)
@@ -380,15 +381,33 @@ describe('MemoryShortTermStore.claimTask', () => {
     expect(task!.status).toBe('assigned')
     expect(task!.assignedWorker).toBe('w1')
     expect(task!.cost).toBe(2)
+    const worker = await store.getWorker('w1')
+    expect(worker!.usedSlots).toBe(2)
   })
 
   it('successfully claims an assigned task (re-assignment)', async () => {
     const store = new MemoryShortTermStore()
+    await store.saveWorker(makeWorker({ id: 'w-new', capacity: 10 }))
     await store.saveTask(makeTask({ id: 't1', status: 'assigned', assignedWorker: 'w-old' }))
     const result = await store.claimTask('t1', 'w-new', 1)
     expect(result).toBe(true)
     const task = await store.getTask('t1')
     expect(task!.assignedWorker).toBe('w-new')
+  })
+
+  it('rejects claim when worker capacity exceeded', async () => {
+    const store = new MemoryShortTermStore()
+    await store.saveWorker(makeWorker({ id: 'w1', capacity: 1, usedSlots: 0 }))
+    await store.saveTask(makeTask({ id: 't1', status: 'pending' }))
+    const result = await store.claimTask('t1', 'w1', 2)
+    expect(result).toBe(false)
+  })
+
+  it('rejects claim for unregistered worker', async () => {
+    const store = new MemoryShortTermStore()
+    await store.saveTask(makeTask({ id: 't1', status: 'pending' }))
+    const result = await store.claimTask('t1', 'unknown-worker', 1)
+    expect(result).toBe(false)
   })
 
   it('rejects claim for running task', async () => {
@@ -420,6 +439,7 @@ describe('MemoryShortTermStore.claimTask', () => {
 
   it('updates updatedAt timestamp on successful claim', async () => {
     const store = new MemoryShortTermStore()
+    await store.saveWorker(makeWorker({ id: 'w1', capacity: 10 }))
     await store.saveTask(makeTask({ id: 't1', updatedAt: 1000 }))
     await store.claimTask('t1', 'w1', 1)
     const task = await store.getTask('t1')

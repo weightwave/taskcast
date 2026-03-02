@@ -127,13 +127,30 @@ pub async fn ws_handler(
 
 async fn handle_socket(mut socket: WebSocket, manager: Arc<WorkerManager>, _auth: AuthContext) {
     let mut worker_id: Option<String> = None;
+    let interval_ms = manager.heartbeat_interval_ms();
+    let mut ping_interval = tokio::time::interval(tokio::time::Duration::from_millis(interval_ms));
+    // Skip the first immediate tick
+    ping_interval.tick().await;
+    let mut registered = false;
 
-    while let Some(msg) = socket.recv().await {
+    loop {
+        let msg = if registered {
+            tokio::select! {
+                msg = socket.recv() => msg,
+                _ = ping_interval.tick() => {
+                    let _ = send_message(&mut socket, &ServerMessage::Ping).await;
+                    continue;
+                }
+            }
+        } else {
+            socket.recv().await
+        };
+
         let msg = match msg {
-            Ok(Message::Text(text)) => text,
-            Ok(Message::Close(_)) => break,
-            Ok(_) => continue,
-            Err(_) => break,
+            Some(Ok(Message::Text(text))) => text,
+            Some(Ok(Message::Close(_))) | None => break,
+            Some(Ok(_)) => continue,
+            Some(Err(_)) => break,
         };
 
         let client_msg: ClientMessage = match serde_json::from_str(&msg) {
@@ -170,6 +187,7 @@ async fn handle_socket(mut socket: WebSocket, manager: Arc<WorkerManager>, _auth
                 match manager.register_worker(registration).await {
                     Ok(worker) => {
                         worker_id = Some(worker.id.clone());
+                        registered = true;
                         let _ = send_message(
                             &mut socket,
                             &ServerMessage::Registered {

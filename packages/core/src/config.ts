@@ -42,6 +42,17 @@ export interface TaskcastConfig {
   cleanup?: {
     rules?: unknown[]
   }
+  workers?: {
+    enabled?: boolean
+    defaults?: {
+      assignMode?: 'external' | 'pull' | 'ws-offer' | 'ws-race'
+      heartbeatIntervalMs?: number
+      heartbeatTimeoutMs?: number
+      offerTimeoutMs?: number
+      disconnectPolicy?: 'reassign' | 'mark' | 'fail'
+      disconnectGraceMs?: number
+    }
+  }
 }
 
 export function interpolateEnvVars(value: string): string {

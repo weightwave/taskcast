@@ -8,6 +8,7 @@ import { join } from 'path'
 import { homedir } from 'os'
 import {
   TaskEngine,
+  WorkerManager,
   loadConfigFile,
   MemoryBroadcastProvider,
   MemoryShortTermStore,
@@ -139,10 +140,28 @@ program
     const engine = new TaskEngine(engineOpts)
 
     const authMode = (process.env['TASKCAST_AUTH_MODE'] ?? fileConfig.auth?.mode ?? 'none') as 'none' | 'jwt'
-    const app = createTaskcastApp({
+
+    // Worker assignment system
+    const workersEnabled = fileConfig.workers?.enabled ?? false
+    let workerManager: WorkerManager | undefined
+    if (workersEnabled) {
+      console.log('[taskcast] Worker assignment system enabled')
+      const wmOpts: ConstructorParameters<typeof WorkerManager>[0] = {
+        engine,
+        shortTerm,
+        broadcast,
+      }
+      if (longTerm !== undefined) wmOpts.longTerm = longTerm
+      if (fileConfig.workers?.defaults) wmOpts.defaults = fileConfig.workers.defaults
+      workerManager = new WorkerManager(wmOpts)
+    }
+
+    const serverOpts: Parameters<typeof createTaskcastApp>[0] = {
       engine,
       auth: { mode: authMode },
-    })
+    }
+    if (workerManager !== undefined) serverOpts.workerManager = workerManager
+    const app = createTaskcastApp(serverOpts)
 
     const { serve } = await import('@hono/node-server')
     serve({ fetch: app.fetch, port }, () => {
