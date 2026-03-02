@@ -32,6 +32,8 @@ pub struct JwtConfig {
 #[derive(Debug, Clone)]
 pub struct AuthContext {
     pub sub: Option<String>,
+    pub jti: Option<String>,
+    pub worker_id: Option<String>,
     pub task_ids: TaskIdAccess,
     pub scope: Vec<PermissionScope>,
 }
@@ -46,6 +48,8 @@ impl AuthContext {
     pub fn open() -> Self {
         Self {
             sub: None,
+            jti: None,
+            worker_id: None,
             task_ids: TaskIdAccess::All,
             scope: vec![PermissionScope::All],
         }
@@ -58,6 +62,10 @@ impl AuthContext {
 struct JwtClaims {
     #[serde(default)]
     sub: Option<String>,
+    #[serde(default)]
+    jti: Option<String>,
+    #[serde(default, rename = "workerId")]
+    worker_id: Option<String>,
     #[serde(default, rename = "taskIds")]
     task_ids: Option<TaskIdsClaim>,
     #[serde(default)]
@@ -179,6 +187,8 @@ fn decode_jwt(token: &str, config: &JwtConfig) -> Result<AuthContext, jsonwebtok
 
     Ok(AuthContext {
         sub: claims.sub,
+        jti: claims.jti,
+        worker_id: claims.worker_id,
         task_ids,
         scope,
     })
