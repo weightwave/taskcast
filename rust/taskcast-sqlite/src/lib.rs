@@ -1,4 +1,5 @@
 mod long_term;
+mod row_helpers;
 mod short_term;
 
 pub use long_term::SqliteLongTermStore;
