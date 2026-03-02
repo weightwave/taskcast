@@ -21,6 +21,15 @@ pub struct TaskcastConfig {
     pub webhook: Option<WebhookGlobalConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cleanup: Option<CleanupGlobalConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workers: Option<WorkersConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkersConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -93,10 +93,7 @@ fn to_envelope(event: &TaskEvent, filtered_index: u64) -> SSEEnvelope {
 // ─── Terminal Status Check ──────────────────────────────────────────────────
 
 fn is_terminal_status(status: &TaskStatus) -> bool {
-    matches!(
-        status,
-        TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Timeout | TaskStatus::Cancelled
-    )
+    taskcast_core::state_machine::is_terminal(status)
 }
 
 // ─── SSE Handler ────────────────────────────────────────────────────────────
