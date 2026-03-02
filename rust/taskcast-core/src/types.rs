@@ -186,11 +186,14 @@ pub struct CleanupConfig {
 // ─── Worker Assignment ──────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub enum AssignMode {
+    #[serde(rename = "external")]
     External,
+    #[serde(rename = "pull")]
     Pull,
+    #[serde(rename = "ws-offer")]
     WsOffer,
+    #[serde(rename = "ws-race")]
     WsRace,
 }
 

@@ -5,8 +5,8 @@ use std::sync::{Arc, RwLock};
 use async_trait::async_trait;
 
 use crate::types::{
-    BroadcastProvider, EventQueryOptions, ShortTermStore, Task, TaskEvent, TaskFilter, Worker,
-    WorkerAssignment, WorkerFilter,
+    BroadcastProvider, EventQueryOptions, ShortTermStore, Task, TaskEvent, TaskFilter, TaskStatus,
+    Worker, WorkerAssignment, WorkerFilter,
 };
 
 // ─── MemoryBroadcastProvider ────────────────────────────────────────────────
@@ -256,10 +256,49 @@ impl ShortTermStore for MemoryShortTermStore {
 
     async fn list_tasks(
         &self,
-        _filter: TaskFilter,
+        filter: TaskFilter,
     ) -> Result<Vec<Task>, Box<dyn std::error::Error + Send + Sync>> {
         let tasks = self.tasks.read().unwrap();
-        Ok(tasks.values().cloned().collect())
+        Ok(tasks
+            .values()
+            .filter(|t| {
+                if let Some(ref statuses) = filter.status {
+                    if !statuses.contains(&t.status) {
+                        return false;
+                    }
+                }
+                if let Some(ref types) = filter.types {
+                    if let Some(ref task_type) = t.r#type {
+                        if !types.iter().any(|ty| ty == task_type) {
+                            return false;
+                        }
+                    } else {
+                        return false;
+                    }
+                }
+                if let Some(ref modes) = filter.assign_mode {
+                    if let Some(ref am) = t.assign_mode {
+                        if !modes.contains(am) {
+                            return false;
+                        }
+                    } else {
+                        return false;
+                    }
+                }
+                // Tag filtering will be applied when worker_matching module is available
+                if filter.tags.is_some() {
+                    // TODO: integrate with worker_matching::matches_tag
+                }
+                if let Some(ref exclude) = filter.exclude_task_ids {
+                    if exclude.contains(&t.id) {
+                        return false;
+                    }
+                }
+                true
+            })
+            .take(filter.limit.unwrap_or(u64::MAX) as usize)
+            .cloned()
+            .collect())
     }
 
     async fn save_worker(
@@ -281,10 +320,28 @@ impl ShortTermStore for MemoryShortTermStore {
 
     async fn list_workers(
         &self,
-        _filter: Option<WorkerFilter>,
+        filter: Option<WorkerFilter>,
     ) -> Result<Vec<Worker>, Box<dyn std::error::Error + Send + Sync>> {
         let workers = self.workers.read().unwrap();
-        Ok(workers.values().cloned().collect())
+        Ok(workers
+            .values()
+            .filter(|w| {
+                if let Some(ref f) = filter {
+                    if let Some(ref statuses) = f.status {
+                        if !statuses.contains(&w.status) {
+                            return false;
+                        }
+                    }
+                    if let Some(ref modes) = f.connection_mode {
+                        if !modes.contains(&w.connection_mode) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
+            .cloned()
+            .collect())
     }
 
     async fn delete_worker(
@@ -299,11 +356,35 @@ impl ShortTermStore for MemoryShortTermStore {
     async fn claim_task(
         &self,
         task_id: &str,
-        _worker_id: &str,
-        _cost: u32,
+        worker_id: &str,
+        cost: u32,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-        let tasks = self.tasks.read().unwrap();
-        Ok(tasks.contains_key(task_id))
+        let mut tasks = self.tasks.write().unwrap();
+        let workers = self.workers.read().unwrap();
+
+        let task = match tasks.get(task_id) {
+            Some(t) if t.status == TaskStatus::Pending || t.status == TaskStatus::Assigned => t,
+            _ => return Ok(false),
+        };
+
+        let worker = match workers.get(worker_id) {
+            Some(w) if w.used_slots + cost <= w.capacity => w,
+            _ => return Ok(false),
+        };
+        // Drop the workers read lock before we need it again
+        drop(workers);
+
+        // Update task atomically
+        let task = tasks.get_mut(task_id).unwrap();
+        task.status = TaskStatus::Assigned;
+        task.assigned_worker = Some(worker_id.to_string());
+        task.cost = Some(cost);
+        task.updated_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as f64;
+
+        Ok(true)
     }
 
     async fn add_assignment(
