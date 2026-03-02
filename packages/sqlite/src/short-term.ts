@@ -167,21 +167,18 @@ export class SqliteShortTermStore implements ShortTermStore {
     const prev = await this.getSeriesLatest(taskId, seriesId)
 
     if (prev) {
-      // Replace the previous event row in-place, keeping the original idx so
-      // that the event stays at its original position in idx-based ordering.
+      // Replace content fields only, preserving the original id and idx so
+      // the event stays at its original position in idx-based ordering.
       // This mirrors Redis lset behaviour where the list position is preserved.
       this.db
         .prepare(
           `UPDATE taskcast_events
-           SET id = @id, idx = @idx, timestamp = @timestamp, type = @type,
-               level = @level, data = @data, series_id = @series_id, series_mode = @series_mode
+           SET data = @data, type = @type, level = @level,
+               series_id = @series_id, series_mode = @series_mode
            WHERE id = @prev_id`,
         )
         .run({
-          id: event.id,
           prev_id: prev.id,
-          idx: event.index,
-          timestamp: event.timestamp,
           type: event.type,
           level: event.level,
           data: event.data != null ? JSON.stringify(event.data) : null,

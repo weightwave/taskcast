@@ -265,21 +265,23 @@ describe('SqliteShortTermStore', () => {
   it('should replace last series event in event list', async () => {
     await store.saveTask(makeTask())
     const e0 = makeEvent('task-1', 0)
-    const e1 = makeEvent('task-1', 1)
 
     await store.appendEvent('task-1', e0)
     await store.setSeriesLatest('task-1', 'series-a', e0)
 
-    await store.replaceLastSeriesEvent('task-1', 'series-a', e1)
+    const replacement = { ...makeEvent('task-1', 1), data: { text: 'replaced' } }
+    await store.replaceLastSeriesEvent('task-1', 'series-a', replacement)
 
     const events = await store.getEvents('task-1')
-    // e0 should have been replaced by e1
+    // Original event's position (id, idx) is preserved, content is replaced
     expect(events).toHaveLength(1)
-    expect(events[0]).toEqual(e1)
+    expect(events[0]!.id).toBe(e0.id) // original id preserved
+    expect(events[0]!.index).toBe(0) // original idx preserved
+    expect((events[0]!.data as Record<string, unknown>)?.['text']).toBe('replaced')
 
-    // series latest should also be updated
+    // series latest should be updated
     const latest = await store.getSeriesLatest('task-1', 'series-a')
-    expect(latest).toEqual(e1)
+    expect(latest).toEqual(replacement)
   })
 
   it('should append when no previous series event exists', async () => {
@@ -312,12 +314,13 @@ describe('SqliteShortTermStore', () => {
     await store.replaceLastSeriesEvent('task-1', 'series-a', replacement)
 
     const events = await store.getEvents('task-1')
-    // e1 (idx=1) was replaced by replacement (idx=3). Since SQLite orders by idx,
-    // the replacement now sorts after e2 (idx=2).
+    // e1 content replaced in-place, position preserved (idx=1 stays between e0 and e2)
     expect(events).toHaveLength(3)
     expect(events[0]).toEqual(e0)
-    expect(events[1]).toEqual(e2)
-    expect(events[2]).toEqual(replacement)
+    expect(events[1]!.id).toBe(e1.id) // original id preserved
+    expect(events[1]!.index).toBe(1) // original idx preserved
+    expect(events[1]!.type).toBe(replacement.type) // content replaced
+    expect(events[2]).toEqual(e2)
   })
 
   // ─── setTTL ─────────────────────────────────────────────────────────────
