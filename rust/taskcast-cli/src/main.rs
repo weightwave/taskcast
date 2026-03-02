@@ -23,6 +23,12 @@ enum Commands {
         /// Port to listen on
         #[arg(short, long, default_value = "3721")]
         port: u16,
+        /// Storage backend: memory, redis, or sqlite
+        #[arg(short, long, default_value = "memory")]
+        storage: String,
+        /// SQLite database file path (default: ./taskcast.db)
+        #[arg(long, default_value = "./taskcast.db")]
+        db_path: String,
     },
     /// Start the server as a background service (not yet implemented)
     Daemon,
@@ -38,10 +44,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cmd = cli.command.unwrap_or(Commands::Start {
         config: None,
         port: 3721,
+        storage: "memory".to_string(),
+        db_path: "./taskcast.db".to_string(),
     });
 
     match cmd {
-        Commands::Start { config, port } => {
+        Commands::Start {
+            config,
+            port,
+            storage,
+            db_path,
+        } => {
             // 1. Load config file
             let file_config = taskcast_core::config::load_config_file(config.as_deref())
                 .unwrap_or_default();
@@ -61,39 +74,84 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .ok()
                 .or_else(|| file_config.adapters.as_ref()?.long_term.as_ref()?.url.clone());
 
-            // 4. Build adapters
-            let (broadcast, short_term): (
-                Arc<dyn taskcast_core::BroadcastProvider>,
-                Arc<dyn taskcast_core::ShortTermStore>,
-            ) = if let Some(ref url) = redis_url {
-                let client = redis::Client::open(url.as_str())?;
-                let pub_conn = client.get_multiplexed_async_connection().await?;
-                let sub_conn = client.get_async_pubsub().await?;
-                let store_conn = client.get_multiplexed_async_connection().await?;
-
-                let adapters =
-                    taskcast_redis::create_redis_adapters(pub_conn, sub_conn, store_conn, None);
-                (Arc::new(adapters.broadcast), Arc::new(adapters.short_term))
+            // 4. Resolve storage mode: CLI flag > env var > auto-detect
+            let storage_mode = if storage != "memory" {
+                storage.as_str()
+            } else if std::env::var("TASKCAST_STORAGE").ok().as_deref() == Some("sqlite") {
+                "sqlite"
+            } else if redis_url.is_some() {
+                "redis"
             } else {
-                eprintln!(
-                    "[taskcast] No TASKCAST_REDIS_URL configured \u{2014} using in-memory adapters"
-                );
-                (
-                    Arc::new(taskcast_core::MemoryBroadcastProvider::new()),
-                    Arc::new(taskcast_core::MemoryShortTermStore::new()),
-                )
+                "memory"
             };
 
-            let long_term: Option<Arc<dyn taskcast_core::LongTermStore>> =
-                if let Some(ref url) = postgres_url {
-                    let pool = sqlx::PgPool::connect(url).await?;
-                    let store = taskcast_postgres::PostgresLongTermStore::new(pool, None);
-                    Some(Arc::new(store))
-                } else {
-                    None
-                };
+            // 5. Build adapters
+            let (broadcast, short_term, long_term): (
+                Arc<dyn taskcast_core::BroadcastProvider>,
+                Arc<dyn taskcast_core::ShortTermStore>,
+                Option<Arc<dyn taskcast_core::LongTermStore>>,
+            ) = match storage_mode {
+                "sqlite" => {
+                    let adapters = taskcast_sqlite::create_sqlite_adapters(&db_path).await?;
+                    eprintln!("[taskcast] Using SQLite storage at {db_path}");
+                    (
+                        Arc::new(taskcast_core::MemoryBroadcastProvider::new()),
+                        Arc::new(adapters.short_term),
+                        Some(Arc::new(adapters.long_term) as Arc<dyn taskcast_core::LongTermStore>),
+                    )
+                }
+                "redis" => {
+                    let url = redis_url
+                        .as_deref()
+                        .ok_or("--storage redis requires TASKCAST_REDIS_URL")?;
+                    let client = redis::Client::open(url)?;
+                    let pub_conn = client.get_multiplexed_async_connection().await?;
+                    let sub_conn = client.get_async_pubsub().await?;
+                    let store_conn = client.get_multiplexed_async_connection().await?;
 
-            // 5. Build engine
+                    let adapters =
+                        taskcast_redis::create_redis_adapters(pub_conn, sub_conn, store_conn, None);
+
+                    let long_term: Option<Arc<dyn taskcast_core::LongTermStore>> =
+                        if let Some(ref pg_url) = postgres_url {
+                            let pool = sqlx::PgPool::connect(pg_url).await?;
+                            let store =
+                                taskcast_postgres::PostgresLongTermStore::new(pool, None);
+                            Some(Arc::new(store))
+                        } else {
+                            None
+                        };
+
+                    (
+                        Arc::new(adapters.broadcast),
+                        Arc::new(adapters.short_term),
+                        long_term,
+                    )
+                }
+                _ => {
+                    eprintln!(
+                        "[taskcast] No TASKCAST_REDIS_URL configured \u{2014} using in-memory adapters"
+                    );
+
+                    let long_term: Option<Arc<dyn taskcast_core::LongTermStore>> =
+                        if let Some(ref pg_url) = postgres_url {
+                            let pool = sqlx::PgPool::connect(pg_url).await?;
+                            let store =
+                                taskcast_postgres::PostgresLongTermStore::new(pool, None);
+                            Some(Arc::new(store))
+                        } else {
+                            None
+                        };
+
+                    (
+                        Arc::new(taskcast_core::MemoryBroadcastProvider::new()),
+                        Arc::new(taskcast_core::MemoryShortTermStore::new()),
+                        long_term,
+                    )
+                }
+            };
+
+            // 6. Build engine
             let engine = Arc::new(taskcast_core::TaskEngine::new(
                 taskcast_core::TaskEngineOptions {
                     short_term,
@@ -103,7 +161,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
             ));
 
-            // 6. Auth mode
+            // 7. Auth mode
             let auth_mode_str = std::env::var("TASKCAST_AUTH_MODE").ok().or_else(|| {
                 file_config.auth.as_ref().map(|a| match a.mode {
                     taskcast_core::config::AuthMode::None => "none".to_string(),
@@ -147,7 +205,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 _ => taskcast_server::AuthMode::None,
             };
 
-            // 7. Create and serve app
+            // 8. Create and serve app
             let app = taskcast_server::create_app(engine, auth_mode);
             let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await?;
             println!("[taskcast] Server started on http://localhost:{port}");

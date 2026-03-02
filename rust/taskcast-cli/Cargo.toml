@@ -12,6 +12,7 @@ taskcast-core = { path = "../taskcast-core" }
 taskcast-server = { path = "../taskcast-server" }
 taskcast-postgres = { path = "../taskcast-postgres" }
 taskcast-redis = { path = "../taskcast-redis" }
+taskcast-sqlite = { path = "../taskcast-sqlite" }
 clap = { version = "4", features = ["derive"] }
 tokio = { workspace = true }
 serde_json = { workspace = true }
