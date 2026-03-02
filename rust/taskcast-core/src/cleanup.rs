@@ -127,6 +127,11 @@ mod tests {
             auth_config: None,
             webhooks: None,
             cleanup: None,
+            tags: None,
+            assign_mode: None,
+            cost: None,
+            assigned_worker: None,
+            disconnect_policy: None,
         }
     }
 

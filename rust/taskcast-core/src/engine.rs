@@ -5,8 +5,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::series::process_series;
 use crate::state_machine::{can_transition, is_terminal};
 use crate::types::{
-    BroadcastProvider, CleanupConfig, EventQueryOptions, Level, LongTermStore, ShortTermStore,
-    Task, TaskAuthConfig, TaskcastHooks, TaskError, TaskEvent, TaskStatus, WebhookConfig,
+    AssignMode, BroadcastProvider, CleanupConfig, DisconnectPolicy, EventQueryOptions, Level,
+    LongTermStore, ShortTermStore, Task, TaskAuthConfig, TaskFilter, TaskcastHooks, TaskError,
+    TaskEvent, TaskStatus, WebhookConfig,
 };
 
 // ─── Error ───────────────────────────────────────────────────────────────────
@@ -38,6 +39,10 @@ pub struct CreateTaskInput {
     pub webhooks: Option<Vec<WebhookConfig>>,
     pub cleanup: Option<CleanupConfig>,
     pub auth_config: Option<TaskAuthConfig>,
+    pub tags: Option<Vec<String>>,
+    pub assign_mode: Option<AssignMode>,
+    pub cost: Option<u32>,
+    pub disconnect_policy: Option<DisconnectPolicy>,
 }
 
 pub struct PublishEventInput {
@@ -98,6 +103,11 @@ impl TaskEngine {
             result: None,
             error: None,
             completed_at: None,
+            tags: input.tags,
+            assign_mode: input.assign_mode,
+            cost: input.cost,
+            assigned_worker: None,
+            disconnect_policy: input.disconnect_policy,
         };
 
         self.short_term_store.save_task(task.clone()).await?;
@@ -108,6 +118,10 @@ impl TaskEngine {
 
         if let Some(ttl) = task.ttl {
             self.short_term_store.set_ttl(&task.id, ttl).await?;
+        }
+
+        if let Some(ref hooks) = self.hooks {
+            hooks.on_task_created(&task);
         }
 
         Ok(task)
@@ -135,9 +149,11 @@ impl TaskEngine {
             .await?
             .ok_or_else(|| EngineError::TaskNotFound(task_id.to_string()))?;
 
-        if !can_transition(&task.status, &to) {
+        let current_status = task.status.clone();
+
+        if !can_transition(&current_status, &to) {
             return Err(EngineError::InvalidTransition {
-                from: task.status.clone(),
+                from: current_status,
                 to,
             });
         }
@@ -185,6 +201,10 @@ impl TaskEngine {
         )
         .await?;
 
+        if let Some(ref hooks) = self.hooks {
+            hooks.on_task_transitioned(&updated, &current_status, &updated.status);
+        }
+
         Ok(updated)
     }
 
@@ -211,6 +231,10 @@ impl TaskEngine {
         opts: Option<EventQueryOptions>,
     ) -> Result<Vec<TaskEvent>, EngineError> {
         Ok(self.short_term_store.get_events(task_id, opts).await?)
+    }
+
+    pub async fn list_tasks(&self, filter: TaskFilter) -> Result<Vec<Task>, EngineError> {
+        Ok(self.short_term.list_tasks(filter).await?)
     }
 
     pub async fn subscribe(
@@ -425,6 +449,10 @@ mod tests {
                 }]),
                 cleanup: Some(CleanupConfig { rules: vec![] }),
                 auth_config: Some(TaskAuthConfig { rules: vec![] }),
+                tags: Some(vec!["gpu".to_string()]),
+                assign_mode: Some(AssignMode::Pull),
+                cost: Some(2),
+                disconnect_policy: Some(DisconnectPolicy::Reassign),
             })
             .await
             .unwrap();
@@ -437,6 +465,11 @@ mod tests {
         assert!(task.webhooks.is_some());
         assert!(task.cleanup.is_some());
         assert!(task.auth_config.is_some());
+        assert_eq!(task.tags, Some(vec!["gpu".to_string()]));
+        assert_eq!(task.assign_mode, Some(AssignMode::Pull));
+        assert_eq!(task.cost, Some(2));
+        assert_eq!(task.assigned_worker, None);
+        assert_eq!(task.disconnect_policy, Some(DisconnectPolicy::Reassign));
         assert_eq!(task.status, TaskStatus::Pending);
     }
 

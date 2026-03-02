@@ -4,7 +4,10 @@ use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 
-use crate::types::{BroadcastProvider, EventQueryOptions, ShortTermStore, Task, TaskEvent};
+use crate::types::{
+    BroadcastProvider, EventQueryOptions, ShortTermStore, Task, TaskEvent, TaskFilter, Worker,
+    WorkerAssignment, WorkerFilter,
+};
 
 // ─── MemoryBroadcastProvider ────────────────────────────────────────────────
 
@@ -83,6 +86,8 @@ pub struct MemoryShortTermStore {
     events: RwLock<HashMap<String, Vec<TaskEvent>>>,
     series_latest: RwLock<HashMap<String, TaskEvent>>,
     index_counters: RwLock<HashMap<String, Arc<AtomicU64>>>,
+    workers: RwLock<HashMap<String, Worker>>,
+    assignments: RwLock<Vec<WorkerAssignment>>,
 }
 
 impl MemoryShortTermStore {
@@ -92,6 +97,8 @@ impl MemoryShortTermStore {
             events: RwLock::new(HashMap::new()),
             series_latest: RwLock::new(HashMap::new()),
             index_counters: RwLock::new(HashMap::new()),
+            workers: RwLock::new(HashMap::new()),
+            assignments: RwLock::new(Vec::new()),
         }
     }
 }
@@ -246,6 +253,96 @@ impl ShortTermStore for MemoryShortTermStore {
         };
         Ok(counter.fetch_add(1, Ordering::SeqCst))
     }
+
+    async fn list_tasks(
+        &self,
+        _filter: TaskFilter,
+    ) -> Result<Vec<Task>, Box<dyn std::error::Error + Send + Sync>> {
+        let tasks = self.tasks.read().unwrap();
+        Ok(tasks.values().cloned().collect())
+    }
+
+    async fn save_worker(
+        &self,
+        worker: Worker,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut workers = self.workers.write().unwrap();
+        workers.insert(worker.id.clone(), worker);
+        Ok(())
+    }
+
+    async fn get_worker(
+        &self,
+        worker_id: &str,
+    ) -> Result<Option<Worker>, Box<dyn std::error::Error + Send + Sync>> {
+        let workers = self.workers.read().unwrap();
+        Ok(workers.get(worker_id).cloned())
+    }
+
+    async fn list_workers(
+        &self,
+        _filter: Option<WorkerFilter>,
+    ) -> Result<Vec<Worker>, Box<dyn std::error::Error + Send + Sync>> {
+        let workers = self.workers.read().unwrap();
+        Ok(workers.values().cloned().collect())
+    }
+
+    async fn delete_worker(
+        &self,
+        worker_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut workers = self.workers.write().unwrap();
+        workers.remove(worker_id);
+        Ok(())
+    }
+
+    async fn claim_task(
+        &self,
+        task_id: &str,
+        _worker_id: &str,
+        _cost: u32,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let tasks = self.tasks.read().unwrap();
+        Ok(tasks.contains_key(task_id))
+    }
+
+    async fn add_assignment(
+        &self,
+        assignment: WorkerAssignment,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut assignments = self.assignments.write().unwrap();
+        assignments.push(assignment);
+        Ok(())
+    }
+
+    async fn remove_assignment(
+        &self,
+        task_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut assignments = self.assignments.write().unwrap();
+        assignments.retain(|a| a.task_id != task_id);
+        Ok(())
+    }
+
+    async fn get_worker_assignments(
+        &self,
+        worker_id: &str,
+    ) -> Result<Vec<WorkerAssignment>, Box<dyn std::error::Error + Send + Sync>> {
+        let assignments = self.assignments.read().unwrap();
+        Ok(assignments
+            .iter()
+            .filter(|a| a.worker_id == worker_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn get_task_assignment(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<WorkerAssignment>, Box<dyn std::error::Error + Send + Sync>> {
+        let assignments = self.assignments.read().unwrap();
+        Ok(assignments.iter().find(|a| a.task_id == task_id).cloned())
+    }
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -273,6 +370,11 @@ mod tests {
             auth_config: None,
             webhooks: None,
             cleanup: None,
+            tags: None,
+            assign_mode: None,
+            cost: None,
+            assigned_worker: None,
+            disconnect_policy: None,
         }
     }
 
