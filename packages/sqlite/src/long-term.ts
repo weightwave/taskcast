@@ -1,10 +1,10 @@
 import type Database from 'better-sqlite3'
-import type { Task, TaskEvent, ShortTermStore, EventQueryOptions } from '@taskcast/core'
+import type { Task, TaskEvent, LongTermStore, EventQueryOptions } from '@taskcast/core'
 import { rowToTask, rowToEvent } from './row-mappers.js'
 
-// ─── SqliteShortTermStore ─────────────────────────────────────────────────
+// ─── SqliteLongTermStore ──────────────────────────────────────────────────
 
-export class SqliteShortTermStore implements ShortTermStore {
+export class SqliteLongTermStore implements LongTermStore {
   constructor(private db: Database.Database) {}
 
   async saveTask(task: Task): Promise<void> {
@@ -52,24 +52,12 @@ export class SqliteShortTermStore implements ShortTermStore {
     return row ? rowToTask(row) : null
   }
 
-  async nextIndex(taskId: string): Promise<number> {
-    const row = this.db
-      .prepare(
-        `INSERT INTO taskcast_index_counters (task_id, counter)
-         VALUES (?, 0)
-         ON CONFLICT (task_id) DO UPDATE SET counter = counter + 1
-         RETURNING counter`,
-      )
-      .get(taskId) as { counter: number }
-
-    return row.counter
-  }
-
-  async appendEvent(taskId: string, event: TaskEvent): Promise<void> {
+  async saveEvent(event: TaskEvent): Promise<void> {
     this.db
       .prepare(
         `INSERT INTO taskcast_events (id, task_id, idx, timestamp, type, level, data, series_id, series_mode)
-         VALUES (@id, @task_id, @idx, @timestamp, @type, @level, @data, @series_id, @series_mode)`,
+         VALUES (@id, @task_id, @idx, @timestamp, @type, @level, @data, @series_id, @series_mode)
+         ON CONFLICT (id) DO NOTHING`,
       )
       .run({
         id: event.id,
@@ -92,10 +80,6 @@ export class SqliteShortTermStore implements ShortTermStore {
     const params: unknown[] = [taskId]
 
     if (since?.id) {
-      // Find the idx of the since event, then return everything after it.
-      // If the id is not found, the subquery returns NULL and the WHERE
-      // condition `idx > NULL` is never true — we need to fall back to
-      // returning all events.
       sql = `
         SELECT * FROM taskcast_events
         WHERE task_id = ?
@@ -135,63 +119,5 @@ export class SqliteShortTermStore implements ShortTermStore {
 
     const rows = this.db.prepare(sql).all(...params) as Record<string, unknown>[]
     return rows.map(rowToEvent)
-  }
-
-  async setTTL(_taskId: string, _ttlSeconds: number): Promise<void> {
-    // No-op: SQLite does not support key-level TTL.
-  }
-
-  async getSeriesLatest(taskId: string, seriesId: string): Promise<TaskEvent | null> {
-    const row = this.db
-      .prepare('SELECT event_json FROM taskcast_series_latest WHERE task_id = ? AND series_id = ?')
-      .get(taskId, seriesId) as { event_json: string } | undefined
-
-    return row ? (JSON.parse(row.event_json) as TaskEvent) : null
-  }
-
-  async setSeriesLatest(taskId: string, seriesId: string, event: TaskEvent): Promise<void> {
-    this.db
-      .prepare(
-        `INSERT INTO taskcast_series_latest (task_id, series_id, event_json)
-         VALUES (?, ?, ?)
-         ON CONFLICT (task_id, series_id) DO UPDATE SET event_json = excluded.event_json`,
-      )
-      .run(taskId, seriesId, JSON.stringify(event))
-  }
-
-  async replaceLastSeriesEvent(
-    taskId: string,
-    seriesId: string,
-    event: TaskEvent,
-  ): Promise<void> {
-    const prev = await this.getSeriesLatest(taskId, seriesId)
-
-    if (prev) {
-      // Replace the previous event row in-place, keeping the original idx so
-      // that the event stays at its original position in idx-based ordering.
-      // This mirrors Redis lset behaviour where the list position is preserved.
-      this.db
-        .prepare(
-          `UPDATE taskcast_events
-           SET id = @id, idx = @idx, timestamp = @timestamp, type = @type,
-               level = @level, data = @data, series_id = @series_id, series_mode = @series_mode
-           WHERE id = @prev_id`,
-        )
-        .run({
-          id: event.id,
-          prev_id: prev.id,
-          idx: event.index,
-          timestamp: event.timestamp,
-          type: event.type,
-          level: event.level,
-          data: event.data != null ? JSON.stringify(event.data) : null,
-          series_id: event.seriesId ?? null,
-          series_mode: event.seriesMode ?? null,
-        })
-    } else {
-      await this.appendEvent(taskId, event)
-    }
-
-    await this.setSeriesLatest(taskId, seriesId, event)
   }
 }
