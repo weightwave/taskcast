@@ -285,9 +285,10 @@ impl ShortTermStore for MemoryShortTermStore {
                         return false;
                     }
                 }
-                // Tag filtering will be applied when worker_matching module is available
-                if filter.tags.is_some() {
-                    // TODO: integrate with worker_matching::matches_tag
+                if let Some(ref tag_matcher) = filter.tags {
+                    if !crate::worker_matching::matches_tag(t.tags.as_deref(), tag_matcher) {
+                        return false;
+                    }
                 }
                 if let Some(ref exclude) = filter.exclude_task_ids {
                     if exclude.contains(&t.id) {
