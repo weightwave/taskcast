@@ -1,0 +1,46 @@
+{
+  "name": "@taskcast/sqlite",
+  "version": "0.1.1",
+  "description": "SQLite local storage adapter for Taskcast.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/weightwave/taskcast.git",
+    "directory": "packages/sqlite"
+  },
+  "homepage": "https://github.com/weightwave/taskcast/tree/main/packages/sqlite#readme",
+  "bugs": {
+    "url": "https://github.com/weightwave/taskcast/issues"
+  },
+  "license": "MIT",
+  "files": [
+    "dist",
+    "migrations",
+    "LICENSE",
+    "README.md"
+  ],
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "publishConfig": {
+    "provenance": true
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@taskcast/core": "workspace:*",
+    "better-sqlite3": "^11.0.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.0",
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.0",
+    "@vitest/coverage-v8": "^2.1.0"
+  }
+}

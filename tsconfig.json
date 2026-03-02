@@ -9,6 +9,7 @@
     { "path": "packages/cli" },
     { "path": "packages/redis" },
     { "path": "packages/postgres" },
+    { "path": "packages/sqlite" },
     { "path": "packages/sentry" }
   ]
 }
