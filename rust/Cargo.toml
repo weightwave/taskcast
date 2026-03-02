@@ -6,6 +6,7 @@ members = [
     "taskcast-postgres",
     "taskcast-redis",
     "taskcast-server",
+    "taskcast-sqlite",
 ]
 
 [workspace.dependencies]
