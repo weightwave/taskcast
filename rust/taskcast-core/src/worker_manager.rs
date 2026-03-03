@@ -281,11 +281,11 @@ impl WorkerManager {
     }
 
     pub async fn get_worker(&self, worker_id: &str) -> ManagerResult<Option<Worker>> {
-        Ok(self.short_term.get_worker(worker_id).await?)
+        self.short_term.get_worker(worker_id).await
     }
 
     pub async fn list_workers(&self, filter: Option<WorkerFilter>) -> ManagerResult<Vec<Worker>> {
-        Ok(self.short_term.list_workers(filter).await?)
+        self.short_term.list_workers(filter).await
     }
 
     // ─── Task Dispatch ─────────────────────────────────────────────────
@@ -461,7 +461,7 @@ impl WorkerManager {
             .await;
 
         // Emit audit events
-        let blacklisted = opts.as_ref().map_or(false, |o| o.blacklist);
+        let blacklisted = opts.as_ref().is_some_and(|o| o.blacklist);
         let mut task_audit_data = HashMap::new();
         task_audit_data.insert(
             "taskId".to_string(),
@@ -534,7 +534,7 @@ impl WorkerManager {
         &self,
         worker_id: &str,
     ) -> ManagerResult<Vec<WorkerAssignment>> {
-        Ok(self.short_term.get_worker_assignments(worker_id).await?)
+        self.short_term.get_worker_assignments(worker_id).await
     }
 
     // ─── Pull Mode (Long-Poll) ─────────────────────────────────────────
@@ -662,12 +662,7 @@ impl WorkerManager {
             .await;
 
         let result = tokio::select! {
-            res = rx => {
-                match res {
-                    Ok(task) => task,
-                    Err(_) => None,
-                }
-            }
+            res = rx => res.unwrap_or_default(),
             _ = tokio::time::sleep(tokio::time::Duration::from_millis(timeout_ms)) => {
                 None
             }
