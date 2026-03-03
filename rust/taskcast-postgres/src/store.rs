@@ -63,44 +63,50 @@ impl PostgresLongTermStore {
         let tasks = &self.tables.tasks;
         let events = &self.tables.events;
 
-        let migration = format!(
-            r#"
-            CREATE TABLE IF NOT EXISTS {tasks} (
-              id TEXT PRIMARY KEY,
-              type TEXT,
-              status TEXT NOT NULL,
-              params JSONB,
-              result JSONB,
-              error JSONB,
-              metadata JSONB,
-              auth_config JSONB,
-              webhooks JSONB,
-              cleanup JSONB,
-              created_at BIGINT NOT NULL,
-              updated_at BIGINT NOT NULL,
-              completed_at BIGINT,
-              ttl INTEGER
-            );
+        // Execute each statement separately — PostgreSQL does not allow
+        // multiple commands in a single prepared statement.
+        let statements = vec![
+            format!(
+                r#"CREATE TABLE IF NOT EXISTS {tasks} (
+                  id TEXT PRIMARY KEY,
+                  type TEXT,
+                  status TEXT NOT NULL,
+                  params JSONB,
+                  result JSONB,
+                  error JSONB,
+                  metadata JSONB,
+                  auth_config JSONB,
+                  webhooks JSONB,
+                  cleanup JSONB,
+                  created_at BIGINT NOT NULL,
+                  updated_at BIGINT NOT NULL,
+                  completed_at BIGINT,
+                  ttl INTEGER
+                )"#
+            ),
+            format!(
+                r#"CREATE TABLE IF NOT EXISTS {events} (
+                  id TEXT PRIMARY KEY,
+                  task_id TEXT NOT NULL REFERENCES {tasks}(id) ON DELETE CASCADE,
+                  idx INTEGER NOT NULL,
+                  timestamp BIGINT NOT NULL,
+                  type TEXT NOT NULL,
+                  level TEXT NOT NULL,
+                  data JSONB,
+                  series_id TEXT,
+                  series_mode TEXT,
+                  UNIQUE(task_id, idx)
+                )"#
+            ),
+            format!("CREATE INDEX IF NOT EXISTS {events}_task_id_idx ON {events}(task_id, idx)"),
+            format!(
+                "CREATE INDEX IF NOT EXISTS {events}_task_id_timestamp ON {events}(task_id, timestamp)"
+            ),
+        ];
 
-            CREATE TABLE IF NOT EXISTS {events} (
-              id TEXT PRIMARY KEY,
-              task_id TEXT NOT NULL REFERENCES {tasks}(id) ON DELETE CASCADE,
-              idx INTEGER NOT NULL,
-              timestamp BIGINT NOT NULL,
-              type TEXT NOT NULL,
-              level TEXT NOT NULL,
-              data JSONB,
-              series_id TEXT,
-              series_mode TEXT,
-              UNIQUE(task_id, idx)
-            );
-
-            CREATE INDEX IF NOT EXISTS {events}_task_id_idx ON {events}(task_id, idx);
-            CREATE INDEX IF NOT EXISTS {events}_task_id_timestamp ON {events}(task_id, timestamp);
-            "#
-        );
-
-        sqlx::query(&migration).execute(&self.pool).await?;
+        for stmt in &statements {
+            sqlx::query(stmt).execute(&self.pool).await?;
+        }
         Ok(())
     }
 

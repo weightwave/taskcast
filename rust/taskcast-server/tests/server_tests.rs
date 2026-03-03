@@ -1125,3 +1125,680 @@ async fn webhook_delivery_succeeds_on_retry() {
     assert!(result.is_ok());
     assert_eq!(call_count.load(Ordering::SeqCst), 3); // 2 failures + 1 success
 }
+
+// ─── JWT Issuer Validation ──────────────────────────────────────────────────
+
+fn make_jwt_server_with_issuer(issuer: &str) -> (Arc<TaskEngine>, TestServer) {
+    let engine = make_engine();
+    let auth_mode = AuthMode::Jwt(JwtConfig {
+        algorithm: jsonwebtoken::Algorithm::HS256,
+        secret: Some(JWT_SECRET.to_string()),
+        public_key: None,
+        issuer: Some(issuer.to_string()),
+        audience: None,
+    });
+    let server = make_server(Arc::clone(&engine), auth_mode);
+    (engine, server)
+}
+
+#[tokio::test]
+async fn jwt_with_issuer_accepts_matching_issuer() {
+    let (_engine, server) = make_jwt_server_with_issuer("https://auth.example.com");
+
+    let token = make_token(json!({
+        "sub": "user",
+        "scope": ["*"],
+        "taskIds": "*",
+        "iss": "https://auth.example.com",
+        "exp": 9999999999u64
+    }));
+
+    let response = server
+        .post("/tasks")
+        .add_header(
+            axum_test::http::header::AUTHORIZATION,
+            bearer_header(&token),
+        )
+        .json(&json!({}))
+        .await;
+
+    response.assert_status(axum_test::http::StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn jwt_with_issuer_rejects_wrong_issuer() {
+    let (_engine, server) = make_jwt_server_with_issuer("https://auth.example.com");
+
+    let token = make_token(json!({
+        "sub": "user",
+        "scope": ["*"],
+        "taskIds": "*",
+        "iss": "https://wrong-issuer.com",
+        "exp": 9999999999u64
+    }));
+
+    let response = server
+        .post("/tasks")
+        .add_header(
+            axum_test::http::header::AUTHORIZATION,
+            bearer_header(&token),
+        )
+        .json(&json!({}))
+        .await;
+
+    response.assert_status(axum_test::http::StatusCode::UNAUTHORIZED);
+}
+
+// ─── JWT Audience Validation ────────────────────────────────────────────────
+
+fn make_jwt_server_with_audience(audience: &str) -> (Arc<TaskEngine>, TestServer) {
+    let engine = make_engine();
+    let auth_mode = AuthMode::Jwt(JwtConfig {
+        algorithm: jsonwebtoken::Algorithm::HS256,
+        secret: Some(JWT_SECRET.to_string()),
+        public_key: None,
+        issuer: None,
+        audience: Some(audience.to_string()),
+    });
+    let server = make_server(Arc::clone(&engine), auth_mode);
+    (engine, server)
+}
+
+#[tokio::test]
+async fn jwt_with_audience_accepts_matching_audience() {
+    let (_engine, server) = make_jwt_server_with_audience("taskcast-api");
+
+    let token = make_token(json!({
+        "sub": "user",
+        "scope": ["*"],
+        "taskIds": "*",
+        "aud": "taskcast-api",
+        "exp": 9999999999u64
+    }));
+
+    let response = server
+        .post("/tasks")
+        .add_header(
+            axum_test::http::header::AUTHORIZATION,
+            bearer_header(&token),
+        )
+        .json(&json!({}))
+        .await;
+
+    response.assert_status(axum_test::http::StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn jwt_with_audience_rejects_wrong_audience() {
+    let (_engine, server) = make_jwt_server_with_audience("taskcast-api");
+
+    let token = make_token(json!({
+        "sub": "user",
+        "scope": ["*"],
+        "taskIds": "*",
+        "aud": "wrong-audience",
+        "exp": 9999999999u64
+    }));
+
+    let response = server
+        .post("/tasks")
+        .add_header(
+            axum_test::http::header::AUTHORIZATION,
+            bearer_header(&token),
+        )
+        .json(&json!({}))
+        .await;
+
+    response.assert_status(axum_test::http::StatusCode::UNAUTHORIZED);
+}
+
+// ─── JWT No-Key Error ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn jwt_no_key_returns_401() {
+    let engine = make_engine();
+    let auth_mode = AuthMode::Jwt(JwtConfig {
+        algorithm: jsonwebtoken::Algorithm::HS256,
+        secret: None,
+        public_key: None,
+        issuer: None,
+        audience: None,
+    });
+    let server = make_server(Arc::clone(&engine), auth_mode);
+
+    // Use a valid token, but server has no key to validate it
+    let token = make_full_access_token();
+
+    let response = server
+        .post("/tasks")
+        .add_header(
+            axum_test::http::header::AUTHORIZATION,
+            bearer_header(&token),
+        )
+        .json(&json!({}))
+        .await;
+
+    response.assert_status(axum_test::http::StatusCode::UNAUTHORIZED);
+}
+
+// ─── JWT TaskIds Claim Variants ─────────────────────────────────────────────
+
+#[tokio::test]
+async fn jwt_non_star_wildcard_task_ids_maps_to_all() {
+    let (_engine, server) = make_jwt_server();
+
+    // Token with taskIds as a non-"*" string (e.g. "all")
+    let token = make_token(json!({
+        "sub": "user",
+        "scope": ["*"],
+        "taskIds": "all",
+        "exp": 9999999999u64
+    }));
+
+    // This should still grant access to all tasks (TaskIdAccess::All)
+    let response = server
+        .post("/tasks")
+        .add_header(
+            axum_test::http::header::AUTHORIZATION,
+            bearer_header(&token),
+        )
+        .json(&json!({ "id": "wildcard-task" }))
+        .await;
+    response.assert_status(axum_test::http::StatusCode::CREATED);
+
+    // Should be able to get the task (verifies TaskIdAccess::All)
+    let response = server
+        .get("/tasks/wildcard-task")
+        .add_header(
+            axum_test::http::header::AUTHORIZATION,
+            bearer_header(&token),
+        )
+        .await;
+    response.assert_status(axum_test::http::StatusCode::OK);
+}
+
+#[tokio::test]
+async fn jwt_no_task_ids_field_defaults_to_all() {
+    let (_engine, server) = make_jwt_server();
+
+    // Token without taskIds field at all
+    let token = make_token(json!({
+        "sub": "user",
+        "scope": ["*"],
+        "exp": 9999999999u64
+    }));
+
+    let response = server
+        .post("/tasks")
+        .add_header(
+            axum_test::http::header::AUTHORIZATION,
+            bearer_header(&token),
+        )
+        .json(&json!({ "id": "no-taskids-task" }))
+        .await;
+    response.assert_status(axum_test::http::StatusCode::CREATED);
+
+    // Should be able to get any task (TaskIdAccess::All by default)
+    let response = server
+        .get("/tasks/no-taskids-task")
+        .add_header(
+            axum_test::http::header::AUTHORIZATION,
+            bearer_header(&token),
+        )
+        .await;
+    response.assert_status(axum_test::http::StatusCode::OK);
+}
+
+// ─── Forbidden for transition_task ──────────────────────────────────────────
+
+#[tokio::test]
+async fn transition_task_returns_403_without_task_manage_scope() {
+    let (_engine, server) = make_jwt_server();
+
+    // Token with only event:subscribe scope (no task:manage)
+    let limited_token = make_token(json!({
+        "sub": "limited-user",
+        "scope": ["event:subscribe"],
+        "taskIds": "*",
+        "exp": 9999999999u64
+    }));
+
+    // First create a task with full access
+    let full_token = make_full_access_token();
+    server
+        .post("/tasks")
+        .add_header(
+            axum_test::http::header::AUTHORIZATION,
+            bearer_header(&full_token),
+        )
+        .json(&json!({ "id": "task-trans-forbidden" }))
+        .await;
+
+    // Try to transition with limited token
+    let response = server
+        .patch("/tasks/task-trans-forbidden/status")
+        .add_header(
+            axum_test::http::header::AUTHORIZATION,
+            bearer_header(&limited_token),
+        )
+        .json(&json!({ "status": "running" }))
+        .await;
+
+    response.assert_status(axum_test::http::StatusCode::FORBIDDEN);
+}
+
+// ─── TaskTerminal error in transition_task ──────────────────────────────────
+
+#[tokio::test]
+async fn transition_task_returns_400_for_terminal_task() {
+    let (_engine, server) = make_no_auth_server();
+
+    // Create -> run -> complete the task
+    server
+        .post("/tasks")
+        .json(&json!({ "id": "task-terminal-trans" }))
+        .await;
+    server
+        .patch("/tasks/task-terminal-trans/status")
+        .json(&json!({ "status": "running" }))
+        .await;
+    server
+        .patch("/tasks/task-terminal-trans/status")
+        .json(&json!({ "status": "completed" }))
+        .await;
+
+    // Try to transition again — task is already terminal
+    let response = server
+        .patch("/tasks/task-terminal-trans/status")
+        .json(&json!({ "status": "running" }))
+        .await;
+
+    response.assert_status(axum_test::http::StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = response.json();
+    let error_msg = body["error"].as_str().unwrap();
+    assert!(
+        error_msg.contains("terminal") || error_msg.contains("Terminal") || error_msg.contains("Invalid"),
+        "Error message should indicate terminal state, got: {error_msg}"
+    );
+}
+
+// ─── Forbidden for publish_events ───────────────────────────────────────────
+
+#[tokio::test]
+async fn publish_events_returns_403_without_event_publish_scope() {
+    let (_engine, server) = make_jwt_server();
+
+    // Full access token to set up the task
+    let full_token = make_full_access_token();
+    server
+        .post("/tasks")
+        .add_header(
+            axum_test::http::header::AUTHORIZATION,
+            bearer_header(&full_token),
+        )
+        .json(&json!({ "id": "task-pub-forbidden" }))
+        .await;
+    server
+        .patch("/tasks/task-pub-forbidden/status")
+        .add_header(
+            axum_test::http::header::AUTHORIZATION,
+            bearer_header(&full_token),
+        )
+        .json(&json!({ "status": "running" }))
+        .await;
+
+    // Token without event:publish scope
+    let limited_token = make_token(json!({
+        "sub": "limited-user",
+        "scope": ["event:subscribe"],
+        "taskIds": "*",
+        "exp": 9999999999u64
+    }));
+
+    let response = server
+        .post("/tasks/task-pub-forbidden/events")
+        .add_header(
+            axum_test::http::header::AUTHORIZATION,
+            bearer_header(&limited_token),
+        )
+        .json(&json!({
+            "type": "progress",
+            "level": "info",
+            "data": null
+        }))
+        .await;
+
+    response.assert_status(axum_test::http::StatusCode::FORBIDDEN);
+}
+
+// ─── TaskTerminal error in publish_events ───────────────────────────────────
+
+#[tokio::test]
+async fn publish_events_returns_400_for_terminal_task() {
+    let (_engine, server) = make_no_auth_server();
+
+    // Create -> run -> complete the task
+    server
+        .post("/tasks")
+        .json(&json!({ "id": "task-terminal-pub" }))
+        .await;
+    server
+        .patch("/tasks/task-terminal-pub/status")
+        .json(&json!({ "status": "running" }))
+        .await;
+    server
+        .patch("/tasks/task-terminal-pub/status")
+        .json(&json!({ "status": "completed" }))
+        .await;
+
+    // Try to publish events to a completed task
+    let response = server
+        .post("/tasks/task-terminal-pub/events")
+        .json(&json!({
+            "type": "progress",
+            "level": "info",
+            "data": null
+        }))
+        .await;
+
+    response.assert_status(axum_test::http::StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = response.json();
+    let error_msg = body["error"].as_str().unwrap();
+    assert!(
+        error_msg.contains("terminal") || error_msg.contains("Terminal"),
+        "Error message should indicate terminal state, got: {error_msg}"
+    );
+}
+
+// ─── Forbidden for get_event_history ────────────────────────────────────────
+
+#[tokio::test]
+async fn get_event_history_returns_403_without_event_history_scope() {
+    let (_engine, server) = make_jwt_server();
+
+    // Full access token to set up the task
+    let full_token = make_full_access_token();
+    server
+        .post("/tasks")
+        .add_header(
+            axum_test::http::header::AUTHORIZATION,
+            bearer_header(&full_token),
+        )
+        .json(&json!({ "id": "task-hist-forbidden" }))
+        .await;
+
+    // Token without event:history scope
+    let limited_token = make_token(json!({
+        "sub": "limited-user",
+        "scope": ["task:create"],
+        "taskIds": "*",
+        "exp": 9999999999u64
+    }));
+
+    let response = server
+        .get("/tasks/task-hist-forbidden/events/history")
+        .add_header(
+            axum_test::http::header::AUTHORIZATION,
+            bearer_header(&limited_token),
+        )
+        .await;
+
+    response.assert_status(axum_test::http::StatusCode::FORBIDDEN);
+}
+
+// ─── WebhookDelivery Default Impl ───────────────────────────────────────────
+
+#[test]
+fn webhook_delivery_default_works() {
+    // WebhookDelivery::default() should work the same as WebhookDelivery::new()
+    let _delivery: WebhookDelivery = WebhookDelivery::default();
+    // If this compiles and runs without panic, the Default impl is valid
+}
+
+// ─── Webhook with No Custom Retry (uses default_retry) ─────────────────────
+
+#[tokio::test]
+async fn webhook_uses_default_retry_when_none_provided() {
+    use axum::{routing::post as axum_post, Router};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    let call_count = Arc::new(AtomicU32::new(0));
+    let count_clone = Arc::clone(&call_count);
+
+    let mock_app = Router::new().route(
+        "/hook",
+        axum_post(move || async move {
+            count_clone.fetch_add(1, Ordering::SeqCst);
+            axum_test::http::StatusCode::OK
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, mock_app).await.unwrap();
+    });
+
+    let delivery = WebhookDelivery::new();
+    let event = taskcast_core::TaskEvent {
+        id: "evt_default_retry".to_string(),
+        task_id: "task_default_retry".to_string(),
+        index: 0,
+        timestamp: 1700000000000.0,
+        r#type: "progress".to_string(),
+        level: Level::Info,
+        data: json!({ "percent": 50 }),
+        series_id: None,
+        series_mode: None,
+    };
+    let config = taskcast_core::WebhookConfig {
+        url: format!("http://{addr}/hook"),
+        filter: None,
+        secret: None,
+        wrap: None,
+        retry: None, // No custom retry — should use default_retry()
+    };
+
+    let result = delivery.send(&event, &config).await;
+    assert!(result.is_ok());
+    assert_eq!(call_count.load(Ordering::SeqCst), 1);
+}
+
+// ─── Webhook Network Error ──────────────────────────────────────────────────
+
+#[tokio::test]
+async fn webhook_network_error_captures_error_string() {
+    let delivery = WebhookDelivery::new();
+    let event = taskcast_core::TaskEvent {
+        id: "evt_net_err".to_string(),
+        task_id: "task_net_err".to_string(),
+        index: 0,
+        timestamp: 1700000000000.0,
+        r#type: "progress".to_string(),
+        level: Level::Info,
+        data: json!({ "step": 1 }),
+        series_id: None,
+        series_mode: None,
+    };
+    // Unreachable address — should trigger a network error (not an HTTP status error)
+    let config = taskcast_core::WebhookConfig {
+        url: "http://127.0.0.1:1/hook".to_string(),
+        filter: None,
+        secret: None,
+        wrap: None,
+        retry: Some(taskcast_core::RetryConfig {
+            retries: 0, // No retries — just fail immediately
+            backoff: taskcast_core::BackoffStrategy::Fixed,
+            initial_delay_ms: 10,
+            max_delay_ms: 10,
+            timeout_ms: 2000,
+        }),
+    };
+
+    let result = delivery.send(&event, &config).await;
+    assert!(result.is_err());
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("1 attempts"),
+        "Error should mention attempt count, got: {err_msg}"
+    );
+    // The message should contain the network error (connection refused or similar)
+    assert!(
+        err_msg.contains("error") || err_msg.contains("connect") || err_msg.contains("Connection"),
+        "Error should contain network error detail, got: {err_msg}"
+    );
+}
+
+// ─── SSE with Level Filter ──────────────────────────────────────────────────
+
+#[tokio::test]
+async fn sse_level_filter_only_returns_matching_levels() {
+    let (_engine, server) = make_no_auth_server();
+
+    server
+        .post("/tasks")
+        .json(&json!({ "id": "sse-level-filter" }))
+        .await;
+    server
+        .patch("/tasks/sse-level-filter/status")
+        .json(&json!({ "status": "running" }))
+        .await;
+    server
+        .post("/tasks/sse-level-filter/events")
+        .json(&json!([
+            { "type": "log", "level": "info", "data": "info msg" },
+            { "type": "log", "level": "warn", "data": "warn msg" },
+            { "type": "log", "level": "error", "data": "error msg" },
+            { "type": "log", "level": "debug", "data": "debug msg" }
+        ]))
+        .await;
+    server
+        .patch("/tasks/sse-level-filter/status")
+        .json(&json!({ "status": "completed" }))
+        .await;
+
+    // Filter for warn,error levels only
+    let response = server
+        .get("/tasks/sse-level-filter/events")
+        .add_query_param("levels", "warn,error")
+        .add_query_param("wrap", "false")
+        .await;
+    let text = response.text();
+
+    // Should contain warn and error messages
+    assert!(text.contains("warn msg"), "should contain warn message");
+    assert!(text.contains("error msg"), "should contain error message");
+    // Should NOT contain info or debug messages
+    assert!(!text.contains("info msg"), "info msg should be filtered out");
+    assert!(!text.contains("debug msg"), "debug msg should be filtered out");
+}
+
+// ─── SSE Live Streaming with Running Task ───────────────────────────────────
+
+#[tokio::test]
+async fn sse_live_streaming_receives_events_and_done() {
+    let engine = make_engine();
+    let app = create_app(Arc::clone(&engine), AuthMode::None);
+
+    // Bind to a random port
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let client = reqwest::Client::new();
+
+    // Create task and transition to running via HTTP
+    client
+        .post(format!("http://{addr}/tasks"))
+        .json(&json!({ "id": "sse-live" }))
+        .send()
+        .await
+        .unwrap();
+    client
+        .patch(format!("http://{addr}/tasks/sse-live/status"))
+        .json(&json!({ "status": "running" }))
+        .send()
+        .await
+        .unwrap();
+
+    // Spawn a background task to publish events after SSE connects
+    let engine_clone = Arc::clone(&engine);
+    tokio::spawn(async move {
+        // Wait for SSE subscription to establish
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Publish events directly via the engine
+        engine_clone
+            .publish_event(
+                "sse-live",
+                taskcast_core::PublishEventInput {
+                    r#type: "progress".to_string(),
+                    level: Level::Info,
+                    data: json!({ "step": 1 }),
+                    series_id: None,
+                    series_mode: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        engine_clone
+            .publish_event(
+                "sse-live",
+                taskcast_core::PublishEventInput {
+                    r#type: "progress".to_string(),
+                    level: Level::Info,
+                    data: json!({ "step": 2 }),
+                    series_id: None,
+                    series_mode: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Transition to completed — this will trigger the done event and close the SSE stream
+        engine_clone
+            .transition_task("sse-live", TaskStatus::Completed, None)
+            .await
+            .unwrap();
+    });
+
+    // Connect to SSE stream — reqwest::text() will block until stream closes (when task completes)
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client
+            .get(format!("http://{addr}/tasks/sse-live/events"))
+            .send(),
+    )
+    .await
+    .expect("SSE connect timed out")
+    .unwrap();
+    assert_eq!(response.status(), 200);
+
+    let all_text = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        response.text(),
+    )
+    .await
+    .expect("SSE stream timed out")
+    .unwrap();
+
+    // Verify we got live events (1 status from running + 2 progress + 1 status from completed)
+    let event_count = all_text.matches("event: taskcast.event").count();
+    assert!(
+        event_count >= 3,
+        "should have at least 3 events (history + live), got {event_count}. Full text:\n{all_text}"
+    );
+
+    // Verify done event
+    assert!(
+        all_text.contains("event: taskcast.done"),
+        "should have done event. Full text:\n{all_text}"
+    );
+    assert!(
+        all_text.contains("completed"),
+        "done reason should contain completed. Full text:\n{all_text}"
+    );
+}

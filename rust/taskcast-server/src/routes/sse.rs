@@ -222,7 +222,7 @@ pub async fn sse_events(
 
         // Wait for terminal event or channel close
         let _ = done_rx.await;
-        drop(unsub);
+        unsub();
     });
 
     let stream = ReceiverStream::new(rx);

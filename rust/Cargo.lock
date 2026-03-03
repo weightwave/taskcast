@@ -2847,6 +2847,8 @@ dependencies = [
  "serde_json",
  "sqlx",
  "taskcast-core",
+ "testcontainers",
+ "testcontainers-modules",
  "tokio",
 ]
 
