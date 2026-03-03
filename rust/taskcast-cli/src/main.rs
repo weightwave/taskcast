@@ -130,11 +130,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 resolve_storage_mode(&storage, env_storage.as_deref(), redis_url.is_some());
 
             // 5. Build adapters
-            let (broadcast, short_term, long_term): (
+            type StorageAdapters = (
                 Arc<dyn taskcast_core::BroadcastProvider>,
                 Arc<dyn taskcast_core::ShortTermStore>,
                 Option<Arc<dyn taskcast_core::LongTermStore>>,
-            ) = match storage_mode {
+            );
+            let (broadcast, short_term, long_term): StorageAdapters = match storage_mode {
                 "sqlite" => {
                     let adapters = taskcast_sqlite::create_sqlite_adapters(&db_path).await?;
                     eprintln!("[taskcast] Using SQLite storage at {db_path}");
