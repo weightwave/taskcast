@@ -1109,4 +1109,40 @@ mod tests {
         assert_eq!(json["filter"]["types"][0], "status");
         assert_eq!(json["filter"]["includeStatus"], true);
     }
+
+    // ─── TaskcastHooks default no-op impls ──────────────────────────
+
+    struct NoopHooks;
+    impl TaskcastHooks for NoopHooks {}
+
+    #[test]
+    fn taskcast_hooks_default_impls_do_not_panic() {
+        let hooks = NoopHooks;
+        let task = Task {
+            id: "t".to_string(), r#type: None, status: TaskStatus::Failed,
+            params: None, result: None, error: None, metadata: None,
+            created_at: 0.0, updated_at: 0.0, completed_at: None, ttl: None,
+            auth_config: None, webhooks: None, cleanup: None,
+        };
+        let err = TaskError { code: None, message: "boom".to_string(), details: None };
+        let event = TaskEvent {
+            id: "e".to_string(), task_id: "t".to_string(), index: 0,
+            timestamp: 0.0, r#type: "x".to_string(), level: Level::Info,
+            data: json!(null), series_id: None, series_mode: None,
+        };
+        let webhook = WebhookConfig {
+            url: "https://example.com".to_string(),
+            filter: None, secret: None, wrap: None, retry: None,
+        };
+        let io_err: Box<dyn std::error::Error + Send + Sync> = "io error".into();
+        let ctx = ErrorContext { operation: "test".to_string(), task_id: None };
+
+        hooks.on_task_failed(&task, &err);
+        hooks.on_task_timeout(&task);
+        hooks.on_unhandled_error(io_err.as_ref(), &ctx);
+        hooks.on_event_dropped(&event, "test reason");
+        hooks.on_webhook_failed(&webhook, io_err.as_ref());
+        hooks.on_sse_connect("t", "client-1");
+        hooks.on_sse_disconnect("t", "client-1", 1000.0);
+    }
 }
