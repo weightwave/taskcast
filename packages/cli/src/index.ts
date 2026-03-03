@@ -29,7 +29,7 @@ program
   .option('-s, --storage <type>', 'storage backend: memory | redis | sqlite', 'memory')
   .option('--db-path <path>', 'SQLite database file path (default: ./taskcast.db)')
   .action(async (options: { config?: string; port: string; storage?: string; dbPath?: string }) => {
-    const fileConfig = await loadConfigFile(options.config)
+    const { config: fileConfig } = await loadConfigFile(options.config)
 
     const port = Number(options.port ?? fileConfig.port ?? 3721)
     const redisUrl = process.env['TASKCAST_REDIS_URL'] ?? fileConfig.adapters?.broadcast?.url

@@ -1,5 +1,5 @@
-import { describe, it, expect } from 'vitest'
-import { writeFileSync, unlinkSync } from 'fs'
+import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { writeFileSync, unlinkSync, mkdirSync, rmSync } from 'fs'
 import { join } from 'path'
 import { tmpdir } from 'os'
 import { interpolateEnvVars, parseConfig, loadConfigFile } from '../../src/config.js'
@@ -82,7 +82,7 @@ describe('loadConfigFile', () => {
     const tmpPath = join(tmpdir(), `taskcast-test-${Date.now()}.yaml`)
     writeFileSync(tmpPath, 'port: 9999\n')
     try {
-      const config = await loadConfigFile(tmpPath)
+      const { config } = await loadConfigFile(tmpPath)
       expect(config.port).toBe(9999)
     } finally {
       unlinkSync(tmpPath)
@@ -93,7 +93,7 @@ describe('loadConfigFile', () => {
     const tmpPath = join(tmpdir(), `taskcast-test-${Date.now()}.json`)
     writeFileSync(tmpPath, JSON.stringify({ port: 7777, logLevel: 'debug' }))
     try {
-      const config = await loadConfigFile(tmpPath)
+      const { config } = await loadConfigFile(tmpPath)
       expect(config.port).toBe(7777)
       expect(config.logLevel).toBe('debug')
     } finally {
@@ -101,16 +101,65 @@ describe('loadConfigFile', () => {
     }
   })
 
-  it('returns empty object for a nonexistent path', async () => {
-    const config = await loadConfigFile('/tmp/taskcast-nonexistent-xyz-12345.yaml')
+  it('returns empty config for a nonexistent explicit path', async () => {
+    const { config } = await loadConfigFile('/tmp/taskcast-nonexistent-xyz-12345.yaml')
     expect(config).toEqual({})
   })
 
-  it('returns empty object when no default config files exist', async () => {
-    // Call with no argument from a directory where no default files exist
-    // The function resolves paths relative to cwd; in test env none of the defaults should exist
-    const config = await loadConfigFile()
-    // Should return {} (no default config files present in test runner cwd)
-    expect(config).toBeDefined()
+  it('returns a defined result when no default config files exist', async () => {
+    const result = await loadConfigFile()
+    expect(result.config).toBeDefined()
+  })
+})
+
+describe('loadConfigFile - return type with source', () => {
+  it('returns source "explicit" when a path is given and file exists', async () => {
+    const tmpPath = join(tmpdir(), `taskcast-test-${Date.now()}.yaml`)
+    writeFileSync(tmpPath, 'port: 9999\n')
+    try {
+      const result = await loadConfigFile(tmpPath)
+      expect(result.config.port).toBe(9999)
+      expect(result.source).toBe('explicit')
+    } finally {
+      unlinkSync(tmpPath)
+    }
+  })
+
+  it('returns source "explicit" with empty config when explicit path does not exist', async () => {
+    const result = await loadConfigFile('/tmp/taskcast-nonexistent-xyz-12345.yaml')
+    expect(result.config).toEqual({})
+    expect(result.source).toBe('explicit')
+  })
+
+  it('returns source "none" when no config files exist anywhere', async () => {
+    const result = await loadConfigFile()
+    expect(result.source).toBe('none')
+    expect(result.config).toEqual({})
+  })
+})
+
+describe('loadConfigFile - global fallback', () => {
+  const globalDir = join(tmpdir(), `taskcast-global-test-${Date.now()}`)
+  const globalConfigPath = join(globalDir, 'taskcast.config.yaml')
+
+  beforeEach(() => {
+    mkdirSync(globalDir, { recursive: true })
+  })
+
+  afterEach(() => {
+    rmSync(globalDir, { recursive: true, force: true })
+  })
+
+  it('finds config in global directory when local directory has none', async () => {
+    writeFileSync(globalConfigPath, 'port: 5555\n')
+    const result = await loadConfigFile(undefined, globalDir)
+    expect(result.config.port).toBe(5555)
+    expect(result.source).toBe('global')
+  })
+
+  it('does not search global for ts/js/mjs files', async () => {
+    writeFileSync(join(globalDir, 'taskcast.config.js'), 'export default { port: 1234 }')
+    const result = await loadConfigFile(undefined, globalDir)
+    expect(result.source).toBe('none')
   })
 })
