@@ -78,47 +78,25 @@ describe('parseConfig - interpolateObject non-string primitives', () => {
 })
 
 describe('loadConfigFile', () => {
-  it('loads a YAML config file from a given path', async () => {
-    const tmpPath = join(tmpdir(), `taskcast-test-${Date.now()}.yaml`)
-    writeFileSync(tmpPath, 'port: 9999\n')
-    try {
-      const { config } = await loadConfigFile(tmpPath)
-      expect(config.port).toBe(9999)
-    } finally {
-      unlinkSync(tmpPath)
-    }
-  })
-
-  it('loads a JSON config file from a given path', async () => {
-    const tmpPath = join(tmpdir(), `taskcast-test-${Date.now()}.json`)
-    writeFileSync(tmpPath, JSON.stringify({ port: 7777, logLevel: 'debug' }))
-    try {
-      const { config } = await loadConfigFile(tmpPath)
-      expect(config.port).toBe(7777)
-      expect(config.logLevel).toBe('debug')
-    } finally {
-      unlinkSync(tmpPath)
-    }
-  })
-
-  it('returns empty config for a nonexistent explicit path', async () => {
-    const { config } = await loadConfigFile('/tmp/taskcast-nonexistent-xyz-12345.yaml')
-    expect(config).toEqual({})
-  })
-
-  it('returns a defined result when no default config files exist', async () => {
-    const result = await loadConfigFile()
-    expect(result.config).toBeDefined()
-  })
-})
-
-describe('loadConfigFile - return type with source', () => {
-  it('returns source "explicit" when a path is given and file exists', async () => {
+  it('loads a YAML config file from a given path with source "explicit"', async () => {
     const tmpPath = join(tmpdir(), `taskcast-test-${Date.now()}.yaml`)
     writeFileSync(tmpPath, 'port: 9999\n')
     try {
       const result = await loadConfigFile(tmpPath)
       expect(result.config.port).toBe(9999)
+      expect(result.source).toBe('explicit')
+    } finally {
+      unlinkSync(tmpPath)
+    }
+  })
+
+  it('loads a JSON config file from a given path with source "explicit"', async () => {
+    const tmpPath = join(tmpdir(), `taskcast-test-${Date.now()}.json`)
+    writeFileSync(tmpPath, JSON.stringify({ port: 7777, logLevel: 'debug' }))
+    try {
+      const result = await loadConfigFile(tmpPath)
+      expect(result.config.port).toBe(7777)
+      expect(result.config.logLevel).toBe('debug')
       expect(result.source).toBe('explicit')
     } finally {
       unlinkSync(tmpPath)
@@ -132,9 +110,15 @@ describe('loadConfigFile - return type with source', () => {
   })
 
   it('returns source "none" when no config files exist anywhere', async () => {
-    const result = await loadConfigFile()
-    expect(result.source).toBe('none')
-    expect(result.config).toEqual({})
+    const emptyDir = join(tmpdir(), `taskcast-empty-${Date.now()}`)
+    mkdirSync(emptyDir, { recursive: true })
+    try {
+      const result = await loadConfigFile(undefined, emptyDir)
+      expect(result.source).toBe('none')
+      expect(result.config).toEqual({})
+    } finally {
+      rmSync(emptyDir, { recursive: true, force: true })
+    }
   })
 })
 
