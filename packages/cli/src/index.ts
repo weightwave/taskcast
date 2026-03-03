@@ -2,6 +2,10 @@
 import { Command } from 'commander'
 import { Redis } from 'ioredis'
 import postgres from 'postgres'
+import { createInterface } from 'readline'
+import { mkdirSync, writeFileSync } from 'fs'
+import { join } from 'path'
+import { homedir } from 'os'
 import {
   TaskEngine,
   loadConfigFile,
@@ -13,6 +17,59 @@ import { createTaskcastApp } from '@taskcast/server'
 import { createRedisAdapters } from '@taskcast/redis'
 import { PostgresLongTermStore } from '@taskcast/postgres'
 import { createSqliteAdapters } from '@taskcast/sqlite'
+
+const DEFAULT_CONFIG_YAML = `# Taskcast configuration
+# Docs: https://github.com/weightwave/taskcast
+
+port: 3721
+
+# auth:
+#   mode: none  # none | jwt
+
+# adapters:
+#   broadcast:
+#     provider: memory  # memory | redis
+#     # url: redis://localhost:6379
+#   shortTerm:
+#     provider: memory  # memory | redis
+#     # url: redis://localhost:6379
+#   longTerm:
+#     provider: postgres
+#     # url: postgresql://localhost:5432/taskcast
+`
+
+async function promptCreateGlobalConfig(): Promise<boolean> {
+  if (!process.stdin.isTTY) return false
+
+  const globalConfigPath = join(homedir(), '.taskcast', 'taskcast.config.yaml')
+
+  return new Promise((resolve) => {
+    const rl = createInterface({ input: process.stdin, output: process.stdout })
+    rl.on('close', () => resolve(false))
+    rl.question(
+      `[taskcast] No config file found.\n? Create a default config at ${globalConfigPath}? (Y/n) `,
+      (answer) => {
+        rl.close()
+        const trimmed = answer.trim().toLowerCase()
+        resolve(trimmed === '' || trimmed === 'y' || trimmed === 'yes')
+      },
+    )
+  })
+}
+
+function createDefaultGlobalConfig(): string | null {
+  const globalDir = join(homedir(), '.taskcast')
+  const globalConfigPath = join(globalDir, 'taskcast.config.yaml')
+  try {
+    mkdirSync(globalDir, { recursive: true })
+    writeFileSync(globalConfigPath, DEFAULT_CONFIG_YAML)
+    console.log(`[taskcast] Created default config at ${globalConfigPath}`)
+    return globalConfigPath
+  } catch (err) {
+    console.warn(`[taskcast] Could not create config at ${globalConfigPath}: ${(err as Error).message}`)
+    return null
+  }
+}
 
 const program = new Command()
 
@@ -29,7 +86,18 @@ program
   .option('-s, --storage <type>', 'storage backend: memory | redis | sqlite', 'memory')
   .option('--db-path <path>', 'SQLite database file path (default: ./taskcast.db)')
   .action(async (options: { config?: string; port: string; storage?: string; dbPath?: string }) => {
-    const { config: fileConfig } = await loadConfigFile(options.config)
+    let { config: fileConfig, source } = await loadConfigFile(options.config)
+
+    if (source === 'none') {
+      const shouldCreate = await promptCreateGlobalConfig()
+      if (shouldCreate) {
+        const createdPath = createDefaultGlobalConfig()
+        if (createdPath) {
+          const created = await loadConfigFile(createdPath)
+          fileConfig = created.config
+        }
+      }
+    }
 
     const port = Number(options.port ?? fileConfig.port ?? 3721)
     const redisUrl = process.env['TASKCAST_REDIS_URL'] ?? fileConfig.adapters?.broadcast?.url
