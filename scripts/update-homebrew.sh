@@ -17,7 +17,11 @@ if [ ! -f "$TEMPLATE" ]; then
 fi
 
 sha256_of() {
-  shasum -a 256 "$1" | awk '{print $1}'
+  if command -v sha256sum &>/dev/null; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
 }
 
 SHA_MACOS_ARM64=$(sha256_of "$ARTIFACTS_DIR/taskcast-v${VERSION}-aarch64-apple-darwin.tar.gz")
