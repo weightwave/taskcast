@@ -3,6 +3,8 @@
 export type TaskStatus =
   | 'pending'
   | 'running'
+  | 'paused'
+  | 'blocked'
   | 'completed'
   | 'failed'
   | 'timeout'
@@ -22,6 +24,11 @@ export interface TaskAuthConfig {
       sub?: string[]
     }
   }>
+}
+
+export interface BlockedRequest {
+  type: string
+  data: unknown
 }
 
 export interface WebhookConfig {
@@ -47,10 +54,13 @@ export type Level = 'debug' | 'info' | 'warn' | 'error'
 export type PermissionScope =
   | 'task:create'
   | 'task:manage'
+  | 'task:resolve'
+  | 'task:signal'
   | 'event:publish'
   | 'event:subscribe'
   | 'event:history'
   | 'webhook:create'
+  | 'worker:connect'
   | '*'
 
 export interface CleanupRule {
@@ -86,6 +96,11 @@ export interface Task {
   authConfig?: TaskAuthConfig
   webhooks?: WebhookConfig[]
   cleanup?: { rules: CleanupRule[] }
+  reason?: string
+  resumeAt?: number
+  blockedRequest?: BlockedRequest
+  workerId?: string
+  workerOnly?: boolean
 }
 
 // ─── Events ─────────────────────────────────────────────────────────────────
