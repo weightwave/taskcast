@@ -1,0 +1,36 @@
+class Taskcast < Formula
+  desc "Unified long-lifecycle task tracking service for LLM streaming and async workloads"
+  homepage "https://github.com/weightwave/taskcast"
+  version "__VERSION__"
+  license "MIT"
+
+  on_macos do
+    if Hardware::CPU.arm?
+      url "https://github.com/weightwave/taskcast/releases/download/v#{version}/taskcast-v#{version}-aarch64-apple-darwin.tar.gz"
+      sha256 "__SHA256_MACOS_ARM64__"
+    end
+    if Hardware::CPU.intel?
+      url "https://github.com/weightwave/taskcast/releases/download/v#{version}/taskcast-v#{version}-x86_64-apple-darwin.tar.gz"
+      sha256 "__SHA256_MACOS_X64__"
+    end
+  end
+
+  on_linux do
+    if Hardware::CPU.arm?
+      url "https://github.com/weightwave/taskcast/releases/download/v#{version}/taskcast-v#{version}-aarch64-unknown-linux-gnu.tar.gz"
+      sha256 "__SHA256_LINUX_ARM64__"
+    end
+    if Hardware::CPU.intel?
+      url "https://github.com/weightwave/taskcast/releases/download/v#{version}/taskcast-v#{version}-x86_64-unknown-linux-gnu.tar.gz"
+      sha256 "__SHA256_LINUX_X64__"
+    end
+  end
+
+  def install
+    bin.install "taskcast"
+  end
+
+  test do
+    assert_match version.to_s, shell_output("#{bin}/taskcast --version")
+  end
+end
