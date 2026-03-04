@@ -10,6 +10,7 @@
     { "path": "../core" },
     { "path": "../server" },
     { "path": "../redis" },
-    { "path": "../postgres" }
+    { "path": "../postgres" },
+    { "path": "../sqlite" }
   ]
 }

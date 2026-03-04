@@ -883,4 +883,16 @@ mod tests {
         assert_eq!(count1.load(Ordering::SeqCst), 0);
         assert_eq!(count2.load(Ordering::SeqCst), 1);
     }
+
+    // ─── Default impls ───────────────────────────────────────────────
+
+    #[test]
+    fn memory_broadcast_provider_default_works() {
+        let _provider: MemoryBroadcastProvider = Default::default();
+    }
+
+    #[test]
+    fn memory_short_term_store_default_works() {
+        let _store: MemoryShortTermStore = Default::default();
+    }
 }

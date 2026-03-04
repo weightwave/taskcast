@@ -279,7 +279,77 @@ fn now_millis() -> f64 {
 mod tests {
     use super::*;
     use crate::memory_adapters::{MemoryBroadcastProvider, MemoryShortTermStore};
+    use crate::types::LongTermStore;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use tokio::sync::RwLock as TokioRwLock;
+
+    // ─── Mock LongTermStore ───────────────────────────────────────────
+
+    struct MockLongTermStore {
+        tasks: TokioRwLock<HashMap<String, Task>>,
+        events: TokioRwLock<Vec<TaskEvent>>,
+        fail_save_event: bool,
+    }
+
+    impl MockLongTermStore {
+        fn new() -> Self {
+            Self {
+                tasks: TokioRwLock::new(HashMap::new()),
+                events: TokioRwLock::new(Vec::new()),
+                fail_save_event: false,
+            }
+        }
+
+        fn failing_save_event() -> Self {
+            Self {
+                tasks: TokioRwLock::new(HashMap::new()),
+                events: TokioRwLock::new(Vec::new()),
+                fail_save_event: true,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LongTermStore for MockLongTermStore {
+        async fn save_task(&self, task: Task) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.tasks.write().await.insert(task.id.clone(), task);
+            Ok(())
+        }
+
+        async fn get_task(&self, task_id: &str) -> Result<Option<Task>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self.tasks.read().await.get(task_id).cloned())
+        }
+
+        async fn save_event(&self, event: TaskEvent) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            if self.fail_save_event {
+                return Err("mock save_event failure".into());
+            }
+            self.events.write().await.push(event);
+            Ok(())
+        }
+
+        async fn get_events(&self, _task_id: &str, _opts: Option<EventQueryOptions>) -> Result<Vec<TaskEvent>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self.events.read().await.clone())
+        }
+    }
+
+    // ─── Mock Hooks ───────────────────────────────────────────────────
+
+    struct MockHooks {
+        dropped_count: AtomicU64,
+    }
+
+    impl MockHooks {
+        fn new() -> Self {
+            Self { dropped_count: AtomicU64::new(0) }
+        }
+    }
+
+    impl TaskcastHooks for MockHooks {
+        fn on_event_dropped(&self, _event: &TaskEvent, _reason: &str) {
+            self.dropped_count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 
     fn make_engine() -> TaskEngine {
         TaskEngine::new(TaskEngineOptions {
@@ -1053,5 +1123,127 @@ mod tests {
         for unsub in unsubs {
             unsub();
         }
+    }
+
+    // ─── long_term integration ────────────────────────────────────────
+
+    fn make_engine_with_long_term(long_term: Arc<dyn LongTermStore>) -> TaskEngine {
+        TaskEngine::new(TaskEngineOptions {
+            short_term: Arc::new(MemoryShortTermStore::new()),
+            broadcast: Arc::new(MemoryBroadcastProvider::new()),
+            long_term: Some(long_term),
+            hooks: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn create_task_saves_to_long_term() {
+        let long_term = Arc::new(MockLongTermStore::new());
+        let engine = make_engine_with_long_term(Arc::clone(&long_term) as Arc<dyn LongTermStore>);
+
+        let task = engine.create_task(CreateTaskInput {
+            id: Some("lt-1".to_string()),
+            ..Default::default()
+        }).await.unwrap();
+
+        let retrieved = long_term.get_task(&task.id).await.unwrap();
+        assert!(retrieved.is_some());
+        assert_eq!(retrieved.unwrap().id, "lt-1");
+    }
+
+    #[tokio::test]
+    async fn get_task_falls_back_to_long_term() {
+        let long_term = Arc::new(MockLongTermStore::new());
+        // Save directly to long_term, bypassing short_term
+        let task = Task {
+            id: "lt-only".to_string(),
+            status: TaskStatus::Completed,
+            created_at: 1000.0,
+            updated_at: 1000.0,
+            r#type: None, params: None, result: None, error: None,
+            metadata: None, completed_at: None, ttl: None,
+            auth_config: None, webhooks: None, cleanup: None,
+        };
+        long_term.save_task(task).await.unwrap();
+
+        let engine = make_engine_with_long_term(long_term);
+        let retrieved = engine.get_task("lt-only").await.unwrap();
+        assert!(retrieved.is_some());
+        assert_eq!(retrieved.unwrap().id, "lt-only");
+    }
+
+    #[tokio::test]
+    async fn transition_task_saves_to_long_term() {
+        let long_term = Arc::new(MockLongTermStore::new());
+        let engine = make_engine_with_long_term(Arc::clone(&long_term) as Arc<dyn LongTermStore>);
+
+        engine.create_task(CreateTaskInput {
+            id: Some("lt-2".to_string()),
+            ..Default::default()
+        }).await.unwrap();
+
+        engine.transition_task("lt-2", TaskStatus::Running, None).await.unwrap();
+
+        let retrieved = long_term.get_task("lt-2").await.unwrap().unwrap();
+        assert_eq!(retrieved.status, TaskStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn emit_saves_event_to_long_term_async() {
+        let long_term = Arc::new(MockLongTermStore::new());
+        let engine = make_engine_with_long_term(Arc::clone(&long_term) as Arc<dyn LongTermStore>);
+
+        engine.create_task(CreateTaskInput {
+            id: Some("lt-3".to_string()),
+            ..Default::default()
+        }).await.unwrap();
+        engine.transition_task("lt-3", TaskStatus::Running, None).await.unwrap();
+
+        engine.publish_event("lt-3", PublishEventInput {
+            r#type: "test".to_string(),
+            level: Level::Info,
+            data: serde_json::json!(null),
+            series_id: None,
+            series_mode: None,
+        }).await.unwrap();
+
+        // The long_term save is async (tokio::spawn), give it a moment
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let events = long_term.get_events("lt-3", None).await.unwrap();
+        // transition emits a status event + our event = at least 2
+        assert!(events.len() >= 2);
+    }
+
+    #[tokio::test]
+    async fn emit_calls_on_event_dropped_when_long_term_fails() {
+        let long_term = Arc::new(MockLongTermStore::failing_save_event());
+        let hooks = Arc::new(MockHooks::new());
+
+        let engine = TaskEngine::new(TaskEngineOptions {
+            short_term: Arc::new(MemoryShortTermStore::new()),
+            broadcast: Arc::new(MemoryBroadcastProvider::new()),
+            long_term: Some(long_term),
+            hooks: Some(Arc::clone(&hooks) as Arc<dyn TaskcastHooks>),
+        });
+
+        engine.create_task(CreateTaskInput {
+            id: Some("lt-fail".to_string()),
+            ..Default::default()
+        }).await.unwrap();
+        engine.transition_task("lt-fail", TaskStatus::Running, None).await.unwrap();
+
+        engine.publish_event("lt-fail", PublishEventInput {
+            r#type: "test".to_string(),
+            level: Level::Info,
+            data: serde_json::json!(null),
+            series_id: None,
+            series_mode: None,
+        }).await.unwrap();
+
+        // Give async spawn time to execute
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert!(hooks.dropped_count.load(Ordering::SeqCst) >= 1);
     }
 }

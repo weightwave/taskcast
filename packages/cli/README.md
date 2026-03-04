@@ -34,6 +34,8 @@ Start the server in foreground mode. This is the default command — `taskcast` 
 Options:
   -c, --config <path>   Path to config file
   -p, --port <port>     Server port (default: 3721)
+  -s, --storage <type>  Storage backend: memory | redis | sqlite (default: memory)
+  --db-path <path>      SQLite database file path (default: ./taskcast.db)
 ```
 
 ## Configuration
@@ -57,7 +59,23 @@ Taskcast searches for config files in the current directory:
 | `TASKCAST_JWT_SECRET` | JWT HMAC secret | -- |
 | `TASKCAST_REDIS_URL` | Redis connection URL | -- |
 | `TASKCAST_POSTGRES_URL` | PostgreSQL connection URL | -- |
+| `TASKCAST_STORAGE` | `memory` \| `redis` \| `sqlite` | `memory` |
+| `TASKCAST_SQLITE_PATH` | SQLite database file path | `./taskcast.db` |
 | `TASKCAST_LOG_LEVEL` | `debug` \| `info` \| `warn` \| `error` | `info` |
+
+### SQLite Storage
+
+For zero-dependency local development with persistent storage:
+
+```bash
+npx taskcast start --storage sqlite
+```
+
+Data is stored in `./taskcast.db` by default. Customize with `--db-path`:
+
+```bash
+npx taskcast start --storage sqlite --db-path /tmp/my-taskcast.db
+```
 
 ## Part of Taskcast
 

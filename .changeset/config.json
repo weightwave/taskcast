@@ -12,6 +12,7 @@
       "@taskcast/cli",
       "@taskcast/redis",
       "@taskcast/postgres",
+      "@taskcast/sqlite",
       "@taskcast/sentry"
     ]
   ],
