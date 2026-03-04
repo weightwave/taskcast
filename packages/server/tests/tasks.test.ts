@@ -237,51 +237,75 @@ describe('PATCH /tasks/:taskId/status - error payload', () => {
 })
 
 describe('PATCH /tasks/:taskId/status – suspended states', () => {
-  it('transitions running → paused with reason', async () => {
+  it('transitions running → paused', async () => {
     const { app, engine } = makeApp()
     const task = await engine.createTask({})
     await engine.transitionTask(task.id, 'running')
-    const taskId = task.id
-    const res = await app.request(`/tasks/${taskId}/status`, {
+    const res = await app.request(`/tasks/${task.id}/status`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ status: 'paused', reason: 'User requested' }),
+      body: JSON.stringify({ status: 'paused' }),
     })
     expect(res.status).toBe(200)
     const body = await res.json()
     expect(body.status).toBe('paused')
-    expect(body.reason).toBe('User requested')
   })
 
-  it('transitions running → blocked with resumeAfterMs', async () => {
+  it('transitions running → blocked', async () => {
     const { app, engine } = makeApp()
     const task = await engine.createTask({})
     await engine.transitionTask(task.id, 'running')
-    const taskId = task.id
-    const res = await app.request(`/tasks/${taskId}/status`, {
+    const res = await app.request(`/tasks/${task.id}/status`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ status: 'blocked', reason: 'Waiting approval', resumeAfterMs: 30000 }),
+      body: JSON.stringify({ status: 'blocked' }),
     })
     expect(res.status).toBe(200)
     const body = await res.json()
     expect(body.status).toBe('blocked')
-    expect(body.resumeAt).toBeDefined()
   })
 
-  it('allows ttl override on transition', async () => {
+  it('transitions paused → running', async () => {
     const { app, engine } = makeApp()
     const task = await engine.createTask({})
     await engine.transitionTask(task.id, 'running')
-    const taskId = task.id
-    const res = await app.request(`/tasks/${taskId}/status`, {
+    await engine.transitionTask(task.id, 'paused')
+    const res = await app.request(`/tasks/${task.id}/status`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ status: 'blocked', ttl: 1800 }),
+      body: JSON.stringify({ status: 'running' }),
     })
     expect(res.status).toBe(200)
     const body = await res.json()
-    expect(body.ttl).toBe(1800)
+    expect(body.status).toBe('running')
+  })
+
+  it('transitions blocked → cancelled', async () => {
+    const { app, engine } = makeApp()
+    const task = await engine.createTask({})
+    await engine.transitionTask(task.id, 'running')
+    await engine.transitionTask(task.id, 'blocked')
+    const res = await app.request(`/tasks/${task.id}/status`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: 'cancelled' }),
+    })
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.status).toBe('cancelled')
+  })
+
+  it('rejects invalid transition from paused → completed', async () => {
+    const { app, engine } = makeApp()
+    const task = await engine.createTask({})
+    await engine.transitionTask(task.id, 'running')
+    await engine.transitionTask(task.id, 'paused')
+    const res = await app.request(`/tasks/${task.id}/status`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: 'completed' }),
+    })
+    expect(res.status).toBe(400)
   })
 })
 

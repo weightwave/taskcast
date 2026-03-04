@@ -1129,9 +1129,9 @@ mod tests {
 
     fn make_engine_with_long_term(long_term: Arc<dyn LongTermStore>) -> TaskEngine {
         TaskEngine::new(TaskEngineOptions {
-            short_term: Arc::new(MemoryShortTermStore::new()),
+            short_term_store: Arc::new(MemoryShortTermStore::new()),
             broadcast: Arc::new(MemoryBroadcastProvider::new()),
-            long_term: Some(long_term),
+            long_term_store: Some(long_term),
             hooks: None,
         })
     }
@@ -1221,9 +1221,9 @@ mod tests {
         let hooks = Arc::new(MockHooks::new());
 
         let engine = TaskEngine::new(TaskEngineOptions {
-            short_term: Arc::new(MemoryShortTermStore::new()),
+            short_term_store: Arc::new(MemoryShortTermStore::new()),
             broadcast: Arc::new(MemoryBroadcastProvider::new()),
-            long_term: Some(long_term),
+            long_term_store: Some(long_term),
             hooks: Some(Arc::clone(&hooks) as Arc<dyn TaskcastHooks>),
         });
 

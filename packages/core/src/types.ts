@@ -3,6 +3,8 @@
 export type TaskStatus =
   | 'pending'
   | 'running'
+  | 'paused'
+  | 'blocked'
   | 'completed'
   | 'failed'
   | 'timeout'
