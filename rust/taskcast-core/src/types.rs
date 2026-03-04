@@ -9,6 +9,8 @@ use std::collections::HashMap;
 pub enum TaskStatus {
     Pending,
     Running,
+    Paused,
+    Blocked,
     Completed,
     Failed,
     Timeout,
@@ -347,6 +349,8 @@ mod tests {
     fn task_status_serializes_to_camel_case() {
         assert_eq!(serde_json::to_string(&TaskStatus::Pending).unwrap(), "\"pending\"");
         assert_eq!(serde_json::to_string(&TaskStatus::Running).unwrap(), "\"running\"");
+        assert_eq!(serde_json::to_string(&TaskStatus::Paused).unwrap(), "\"paused\"");
+        assert_eq!(serde_json::to_string(&TaskStatus::Blocked).unwrap(), "\"blocked\"");
         assert_eq!(serde_json::to_string(&TaskStatus::Completed).unwrap(), "\"completed\"");
         assert_eq!(serde_json::to_string(&TaskStatus::Failed).unwrap(), "\"failed\"");
         assert_eq!(serde_json::to_string(&TaskStatus::Timeout).unwrap(), "\"timeout\"");
@@ -356,6 +360,8 @@ mod tests {
     #[test]
     fn task_status_deserializes_from_camel_case() {
         assert_eq!(serde_json::from_str::<TaskStatus>("\"pending\"").unwrap(), TaskStatus::Pending);
+        assert_eq!(serde_json::from_str::<TaskStatus>("\"paused\"").unwrap(), TaskStatus::Paused);
+        assert_eq!(serde_json::from_str::<TaskStatus>("\"blocked\"").unwrap(), TaskStatus::Blocked);
         assert_eq!(serde_json::from_str::<TaskStatus>("\"cancelled\"").unwrap(), TaskStatus::Cancelled);
     }
 

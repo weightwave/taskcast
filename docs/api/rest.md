@@ -113,11 +113,13 @@ Additional fields by target status:
 
 ---
 
-### Delete Task
+### Delete Task (planned)
 
 ```
 DELETE /tasks/:taskId
 ```
+
+> **Note:** This endpoint is planned but not yet implemented.
 
 **Response:** `204 No Content`
 

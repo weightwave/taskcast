@@ -9,7 +9,7 @@ import { MemoryShortTermStore, MemoryBroadcastProvider } from '../../src/memory-
 function makeMemoryEngine() {
   const store = new MemoryShortTermStore()
   const broadcast = new MemoryBroadcastProvider()
-  return new TaskEngine({ shortTerm: store, broadcast })
+  return new TaskEngine({ shortTermStore: store, broadcast })
 }
 
 // ─── Concurrent subscriber tests (memory, no IO) ─────────────────────────────
@@ -127,7 +127,7 @@ describe('Redis concurrent fan-out', () => {
     store = new Redis(redisUrl)
     engine = new TaskEngine({
       broadcast: new RedisBroadcastProvider(pub, sub),
-      shortTerm: new RedisShortTermStore(store),
+      shortTermStore: new RedisShortTermStore(store),
     })
   }, 60000)
 
@@ -181,7 +181,7 @@ describe('Redis concurrent fan-out', () => {
     const store2 = new Redis(redisUrl)
     const engine2 = new TaskEngine({
       broadcast: new RedisBroadcastProvider(pub2, sub2),
-      shortTerm: new RedisShortTermStore(store2),
+      shortTermStore: new RedisShortTermStore(store2),
     })
 
     try {

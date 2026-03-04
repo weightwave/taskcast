@@ -12,12 +12,22 @@ import type {
   EventQueryOptions,
 } from './types.js'
 
-export interface TaskEngineOptions {
-  shortTerm: ShortTermStore
+interface TaskEngineOptionsBase {
   broadcast: BroadcastProvider
-  longTerm?: LongTermStore
   hooks?: TaskcastHooks
 }
+
+interface TaskEngineOptionsCanonical extends TaskEngineOptionsBase {
+  shortTermStore: ShortTermStore
+  longTermStore?: LongTermStore
+}
+
+interface TaskEngineOptionsLegacy extends TaskEngineOptionsBase {
+  shortTerm: ShortTermStore
+  longTerm?: LongTermStore
+}
+
+export type TaskEngineOptions = TaskEngineOptionsCanonical | TaskEngineOptionsLegacy
 
 export interface PublishEventInput {
   type: string
@@ -39,7 +49,27 @@ export interface CreateTaskInput {
 }
 
 export class TaskEngine {
-  constructor(private opts: TaskEngineOptions) {}
+  private shortTermStore: ShortTermStore
+  private longTermStore: LongTermStore | undefined
+  private broadcast: BroadcastProvider
+  private hooks: TaskcastHooks | undefined
+
+  constructor(opts: TaskEngineOptions) {
+    if ('shortTermStore' in opts && 'shortTerm' in opts) {
+      throw new Error('Cannot specify both shortTermStore and shortTerm')
+    }
+    if ('longTermStore' in opts && 'longTerm' in opts) {
+      throw new Error('Cannot specify both longTermStore and longTerm')
+    }
+    this.shortTermStore = 'shortTermStore' in opts ? opts.shortTermStore : opts.shortTerm
+    this.longTermStore = 'longTermStore' in opts
+      ? opts.longTermStore
+      : 'longTerm' in opts
+        ? opts.longTerm
+        : undefined
+    this.broadcast = opts.broadcast
+    if (opts.hooks !== undefined) this.hooks = opts.hooks
+  }
 
   async createTask(input: CreateTaskInput): Promise<Task> {
     const now = Date.now()
@@ -56,16 +86,16 @@ export class TaskEngine {
       ...(input.cleanup !== undefined && { cleanup: input.cleanup }),
       ...(input.authConfig !== undefined && { authConfig: input.authConfig }),
     }
-    await this.opts.shortTerm.saveTask(task)
-    if (this.opts.longTerm) await this.opts.longTerm.saveTask(task)
-    if (task.ttl) await this.opts.shortTerm.setTTL(task.id, task.ttl)
+    await this.shortTermStore.saveTask(task)
+    if (this.longTermStore) await this.longTermStore.saveTask(task)
+    if (task.ttl) await this.shortTermStore.setTTL(task.id, task.ttl)
     return task
   }
 
   async getTask(taskId: string): Promise<Task | null> {
-    const fromShort = await this.opts.shortTerm.getTask(taskId)
+    const fromShort = await this.shortTermStore.getTask(taskId)
     if (fromShort) return fromShort
-    return this.opts.longTerm?.getTask(taskId) ?? null
+    return this.longTermStore?.getTask(taskId) ?? null
   }
 
   async transitionTask(
@@ -92,8 +122,8 @@ export class TaskEngine {
       ...(newError !== undefined && { error: newError }),
     }
 
-    await this.opts.shortTerm.saveTask(updated)
-    if (this.opts.longTerm) await this.opts.longTerm.saveTask(updated)
+    await this.shortTermStore.saveTask(updated)
+    if (this.longTermStore) await this.longTermStore.saveTask(updated)
 
     await this._emit(taskId, {
       type: 'taskcast:status',
@@ -102,10 +132,10 @@ export class TaskEngine {
     })
 
     if (to === 'failed' && updated.error) {
-      this.opts.hooks?.onTaskFailed?.(updated, updated.error)
+      this.hooks?.onTaskFailed?.(updated, updated.error)
     }
     if (to === 'timeout') {
-      this.opts.hooks?.onTaskTimeout?.(updated)
+      this.hooks?.onTaskTimeout?.(updated)
     }
 
     return updated
@@ -122,15 +152,15 @@ export class TaskEngine {
   }
 
   async getEvents(taskId: string, opts?: EventQueryOptions): Promise<TaskEvent[]> {
-    return this.opts.shortTerm.getEvents(taskId, opts)
+    return this.shortTermStore.getEvents(taskId, opts)
   }
 
   subscribe(taskId: string, handler: (event: TaskEvent) => void): () => void {
-    return this.opts.broadcast.subscribe(taskId, handler)
+    return this.broadcast.subscribe(taskId, handler)
   }
 
   private async _emit(taskId: string, input: PublishEventInput): Promise<TaskEvent> {
-    const index = await this.opts.shortTerm.nextIndex(taskId)
+    const index = await this.shortTermStore.nextIndex(taskId)
     const raw: TaskEvent = {
       id: ulid(),
       taskId,
@@ -143,13 +173,13 @@ export class TaskEngine {
       ...(input.seriesMode !== undefined && { seriesMode: input.seriesMode }),
     }
 
-    const event = await processSeries(raw, this.opts.shortTerm)
-    await this.opts.shortTerm.appendEvent(taskId, event)
-    await this.opts.broadcast.publish(taskId, event)
+    const event = await processSeries(raw, this.shortTermStore)
+    await this.shortTermStore.appendEvent(taskId, event)
+    await this.broadcast.publish(taskId, event)
 
-    if (this.opts.longTerm) {
-      this.opts.longTerm.saveEvent(event).catch((err) => {
-        this.opts.hooks?.onEventDropped?.(event, String(err))
+    if (this.longTermStore) {
+      this.longTermStore.saveEvent(event).catch((err) => {
+        this.hooks?.onEventDropped?.(event, String(err))
       })
     }
 

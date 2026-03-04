@@ -12,12 +12,13 @@ pnpm add @taskcast/sentry @sentry/node
 
 ```typescript
 import { TaskEngine, MemoryBroadcastProvider, MemoryShortTermStore } from '@taskcast/core'
+import * as Sentry from '@sentry/node'
 import { createSentryHooks } from '@taskcast/sentry'
 
 const engine = new TaskEngine({
   broadcast: new MemoryBroadcastProvider(),
   shortTermStore: new MemoryShortTermStore(),
-  hooks: createSentryHooks({
+  hooks: createSentryHooks(Sentry, {
     captureTaskFailures: true,
     captureTaskTimeouts: true,
   }),

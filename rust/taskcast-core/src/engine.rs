@@ -56,27 +56,27 @@ pub struct TransitionPayload {
 // ─── TaskEngineOptions ───────────────────────────────────────────────────────
 
 pub struct TaskEngineOptions {
-    pub short_term: Arc<dyn ShortTermStore>,
+    pub short_term_store: Arc<dyn ShortTermStore>,
     pub broadcast: Arc<dyn BroadcastProvider>,
-    pub long_term: Option<Arc<dyn LongTermStore>>,
+    pub long_term_store: Option<Arc<dyn LongTermStore>>,
     pub hooks: Option<Arc<dyn TaskcastHooks>>,
 }
 
 // ─── TaskEngine ──────────────────────────────────────────────────────────────
 
 pub struct TaskEngine {
-    short_term: Arc<dyn ShortTermStore>,
+    short_term_store: Arc<dyn ShortTermStore>,
     broadcast: Arc<dyn BroadcastProvider>,
-    long_term: Option<Arc<dyn LongTermStore>>,
+    long_term_store: Option<Arc<dyn LongTermStore>>,
     hooks: Option<Arc<dyn TaskcastHooks>>,
 }
 
 impl TaskEngine {
     pub fn new(opts: TaskEngineOptions) -> Self {
         Self {
-            short_term: opts.short_term,
+            short_term_store: opts.short_term_store,
             broadcast: opts.broadcast,
-            long_term: opts.long_term,
+            long_term_store: opts.long_term_store,
             hooks: opts.hooks,
         }
     }
@@ -100,25 +100,25 @@ impl TaskEngine {
             completed_at: None,
         };
 
-        self.short_term.save_task(task.clone()).await?;
+        self.short_term_store.save_task(task.clone()).await?;
 
-        if let Some(ref long_term) = self.long_term {
+        if let Some(ref long_term) = self.long_term_store {
             long_term.save_task(task.clone()).await?;
         }
 
         if let Some(ttl) = task.ttl {
-            self.short_term.set_ttl(&task.id, ttl).await?;
+            self.short_term_store.set_ttl(&task.id, ttl).await?;
         }
 
         Ok(task)
     }
 
     pub async fn get_task(&self, task_id: &str) -> Result<Option<Task>, EngineError> {
-        let from_short = self.short_term.get_task(task_id).await?;
+        let from_short = self.short_term_store.get_task(task_id).await?;
         if from_short.is_some() {
             return Ok(from_short);
         }
-        if let Some(ref long_term) = self.long_term {
+        if let Some(ref long_term) = self.long_term_store {
             return Ok(long_term.get_task(task_id).await?);
         }
         Ok(None)
@@ -163,9 +163,9 @@ impl TaskEngine {
             ..task
         };
 
-        self.short_term.save_task(updated.clone()).await?;
+        self.short_term_store.save_task(updated.clone()).await?;
 
-        if let Some(ref long_term) = self.long_term {
+        if let Some(ref long_term) = self.long_term_store {
             long_term.save_task(updated.clone()).await?;
         }
 
@@ -210,7 +210,7 @@ impl TaskEngine {
         task_id: &str,
         opts: Option<EventQueryOptions>,
     ) -> Result<Vec<TaskEvent>, EngineError> {
-        Ok(self.short_term.get_events(task_id, opts).await?)
+        Ok(self.short_term_store.get_events(task_id, opts).await?)
     }
 
     pub async fn subscribe(
@@ -228,7 +228,7 @@ impl TaskEngine {
         task_id: &str,
         input: PublishEventInput,
     ) -> Result<TaskEvent, EngineError> {
-        let index = self.short_term.next_index(task_id).await?;
+        let index = self.short_term_store.next_index(task_id).await?;
         let raw = TaskEvent {
             id: ulid::Ulid::new().to_string(),
             task_id: task_id.to_string(),
@@ -241,14 +241,14 @@ impl TaskEngine {
             series_mode: input.series_mode,
         };
 
-        let event = process_series(raw, self.short_term.as_ref()).await?;
+        let event = process_series(raw, self.short_term_store.as_ref()).await?;
 
-        self.short_term
+        self.short_term_store
             .append_event(task_id, event.clone())
             .await?;
         self.broadcast.publish(task_id, event.clone()).await?;
 
-        if let Some(ref long_term) = self.long_term {
+        if let Some(ref long_term) = self.long_term_store {
             let long_term = Arc::clone(long_term);
             let event_clone = event.clone();
             let hooks = self.hooks.clone();
@@ -353,18 +353,18 @@ mod tests {
 
     fn make_engine() -> TaskEngine {
         TaskEngine::new(TaskEngineOptions {
-            short_term: Arc::new(MemoryShortTermStore::new()),
+            short_term_store: Arc::new(MemoryShortTermStore::new()),
             broadcast: Arc::new(MemoryBroadcastProvider::new()),
-            long_term: None,
+            long_term_store: None,
             hooks: None,
         })
     }
 
     fn make_engine_with_broadcast(broadcast: Arc<MemoryBroadcastProvider>) -> TaskEngine {
         TaskEngine::new(TaskEngineOptions {
-            short_term: Arc::new(MemoryShortTermStore::new()),
+            short_term_store: Arc::new(MemoryShortTermStore::new()),
             broadcast,
-            long_term: None,
+            long_term_store: None,
             hooks: None,
         })
     }
@@ -1129,9 +1129,9 @@ mod tests {
 
     fn make_engine_with_long_term(long_term: Arc<dyn LongTermStore>) -> TaskEngine {
         TaskEngine::new(TaskEngineOptions {
-            short_term: Arc::new(MemoryShortTermStore::new()),
+            short_term_store: Arc::new(MemoryShortTermStore::new()),
             broadcast: Arc::new(MemoryBroadcastProvider::new()),
-            long_term: Some(long_term),
+            long_term_store: Some(long_term),
             hooks: None,
         })
     }
@@ -1221,9 +1221,9 @@ mod tests {
         let hooks = Arc::new(MockHooks::new());
 
         let engine = TaskEngine::new(TaskEngineOptions {
-            short_term: Arc::new(MemoryShortTermStore::new()),
+            short_term_store: Arc::new(MemoryShortTermStore::new()),
             broadcast: Arc::new(MemoryBroadcastProvider::new()),
-            long_term: Some(long_term),
+            long_term_store: Some(long_term),
             hooks: Some(Arc::clone(&hooks) as Arc<dyn TaskcastHooks>),
         });
 

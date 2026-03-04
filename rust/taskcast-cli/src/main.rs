@@ -122,7 +122,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .or_else(|| file_config.adapters.as_ref()?.broadcast.as_ref()?.url.clone());
             let postgres_url = std::env::var("TASKCAST_POSTGRES_URL")
                 .ok()
-                .or_else(|| file_config.adapters.as_ref()?.long_term.as_ref()?.url.clone());
+                .or_else(|| file_config.adapters.as_ref()?.long_term_store.as_ref()?.url.clone());
 
             // 4. Resolve storage mode: CLI flag > env var > auto-detect
             let env_storage = std::env::var("TASKCAST_STORAGE").ok();
@@ -130,11 +130,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 resolve_storage_mode(&storage, env_storage.as_deref(), redis_url.is_some());
 
             // 5. Build adapters
-            let (broadcast, short_term, long_term): (
+            type StorageAdapters = (
                 Arc<dyn taskcast_core::BroadcastProvider>,
                 Arc<dyn taskcast_core::ShortTermStore>,
                 Option<Arc<dyn taskcast_core::LongTermStore>>,
-            ) = match storage_mode {
+            );
+            let (broadcast, short_term_store, long_term_store): StorageAdapters = match storage_mode {
                 "sqlite" => {
                     let adapters = taskcast_sqlite::create_sqlite_adapters(&db_path).await?;
                     eprintln!("[taskcast] Using SQLite storage at {db_path}");
@@ -156,7 +157,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let adapters =
                         taskcast_redis::create_redis_adapters(pub_conn, sub_conn, store_conn, None);
 
-                    let long_term: Option<Arc<dyn taskcast_core::LongTermStore>> =
+                    let long_term_store: Option<Arc<dyn taskcast_core::LongTermStore>> =
                         if let Some(ref pg_url) = postgres_url {
                             let pool = sqlx::PgPool::connect(pg_url).await?;
                             let store =
@@ -168,8 +169,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     (
                         Arc::new(adapters.broadcast),
-                        Arc::new(adapters.short_term),
-                        long_term,
+                        Arc::new(adapters.short_term_store),
+                        long_term_store,
                     )
                 }
                 _ => {
@@ -177,7 +178,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "[taskcast] No TASKCAST_REDIS_URL configured \u{2014} using in-memory adapters"
                     );
 
-                    let long_term: Option<Arc<dyn taskcast_core::LongTermStore>> =
+                    let long_term_store: Option<Arc<dyn taskcast_core::LongTermStore>> =
                         if let Some(ref pg_url) = postgres_url {
                             let pool = sqlx::PgPool::connect(pg_url).await?;
                             let store =
@@ -190,7 +191,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     (
                         Arc::new(taskcast_core::MemoryBroadcastProvider::new()),
                         Arc::new(taskcast_core::MemoryShortTermStore::new()),
-                        long_term,
+                        long_term_store,
                     )
                 }
             };
@@ -198,9 +199,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // 6. Build engine
             let engine = Arc::new(taskcast_core::TaskEngine::new(
                 taskcast_core::TaskEngineOptions {
-                    short_term,
+                    short_term_store,
                     broadcast,
-                    long_term,
+                    long_term_store,
                     hooks: None,
                 },
             ));

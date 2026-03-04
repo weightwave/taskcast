@@ -236,6 +236,79 @@ describe('PATCH /tasks/:taskId/status - error payload', () => {
   })
 })
 
+describe('PATCH /tasks/:taskId/status – suspended states', () => {
+  it('transitions running → paused', async () => {
+    const { app, engine } = makeApp()
+    const task = await engine.createTask({})
+    await engine.transitionTask(task.id, 'running')
+    const res = await app.request(`/tasks/${task.id}/status`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: 'paused' }),
+    })
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.status).toBe('paused')
+  })
+
+  it('transitions running → blocked', async () => {
+    const { app, engine } = makeApp()
+    const task = await engine.createTask({})
+    await engine.transitionTask(task.id, 'running')
+    const res = await app.request(`/tasks/${task.id}/status`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: 'blocked' }),
+    })
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.status).toBe('blocked')
+  })
+
+  it('transitions paused → running', async () => {
+    const { app, engine } = makeApp()
+    const task = await engine.createTask({})
+    await engine.transitionTask(task.id, 'running')
+    await engine.transitionTask(task.id, 'paused')
+    const res = await app.request(`/tasks/${task.id}/status`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: 'running' }),
+    })
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.status).toBe('running')
+  })
+
+  it('transitions blocked → cancelled', async () => {
+    const { app, engine } = makeApp()
+    const task = await engine.createTask({})
+    await engine.transitionTask(task.id, 'running')
+    await engine.transitionTask(task.id, 'blocked')
+    const res = await app.request(`/tasks/${task.id}/status`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: 'cancelled' }),
+    })
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.status).toBe('cancelled')
+  })
+
+  it('rejects invalid transition from paused → completed', async () => {
+    const { app, engine } = makeApp()
+    const task = await engine.createTask({})
+    await engine.transitionTask(task.id, 'running')
+    await engine.transitionTask(task.id, 'paused')
+    const res = await app.request(`/tasks/${task.id}/status`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: 'completed' }),
+    })
+    expect(res.status).toBe(400)
+  })
+})
+
 describe('POST /tasks/:taskId/events - error handling', () => {
   it('returns 404 when publishing event to nonexistent task', async () => {
     const { app } = makeApp()

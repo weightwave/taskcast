@@ -17,18 +17,18 @@ import Redis from 'ioredis'
 const pubClient = new Redis(process.env.REDIS_URL)
 const subClient = new Redis(process.env.REDIS_URL)
 const storeClient = new Redis(process.env.REDIS_URL)
-const { broadcast, shortTerm } = createRedisAdapters(pubClient, subClient, storeClient)
+const { broadcast, shortTermStore } = createRedisAdapters(pubClient, subClient, storeClient)
 
 // 创建 PostgreSQL 适配器（可选）
-const longTerm = await createPostgresAdapter({
+const longTermStore = await createPostgresAdapter({
   url: process.env.DATABASE_URL!,
 })
 
 // 创建引擎
 const engine = new TaskEngine({
   broadcast,
-  shortTermStore: shortTerm,
-  longTermStore: longTerm, // 可选
+  shortTermStore,
+  longTermStore, // 可选
 })
 
 // 创建 HTTP 应用
@@ -313,7 +313,7 @@ import { createSentryHooks } from '@taskcast/sentry'
 
 Sentry.init({ dsn: process.env.SENTRY_DSN })
 
-const hooks = createSentryHooks({
+const hooks = createSentryHooks(Sentry, {
   captureTaskFailures: true,
   captureTaskTimeouts: true,
   captureUnhandledErrors: true,
@@ -321,7 +321,7 @@ const hooks = createSentryHooks({
 
 const engine = new TaskEngine({
   broadcast,
-  shortTermStore: shortTerm,
+  shortTermStore,
   hooks,
 })
 ```

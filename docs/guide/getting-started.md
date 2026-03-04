@@ -134,7 +134,7 @@ import { createTaskcastApp } from '@taskcast/server'
 // Create the engine
 const engine = new TaskEngine({
   broadcast: new MemoryBroadcastProvider(),
-  shortTermStore: new MemoryShortTermStore(),
+  shortTerm: new MemoryShortTermStore(),
 })
 
 // Create the HTTP application

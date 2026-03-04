@@ -50,7 +50,7 @@ beforeAll(async () => {
   const shortTerm = new RedisShortTermStore(storeClient)
   const longTerm = new PostgresLongTermStore(sql)
 
-  engine = new TaskEngine({ broadcast, shortTerm, longTerm })
+  engine = new TaskEngine({ broadcast, shortTermStore: shortTerm, longTermStore: longTerm })
 }, 120000)
 
 afterAll(async () => {

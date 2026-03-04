@@ -45,9 +45,9 @@ async fn make_redis_engine(redis_url: &str) -> TaskEngine {
     let conn = client.get_multiplexed_async_connection().await.unwrap();
     let store = RedisShortTermStore::new(conn, Some("test"));
     TaskEngine::new(TaskEngineOptions {
-        short_term: Arc::new(store),
+        short_term_store: Arc::new(store),
         broadcast: Arc::new(MemoryBroadcastProvider::new()),
-        long_term: None,
+        long_term_store: None,
         hooks: None,
     })
 }

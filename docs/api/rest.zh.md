@@ -113,11 +113,13 @@ PATCH /tasks/:taskId/status
 
 ---
 
-### 删除任务
+### 删除任务（planned）
 
 ```
 DELETE /tasks/:taskId
 ```
+
+> **注意：** 此端点已规划但尚未实现。
 
 **响应：** `204 No Content`
 

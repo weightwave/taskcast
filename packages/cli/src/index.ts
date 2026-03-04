@@ -2,6 +2,10 @@
 import { Command } from 'commander'
 import { Redis } from 'ioredis'
 import postgres from 'postgres'
+import { createInterface } from 'readline'
+import { mkdirSync, writeFileSync } from 'fs'
+import { join } from 'path'
+import { homedir } from 'os'
 import {
   TaskEngine,
   loadConfigFile,
@@ -13,6 +17,59 @@ import { createTaskcastApp } from '@taskcast/server'
 import { createRedisAdapters } from '@taskcast/redis'
 import { PostgresLongTermStore } from '@taskcast/postgres'
 import { createSqliteAdapters } from '@taskcast/sqlite'
+
+const DEFAULT_CONFIG_YAML = `# Taskcast configuration
+# Docs: https://github.com/weightwave/taskcast
+
+port: 3721
+
+# auth:
+#   mode: none  # none | jwt
+
+# adapters:
+#   broadcast:
+#     provider: memory  # memory | redis
+#     # url: redis://localhost:6379
+#   shortTerm:
+#     provider: memory  # memory | redis
+#     # url: redis://localhost:6379
+#   longTerm:
+#     provider: postgres
+#     # url: postgresql://localhost:5432/taskcast
+`
+
+async function promptCreateGlobalConfig(): Promise<boolean> {
+  if (!process.stdin.isTTY) return false
+
+  const globalConfigPath = join(homedir(), '.taskcast', 'taskcast.config.yaml')
+
+  return new Promise((resolve) => {
+    const rl = createInterface({ input: process.stdin, output: process.stdout })
+    rl.on('close', () => resolve(false))
+    rl.question(
+      `[taskcast] No config file found.\n? Create a default config at ${globalConfigPath}? (Y/n) `,
+      (answer) => {
+        rl.close()
+        const trimmed = answer.trim().toLowerCase()
+        resolve(trimmed === '' || trimmed === 'y' || trimmed === 'yes')
+      },
+    )
+  })
+}
+
+function createDefaultGlobalConfig(): string | null {
+  const globalDir = join(homedir(), '.taskcast')
+  const globalConfigPath = join(globalDir, 'taskcast.config.yaml')
+  try {
+    mkdirSync(globalDir, { recursive: true })
+    writeFileSync(globalConfigPath, DEFAULT_CONFIG_YAML)
+    console.log(`[taskcast] Created default config at ${globalConfigPath}`)
+    return globalConfigPath
+  } catch (err) {
+    console.warn(`[taskcast] Could not create config at ${globalConfigPath}: ${(err as Error).message}`)
+    return null
+  }
+}
 
 const program = new Command()
 
@@ -29,15 +86,26 @@ program
   .option('-s, --storage <type>', 'storage backend: memory | redis | sqlite', 'memory')
   .option('--db-path <path>', 'SQLite database file path (default: ./taskcast.db)')
   .action(async (options: { config?: string; port: string; storage?: string; dbPath?: string }) => {
-    const fileConfig = await loadConfigFile(options.config)
+    let { config: fileConfig, source } = await loadConfigFile(options.config)
+
+    if (source === 'none') {
+      const shouldCreate = await promptCreateGlobalConfig()
+      if (shouldCreate) {
+        const createdPath = createDefaultGlobalConfig()
+        if (createdPath) {
+          const created = await loadConfigFile(createdPath)
+          fileConfig = created.config
+        }
+      }
+    }
 
     const port = Number(options.port ?? fileConfig.port ?? 3721)
     const redisUrl = process.env['TASKCAST_REDIS_URL'] ?? fileConfig.adapters?.broadcast?.url
     const postgresUrl = process.env['TASKCAST_POSTGRES_URL'] ?? fileConfig.adapters?.longTerm?.url
 
-    let shortTerm: ShortTermStore
+    let shortTermStore: ShortTermStore
     let broadcast: BroadcastProvider
-    let longTerm: LongTermStore | undefined
+    let longTermStore: LongTermStore | undefined
 
     const storage = options.storage ?? process.env['TASKCAST_STORAGE'] ?? (redisUrl ? 'redis' : 'memory')
 
@@ -45,8 +113,8 @@ program
       const sqliteOpts = options.dbPath ? { path: options.dbPath } : {}
       const adapters = createSqliteAdapters(sqliteOpts)
       broadcast = new MemoryBroadcastProvider()
-      shortTerm = adapters.shortTerm
-      longTerm = adapters.longTerm
+      shortTermStore = adapters.shortTerm
+      longTermStore = adapters.longTerm
       console.log(`[taskcast] Using SQLite storage at ${options.dbPath ?? './taskcast.db'}`)
     } else if (storage === 'redis' || redisUrl) {
       const pubClient = new Redis(redisUrl!)
@@ -54,20 +122,20 @@ program
       const storeClient = new Redis(redisUrl!)
       const adapters = createRedisAdapters(pubClient, subClient, storeClient)
       broadcast = adapters.broadcast
-      shortTerm = adapters.shortTerm
+      shortTermStore = adapters.shortTermStore
     } else {
       console.warn('[taskcast] No TASKCAST_REDIS_URL configured — using in-memory adapters')
       broadcast = new MemoryBroadcastProvider()
-      shortTerm = new MemoryShortTermStore()
+      shortTermStore = new MemoryShortTermStore()
     }
 
     if (storage !== 'sqlite' && postgresUrl) {
       const sql = postgres(postgresUrl)
-      longTerm = new PostgresLongTermStore(sql)
+      longTermStore = new PostgresLongTermStore(sql)
     }
 
-    const engineOpts: ConstructorParameters<typeof TaskEngine>[0] = { shortTerm, broadcast }
-    if (longTerm !== undefined) engineOpts.longTerm = longTerm
+    const engineOpts: ConstructorParameters<typeof TaskEngine>[0] = { shortTermStore, broadcast }
+    if (longTermStore !== undefined) engineOpts.longTermStore = longTermStore
     const engine = new TaskEngine(engineOpts)
 
     const authMode = (process.env['TASKCAST_AUTH_MODE'] ?? fileConfig.auth?.mode ?? 'none') as 'none' | 'jwt'

@@ -6,7 +6,7 @@ import type { LongTermStore } from '../../src/types.js'
 function makeEngine() {
   const store = new MemoryShortTermStore()
   const broadcast = new MemoryBroadcastProvider()
-  const engine = new TaskEngine({ shortTerm: store, broadcast })
+  const engine = new TaskEngine({ shortTermStore: store, broadcast })
   return { engine, store, broadcast }
 }
 
@@ -55,7 +55,7 @@ describe('TaskEngine.createTask', () => {
     const store = new MemoryShortTermStore()
     const broadcast = new MemoryBroadcastProvider()
     const longTerm = makeLongTermStore()
-    const engine = new TaskEngine({ shortTerm: store, broadcast, longTerm })
+    const engine = new TaskEngine({ shortTermStore: store, broadcast, longTermStore: longTerm })
     const task = await engine.createTask({ type: 'test' })
     expect(longTerm.saveTask).toHaveBeenCalledWith(expect.objectContaining({ id: task.id }))
   })
@@ -64,7 +64,7 @@ describe('TaskEngine.createTask', () => {
     const store = new MemoryShortTermStore()
     const broadcast = new MemoryBroadcastProvider()
     const setTTLSpy = vi.spyOn(store, 'setTTL')
-    const engine = new TaskEngine({ shortTerm: store, broadcast })
+    const engine = new TaskEngine({ shortTermStore: store, broadcast })
     const task = await engine.createTask({ ttl: 300 })
     expect(setTTLSpy).toHaveBeenCalledWith(task.id, 300)
   })
@@ -113,7 +113,7 @@ describe('TaskEngine.transitionTask', () => {
     const store = new MemoryShortTermStore()
     const broadcast = new MemoryBroadcastProvider()
     const longTerm = makeLongTermStore()
-    const engine = new TaskEngine({ shortTerm: store, broadcast, longTerm })
+    const engine = new TaskEngine({ shortTermStore: store, broadcast, longTermStore: longTerm })
     const task = await engine.createTask({})
     vi.mocked(longTerm.saveTask).mockClear()
     await engine.transitionTask(task.id, 'running')
@@ -124,7 +124,7 @@ describe('TaskEngine.transitionTask', () => {
     const onTaskTimeout = vi.fn()
     const store = new MemoryShortTermStore()
     const broadcast = new MemoryBroadcastProvider()
-    const engine = new TaskEngine({ shortTerm: store, broadcast, hooks: { onTaskTimeout } })
+    const engine = new TaskEngine({ shortTermStore: store, broadcast, hooks: { onTaskTimeout } })
     const task = await engine.createTask({})
     await engine.transitionTask(task.id, 'running')
     await engine.transitionTask(task.id, 'timeout')
@@ -135,7 +135,7 @@ describe('TaskEngine.transitionTask', () => {
     const onTaskFailed = vi.fn()
     const store = new MemoryShortTermStore()
     const broadcast = new MemoryBroadcastProvider()
-    const engine = new TaskEngine({ shortTerm: store, broadcast, hooks: { onTaskFailed } })
+    const engine = new TaskEngine({ shortTermStore: store, broadcast, hooks: { onTaskFailed } })
     const task = await engine.createTask({})
     await engine.transitionTask(task.id, 'running')
     const error = { message: 'something went wrong', code: 'ERR_TEST' }
@@ -150,7 +150,7 @@ describe('TaskEngine.transitionTask', () => {
     const onTaskFailed = vi.fn()
     const store = new MemoryShortTermStore()
     const broadcast = new MemoryBroadcastProvider()
-    const engine = new TaskEngine({ shortTerm: store, broadcast, hooks: { onTaskFailed } })
+    const engine = new TaskEngine({ shortTermStore: store, broadcast, hooks: { onTaskFailed } })
     const task = await engine.createTask({})
     await engine.transitionTask(task.id, 'running')
     await engine.transitionTask(task.id, 'failed')
@@ -238,7 +238,7 @@ describe('TaskEngine.publishEvent', () => {
     const store = new MemoryShortTermStore()
     const broadcast = new MemoryBroadcastProvider()
     const longTerm = makeLongTermStore()
-    const engine = new TaskEngine({ shortTerm: store, broadcast, longTerm })
+    const engine = new TaskEngine({ shortTermStore: store, broadcast, longTermStore: longTerm })
     const task = await engine.createTask({})
     await engine.transitionTask(task.id, 'running')
     await engine.publishEvent(task.id, { type: 'llm.delta', level: 'info', data: { text: 'hi' } })
@@ -255,7 +255,7 @@ describe('TaskEngine.publishEvent', () => {
     const longTerm = makeLongTermStore({
       saveEvent: vi.fn().mockRejectedValue(new Error('storage unavailable')),
     })
-    const engine = new TaskEngine({ shortTerm: store, broadcast, longTerm, hooks: { onEventDropped } })
+    const engine = new TaskEngine({ shortTermStore: store, broadcast, longTermStore: longTerm, hooks: { onEventDropped } })
     const task = await engine.createTask({})
     await engine.transitionTask(task.id, 'running')
     await engine.publishEvent(task.id, { type: 'llm.delta', level: 'info', data: null })
@@ -292,7 +292,7 @@ describe('TaskEngine.getTask', () => {
     const longTerm = makeLongTermStore({
       getTask: vi.fn().mockResolvedValue(fallbackTask),
     })
-    const engine = new TaskEngine({ shortTerm: store, broadcast, longTerm })
+    const engine = new TaskEngine({ shortTermStore: store, broadcast, longTermStore: longTerm })
     const found = await engine.getTask('archived-task')
     expect(found).toEqual(fallbackTask)
     expect(longTerm.getTask).toHaveBeenCalledWith('archived-task')
@@ -322,5 +322,29 @@ describe('TaskEngine.subscribe', () => {
     await engine.publishEvent(task.id, { type: 'live.event', level: 'info', data: null })
     expect(received).toContain('live.event')
     unsub()
+  })
+})
+
+describe('TaskEngine constructor validation', () => {
+  it('throws when both shortTerm and shortTermStore are provided', () => {
+    const store = new MemoryShortTermStore()
+    const broadcast = new MemoryBroadcastProvider()
+    expect(() => new TaskEngine({
+      shortTerm: store,
+      shortTermStore: store,
+      broadcast,
+    } as any)).toThrow('Cannot specify both shortTermStore and shortTerm')
+  })
+
+  it('throws when both longTerm and longTermStore are provided', () => {
+    const store = new MemoryShortTermStore()
+    const broadcast = new MemoryBroadcastProvider()
+    const longTerm = makeLongTermStore()
+    expect(() => new TaskEngine({
+      shortTermStore: store,
+      longTerm,
+      longTermStore: longTerm,
+      broadcast,
+    } as any)).toThrow('Cannot specify both longTermStore and longTerm')
   })
 })

@@ -9,7 +9,7 @@ use redis::aio::MultiplexedConnection;
 /// Adapters returned by [`create_redis_adapters`].
 pub struct RedisAdapters {
     pub broadcast: RedisBroadcastProvider,
-    pub short_term: RedisShortTermStore,
+    pub short_term_store: RedisShortTermStore,
 }
 
 /// Convenience factory that builds both a [`RedisBroadcastProvider`] and a
@@ -27,6 +27,6 @@ pub fn create_redis_adapters(
 ) -> RedisAdapters {
     RedisAdapters {
         broadcast: RedisBroadcastProvider::new(pub_conn, sub_conn, prefix),
-        short_term: RedisShortTermStore::new(store_conn, prefix),
+        short_term_store: RedisShortTermStore::new(store_conn, prefix),
     }
 }

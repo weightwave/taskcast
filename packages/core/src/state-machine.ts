@@ -7,9 +7,16 @@ export const TERMINAL_STATUSES: readonly TaskStatus[] = [
   'cancelled',
 ] as const
 
+export const SUSPENDED_STATUSES: readonly TaskStatus[] = [
+  'paused',
+  'blocked',
+] as const
+
 const ALLOWED_TRANSITIONS: Record<TaskStatus, TaskStatus[]> = {
   pending: ['running', 'cancelled'],
-  running: ['completed', 'failed', 'timeout', 'cancelled'],
+  running: ['paused', 'blocked', 'completed', 'failed', 'timeout', 'cancelled'],
+  paused: ['running', 'blocked', 'cancelled'],
+  blocked: ['running', 'paused', 'cancelled', 'failed'],
   completed: [],
   failed: [],
   timeout: [],
@@ -31,4 +38,8 @@ export function applyTransition(from: TaskStatus, to: TaskStatus): TaskStatus {
 
 export function isTerminal(status: TaskStatus): boolean {
   return TERMINAL_STATUSES.includes(status)
+}
+
+export function isSuspended(status: TaskStatus): boolean {
+  return SUSPENDED_STATUSES.includes(status)
 }

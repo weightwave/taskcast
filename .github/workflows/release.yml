@@ -271,3 +271,36 @@ jobs:
           tag_name: "v${{ env.VERSION }}"
           files: /tmp/binaries/*
           fail_on_unmatched_files: true
+
+  # ── Update Homebrew tap ────────────────────────────────────────────────────
+  update-homebrew:
+    needs: [get-version, rust-build]
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.get-version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          path: /tmp/binaries
+          merge-multiple: true
+
+      - name: Clone homebrew-tap
+        run: |
+          git clone https://x-access-token:${{ secrets.HOMEBREW_TAP_TOKEN }}@github.com/weightwave/homebrew-tap.git /tmp/homebrew-tap
+
+      - name: Update formula
+        run: bash scripts/update-homebrew.sh "$VERSION" /tmp/binaries /tmp/homebrew-tap
+
+      - name: Push to homebrew-tap
+        working-directory: /tmp/homebrew-tap
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/taskcast.rb
+          git commit -m "taskcast $VERSION"
+          git push
