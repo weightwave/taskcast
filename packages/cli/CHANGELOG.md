@@ -1,5 +1,22 @@
 # @taskcast/cli
 
+## 0.2.0
+
+### Minor Changes
+
+- ca5ec96: Add SQLite local storage adapter for zero-dependency development. Use `taskcast start --storage sqlite` to persist data locally without Redis or PostgreSQL.
+
+### Patch Changes
+
+- d4a391c: Unified release workflow: npm publish, Rust binary builds (5 platforms), and Docker image push now share a single version number and run in one workflow.
+- Updated dependencies [ca5ec96]
+- Updated dependencies [d4a391c]
+  - @taskcast/sqlite@0.2.0
+  - @taskcast/core@0.2.0
+  - @taskcast/server@0.2.0
+  - @taskcast/redis@0.2.0
+  - @taskcast/postgres@0.2.0
+
 ## 0.1.2
 
 ### Patch Changes

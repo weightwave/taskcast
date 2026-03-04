@@ -1,5 +1,11 @@
 # @taskcast/core
 
+## 0.2.0
+
+### Patch Changes
+
+- d4a391c: Unified release workflow: npm publish, Rust binary builds (5 platforms), and Docker image push now share a single version number and run in one workflow.
+
 ## 0.1.2
 
 ### Patch Changes
