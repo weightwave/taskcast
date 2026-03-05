@@ -147,48 +147,60 @@ import { TaskEngine, MemoryBroadcastProvider, MemoryShortTermStore } from '@task
 import { createTaskcastApp } from '@taskcast/server'
 import { Hono } from 'hono'
 
+// Create the task engine with in-memory adapters (swap to Redis/SQLite for production)
 const engine = new TaskEngine({
-  broadcast: new MemoryBroadcastProvider(),
-  shortTermStore: new MemoryShortTermStore(),
+  broadcast: new MemoryBroadcastProvider(),   // real-time event fan-out to all SSE subscribers
+  shortTermStore: new MemoryShortTermStore(), // task state + event buffer (sync writes ensure ordering)
 })
 
 const app = new Hono()
+// Mount the Taskcast HTTP routes — provides REST API + SSE endpoints under /taskcast
 app.route('/taskcast', createTaskcastApp({ engine }))
 
 // Your API endpoint — creates and handles tasks directly
 app.post('/api/chat', async (c) => {
   const { prompt } = await c.req.json()
+
+  // Create a task in "pending" status. The client can start subscribing immediately —
+  // SSE will hold the connection and auto-stream once the task transitions to "running".
   const task = await engine.createTask({
-    type: 'llm.chat',
-    params: { prompt },
-    ttl: 600,
+    type: 'llm.chat',       // task type, used for event filtering (supports wildcards like "llm.*")
+    params: { prompt },      // arbitrary params, passed through to consumers
+    ttl: 600,                // auto-timeout after 10 minutes if not completed
   })
 
-  // Process in background — this server IS the worker
+  // Process in background — this server IS the worker.
+  // The client receives the taskId immediately and subscribes via SSE.
   processChat(task.id, prompt)
   return c.json({ taskId: task.id })
 })
 
 async function processChat(taskId: string, prompt: string) {
+  // pending → running: SSE subscribers waiting on this task will start receiving events
   await engine.transitionTask(taskId, 'running')
 
   for await (const chunk of callLLM(prompt)) {
+    // Publish a streaming event. seriesMode: 'accumulate' means the engine merges
+    // all deltas into a single series entry (like ChatCompletion streaming).
+    // Late-joining subscribers see the accumulated result, not individual chunks.
     await engine.publishEvent(taskId, {
       type: 'llm.delta',
       level: 'info',
       data: { delta: chunk },
-      seriesId: 'response',
-      seriesMode: 'accumulate',
+      seriesId: 'response',       // groups events into a named series
+      seriesMode: 'accumulate',   // 'accumulate' | 'latest' | 'keep-all'
     })
   }
 
+  // running → completed: SSE connections receive the completion event and close automatically.
+  // Only one terminal transition is allowed (concurrent-safe).
   await engine.transitionTask(taskId, 'completed', {
     result: { output: 'full response text' },
   })
 }
 ```
 
-The client subscribes to `GET /taskcast/tasks/{taskId}/events` (SSE) to receive streamed results.
+The client subscribes to `GET /taskcast/tasks/{taskId}/events` (SSE) to receive streamed results. If the task is still `pending`, the connection holds and auto-streams when it transitions to `running`. If the task is already `completed`, the client receives the full history replay then closes.
 
 ### Pattern 2: Backend + Worker Separated
 
@@ -201,17 +213,19 @@ import { TaskcastServerClient } from '@taskcast/server-sdk'
 
 const taskcast = new TaskcastServerClient({
   baseUrl: 'http://taskcast-service:3721',
-  token: process.env.TASKCAST_TOKEN,
+  token: process.env.TASKCAST_TOKEN, // JWT with task:create + event:subscribe scopes
 })
 
-// Create a task — a worker will pick it up
+// Create a task — it stays in "pending" until a worker picks it up.
+// assignMode tells the engine how to distribute this task to workers.
 const task = await taskcast.createTask({
   type: 'llm.chat',
   params: { prompt: 'Tell me a story' },
-  assignMode: 'pull', // or 'ws-offer' / 'ws-race'
+  assignMode: 'pull',    // 'pull' = worker long-polls; 'ws-offer' = server pushes to WS worker;
+                         // 'ws-race' = server offers to multiple WS workers, first accept wins
 })
 
-// Return taskId to the client for SSE subscription
+// Return taskId to the client — they subscribe via SSE to receive streaming results
 return { taskId: task.id }
 ```
 
@@ -223,28 +237,31 @@ const WORKER_ID = 'worker-1'
 
 async function workerLoop() {
   while (true) {
-    // Long-poll for a task assignment
+    // Long-poll: the server holds the connection until a matching task is available
+    // or the timeout expires. On match, the task is atomically assigned to this worker
+    // (pending → assigned) so no other worker can claim it.
     const res = await fetch(
       `${TASKCAST_URL}/workers/pull?workerId=${WORKER_ID}&timeout=30000`,
       { headers: { Authorization: `Bearer ${WORKER_TOKEN}` } },
     )
 
-    if (res.status === 204) continue // no task available, retry
+    if (res.status === 204) continue // timeout, no task matched — retry
 
-    const task = await res.json()
+    const task = await res.json() // { id, type, params, ... }
     await processAndComplete(task.id, task.params)
   }
 }
 
 async function processAndComplete(taskId: string, params: Record<string, unknown>) {
-  // Transition to running
+  // assigned → running: tells subscribers that processing has started
   await fetch(`${TASKCAST_URL}/tasks/${taskId}/status`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${WORKER_TOKEN}` },
     body: JSON.stringify({ status: 'running' }),
   })
 
-  // Stream results
+  // Publish streaming events — each event is broadcast to all SSE subscribers in real time.
+  // seriesMode: 'accumulate' merges deltas so late-joiners see the full text so far.
   for await (const chunk of callLLM(params.prompt as string)) {
     await fetch(`${TASKCAST_URL}/tasks/${taskId}/events`, {
       method: 'POST',
@@ -257,7 +274,8 @@ async function processAndComplete(taskId: string, params: Record<string, unknown
     })
   }
 
-  // Complete
+  // running → completed: SSE subscribers receive the terminal event and disconnect.
+  // The worker's capacity slot is automatically freed for the next task.
   await fetch(`${TASKCAST_URL}/tasks/${taskId}/status`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${WORKER_TOKEN}` },
@@ -272,11 +290,12 @@ async function processAndComplete(taskId: string, params: Record<string, unknown
 const ws = new WebSocket('ws://taskcast-service:3721/workers/ws')
 
 ws.addEventListener('open', () => {
-  // Register with matching rules and capacity
+  // Register this worker with the server. matchRule filters which tasks
+  // are offered to this worker; capacity limits concurrent assignments.
   ws.send(JSON.stringify({
     type: 'register',
-    matchRule: { types: ['llm.*'] },
-    capacity: 5,
+    matchRule: { types: ['llm.*'] }, // only accept tasks with type matching "llm.*"
+    capacity: 5,                     // max 5 concurrent tasks
   }))
 })
 
@@ -284,7 +303,9 @@ ws.addEventListener('message', async (event) => {
   const msg = JSON.parse(event.data)
 
   if (msg.type === 'offer') {
-    // Accept the offered task
+    // Server offers a task to this worker (ws-offer mode: exclusive offer;
+    // ws-race mode: offered to multiple workers, first accept wins).
+    // msg.task contains { id, type, params, tags, cost }.
     ws.send(JSON.stringify({ type: 'accept', taskId: msg.task.id }))
     await processAndComplete(msg.task.id, msg.task.params)
   }
@@ -297,7 +318,7 @@ ws.addEventListener('message', async (event) => {
 import { TaskcastClient } from '@taskcast/client'
 
 const client = new TaskcastClient({
-  baseUrl: 'http://taskcast-service:3721',
+  baseUrl: 'http://taskcast-service:3721', // or behind an API gateway that handles auth
   token: 'user-jwt-token',
 })
 
