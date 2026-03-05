@@ -22,5 +22,5 @@ sha2 = "0.10"
 hex = "0.4"
 
 [dev-dependencies]
-axum-test = "19"
+axum-test = { version = "19", features = ["ws"] }
 tempfile = { workspace = true }

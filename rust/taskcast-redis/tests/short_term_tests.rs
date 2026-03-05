@@ -6,8 +6,9 @@
 //! Run with: `cargo test -p taskcast-redis --test short_term_tests`
 
 use taskcast_core::types::{
-    EventQueryOptions, Level, SeriesMode, ShortTermStore, SinceCursor, Task, TaskError,
-    TaskStatus,
+    AssignMode, ConnectionMode, EventQueryOptions, Level, SeriesMode, ShortTermStore, SinceCursor,
+    Task, TaskError, TaskFilter, TaskStatus, Worker, WorkerAssignment, WorkerAssignmentStatus,
+    WorkerFilter, WorkerMatchRule, WorkerStatus,
 };
 use taskcast_core::TaskEvent;
 use taskcast_redis::RedisShortTermStore;
@@ -788,4 +789,408 @@ async fn preserve_series_id_and_series_mode_on_events() {
         .unwrap();
     assert_eq!(latest.series_id, Some("progress-stream".to_string()));
     assert_eq!(latest.series_mode, Some(SeriesMode::Accumulate));
+}
+
+// ── Worker Helpers ──────────────────────────────────────────────────────────
+
+fn make_worker(id: &str) -> Worker {
+    Worker {
+        id: id.to_string(),
+        status: WorkerStatus::Idle,
+        match_rule: WorkerMatchRule::default(),
+        capacity: 5,
+        used_slots: 0,
+        weight: 50,
+        connection_mode: ConnectionMode::Pull,
+        connected_at: 1000.0,
+        last_heartbeat_at: 1000.0,
+        metadata: None,
+    }
+}
+
+fn make_assignment(task_id: &str, worker_id: &str) -> WorkerAssignment {
+    WorkerAssignment {
+        task_id: task_id.to_string(),
+        worker_id: worker_id.to_string(),
+        cost: 1,
+        status: WorkerAssignmentStatus::Assigned,
+        assigned_at: 1000.0,
+    }
+}
+
+// ── Worker CRUD Tests ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn save_and_retrieve_worker() {
+    let (_container, redis_url) = start_redis().await;
+    flush_redis(&redis_url).await;
+    let store = make_store(&redis_url).await;
+
+    let worker = make_worker("w-1");
+    store.save_worker(worker.clone()).await.unwrap();
+
+    let retrieved = store.get_worker("w-1").await.unwrap();
+    assert!(retrieved.is_some(), "worker should exist after save");
+    let retrieved = retrieved.unwrap();
+    assert_eq!(retrieved.id, "w-1");
+    assert_eq!(retrieved.status, WorkerStatus::Idle);
+    assert_eq!(retrieved.capacity, 5);
+    assert_eq!(retrieved.used_slots, 0);
+    assert_eq!(retrieved.weight, 50);
+    assert_eq!(retrieved.connection_mode, ConnectionMode::Pull);
+    assert_eq!(retrieved.connected_at, 1000.0);
+    assert_eq!(retrieved.last_heartbeat_at, 1000.0);
+    assert!(retrieved.metadata.is_none());
+}
+
+#[tokio::test]
+async fn get_nonexistent_worker_returns_none() {
+    let (_container, redis_url) = start_redis().await;
+    flush_redis(&redis_url).await;
+    let store = make_store(&redis_url).await;
+
+    let result = store.get_worker("nonexistent").await.unwrap();
+    assert!(result.is_none(), "get_worker for missing ID must return None");
+}
+
+#[tokio::test]
+async fn list_workers_all() {
+    let (_container, redis_url) = start_redis().await;
+    flush_redis(&redis_url).await;
+    let store = make_store(&redis_url).await;
+
+    store.save_worker(make_worker("w-a")).await.unwrap();
+    store.save_worker(make_worker("w-b")).await.unwrap();
+    store.save_worker(make_worker("w-c")).await.unwrap();
+
+    let workers = store.list_workers(None).await.unwrap();
+    assert_eq!(workers.len(), 3, "should return all 3 workers");
+}
+
+#[tokio::test]
+async fn list_workers_filter_by_status() {
+    let (_container, redis_url) = start_redis().await;
+    flush_redis(&redis_url).await;
+    let store = make_store(&redis_url).await;
+
+    let mut w1 = make_worker("w-idle");
+    w1.status = WorkerStatus::Idle;
+    let mut w2 = make_worker("w-busy");
+    w2.status = WorkerStatus::Busy;
+    let mut w3 = make_worker("w-draining");
+    w3.status = WorkerStatus::Draining;
+
+    store.save_worker(w1).await.unwrap();
+    store.save_worker(w2).await.unwrap();
+    store.save_worker(w3).await.unwrap();
+
+    let idle_workers = store
+        .list_workers(Some(WorkerFilter {
+            status: Some(vec![WorkerStatus::Idle]),
+            connection_mode: None,
+        }))
+        .await
+        .unwrap();
+    assert_eq!(idle_workers.len(), 1);
+    assert_eq!(idle_workers[0].id, "w-idle");
+
+    let busy_or_draining = store
+        .list_workers(Some(WorkerFilter {
+            status: Some(vec![WorkerStatus::Busy, WorkerStatus::Draining]),
+            connection_mode: None,
+        }))
+        .await
+        .unwrap();
+    assert_eq!(busy_or_draining.len(), 2);
+}
+
+#[tokio::test]
+async fn list_workers_filter_by_connection_mode() {
+    let (_container, redis_url) = start_redis().await;
+    flush_redis(&redis_url).await;
+    let store = make_store(&redis_url).await;
+
+    let mut w1 = make_worker("w-pull");
+    w1.connection_mode = ConnectionMode::Pull;
+    let mut w2 = make_worker("w-ws");
+    w2.connection_mode = ConnectionMode::Websocket;
+
+    store.save_worker(w1).await.unwrap();
+    store.save_worker(w2).await.unwrap();
+
+    let ws_workers = store
+        .list_workers(Some(WorkerFilter {
+            status: None,
+            connection_mode: Some(vec![ConnectionMode::Websocket]),
+        }))
+        .await
+        .unwrap();
+    assert_eq!(ws_workers.len(), 1);
+    assert_eq!(ws_workers[0].id, "w-ws");
+}
+
+#[tokio::test]
+async fn delete_worker() {
+    let (_container, redis_url) = start_redis().await;
+    flush_redis(&redis_url).await;
+    let store = make_store(&redis_url).await;
+
+    store.save_worker(make_worker("w-del")).await.unwrap();
+    assert!(store.get_worker("w-del").await.unwrap().is_some());
+
+    store.delete_worker("w-del").await.unwrap();
+
+    assert!(
+        store.get_worker("w-del").await.unwrap().is_none(),
+        "worker should be gone after delete"
+    );
+    let workers = store.list_workers(None).await.unwrap();
+    assert!(
+        workers.iter().all(|w| w.id != "w-del"),
+        "deleted worker should not appear in list"
+    );
+}
+
+// ── claim_task Tests ────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn claim_task_succeeds_for_pending_task_with_capacity() {
+    let (_container, redis_url) = start_redis().await;
+    flush_redis(&redis_url).await;
+    let store = make_store(&redis_url).await;
+
+    let task = make_task("t-claim");
+    store.save_task(task).await.unwrap();
+
+    let worker = make_worker("w-claim");
+    store.save_worker(worker).await.unwrap();
+
+    let result = store.claim_task("t-claim", "w-claim", 1).await.unwrap();
+    assert!(result, "claim should succeed for pending task with available capacity");
+
+    // Verify task was updated
+    let task = store.get_task("t-claim").await.unwrap().unwrap();
+    assert_eq!(task.status, TaskStatus::Assigned);
+    assert_eq!(task.assigned_worker, Some("w-claim".to_string()));
+    assert_eq!(task.cost, Some(1));
+
+    // Verify worker used_slots was incremented
+    let worker = store.get_worker("w-claim").await.unwrap().unwrap();
+    assert_eq!(worker.used_slots, 1);
+}
+
+#[tokio::test]
+async fn claim_task_fails_when_worker_has_no_capacity() {
+    let (_container, redis_url) = start_redis().await;
+    flush_redis(&redis_url).await;
+    let store = make_store(&redis_url).await;
+
+    let task = make_task("t-nocap");
+    store.save_task(task).await.unwrap();
+
+    let mut worker = make_worker("w-nocap");
+    worker.capacity = 2;
+    worker.used_slots = 2; // Already full
+    store.save_worker(worker).await.unwrap();
+
+    let result = store.claim_task("t-nocap", "w-nocap", 1).await.unwrap();
+    assert!(!result, "claim should fail when worker has no remaining capacity");
+
+    // Task should remain pending
+    let task = store.get_task("t-nocap").await.unwrap().unwrap();
+    assert_eq!(task.status, TaskStatus::Pending);
+}
+
+#[tokio::test]
+async fn claim_task_fails_for_non_pending_task() {
+    let (_container, redis_url) = start_redis().await;
+    flush_redis(&redis_url).await;
+    let store = make_store(&redis_url).await;
+
+    let mut task = make_task("t-running");
+    task.status = TaskStatus::Running;
+    store.save_task(task).await.unwrap();
+
+    let worker = make_worker("w-run");
+    store.save_worker(worker).await.unwrap();
+
+    let result = store.claim_task("t-running", "w-run", 1).await.unwrap();
+    assert!(!result, "claim should fail for a running (non-pending) task");
+}
+
+// ── Assignment Tests ────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn add_and_get_worker_assignments() {
+    let (_container, redis_url) = start_redis().await;
+    flush_redis(&redis_url).await;
+    let store = make_store(&redis_url).await;
+
+    let a1 = make_assignment("t-a1", "w-1");
+    let a2 = make_assignment("t-a2", "w-1");
+    store.add_assignment(a1.clone()).await.unwrap();
+    store.add_assignment(a2.clone()).await.unwrap();
+
+    let assignments = store.get_worker_assignments("w-1").await.unwrap();
+    assert_eq!(assignments.len(), 2, "worker should have 2 assignments");
+
+    let task_ids: Vec<&str> = assignments.iter().map(|a| a.task_id.as_str()).collect();
+    assert!(task_ids.contains(&"t-a1"));
+    assert!(task_ids.contains(&"t-a2"));
+}
+
+#[tokio::test]
+async fn remove_assignment() {
+    let (_container, redis_url) = start_redis().await;
+    flush_redis(&redis_url).await;
+    let store = make_store(&redis_url).await;
+
+    let assignment = make_assignment("t-rem", "w-rem");
+    store.add_assignment(assignment).await.unwrap();
+
+    // Verify it exists
+    let task_assignment = store.get_task_assignment("t-rem").await.unwrap();
+    assert!(task_assignment.is_some());
+
+    // Remove and verify
+    store.remove_assignment("t-rem").await.unwrap();
+
+    let task_assignment = store.get_task_assignment("t-rem").await.unwrap();
+    assert!(task_assignment.is_none(), "assignment should be gone after remove");
+
+    let worker_assignments = store.get_worker_assignments("w-rem").await.unwrap();
+    assert!(
+        worker_assignments.is_empty(),
+        "worker assignments should be empty after removal"
+    );
+}
+
+#[tokio::test]
+async fn get_task_assignment() {
+    let (_container, redis_url) = start_redis().await;
+    flush_redis(&redis_url).await;
+    let store = make_store(&redis_url).await;
+
+    let assignment = make_assignment("t-ga", "w-ga");
+    store.add_assignment(assignment.clone()).await.unwrap();
+
+    let retrieved = store.get_task_assignment("t-ga").await.unwrap();
+    assert!(retrieved.is_some());
+    let retrieved = retrieved.unwrap();
+    assert_eq!(retrieved.task_id, "t-ga");
+    assert_eq!(retrieved.worker_id, "w-ga");
+    assert_eq!(retrieved.status, WorkerAssignmentStatus::Assigned);
+    assert_eq!(retrieved.assigned_at, 1000.0);
+}
+
+#[tokio::test]
+async fn get_task_assignment_returns_none_for_missing() {
+    let (_container, redis_url) = start_redis().await;
+    flush_redis(&redis_url).await;
+    let store = make_store(&redis_url).await;
+
+    let result = store.get_task_assignment("nonexistent").await.unwrap();
+    assert!(result.is_none(), "get_task_assignment for missing task must return None");
+}
+
+// ── list_tasks Filter Tests ─────────────────────────────────────────────────
+
+#[tokio::test]
+async fn list_tasks_filter_by_status() {
+    let (_container, redis_url) = start_redis().await;
+    flush_redis(&redis_url).await;
+    let store = make_store(&redis_url).await;
+
+    let mut t1 = make_task("t-pending");
+    t1.status = TaskStatus::Pending;
+    let mut t2 = make_task("t-running");
+    t2.status = TaskStatus::Running;
+    let mut t3 = make_task("t-completed");
+    t3.status = TaskStatus::Completed;
+
+    store.save_task(t1).await.unwrap();
+    store.save_task(t2).await.unwrap();
+    store.save_task(t3).await.unwrap();
+
+    let tasks = store
+        .list_tasks(TaskFilter {
+            status: Some(vec![TaskStatus::Running]),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].id, "t-running");
+}
+
+#[tokio::test]
+async fn list_tasks_filter_by_assign_mode() {
+    let (_container, redis_url) = start_redis().await;
+    flush_redis(&redis_url).await;
+    let store = make_store(&redis_url).await;
+
+    let mut t1 = make_task("t-pull");
+    t1.assign_mode = Some(AssignMode::Pull);
+    let mut t2 = make_task("t-ws");
+    t2.assign_mode = Some(AssignMode::WsOffer);
+    let t3 = make_task("t-none");
+    // no assign_mode
+
+    store.save_task(t1).await.unwrap();
+    store.save_task(t2).await.unwrap();
+    store.save_task(t3).await.unwrap();
+
+    let tasks = store
+        .list_tasks(TaskFilter {
+            assign_mode: Some(vec![AssignMode::Pull]),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].id, "t-pull");
+}
+
+#[tokio::test]
+async fn list_tasks_with_limit() {
+    let (_container, redis_url) = start_redis().await;
+    flush_redis(&redis_url).await;
+    let store = make_store(&redis_url).await;
+
+    for i in 0..5 {
+        store
+            .save_task(make_task(&format!("t-lim-{}", i)))
+            .await
+            .unwrap();
+    }
+
+    let tasks = store
+        .list_tasks(TaskFilter {
+            limit: Some(2),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(tasks.len(), 2, "limit=2 should return only 2 tasks");
+}
+
+#[tokio::test]
+async fn list_tasks_with_exclude_task_ids() {
+    let (_container, redis_url) = start_redis().await;
+    flush_redis(&redis_url).await;
+    let store = make_store(&redis_url).await;
+
+    store.save_task(make_task("t-ex-1")).await.unwrap();
+    store.save_task(make_task("t-ex-2")).await.unwrap();
+    store.save_task(make_task("t-ex-3")).await.unwrap();
+
+    let tasks = store
+        .list_tasks(TaskFilter {
+            exclude_task_ids: Some(vec!["t-ex-1".to_string(), "t-ex-3".to_string()]),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].id, "t-ex-2");
 }
