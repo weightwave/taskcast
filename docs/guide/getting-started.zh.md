@@ -6,13 +6,28 @@
 
 ### 方式一：独立服务器（推荐快速体验）
 
-无需安装，直接用 npx 启动：
+**Node.js (npx) —— 无需安装：**
 
 ```bash
 npx @taskcast/cli
 ```
 
-服务默认运行在 `http://localhost:3721`。
+**原生 Rust 二进制 —— 极致性能，零 Node.js 依赖：**
+
+```bash
+# Homebrew（macOS / Linux）
+brew tap weightwave/tap
+brew install taskcast
+taskcast-rs
+
+# 或从 GitHub Releases 下载预编译二进制
+# https://github.com/weightwave/taskcast/releases
+
+# 或通过 Docker 运行
+docker run -p 3721:3721 mwr1998/taskcast-rs
+```
+
+两个版本行为完全一致。服务默认运行在 `http://localhost:3721`。
 
 ### 方式二：嵌入到你的项目
 
@@ -125,36 +140,44 @@ curl -X PATCH http://localhost:3721/tasks/{taskId}/status \
 
 订阅连接会收到完成事件后自动关闭。
 
-## 在代码中使用
+## 使用示例
 
-### 嵌入模式（推荐用于生产）
+### 模式一：后端 + Worker 一体（自管理）
+
+后端直接创建任务、处理任务并推送流式结果 —— 全部在同一个进程内完成，无需独立 Worker。适合 API 服务自身承担计算的简单部署场景。
 
 ```typescript
 import { TaskEngine, MemoryBroadcastProvider, MemoryShortTermStore } from '@taskcast/core'
 import { createTaskcastApp } from '@taskcast/server'
+import { Hono } from 'hono'
 
-// 创建引擎
 const engine = new TaskEngine({
   broadcast: new MemoryBroadcastProvider(),
   shortTermStore: new MemoryShortTermStore(),
 })
 
-// 创建 HTTP 应用
-const app = createTaskcastApp({ engine })
+const app = new Hono()
+app.route('/taskcast', createTaskcastApp({ engine }))
 
-// 在你的 LLM 调用中使用
-async function handleChat(prompt: string) {
+// 你的 API 端点 —— 直接创建并处理任务
+app.post('/api/chat', async (c) => {
+  const { prompt } = await c.req.json()
   const task = await engine.createTask({
     type: 'llm.chat',
     params: { prompt },
     ttl: 600, // 10 分钟超时
   })
 
-  await engine.transitionTask(task.id, 'running')
+  // 后台处理 —— 这个服务本身就是 Worker
+  processChat(task.id, prompt)
+  return c.json({ taskId: task.id })
+})
 
-  // 模拟流式输出
-  for (const chunk of ['Hello, ', 'world!']) {
-    await engine.publishEvent(task.id, {
+async function processChat(taskId: string, prompt: string) {
+  await engine.transitionTask(taskId, 'running')
+
+  for await (const chunk of callLLM(prompt)) {
+    await engine.publishEvent(taskId, {
       type: 'llm.delta',
       level: 'info',
       data: { delta: chunk },
@@ -163,15 +186,123 @@ async function handleChat(prompt: string) {
     })
   }
 
-  await engine.transitionTask(task.id, 'completed', {
-    result: { output: 'Hello, world!' },
+  await engine.transitionTask(taskId, 'completed', {
+    result: { output: '完整响应文本' },
   })
-
-  return task.id
 }
 ```
 
-### 浏览器端订阅
+客户端通过 `GET /taskcast/tasks/{taskId}/events`（SSE）订阅流式结果。
+
+### 模式二：后端 + Worker 分离
+
+后端通过 HTTP SDK 创建任务，独立的 Worker 进程连接到 Taskcast 服务领取并处理任务。适合需要独立扩缩 Worker 的场景。
+
+**步骤 1 —— 启动独立的 Taskcast 服务：**
+
+```bash
+npx @taskcast/cli
+# 或：taskcast-rs
+```
+
+**步骤 2 —— 后端创建任务（任务生产者）：**
+
+```typescript
+import { TaskcastServerClient } from '@taskcast/server-sdk'
+
+const taskcast = new TaskcastServerClient({
+  baseUrl: 'http://taskcast-service:3721',
+  token: process.env.TASKCAST_TOKEN,
+})
+
+// 创建任务 —— 由 Worker 领取
+const task = await taskcast.createTask({
+  type: 'llm.chat',
+  params: { prompt: '给我讲个故事' },
+  assignMode: 'pull', // 或 'ws-offer' / 'ws-race'
+})
+
+// 将 taskId 返回给客户端，用于 SSE 订阅
+return { taskId: task.id }
+```
+
+**步骤 3a —— Worker 长轮询领取任务：**
+
+```typescript
+const TASKCAST_URL = 'http://taskcast-service:3721'
+const WORKER_ID = 'worker-1'
+
+async function workerLoop() {
+  while (true) {
+    // 长轮询等待任务分配
+    const res = await fetch(
+      `${TASKCAST_URL}/workers/pull?workerId=${WORKER_ID}&timeout=30000`,
+      { headers: { Authorization: `Bearer ${WORKER_TOKEN}` } },
+    )
+
+    if (res.status === 204) continue // 无可用任务，重试
+
+    const task = await res.json()
+    await processAndComplete(task.id, task.params)
+  }
+}
+
+async function processAndComplete(taskId: string, params: Record<string, unknown>) {
+  // 转换为运行状态
+  await fetch(`${TASKCAST_URL}/tasks/${taskId}/status`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${WORKER_TOKEN}` },
+    body: JSON.stringify({ status: 'running' }),
+  })
+
+  // 推送流式结果
+  for await (const chunk of callLLM(params.prompt as string)) {
+    await fetch(`${TASKCAST_URL}/tasks/${taskId}/events`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${WORKER_TOKEN}` },
+      body: JSON.stringify({
+        type: 'llm.delta', level: 'info',
+        data: { delta: chunk },
+        seriesId: 'response', seriesMode: 'accumulate',
+      }),
+    })
+  }
+
+  // 完成任务
+  await fetch(`${TASKCAST_URL}/tasks/${taskId}/status`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${WORKER_TOKEN}` },
+    body: JSON.stringify({ status: 'completed', result: { output: '完整文本' } }),
+  })
+}
+```
+
+**步骤 3b —— 或使用 WebSocket Worker：**
+
+```typescript
+const ws = new WebSocket('ws://taskcast-service:3721/workers/ws')
+
+ws.addEventListener('open', () => {
+  // 注册 Worker，设置匹配规则和并发容量
+  ws.send(JSON.stringify({
+    type: 'register',
+    matchRule: { types: ['llm.*'] },
+    capacity: 5,
+  }))
+})
+
+ws.addEventListener('message', async (event) => {
+  const msg = JSON.parse(event.data)
+
+  if (msg.type === 'offer') {
+    // 接受分配的任务
+    ws.send(JSON.stringify({ type: 'accept', taskId: msg.task.id }))
+    await processAndComplete(msg.task.id, msg.task.params)
+  }
+})
+```
+
+**步骤 4 —— 客户端订阅（浏览器）：**
 
 ```bash
 pnpm add @taskcast/client
@@ -181,23 +312,17 @@ pnpm add @taskcast/client
 import { TaskcastClient } from '@taskcast/client'
 
 const client = new TaskcastClient({
-  baseUrl: 'http://localhost:3721',
+  baseUrl: 'http://taskcast-service:3721',
+  token: 'user-jwt-token',
 })
 
-await client.subscribe('task-id', {
-  filter: {
-    types: ['llm.*'],
-    since: { index: 0 },
-  },
+await client.subscribe(taskId, {
+  filter: { types: ['llm.*'] },
   onEvent: (envelope) => {
-    // 每收到一个事件都会调用
     document.getElementById('output')!.textContent += envelope.data.delta
   },
   onDone: (reason) => {
-    console.log('任务完成:', reason)
-  },
-  onError: (err) => {
-    console.error('订阅错误:', err)
+    console.log('任务完成：', reason)
   },
 })
 ```
@@ -217,14 +342,14 @@ function ChatStream({ taskId }: { taskId: string }) {
     filter: { types: ['llm.*'] },
   })
 
-  if (error) return <div>错误: {error.message}</div>
+  if (error) return <div>错误：{error.message}</div>
 
   return (
     <div>
       {events.map((e) => (
         <span key={e.eventId}>{e.data.delta}</span>
       ))}
-      {isDone && <p>已完成: {doneReason}</p>}
+      {isDone && <p>已完成：{doneReason}</p>}
     </div>
   )
 }

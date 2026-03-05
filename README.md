@@ -87,14 +87,33 @@ Your Server → @taskcast/server-sdk (REST) → taskcast service ← @taskcast/c
 
 ### Standalone Server
 
+**Node.js (npx):**
+
 ```bash
 npx @taskcast/cli
+```
+
+**Native Rust binary:**
+
+```bash
+# Homebrew (macOS / Linux)
+brew tap weightwave/tap
+brew install taskcast
+taskcast-rs
+
+# Or download a pre-built binary from GitHub Releases
+# https://github.com/weightwave/taskcast/releases
+
+# Or run via Docker
+docker run -p 3721:3721 mwr1998/taskcast-rs
 ```
 
 The server starts on port `3721` by default. Configure with a config file or environment variables:
 
 ```bash
 npx @taskcast/cli -p 8080 -c taskcast.config.yaml
+# or
+taskcast-rs -p 8080 -c taskcast.config.yaml
 ```
 
 ### Embedded Mode
@@ -119,79 +138,178 @@ export default app
 
 ## Usage Examples
 
-### Create & Track a Task (Server-Side)
+### Pattern 1: Backend + Worker Integrated (Self-Managed)
+
+The backend creates tasks, processes them directly, and streams results — all within the same process. No separate worker needed.
 
 ```typescript
-// Create a task
-const task = await engine.createTask({
+import { TaskEngine, MemoryBroadcastProvider, MemoryShortTermStore } from '@taskcast/core'
+import { createTaskcastApp } from '@taskcast/server'
+import { Hono } from 'hono'
+
+const engine = new TaskEngine({
+  broadcast: new MemoryBroadcastProvider(),
+  shortTermStore: new MemoryShortTermStore(),
+})
+
+const app = new Hono()
+app.route('/taskcast', createTaskcastApp({ engine }))
+
+// Your API endpoint — creates and handles tasks directly
+app.post('/api/chat', async (c) => {
+  const { prompt } = await c.req.json()
+  const task = await engine.createTask({
+    type: 'llm.chat',
+    params: { prompt },
+    ttl: 600,
+  })
+
+  // Process in background — this server IS the worker
+  processChat(task.id, prompt)
+  return c.json({ taskId: task.id })
+})
+
+async function processChat(taskId: string, prompt: string) {
+  await engine.transitionTask(taskId, 'running')
+
+  for await (const chunk of callLLM(prompt)) {
+    await engine.publishEvent(taskId, {
+      type: 'llm.delta',
+      level: 'info',
+      data: { delta: chunk },
+      seriesId: 'response',
+      seriesMode: 'accumulate',
+    })
+  }
+
+  await engine.transitionTask(taskId, 'completed', {
+    result: { output: 'full response text' },
+  })
+}
+```
+
+The client subscribes to `GET /taskcast/tasks/{taskId}/events` (SSE) to receive streamed results.
+
+### Pattern 2: Backend + Worker Separated
+
+The backend creates tasks via the HTTP SDK. Independent worker processes connect to the Taskcast service and pick up tasks for processing.
+
+**Backend (task producer):**
+
+```typescript
+import { TaskcastServerClient } from '@taskcast/server-sdk'
+
+const taskcast = new TaskcastServerClient({
+  baseUrl: 'http://taskcast-service:3721',
+  token: process.env.TASKCAST_TOKEN,
+})
+
+// Create a task — a worker will pick it up
+const task = await taskcast.createTask({
   type: 'llm.chat',
   params: { prompt: 'Tell me a story' },
-  ttl: 3600,
+  assignMode: 'pull', // or 'ws-offer' / 'ws-race'
 })
 
-// Transition to running
-await engine.transitionTask(task.id, 'running')
+// Return taskId to the client for SSE subscription
+return { taskId: task.id }
+```
 
-// Publish streaming events
-await engine.publishEvent(task.id, {
-  type: 'llm.delta',
-  level: 'info',
-  data: { delta: 'Once upon a time...' },
-  seriesId: 'response',
-  seriesMode: 'accumulate',
+**Worker — Pull mode (long-polling):**
+
+```typescript
+const TASKCAST_URL = 'http://taskcast-service:3721'
+const WORKER_ID = 'worker-1'
+
+async function workerLoop() {
+  while (true) {
+    // Long-poll for a task assignment
+    const res = await fetch(
+      `${TASKCAST_URL}/workers/pull?workerId=${WORKER_ID}&timeout=30000`,
+      { headers: { Authorization: `Bearer ${WORKER_TOKEN}` } },
+    )
+
+    if (res.status === 204) continue // no task available, retry
+
+    const task = await res.json()
+    await processAndComplete(task.id, task.params)
+  }
+}
+
+async function processAndComplete(taskId: string, params: Record<string, unknown>) {
+  // Transition to running
+  await fetch(`${TASKCAST_URL}/tasks/${taskId}/status`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${WORKER_TOKEN}` },
+    body: JSON.stringify({ status: 'running' }),
+  })
+
+  // Stream results
+  for await (const chunk of callLLM(params.prompt as string)) {
+    await fetch(`${TASKCAST_URL}/tasks/${taskId}/events`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${WORKER_TOKEN}` },
+      body: JSON.stringify({
+        type: 'llm.delta', level: 'info',
+        data: { delta: chunk },
+        seriesId: 'response', seriesMode: 'accumulate',
+      }),
+    })
+  }
+
+  // Complete
+  await fetch(`${TASKCAST_URL}/tasks/${taskId}/status`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${WORKER_TOKEN}` },
+    body: JSON.stringify({ status: 'completed', result: { output: 'full text' } }),
+  })
+}
+```
+
+**Worker — WebSocket mode:**
+
+```typescript
+const ws = new WebSocket('ws://taskcast-service:3721/workers/ws')
+
+ws.addEventListener('open', () => {
+  // Register with matching rules and capacity
+  ws.send(JSON.stringify({
+    type: 'register',
+    matchRule: { types: ['llm.*'] },
+    capacity: 5,
+  }))
 })
 
-// Complete the task
-await engine.transitionTask(task.id, 'completed', {
-  result: { output: 'Once upon a time... The End.' },
+ws.addEventListener('message', async (event) => {
+  const msg = JSON.parse(event.data)
+
+  if (msg.type === 'offer') {
+    // Accept the offered task
+    ws.send(JSON.stringify({ type: 'accept', taskId: msg.task.id }))
+    await processAndComplete(msg.task.id, msg.task.params)
+  }
 })
 ```
 
-### Subscribe from Browser
+**Client (browser):**
 
 ```typescript
 import { TaskcastClient } from '@taskcast/client'
 
 const client = new TaskcastClient({
-  baseUrl: 'http://localhost:3721',
-  token: 'your-jwt-token', // optional
+  baseUrl: 'http://taskcast-service:3721',
+  token: 'user-jwt-token',
 })
 
 await client.subscribe(taskId, {
-  filter: {
-    types: ['llm.*'],
-    since: { index: 0 },
-  },
+  filter: { types: ['llm.*'] },
   onEvent: (envelope) => {
-    console.log(envelope.data) // { text: "Once upon a time..." }
+    console.log(envelope.data.delta) // streamed chunks
   },
   onDone: (reason) => {
-    console.log(`Task ${reason}`) // "Task completed"
+    console.log('Task completed:', reason)
   },
 })
-```
-
-### React Integration
-
-```typescript
-import { useTaskEvents } from '@taskcast/react'
-
-function TaskStream({ taskId }: { taskId: string }) {
-  const { events, isDone, doneReason, error } = useTaskEvents(taskId, {
-    baseUrl: 'http://localhost:3721',
-    filter: { types: ['llm.*'] },
-  })
-
-  return (
-    <div>
-      {events.map((e) => (
-        <span key={e.eventId}>{e.data.text}</span>
-      ))}
-      {isDone && <p>Done: {doneReason}</p>}
-      {error && <p>Error: {error.message}</p>}
-    </div>
-  )
-}
 ```
 
 ## Packages

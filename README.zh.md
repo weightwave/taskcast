@@ -87,14 +87,33 @@ graph TB
 
 ### 独立服务器
 
+**Node.js (npx)：**
+
 ```bash
 npx @taskcast/cli
+```
+
+**原生 Rust 二进制：**
+
+```bash
+# Homebrew（macOS / Linux）
+brew tap weightwave/tap
+brew install taskcast
+taskcast-rs
+
+# 或从 GitHub Releases 下载预编译二进制
+# https://github.com/weightwave/taskcast/releases
+
+# 或通过 Docker 运行
+docker run -p 3721:3721 mwr1998/taskcast-rs
 ```
 
 默认在 `3721` 端口启动。通过配置文件或环境变量进行配置：
 
 ```bash
 npx @taskcast/cli -p 8080 -c taskcast.config.yaml
+# 或
+taskcast-rs -p 8080 -c taskcast.config.yaml
 ```
 
 ### 嵌入模式
@@ -119,79 +138,178 @@ export default app
 
 ## 使用示例
 
-### 创建和追踪任务（服务端）
+### 模式一：后端 + Worker 一体（自管理）
+
+后端直接创建任务、处理任务并推送流式结果 —— 全部在同一个进程内完成，无需独立 Worker。
 
 ```typescript
-// 创建任务
-const task = await engine.createTask({
+import { TaskEngine, MemoryBroadcastProvider, MemoryShortTermStore } from '@taskcast/core'
+import { createTaskcastApp } from '@taskcast/server'
+import { Hono } from 'hono'
+
+const engine = new TaskEngine({
+  broadcast: new MemoryBroadcastProvider(),
+  shortTermStore: new MemoryShortTermStore(),
+})
+
+const app = new Hono()
+app.route('/taskcast', createTaskcastApp({ engine }))
+
+// 你的 API 端点 —— 直接创建并处理任务
+app.post('/api/chat', async (c) => {
+  const { prompt } = await c.req.json()
+  const task = await engine.createTask({
+    type: 'llm.chat',
+    params: { prompt },
+    ttl: 600,
+  })
+
+  // 后台处理 —— 这个服务本身就是 Worker
+  processChat(task.id, prompt)
+  return c.json({ taskId: task.id })
+})
+
+async function processChat(taskId: string, prompt: string) {
+  await engine.transitionTask(taskId, 'running')
+
+  for await (const chunk of callLLM(prompt)) {
+    await engine.publishEvent(taskId, {
+      type: 'llm.delta',
+      level: 'info',
+      data: { delta: chunk },
+      seriesId: 'response',
+      seriesMode: 'accumulate',
+    })
+  }
+
+  await engine.transitionTask(taskId, 'completed', {
+    result: { output: '完整响应文本' },
+  })
+}
+```
+
+客户端通过 `GET /taskcast/tasks/{taskId}/events`（SSE）订阅流式结果。
+
+### 模式二：后端 + Worker 分离
+
+后端通过 HTTP SDK 创建任务，独立的 Worker 进程连接到 Taskcast 服务领取并处理任务。
+
+**后端（任务生产者）：**
+
+```typescript
+import { TaskcastServerClient } from '@taskcast/server-sdk'
+
+const taskcast = new TaskcastServerClient({
+  baseUrl: 'http://taskcast-service:3721',
+  token: process.env.TASKCAST_TOKEN,
+})
+
+// 创建任务 —— 由 Worker 领取
+const task = await taskcast.createTask({
   type: 'llm.chat',
   params: { prompt: '给我讲个故事' },
-  ttl: 3600,
+  assignMode: 'pull', // 或 'ws-offer' / 'ws-race'
 })
 
-// 转换到运行状态
-await engine.transitionTask(task.id, 'running')
+// 将 taskId 返回给客户端，用于 SSE 订阅
+return { taskId: task.id }
+```
 
-// 发布流式事件
-await engine.publishEvent(task.id, {
-  type: 'llm.delta',
-  level: 'info',
-  data: { delta: '从前有座山...' },
-  seriesId: 'response',
-  seriesMode: 'accumulate',
+**Worker —— Pull 模式（长轮询）：**
+
+```typescript
+const TASKCAST_URL = 'http://taskcast-service:3721'
+const WORKER_ID = 'worker-1'
+
+async function workerLoop() {
+  while (true) {
+    // 长轮询等待任务分配
+    const res = await fetch(
+      `${TASKCAST_URL}/workers/pull?workerId=${WORKER_ID}&timeout=30000`,
+      { headers: { Authorization: `Bearer ${WORKER_TOKEN}` } },
+    )
+
+    if (res.status === 204) continue // 无可用任务，重试
+
+    const task = await res.json()
+    await processAndComplete(task.id, task.params)
+  }
+}
+
+async function processAndComplete(taskId: string, params: Record<string, unknown>) {
+  // 转换为运行状态
+  await fetch(`${TASKCAST_URL}/tasks/${taskId}/status`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${WORKER_TOKEN}` },
+    body: JSON.stringify({ status: 'running' }),
+  })
+
+  // 推送流式结果
+  for await (const chunk of callLLM(params.prompt as string)) {
+    await fetch(`${TASKCAST_URL}/tasks/${taskId}/events`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${WORKER_TOKEN}` },
+      body: JSON.stringify({
+        type: 'llm.delta', level: 'info',
+        data: { delta: chunk },
+        seriesId: 'response', seriesMode: 'accumulate',
+      }),
+    })
+  }
+
+  // 完成任务
+  await fetch(`${TASKCAST_URL}/tasks/${taskId}/status`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${WORKER_TOKEN}` },
+    body: JSON.stringify({ status: 'completed', result: { output: '完整文本' } }),
+  })
+}
+```
+
+**Worker —— WebSocket 模式：**
+
+```typescript
+const ws = new WebSocket('ws://taskcast-service:3721/workers/ws')
+
+ws.addEventListener('open', () => {
+  // 注册 Worker，设置匹配规则和并发容量
+  ws.send(JSON.stringify({
+    type: 'register',
+    matchRule: { types: ['llm.*'] },
+    capacity: 5,
+  }))
 })
 
-// 完成任务
-await engine.transitionTask(task.id, 'completed', {
-  result: { output: '从前有座山... 完。' },
+ws.addEventListener('message', async (event) => {
+  const msg = JSON.parse(event.data)
+
+  if (msg.type === 'offer') {
+    // 接受分配的任务
+    ws.send(JSON.stringify({ type: 'accept', taskId: msg.task.id }))
+    await processAndComplete(msg.task.id, msg.task.params)
+  }
 })
 ```
 
-### 浏览器端订阅
+**客户端（浏览器）：**
 
 ```typescript
 import { TaskcastClient } from '@taskcast/client'
 
 const client = new TaskcastClient({
-  baseUrl: 'http://localhost:3721',
-  token: 'your-jwt-token', // 可选
+  baseUrl: 'http://taskcast-service:3721',
+  token: 'user-jwt-token',
 })
 
 await client.subscribe(taskId, {
-  filter: {
-    types: ['llm.*'],
-    since: { index: 0 },
-  },
+  filter: { types: ['llm.*'] },
   onEvent: (envelope) => {
-    console.log(envelope.data) // { text: "从前有座山..." }
+    console.log(envelope.data.delta) // 流式片段
   },
   onDone: (reason) => {
-    console.log(`任务 ${reason}`) // "任务 completed"
+    console.log('任务完成：', reason)
   },
 })
-```
-
-### React 集成
-
-```typescript
-import { useTaskEvents } from '@taskcast/react'
-
-function TaskStream({ taskId }: { taskId: string }) {
-  const { events, isDone, doneReason, error } = useTaskEvents(taskId, {
-    baseUrl: 'http://localhost:3721',
-    filter: { types: ['llm.*'] },
-  })
-
-  return (
-    <div>
-      {events.map((e) => (
-        <span key={e.eventId}>{e.data.text}</span>
-      ))}
-      {isDone && <p>已完成：{doneReason}</p>}
-      {error && <p>错误：{error.message}</p>}
-    </div>
-  )
-}
 ```
 
 ## 包一览
