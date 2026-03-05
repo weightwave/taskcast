@@ -255,7 +255,7 @@ program
     const { dashboardDistPath } = await import('@taskcast/dashboard-web/dist-path')
     const { Hono } = await import('hono')
     const { serve } = await import('@hono/node-server')
-    const { existsSync, readFileSync } = await import('fs')
+    const { existsSync, readFileSync, statSync } = await import('fs')
     const { join: joinPath, extname } = await import('path')
 
     if (!existsSync(dashboardDistPath)) {
@@ -300,7 +300,8 @@ program
       let filePath = joinPath(dashboardDistPath, safePath)
 
       // Try the exact file first, then fall back to index.html (SPA)
-      if (!existsSync(filePath) || filePath === dashboardDistPath || filePath.endsWith('/')) {
+      const isFile = existsSync(filePath) && statSync(filePath).isFile()
+      if (!isFile) {
         filePath = joinPath(dashboardDistPath, 'index.html')
       }
 
