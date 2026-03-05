@@ -36,6 +36,9 @@ importers:
       '@taskcast/core':
         specifier: workspace:*
         version: link:../core
+      '@taskcast/dashboard-web':
+        specifier: workspace:*
+        version: link:../dashboard-web
       '@taskcast/playground':
         specifier: workspace:*
         version: link:../playground
@@ -54,6 +57,9 @@ importers:
       commander:
         specifier: ^12.1.0
         version: 12.1.0
+      hono:
+        specifier: ^4.6.0
+        version: 4.12.3
       ioredis:
         specifier: ^5.4.0
         version: 5.10.0

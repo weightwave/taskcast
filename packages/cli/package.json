@@ -39,7 +39,9 @@
   "dependencies": {
     "@hono/node-server": "^1.19.9",
     "@hono/zod-openapi": "^0.19.10",
+    "hono": "^4.6.0",
     "@taskcast/core": "workspace:*",
+    "@taskcast/dashboard-web": "workspace:*",
     "@taskcast/playground": "workspace:*",
     "@taskcast/postgres": "workspace:*",
     "@taskcast/redis": "workspace:*",

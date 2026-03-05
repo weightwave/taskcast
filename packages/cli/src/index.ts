@@ -246,6 +246,85 @@ program
   })
 
 program
+  .command('ui')
+  .description('Start the Taskcast Dashboard web UI')
+  .option('-p, --port <port>', 'Dashboard port', '3722')
+  .option('-s, --server <url>', 'Taskcast server URL', 'http://localhost:3721')
+  .option('--admin-token <token>', 'Admin token for auto-connect')
+  .action(async (opts: { port: string; server: string; adminToken?: string }) => {
+    const { dashboardDistPath } = await import('@taskcast/dashboard-web/dist-path')
+    const { Hono } = await import('hono')
+    const { serve } = await import('@hono/node-server')
+    const { existsSync, readFileSync } = await import('fs')
+    const { join: joinPath, extname } = await import('path')
+
+    if (!existsSync(dashboardDistPath)) {
+      console.error(
+        '[taskcast] Dashboard not built. Run: pnpm --filter @taskcast/dashboard-web build',
+      )
+      process.exit(1)
+    }
+
+    const MIME_TYPES: Record<string, string> = {
+      '.html': 'text/html',
+      '.js': 'application/javascript',
+      '.css': 'text/css',
+      '.json': 'application/json',
+      '.png': 'image/png',
+      '.jpg': 'image/jpeg',
+      '.jpeg': 'image/jpeg',
+      '.gif': 'image/gif',
+      '.svg': 'image/svg+xml',
+      '.ico': 'image/x-icon',
+      '.woff': 'font/woff',
+      '.woff2': 'font/woff2',
+      '.ttf': 'font/ttf',
+      '.eot': 'application/vnd.ms-fontobject',
+      '.map': 'application/json',
+    }
+
+    const app = new Hono()
+
+    // Auto-connect config endpoint
+    app.get('/api/config', (c) => {
+      return c.json({
+        baseUrl: opts.server,
+        adminToken: opts.adminToken,
+      })
+    })
+
+    // Serve static dashboard files with SPA fallback
+    app.get('*', (c) => {
+      const urlPath = new URL(c.req.url).pathname
+      const safePath = urlPath.replace(/\.\./g, '')
+      let filePath = joinPath(dashboardDistPath, safePath)
+
+      // Try the exact file first, then fall back to index.html (SPA)
+      if (!existsSync(filePath) || filePath === dashboardDistPath || filePath.endsWith('/')) {
+        filePath = joinPath(dashboardDistPath, 'index.html')
+      }
+
+      if (!existsSync(filePath)) {
+        return c.text('Not Found', 404)
+      }
+
+      const ext = extname(filePath)
+      const contentType = MIME_TYPES[ext] ?? 'application/octet-stream'
+      const body = readFileSync(filePath)
+      return c.body(body, 200, { 'Content-Type': contentType })
+    })
+
+    const port = Number(opts.port)
+    serve({ fetch: app.fetch, port }, () => {
+      console.log(`[taskcast] Dashboard running at http://localhost:${port}`)
+      console.log(`[taskcast] Connected to server: ${opts.server}`)
+      if (opts.adminToken) {
+        console.log(`[taskcast] Admin token provided for auto-connect`)
+      }
+    })
+  })
+
+program
   .command('daemon')
   .description('Start the server as a background service (not yet implemented)')
   .action(() => {

@@ -3,6 +3,12 @@
   "version": "0.3.0",
   "type": "module",
   "private": false,
+  "exports": {
+    "./dist-path": {
+      "types": "./src/dist-path.d.ts",
+      "import": "./src/dist-path.js"
+    }
+  },
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
