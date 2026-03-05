@@ -31,6 +31,8 @@ function formatTime(ts: number): string {
   })
 }
 
+const TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled', 'timeout'])
+
 export function TaskList() {
   const { tasks, updateTask } = useDataStore()
   const baseUrl = useConnectionStore((s) => s.baseUrl)
@@ -44,17 +46,29 @@ export function TaskList() {
 
     intervalRef.current = setInterval(async () => {
       const currentTasks = useDataStore.getState().tasks
-      for (const task of currentTasks) {
-        try {
-          const res = await fetch(`${baseUrl}/tasks/${task.id}`)
+      const token = useConnectionStore.getState().token
+
+      const headers: HeadersInit = {}
+      if (token) {
+        headers['Authorization'] = `Bearer ${token}`
+      }
+
+      const pollableTasks = currentTasks.filter(
+        (task) => !TERMINAL_STATUSES.has(task.status),
+      )
+
+      const results = await Promise.allSettled(
+        pollableTasks.map(async (task) => {
+          const res = await fetch(`${baseUrl}/tasks/${task.id}`, { headers })
           if (res.ok) {
             const updated = await res.json()
             updateTask(updated)
           }
-        } catch {
-          // Ignore fetch errors during polling
-        }
-      }
+        }),
+      )
+
+      // Silently ignore individual fetch failures
+      void results
     }, 3000)
 
     return () => {

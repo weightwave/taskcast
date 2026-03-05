@@ -20,9 +20,20 @@ export function useApi(panel: Panel) {
   const apiFetch = useCallback(
     async (path: string, init?: RequestInit) => {
       const url = `${baseUrl}${path}`
+      const mergedHeaders: Record<string, string> = { ...headers() }
+      if (init?.headers) {
+        const h = init.headers
+        if (h instanceof Headers) {
+          h.forEach((v, k) => { mergedHeaders[k] = v })
+        } else if (Array.isArray(h)) {
+          h.forEach(([k, v]) => { mergedHeaders[k] = v })
+        } else {
+          Object.assign(mergedHeaders, h)
+        }
+      }
       return fetch(url, {
         ...init,
-        headers: { ...headers(), ...(init?.headers as Record<string, string>) },
+        headers: mergedHeaders,
       })
     },
     [baseUrl, headers],

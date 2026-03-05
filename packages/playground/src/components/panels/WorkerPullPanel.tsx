@@ -18,6 +18,8 @@ import type { Panel } from '@/stores'
 import { useApi } from '@/hooks/useApi'
 import { useConnectionStore } from '@/stores'
 import { PanelAuthConfig } from '@/components/panels/PanelAuthConfig'
+import { tryParseJson, ResponseDisplay } from '@/components/shared/utils'
+import type { ApiResponse } from '@/components/shared/utils'
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
@@ -35,25 +37,6 @@ interface ClaimedTask {
   assignMode?: string
 }
 
-interface ApiResponse {
-  status: number
-  body: unknown
-}
-
-/* ------------------------------------------------------------------ */
-/*  Helpers                                                            */
-/* ------------------------------------------------------------------ */
-
-function tryParseJson(text: string): { ok: true; value: unknown } | { ok: false; error: string } {
-  const trimmed = text.trim()
-  if (trimmed === '') return { ok: true, value: undefined }
-  try {
-    return { ok: true, value: JSON.parse(trimmed) }
-  } catch (e) {
-    return { ok: false, error: (e as Error).message }
-  }
-}
-
 function statusBadgeVariant(status: WorkerStatus): 'default' | 'secondary' | 'destructive' | 'outline' {
   switch (status) {
     case 'polling': return 'default'
@@ -64,29 +47,7 @@ function statusBadgeVariant(status: WorkerStatus): 'default' | 'secondary' | 'de
   }
 }
 
-let pullWorkerCounter = 0
-
-/* ------------------------------------------------------------------ */
-/*  Response display                                                   */
-/* ------------------------------------------------------------------ */
-
-function ResponseDisplay({ response }: { response: ApiResponse | null }) {
-  if (!response) return null
-  const variant = response.status >= 200 && response.status < 300 ? 'default'
-    : response.status >= 400 && response.status < 500 ? 'secondary'
-    : response.status >= 500 ? 'destructive'
-    : 'outline'
-  return (
-    <div className="mt-2 space-y-1">
-      <Badge variant={variant}>{response.status}</Badge>
-      <ScrollArea className="max-h-32 rounded border">
-        <pre className="p-2 text-xs whitespace-pre-wrap break-all">
-          {JSON.stringify(response.body, null, 2)}
-        </pre>
-      </ScrollArea>
-    </div>
-  )
-}
+let pullWorkerCounter = Date.now()
 
 /* ------------------------------------------------------------------ */
 /*  Task processing section                                            */
@@ -462,7 +423,8 @@ export function WorkerPullPanel({ panel }: { panel: Panel }) {
 
   const getWsUrl = useCallback(() => {
     if (connectionMode === 'embedded' || baseUrl === '/taskcast') {
-      return `ws://${window.location.host}/workers/ws`
+      const wsProtocol = window.location.protocol === 'https:' ? 'wss' : 'ws'
+      return `${wsProtocol}://${window.location.host}/workers/ws`
     }
     // External mode: derive from baseUrl (e.g. http://localhost:3721/taskcast)
     return baseUrl.replace(/^http/, 'ws') + '/workers/ws'
@@ -517,6 +479,7 @@ export function WorkerPullPanel({ panel }: { panel: Panel }) {
           workerId,
           timeout: timeout || '30000',
         }
+        if (typesList.length > 0) params.types = typesList.join(',')
         if (weight && weight !== '1') params.weight = weight
 
         const url = getWorkerFetchUrl(params)
@@ -556,7 +519,7 @@ export function WorkerPullPanel({ panel }: { panel: Panel }) {
             controller.signal.addEventListener('abort', () => {
               clearTimeout(timer)
               reject(new Error('aborted'))
-            })
+            }, { once: true })
           })
         } catch {
           break
@@ -579,7 +542,9 @@ export function WorkerPullPanel({ panel }: { panel: Panel }) {
       .map((t) => t.trim())
       .filter(Boolean)
 
-    const wsUrl = getWsUrl()
+    const wsUrl = effectiveToken
+      ? `${getWsUrl()}?token=${encodeURIComponent(effectiveToken)}`
+      : getWsUrl()
     const ws = new WebSocket(wsUrl)
     wsRef.current = ws
 
@@ -629,7 +594,7 @@ export function WorkerPullPanel({ panel }: { panel: Panel }) {
         pollAbortRef.current?.abort()
       }
     }
-  }, [workerId, matchTypes, weight, getWsUrl, startPollLoop])
+  }, [workerId, matchTypes, weight, effectiveToken, getWsUrl, startPollLoop])
 
   /* ---------------------------------------------------------------- */
   /*  Stop polling                                                     */

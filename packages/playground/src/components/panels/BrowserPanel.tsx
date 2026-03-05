@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef, useEffect } from 'react'
+import { useState, useCallback, useRef, useEffect, useMemo } from 'react'
 import { TaskcastClient } from '@taskcast/client'
 import type { SSEEnvelope, Level } from '@taskcast/core'
 import { Button } from '@/components/ui/button'
@@ -6,56 +6,11 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Badge } from '@/components/ui/badge'
 import { ScrollArea } from '@/components/ui/scroll-area'
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select'
 import { usePanelStore, useDataStore } from '@/stores'
 import type { Panel } from '@/stores'
 import { useApi } from '@/hooks/useApi'
 import { PanelAuthConfig } from '@/components/panels/PanelAuthConfig'
-
-/* ------------------------------------------------------------------ */
-/*  Shared: task ID selector (same pattern as BackendPanel)           */
-/* ------------------------------------------------------------------ */
-
-function TaskIdField({
-  value,
-  onChange,
-}: {
-  value: string
-  onChange: (v: string) => void
-}) {
-  const { tasks } = useDataStore()
-
-  return (
-    <div className="space-y-1.5">
-      <Label>Task ID</Label>
-      {tasks.length > 0 && (
-        <Select value={value} onValueChange={onChange}>
-          <SelectTrigger className="w-full">
-            <SelectValue placeholder="Select a task..." />
-          </SelectTrigger>
-          <SelectContent>
-            {tasks.map((t) => (
-              <SelectItem key={t.id} value={t.id}>
-                {t.id} ({t.type} / {t.status})
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-      )}
-      <Input
-        placeholder="Or type a task ID..."
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-      />
-    </div>
-  )
-}
+import { TaskIdField } from '@/components/shared/utils'
 
 /* ------------------------------------------------------------------ */
 /*  Level toggle button                                               */
@@ -221,21 +176,25 @@ function EventRow({ envelope }: { envelope: SSEEnvelope }) {
 /* ------------------------------------------------------------------ */
 
 function AccumulatedTextDisplay({ events }: { events: SSEEnvelope[] }) {
-  const accumulatedSeries = new Map<string, string>()
+  const accumulatedSeries = useMemo(() => {
+    const map = new Map<string, string>()
 
-  for (const e of events) {
-    if (e.seriesMode === 'accumulate' && e.seriesId) {
-      const current = accumulatedSeries.get(e.seriesId) ?? ''
-      const field = e.seriesAccField ?? 'text'
-      const chunk =
-        e.data && typeof e.data === 'object' && field in (e.data as Record<string, unknown>)
-          ? String((e.data as Record<string, unknown>)[field])
-          : typeof e.data === 'string'
-            ? e.data
-            : ''
-      accumulatedSeries.set(e.seriesId, current + chunk)
+    for (const e of events) {
+      if (e.seriesMode === 'accumulate' && e.seriesId) {
+        const current = map.get(e.seriesId) ?? ''
+        const field = e.seriesAccField ?? 'text'
+        const chunk =
+          e.data && typeof e.data === 'object' && field in (e.data as Record<string, unknown>)
+            ? String((e.data as Record<string, unknown>)[field])
+            : typeof e.data === 'string'
+              ? e.data
+              : ''
+        map.set(e.seriesId, current + chunk)
+      }
     }
-  }
+
+    return map
+  }, [events])
 
   if (accumulatedSeries.size === 0) return null
 
@@ -279,13 +238,17 @@ export function BrowserPanel({ panel }: { panel: Panel }) {
   // Abort controller ref for cancellation
   const abortRef = useRef<AbortController | null>(null)
 
-  // Auto-scroll ref
-  const scrollEndRef = useRef<HTMLDivElement | null>(null)
+  // Auto-scroll: use a ref on the ScrollArea container and scroll its viewport directly,
+  // because scrollIntoView may scroll the wrong container inside Radix ScrollArea.
+  const scrollAreaRef = useRef<HTMLDivElement | null>(null)
   const [autoScroll, setAutoScroll] = useState(true)
 
   useEffect(() => {
-    if (autoScroll && scrollEndRef.current) {
-      scrollEndRef.current.scrollIntoView({ behavior: 'smooth' })
+    if (autoScroll && scrollAreaRef.current) {
+      const viewport = scrollAreaRef.current.querySelector('[data-slot="scroll-area-viewport"]')
+      if (viewport) {
+        viewport.scrollTop = viewport.scrollHeight
+      }
     }
   }, [events.length, autoScroll])
 
@@ -485,7 +448,7 @@ export function BrowserPanel({ panel }: { panel: Panel }) {
       />
 
       {/* Event stream */}
-      <ScrollArea className="flex-1">
+      <ScrollArea className="flex-1" ref={scrollAreaRef}>
         <div className="min-h-0">
           {events.length === 0 && status === 'idle' && (
             <div className="flex items-center justify-center p-8 text-sm text-muted-foreground">
@@ -500,7 +463,6 @@ export function BrowserPanel({ panel }: { panel: Panel }) {
           {events.map((envelope, i) => (
             <EventRow key={`${envelope.eventId}-${i}`} envelope={envelope} />
           ))}
-          <div ref={scrollEndRef} />
         </div>
 
         {/* Accumulated text display */}

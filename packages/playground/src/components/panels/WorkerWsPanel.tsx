@@ -17,6 +17,8 @@ import { usePanelStore, useConnectionStore } from '@/stores'
 import type { Panel } from '@/stores'
 import { useApi } from '@/hooks/useApi'
 import { PanelAuthConfig } from '@/components/panels/PanelAuthConfig'
+import { tryParseJson, ResponseDisplay } from '@/components/shared/utils'
+import type { ApiResponse } from '@/components/shared/utils'
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
@@ -52,25 +54,6 @@ interface AssignedTask {
   params?: Record<string, unknown>
 }
 
-interface ApiResponse {
-  status: number
-  body: unknown
-}
-
-/* ------------------------------------------------------------------ */
-/*  Helpers                                                            */
-/* ------------------------------------------------------------------ */
-
-function tryParseJson(text: string): { ok: true; value: unknown } | { ok: false; error: string } {
-  const trimmed = text.trim()
-  if (trimmed === '') return { ok: true, value: undefined }
-  try {
-    return { ok: true, value: JSON.parse(trimmed) }
-  } catch (e) {
-    return { ok: false, error: (e as Error).message }
-  }
-}
-
 function statusBadgeVariant(
   status: ConnectionStatus,
 ): 'default' | 'secondary' | 'destructive' | 'outline' {
@@ -86,33 +69,7 @@ function statusBadgeVariant(
   }
 }
 
-let logIdCounter = 0
-
-/* ------------------------------------------------------------------ */
-/*  Response display                                                   */
-/* ------------------------------------------------------------------ */
-
-function ResponseDisplay({ response }: { response: ApiResponse | null }) {
-  if (!response) return null
-  const variant =
-    response.status >= 200 && response.status < 300
-      ? 'default'
-      : response.status >= 400 && response.status < 500
-        ? 'secondary'
-        : response.status >= 500
-          ? 'destructive'
-          : 'outline'
-  return (
-    <div className="mt-2 space-y-1">
-      <Badge variant={variant}>{response.status}</Badge>
-      <ScrollArea className="max-h-32 rounded border">
-        <pre className="p-2 text-xs whitespace-pre-wrap break-all">
-          {JSON.stringify(response.body, null, 2)}
-        </pre>
-      </ScrollArea>
-    </div>
-  )
-}
+let logIdCounter = Date.now()
 
 /* ------------------------------------------------------------------ */
 /*  Message log entry component                                        */
@@ -554,7 +511,8 @@ export function WorkerWsPanel({ panel }: { panel: Panel }) {
 
   const getWsUrl = useCallback(() => {
     if (connectionMode === 'embedded' || baseUrl === '/taskcast') {
-      return `ws://${window.location.host}/workers/ws`
+      const wsProtocol = window.location.protocol === 'https:' ? 'wss' : 'ws'
+      return `${wsProtocol}://${window.location.host}/workers/ws`
     }
     // External mode: baseUrl already includes /taskcast (e.g. http://localhost:3721/taskcast)
     return baseUrl.replace(/^http/, 'ws') + '/workers/ws'
@@ -611,7 +569,9 @@ export function WorkerWsPanel({ panel }: { panel: Panel }) {
       .map((t) => t.trim())
       .filter(Boolean)
 
-    const wsUrl = getWsUrl()
+    const wsUrl = effectiveToken
+      ? `${getWsUrl()}?token=${encodeURIComponent(effectiveToken)}`
+      : getWsUrl()
     const ws = new WebSocket(wsUrl)
     wsRef.current = ws
 
@@ -738,7 +698,9 @@ export function WorkerWsPanel({ panel }: { panel: Panel }) {
       setStatus('disconnected')
       wsRef.current = null
     }
-  }, [matchTypes, capacity, weight, getWsUrl, addLog, sendMessage])
+  // sendMessage reads wsRef.current at call time (not capture time), so including
+  // it in the dependency array is safe — it won't cause stale closure issues.
+  }, [matchTypes, capacity, weight, effectiveToken, getWsUrl, addLog, sendMessage])
 
   /* ---------------------------------------------------------------- */
   /*  Disconnect                                                       */

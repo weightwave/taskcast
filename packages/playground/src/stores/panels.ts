@@ -17,7 +17,7 @@ interface PanelState {
   updatePanel: (id: string, update: Partial<Panel>) => void
 }
 
-let counter = 0
+let counter = Date.now()
 const labelMap: Record<PanelType, string> = {
   backend: 'Backend',
   browser: 'Browser',

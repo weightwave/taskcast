@@ -21,6 +21,8 @@ interface DataState {
   tasks: Task[]
   globalEvents: GlobalEvent[]
   webhookLogs: WebhookLog[]
+  /** O(1) dedup index keyed by `${event.id}:${direction}:${sourceLabel}` */
+  _eventKeys: Set<string>
   setTasks: (tasks: Task[]) => void
   addTask: (task: Task) => void
   updateTask: (task: Task) => void
@@ -33,6 +35,7 @@ export const useDataStore = create<DataState>((set) => ({
   tasks: [],
   globalEvents: [],
   webhookLogs: [],
+  _eventKeys: new Set<string>(),
   setTasks: (tasks) => set({ tasks }),
   addTask: (task) => set((state) => ({ tasks: [...state.tasks, task] })),
   updateTask: (task) =>
@@ -41,18 +44,21 @@ export const useDataStore = create<DataState>((set) => ({
     })),
   addEvent: (event, direction, sourceLabel) =>
     set((state) => {
-      const key = `${event.id}:${sourceLabel ?? ''}`
-      if (state.globalEvents.some((e) => `${e.id}:${e.sourceLabel ?? ''}` === key)) {
+      const key = `${event.id}:${direction ?? ''}:${sourceLabel ?? ''}`
+      if (state._eventKeys.has(key)) {
         return state
       }
       const entry: GlobalEvent = { ...event, direction, sourceLabel }
       const list = [entry, ...state.globalEvents]
       list.sort((a, b) => b.timestamp - a.timestamp)
-      return { globalEvents: list.slice(0, 500) }
+      const trimmed = list.slice(0, 500)
+      const newKeys = new Set(state._eventKeys)
+      newKeys.add(key)
+      return { globalEvents: trimmed, _eventKeys: newKeys }
     }),
   addWebhookLog: (log) =>
     set((state) => ({
       webhookLogs: [log, ...state.webhookLogs].slice(0, 200),
     })),
-  clearAll: () => set({ tasks: [], globalEvents: [], webhookLogs: [] }),
+  clearAll: () => set({ tasks: [], globalEvents: [], webhookLogs: [], _eventKeys: new Set<string>() }),
 }))

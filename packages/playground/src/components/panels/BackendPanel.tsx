@@ -3,7 +3,6 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
-import { Badge } from '@/components/ui/badge'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import {
@@ -17,89 +16,8 @@ import { usePanelStore, useDataStore } from '@/stores'
 import type { Panel } from '@/stores'
 import { useApi } from '@/hooks/useApi'
 import { PanelAuthConfig } from '@/components/panels/PanelAuthConfig'
-
-/* ------------------------------------------------------------------ */
-/*  Shared: response display                                          */
-/* ------------------------------------------------------------------ */
-
-interface ApiResponse {
-  status: number
-  body: unknown
-}
-
-function statusBadgeVariant(code: number): 'default' | 'secondary' | 'destructive' | 'outline' {
-  if (code >= 200 && code < 300) return 'default'
-  if (code >= 400 && code < 500) return 'secondary'
-  if (code >= 500) return 'destructive'
-  return 'outline'
-}
-
-function ResponseDisplay({ response }: { response: ApiResponse | null }) {
-  if (!response) return null
-  return (
-    <div className="mt-3 space-y-2">
-      <Badge variant={statusBadgeVariant(response.status)}>{response.status}</Badge>
-      <ScrollArea className="max-h-48 rounded border">
-        <pre className="p-2 text-xs whitespace-pre-wrap break-all">
-          {JSON.stringify(response.body, null, 2)}
-        </pre>
-      </ScrollArea>
-    </div>
-  )
-}
-
-/* ------------------------------------------------------------------ */
-/*  Shared: task ID selector (select from known tasks or type custom) */
-/* ------------------------------------------------------------------ */
-
-function TaskIdField({
-  value,
-  onChange,
-}: {
-  value: string
-  onChange: (v: string) => void
-}) {
-  const { tasks } = useDataStore()
-
-  return (
-    <div className="space-y-1.5">
-      <Label>Task ID</Label>
-      {tasks.length > 0 && (
-        <Select value={value} onValueChange={onChange}>
-          <SelectTrigger className="w-full">
-            <SelectValue placeholder="Select a task..." />
-          </SelectTrigger>
-          <SelectContent>
-            {tasks.map((t) => (
-              <SelectItem key={t.id} value={t.id}>
-                {t.id} ({t.type} / {t.status})
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-      )}
-      <Input
-        placeholder="Or type a task ID..."
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-      />
-    </div>
-  )
-}
-
-/* ------------------------------------------------------------------ */
-/*  Helper: safe JSON parse                                           */
-/* ------------------------------------------------------------------ */
-
-function tryParseJson(text: string): { ok: true; value: unknown } | { ok: false; error: string } {
-  const trimmed = text.trim()
-  if (trimmed === '') return { ok: true, value: undefined }
-  try {
-    return { ok: true, value: JSON.parse(trimmed) }
-  } catch (e) {
-    return { ok: false, error: (e as Error).message }
-  }
-}
+import { tryParseJson, ResponseDisplay, TaskIdField } from '@/components/shared/utils'
+import type { ApiResponse } from '@/components/shared/utils'
 
 /* ------------------------------------------------------------------ */
 /*  Tab 1: Create Task                                                */
