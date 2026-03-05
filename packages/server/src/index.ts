@@ -10,6 +10,7 @@ export {
   CreateTaskSchema, TransitionSchema, PublishEventSchema,
 } from './schemas.js'
 
+import type { Hono } from 'hono'
 import { OpenAPIHono } from '@hono/zod-openapi'
 import { apiReference } from '@scalar/hono-api-reference'
 import { createAuthMiddleware } from './auth.js'
@@ -29,7 +30,7 @@ export interface TaskcastServerOptions {
  * Creates an OpenAPIHono app with all taskcast routes mounted.
  * Can be used standalone or mounted into an existing Hono app.
  */
-export function createTaskcastApp(opts: TaskcastServerOptions): OpenAPIHono {
+export function createTaskcastApp(opts: TaskcastServerOptions): Hono {
   const app = new OpenAPIHono()
   app.get('/health', (c) => c.json({ ok: true }))
   app.use('*', createAuthMiddleware(opts.auth ?? { mode: 'none' }))
@@ -63,5 +64,5 @@ export function createTaskcastApp(opts: TaskcastServerOptions): OpenAPIHono {
     url: '/openapi.json',
   }))
 
-  return app
+  return app as unknown as Hono
 }

@@ -1,3 +1,4 @@
+import type { Hono } from 'hono'
 import { OpenAPIHono, createRoute, z } from '@hono/zod-openapi'
 import type { Context } from 'hono'
 import { checkScope } from '../auth.js'
@@ -115,7 +116,7 @@ const eventHistoryRoute = createRoute({
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type OpenAPIRegister = (route: any, handler: (c: Context) => Promise<Response>) => void
 
-export function createTasksRouter(engine: TaskEngine) {
+export function createTasksRouter(engine: TaskEngine): Hono {
   const router = new OpenAPIHono()
   const register = router.openapi.bind(router) as OpenAPIRegister
 
@@ -245,5 +246,5 @@ export function createTasksRouter(engine: TaskEngine) {
     return c.json(events)
   })
 
-  return router
+  return router as unknown as Hono
 }
