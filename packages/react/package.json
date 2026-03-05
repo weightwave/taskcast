@@ -1,6 +1,6 @@
 {
   "name": "@taskcast/react",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "React hook useTaskEvents for Taskcast SSE subscriptions.",
   "repository": {
     "type": "git",

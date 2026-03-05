@@ -1,6 +1,6 @@
 {
   "name": "@taskcast/sqlite",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "SQLite local storage adapter for Taskcast.",
   "repository": {
     "type": "git",
