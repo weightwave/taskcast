@@ -2,9 +2,9 @@ mod helpers;
 
 use helpers::{make_event, make_task, setup};
 use taskcast_core::types::{
-    AssignMode, ConnectionMode, EventQueryOptions, SeriesMode, ShortTermStore, SinceCursor,
-    TaskFilter, TaskStatus, Worker, WorkerAssignment, WorkerAssignmentStatus, WorkerFilter,
-    WorkerMatchRule, WorkerStatus,
+    AssignMode, ConnectionMode, DisconnectPolicy, EventQueryOptions, SeriesMode, ShortTermStore,
+    SinceCursor, TagMatcher, TaskFilter, TaskStatus, Worker, WorkerAssignment,
+    WorkerAssignmentStatus, WorkerFilter, WorkerMatchRule, WorkerStatus,
 };
 
 // ─── save_task / get_task ─────────────────────────────────────────────────
@@ -1201,4 +1201,162 @@ async fn assignment_running_status_round_trips() {
         .unwrap()
         .unwrap();
     assert_eq!(retrieved.status, WorkerAssignmentStatus::Running);
+}
+
+// ─── disconnect_policy round-trip (covers disconnect_policy_to_string) ───
+
+#[tokio::test]
+async fn task_with_disconnect_policy_reassign_round_trips() {
+    let ctx = setup().await;
+    let mut task = make_task("dp-reassign");
+    task.disconnect_policy = Some(DisconnectPolicy::Reassign);
+    ctx.short.save_task(task.clone()).await.unwrap();
+
+    let retrieved = ctx.short.get_task("dp-reassign").await.unwrap().unwrap();
+    assert_eq!(retrieved.disconnect_policy, Some(DisconnectPolicy::Reassign));
+}
+
+#[tokio::test]
+async fn task_with_disconnect_policy_mark_round_trips() {
+    let ctx = setup().await;
+    let mut task = make_task("dp-mark");
+    task.disconnect_policy = Some(DisconnectPolicy::Mark);
+    ctx.short.save_task(task.clone()).await.unwrap();
+
+    let retrieved = ctx.short.get_task("dp-mark").await.unwrap().unwrap();
+    assert_eq!(retrieved.disconnect_policy, Some(DisconnectPolicy::Mark));
+}
+
+#[tokio::test]
+async fn task_with_disconnect_policy_fail_round_trips() {
+    let ctx = setup().await;
+    let mut task = make_task("dp-fail");
+    task.disconnect_policy = Some(DisconnectPolicy::Fail);
+    ctx.short.save_task(task.clone()).await.unwrap();
+
+    let retrieved = ctx.short.get_task("dp-fail").await.unwrap().unwrap();
+    assert_eq!(retrieved.disconnect_policy, Some(DisconnectPolicy::Fail));
+}
+
+// ─── task cost round-trip ────────────────────────────────────────────────
+
+#[tokio::test]
+async fn task_with_cost_round_trips() {
+    let ctx = setup().await;
+    let mut task = make_task("task-cost");
+    task.cost = Some(42);
+    ctx.short.save_task(task.clone()).await.unwrap();
+
+    let retrieved = ctx.short.get_task("task-cost").await.unwrap().unwrap();
+    assert_eq!(retrieved.cost, Some(42));
+}
+
+#[tokio::test]
+async fn task_with_zero_cost_round_trips() {
+    let ctx = setup().await;
+    let mut task = make_task("task-cost-zero");
+    task.cost = Some(0);
+    ctx.short.save_task(task.clone()).await.unwrap();
+
+    let retrieved = ctx.short.get_task("task-cost-zero").await.unwrap().unwrap();
+    assert_eq!(retrieved.cost, Some(0));
+}
+
+// ─── list_tasks tag matching ─────────────────────────────────────────────
+
+#[tokio::test]
+async fn list_tasks_filters_by_tags_all() {
+    let ctx = setup().await;
+
+    let mut t1 = make_task("task-t1");
+    t1.tags = Some(vec!["gpu".to_string(), "large".to_string()]);
+    ctx.short.save_task(t1).await.unwrap();
+
+    let mut t2 = make_task("task-t2");
+    t2.tags = Some(vec!["cpu".to_string(), "small".to_string()]);
+    ctx.short.save_task(t2).await.unwrap();
+
+    let mut t3 = make_task("task-t3");
+    t3.tags = Some(vec!["gpu".to_string(), "small".to_string()]);
+    ctx.short.save_task(t3).await.unwrap();
+
+    // no tags
+    ctx.short.save_task(make_task("task-t4")).await.unwrap();
+
+    // Filter: all tags must include "gpu"
+    let filter = TaskFilter {
+        tags: Some(TagMatcher {
+            all: Some(vec!["gpu".to_string()]),
+            any: None,
+            none: None,
+        }),
+        ..Default::default()
+    };
+    let tasks = ctx.short.list_tasks(filter).await.unwrap();
+    assert_eq!(tasks.len(), 2);
+    let ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+    assert!(ids.contains(&"task-t1"));
+    assert!(ids.contains(&"task-t3"));
+}
+
+#[tokio::test]
+async fn list_tasks_filters_by_tags_any() {
+    let ctx = setup().await;
+
+    let mut t1 = make_task("task-a1");
+    t1.tags = Some(vec!["gpu".to_string(), "large".to_string()]);
+    ctx.short.save_task(t1).await.unwrap();
+
+    let mut t2 = make_task("task-a2");
+    t2.tags = Some(vec!["cpu".to_string()]);
+    ctx.short.save_task(t2).await.unwrap();
+
+    let mut t3 = make_task("task-a3");
+    t3.tags = Some(vec!["tpu".to_string()]);
+    ctx.short.save_task(t3).await.unwrap();
+
+    // Filter: any of ["gpu", "cpu"]
+    let filter = TaskFilter {
+        tags: Some(TagMatcher {
+            all: None,
+            any: Some(vec!["gpu".to_string(), "cpu".to_string()]),
+            none: None,
+        }),
+        ..Default::default()
+    };
+    let tasks = ctx.short.list_tasks(filter).await.unwrap();
+    assert_eq!(tasks.len(), 2);
+    let ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+    assert!(ids.contains(&"task-a1"));
+    assert!(ids.contains(&"task-a2"));
+}
+
+#[tokio::test]
+async fn list_tasks_filters_by_tags_none() {
+    let ctx = setup().await;
+
+    let mut t1 = make_task("task-n1");
+    t1.tags = Some(vec!["gpu".to_string()]);
+    ctx.short.save_task(t1).await.unwrap();
+
+    let mut t2 = make_task("task-n2");
+    t2.tags = Some(vec!["cpu".to_string()]);
+    ctx.short.save_task(t2).await.unwrap();
+
+    ctx.short.save_task(make_task("task-n3")).await.unwrap(); // no tags
+
+    // Filter: none of ["gpu"] — excludes task-n1
+    let filter = TaskFilter {
+        tags: Some(TagMatcher {
+            all: None,
+            any: None,
+            none: Some(vec!["gpu".to_string()]),
+        }),
+        ..Default::default()
+    };
+    let tasks = ctx.short.list_tasks(filter).await.unwrap();
+    assert_eq!(tasks.len(), 2);
+    let ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+    assert!(ids.contains(&"task-n2"));
+    assert!(ids.contains(&"task-n3"));
 }

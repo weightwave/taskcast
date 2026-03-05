@@ -1932,4 +1932,497 @@ mod tests {
         let task = engine.get_task("t1").await.unwrap().unwrap();
         assert_eq!(task.status, TaskStatus::Assigned);
     }
+
+    // ─── Mock LongTermStore ────────────────────────────────────────────
+
+    use crate::types::{EventQueryOptions, LongTermStore, WorkerAuditEvent};
+    use tokio::sync::RwLock as TokioRwLock;
+
+    struct MockLongTermStore {
+        tasks: TokioRwLock<HashMap<String, Task>>,
+        events: TokioRwLock<Vec<TaskEvent>>,
+        worker_events: TokioRwLock<Vec<WorkerAuditEvent>>,
+    }
+
+    impl MockLongTermStore {
+        fn new() -> Self {
+            Self {
+                tasks: TokioRwLock::new(HashMap::new()),
+                events: TokioRwLock::new(Vec::new()),
+                worker_events: TokioRwLock::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LongTermStore for MockLongTermStore {
+        async fn save_task(
+            &self,
+            task: Task,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.tasks.write().await.insert(task.id.clone(), task);
+            Ok(())
+        }
+
+        async fn get_task(
+            &self,
+            task_id: &str,
+        ) -> Result<Option<Task>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self.tasks.read().await.get(task_id).cloned())
+        }
+
+        async fn save_event(
+            &self,
+            event: TaskEvent,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.events.write().await.push(event);
+            Ok(())
+        }
+
+        async fn get_events(
+            &self,
+            _task_id: &str,
+            _opts: Option<EventQueryOptions>,
+        ) -> Result<Vec<TaskEvent>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self.events.read().await.clone())
+        }
+
+        async fn save_worker_event(
+            &self,
+            event: WorkerAuditEvent,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.worker_events.write().await.push(event);
+            Ok(())
+        }
+
+        async fn get_worker_events(
+            &self,
+            _worker_id: &str,
+            _opts: Option<EventQueryOptions>,
+        ) -> Result<Vec<WorkerAuditEvent>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self.worker_events.read().await.clone())
+        }
+    }
+
+    // ─── Mock Hooks ────────────────────────────────────────────────────
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct MockHooks {
+        connected_count: AtomicU64,
+        disconnected_count: AtomicU64,
+        assigned_count: AtomicU64,
+        declined_count: AtomicU64,
+        connected_ids: std::sync::Mutex<Vec<String>>,
+        disconnected_ids: std::sync::Mutex<Vec<String>>,
+        assigned_task_ids: std::sync::Mutex<Vec<String>>,
+        declined_task_ids: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl MockHooks {
+        fn new() -> Self {
+            Self {
+                connected_count: AtomicU64::new(0),
+                disconnected_count: AtomicU64::new(0),
+                assigned_count: AtomicU64::new(0),
+                declined_count: AtomicU64::new(0),
+                connected_ids: std::sync::Mutex::new(Vec::new()),
+                disconnected_ids: std::sync::Mutex::new(Vec::new()),
+                assigned_task_ids: std::sync::Mutex::new(Vec::new()),
+                declined_task_ids: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl TaskcastHooks for MockHooks {
+        fn on_worker_connected(&self, worker: &Worker) {
+            self.connected_count.fetch_add(1, Ordering::SeqCst);
+            self.connected_ids
+                .lock()
+                .unwrap()
+                .push(worker.id.clone());
+        }
+
+        fn on_worker_disconnected(&self, worker: &Worker, _reason: &str) {
+            self.disconnected_count.fetch_add(1, Ordering::SeqCst);
+            self.disconnected_ids
+                .lock()
+                .unwrap()
+                .push(worker.id.clone());
+        }
+
+        fn on_task_assigned(&self, task: &Task, _worker: &Worker) {
+            self.assigned_count.fetch_add(1, Ordering::SeqCst);
+            self.assigned_task_ids
+                .lock()
+                .unwrap()
+                .push(task.id.clone());
+        }
+
+        fn on_task_declined(&self, task: &Task, _worker: &Worker, _blacklisted: bool) {
+            self.declined_count.fetch_add(1, Ordering::SeqCst);
+            self.declined_task_ids
+                .lock()
+                .unwrap()
+                .push(task.id.clone());
+        }
+    }
+
+    fn make_context_with_long_term(
+        long_term_store: Arc<MockLongTermStore>,
+    ) -> (TestContext, Arc<MockLongTermStore>) {
+        let short_term_store = Arc::new(MemoryShortTermStore::new());
+        let broadcast = Arc::new(MemoryBroadcastProvider::new());
+        let engine = Arc::new(TaskEngine::new(TaskEngineOptions {
+            short_term_store: Arc::clone(&short_term_store) as Arc<dyn ShortTermStore>,
+            broadcast: Arc::clone(&broadcast) as Arc<dyn BroadcastProvider>,
+            long_term_store: Some(Arc::clone(&long_term_store) as Arc<dyn LongTermStore>),
+            hooks: None,
+        }));
+        let manager = WorkerManager::new(WorkerManagerOptions {
+            engine: Arc::clone(&engine),
+            short_term_store: short_term_store as Arc<dyn ShortTermStore>,
+            broadcast: broadcast as Arc<dyn BroadcastProvider>,
+            long_term_store: Some(long_term_store.clone() as Arc<dyn LongTermStore>),
+            hooks: None,
+            defaults: None,
+        });
+        (TestContext { manager, engine }, long_term_store)
+    }
+
+    fn make_context_with_hooks(hooks: Arc<MockHooks>) -> TestContext {
+        let short_term_store = Arc::new(MemoryShortTermStore::new());
+        let broadcast = Arc::new(MemoryBroadcastProvider::new());
+        let engine = Arc::new(TaskEngine::new(TaskEngineOptions {
+            short_term_store: Arc::clone(&short_term_store) as Arc<dyn ShortTermStore>,
+            broadcast: Arc::clone(&broadcast) as Arc<dyn BroadcastProvider>,
+            long_term_store: None,
+            hooks: Some(Arc::clone(&hooks) as Arc<dyn TaskcastHooks>),
+        }));
+        let manager = WorkerManager::new(WorkerManagerOptions {
+            engine: Arc::clone(&engine),
+            short_term_store: short_term_store as Arc<dyn ShortTermStore>,
+            broadcast: broadcast as Arc<dyn BroadcastProvider>,
+            long_term_store: None,
+            hooks: Some(hooks as Arc<dyn TaskcastHooks>),
+            defaults: None,
+        });
+        TestContext { manager, engine }
+    }
+
+    // ─── long_term_store integration ───────────────────────────────────
+
+    #[tokio::test]
+    async fn claim_task_saves_to_long_term_store() {
+        let lt = Arc::new(MockLongTermStore::new());
+        let (ctx, lt) = make_context_with_long_term(lt);
+
+        let mut reg = make_registration(ConnectionMode::Pull);
+        reg.worker_id = Some("w1".to_string());
+        ctx.manager.register_worker(reg).await.unwrap();
+
+        ctx.engine
+            .create_task(CreateTaskInput {
+                id: Some("t1".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        ctx.manager.claim_task("t1", "w1").await.unwrap();
+
+        let saved = lt.get_task("t1").await.unwrap();
+        assert!(saved.is_some());
+        let saved = saved.unwrap();
+        assert_eq!(saved.id, "t1");
+        assert_eq!(saved.status, TaskStatus::Assigned);
+        assert_eq!(saved.assigned_worker, Some("w1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn decline_task_saves_to_long_term_store() {
+        let lt = Arc::new(MockLongTermStore::new());
+        let (ctx, lt) = make_context_with_long_term(lt);
+
+        let mut reg = make_registration(ConnectionMode::Pull);
+        reg.worker_id = Some("w1".to_string());
+        ctx.manager.register_worker(reg).await.unwrap();
+
+        ctx.engine
+            .create_task(CreateTaskInput {
+                id: Some("t1".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        ctx.manager.claim_task("t1", "w1").await.unwrap();
+
+        // Verify it was saved after claim
+        let saved_after_claim = lt.get_task("t1").await.unwrap().unwrap();
+        assert_eq!(saved_after_claim.status, TaskStatus::Assigned);
+
+        // Now decline
+        ctx.manager.decline_task("t1", "w1", None).await.unwrap();
+
+        let saved_after_decline = lt.get_task("t1").await.unwrap().unwrap();
+        assert_eq!(saved_after_decline.status, TaskStatus::Pending);
+        assert_eq!(saved_after_decline.assigned_worker, None);
+    }
+
+    #[tokio::test]
+    async fn claim_task_emits_worker_audit_to_long_term_store() {
+        let lt = Arc::new(MockLongTermStore::new());
+        let (ctx, lt) = make_context_with_long_term(lt);
+
+        let mut reg = make_registration(ConnectionMode::Pull);
+        reg.worker_id = Some("w1".to_string());
+        ctx.manager.register_worker(reg).await.unwrap();
+
+        ctx.engine
+            .create_task(CreateTaskInput {
+                id: Some("t1".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        ctx.manager.claim_task("t1", "w1").await.unwrap();
+
+        // Worker audit is async (tokio::spawn), give it a moment
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let worker_events = lt.worker_events.read().await;
+        // At minimum: Connected audit from register + TaskAssigned audit from claim
+        assert!(
+            worker_events.len() >= 2,
+            "Expected at least 2 worker audit events, got {}",
+            worker_events.len()
+        );
+
+        let has_connected = worker_events
+            .iter()
+            .any(|e| e.action == crate::types::WorkerAuditAction::Connected);
+        let has_assigned = worker_events
+            .iter()
+            .any(|e| e.action == crate::types::WorkerAuditAction::TaskAssigned);
+        assert!(has_connected, "Expected Connected audit event");
+        assert!(has_assigned, "Expected TaskAssigned audit event");
+    }
+
+    #[tokio::test]
+    async fn decline_task_emits_worker_audit_to_long_term_store() {
+        let lt = Arc::new(MockLongTermStore::new());
+        let (ctx, lt) = make_context_with_long_term(lt);
+
+        let mut reg = make_registration(ConnectionMode::Pull);
+        reg.worker_id = Some("w1".to_string());
+        ctx.manager.register_worker(reg).await.unwrap();
+
+        ctx.engine
+            .create_task(CreateTaskInput {
+                id: Some("t1".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        ctx.manager.claim_task("t1", "w1").await.unwrap();
+        ctx.manager.decline_task("t1", "w1", None).await.unwrap();
+
+        // Worker audit is async (tokio::spawn), give it a moment
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let worker_events = lt.worker_events.read().await;
+        let has_declined = worker_events
+            .iter()
+            .any(|e| e.action == crate::types::WorkerAuditAction::TaskDeclined);
+        assert!(has_declined, "Expected TaskDeclined audit event");
+    }
+
+    // ─── hooks integration ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn hooks_on_worker_connected_called_on_register() {
+        let hooks = Arc::new(MockHooks::new());
+        let ctx = make_context_with_hooks(Arc::clone(&hooks));
+
+        let mut reg = make_registration(ConnectionMode::Pull);
+        reg.worker_id = Some("w1".to_string());
+        ctx.manager.register_worker(reg).await.unwrap();
+
+        assert_eq!(hooks.connected_count.load(Ordering::SeqCst), 1);
+        let ids = hooks.connected_ids.lock().unwrap();
+        assert_eq!(ids[0], "w1");
+    }
+
+    #[tokio::test]
+    async fn hooks_on_worker_disconnected_called_on_unregister() {
+        let hooks = Arc::new(MockHooks::new());
+        let ctx = make_context_with_hooks(Arc::clone(&hooks));
+
+        let mut reg = make_registration(ConnectionMode::Pull);
+        reg.worker_id = Some("w1".to_string());
+        ctx.manager.register_worker(reg).await.unwrap();
+
+        ctx.manager.unregister_worker("w1").await.unwrap();
+
+        assert_eq!(hooks.disconnected_count.load(Ordering::SeqCst), 1);
+        let ids = hooks.disconnected_ids.lock().unwrap();
+        assert_eq!(ids[0], "w1");
+    }
+
+    #[tokio::test]
+    async fn hooks_on_task_assigned_called_on_claim() {
+        let hooks = Arc::new(MockHooks::new());
+        let ctx = make_context_with_hooks(Arc::clone(&hooks));
+
+        let mut reg = make_registration(ConnectionMode::Pull);
+        reg.worker_id = Some("w1".to_string());
+        ctx.manager.register_worker(reg).await.unwrap();
+
+        ctx.engine
+            .create_task(CreateTaskInput {
+                id: Some("t1".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        ctx.manager.claim_task("t1", "w1").await.unwrap();
+
+        assert_eq!(hooks.assigned_count.load(Ordering::SeqCst), 1);
+        let ids = hooks.assigned_task_ids.lock().unwrap();
+        assert_eq!(ids[0], "t1");
+    }
+
+    #[tokio::test]
+    async fn hooks_on_task_declined_called_on_decline() {
+        let hooks = Arc::new(MockHooks::new());
+        let ctx = make_context_with_hooks(Arc::clone(&hooks));
+
+        let mut reg = make_registration(ConnectionMode::Pull);
+        reg.worker_id = Some("w1".to_string());
+        ctx.manager.register_worker(reg).await.unwrap();
+
+        ctx.engine
+            .create_task(CreateTaskInput {
+                id: Some("t1".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        ctx.manager.claim_task("t1", "w1").await.unwrap();
+        ctx.manager.decline_task("t1", "w1", None).await.unwrap();
+
+        assert_eq!(hooks.declined_count.load(Ordering::SeqCst), 1);
+        let ids = hooks.declined_task_ids.lock().unwrap();
+        assert_eq!(ids[0], "t1");
+    }
+
+    // ─── connected_at ordering in pick_worker ──────────────────────────
+
+    #[tokio::test]
+    async fn dispatch_prefers_earlier_connected_at_when_weight_and_slots_equal() {
+        let ctx = make_context();
+
+        // Register first worker
+        let mut reg1 = make_registration(ConnectionMode::Pull);
+        reg1.worker_id = Some("early".to_string());
+        reg1.capacity = 5;
+        ctx.manager.register_worker(reg1).await.unwrap();
+
+        // Small delay so connected_at differs
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // Register second worker
+        let mut reg2 = make_registration(ConnectionMode::Pull);
+        reg2.worker_id = Some("late".to_string());
+        reg2.capacity = 5;
+        ctx.manager.register_worker(reg2).await.unwrap();
+
+        let task = ctx
+            .engine
+            .create_task(CreateTaskInput {
+                id: Some("t1".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let result = ctx.manager.dispatch_task(&task.id).await.unwrap();
+        // Both have same weight (50) and same available slots (5),
+        // so the one connected earlier should be preferred
+        assert_eq!(
+            result,
+            DispatchResult::Dispatched {
+                worker_id: "early".to_string()
+            }
+        );
+    }
+
+    // ─── tag preservation in decline with re-enqueue ───────────────────
+
+    #[tokio::test]
+    async fn decline_task_preserves_tags() {
+        let ctx = make_context();
+
+        let mut reg = make_registration(ConnectionMode::Pull);
+        reg.worker_id = Some("w1".to_string());
+        ctx.manager.register_worker(reg).await.unwrap();
+
+        ctx.engine
+            .create_task(CreateTaskInput {
+                id: Some("t1".to_string()),
+                tags: Some(vec!["gpu".to_string(), "high-priority".to_string()]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        ctx.manager.claim_task("t1", "w1").await.unwrap();
+
+        // Decline without blacklist (task goes back to pending)
+        ctx.manager.decline_task("t1", "w1", None).await.unwrap();
+
+        let task = ctx.engine.get_task("t1").await.unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::Pending);
+        assert_eq!(
+            task.tags,
+            Some(vec!["gpu".to_string(), "high-priority".to_string()])
+        );
+    }
+
+    // ─── worker not found in decline ───────────────────────────────────
+
+    #[tokio::test]
+    async fn decline_task_when_worker_deleted_still_succeeds() {
+        let ctx = make_context();
+
+        let mut reg = make_registration(ConnectionMode::Pull);
+        reg.worker_id = Some("w1".to_string());
+        ctx.manager.register_worker(reg).await.unwrap();
+
+        ctx.engine
+            .create_task(CreateTaskInput {
+                id: Some("t1".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        ctx.manager.claim_task("t1", "w1").await.unwrap();
+
+        // Delete the worker before declining
+        ctx.manager.unregister_worker("w1").await.unwrap();
+
+        // Decline should still work (worker not found path returns None for worker)
+        let result = ctx.manager.decline_task("t1", "w1", None).await;
+        assert!(result.is_ok());
+
+        // Task should still be transitioned back to pending
+        let task = ctx.engine.get_task("t1").await.unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::Pending);
+    }
 }

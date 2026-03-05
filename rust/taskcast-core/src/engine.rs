@@ -928,6 +928,50 @@ mod tests {
         assert_eq!(events[1].r#type, "progress");
     }
 
+    // ─── list_tasks ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn list_tasks_returns_all_tasks() {
+        let engine = make_engine();
+        engine
+            .create_task(CreateTaskInput {
+                id: Some("t1".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        engine
+            .create_task(CreateTaskInput {
+                id: Some("t2".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        engine
+            .create_task(CreateTaskInput {
+                id: Some("t3".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let tasks = engine.list_tasks(TaskFilter::default()).await.unwrap();
+        assert_eq!(tasks.len(), 3);
+
+        let ids: std::collections::HashSet<String> =
+            tasks.iter().map(|t| t.id.clone()).collect();
+        assert!(ids.contains("t1"));
+        assert!(ids.contains("t2"));
+        assert!(ids.contains("t3"));
+    }
+
+    #[tokio::test]
+    async fn list_tasks_returns_empty_when_no_tasks() {
+        let engine = make_engine();
+        let tasks = engine.list_tasks(TaskFilter::default()).await.unwrap();
+        assert!(tasks.is_empty());
+    }
+
     // ─── subscribe ───────────────────────────────────────────────────────
 
     #[tokio::test]

@@ -3435,3 +3435,21 @@ async fn ws_accept_pending_task_returns_assigned_v2() {
 
     ws.close().await;
 }
+
+// ─── Workers REST: manager_error path ────────────────────────────────────
+
+#[tokio::test]
+async fn pull_task_returns_400_when_worker_not_registered() {
+    let (_engine, _manager, server) = make_worker_server();
+
+    // Don't register any worker — pull with a non-existent workerId triggers
+    // manager_error (WorkerManager returns error "Worker not found").
+    // heartbeat is a no-op for missing workers, but wait_for_task errors.
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        server.get("/workers/pull?workerId=nonexistent"),
+    )
+    .await
+    .expect("pull request timed out");
+    response.assert_status(axum_test::http::StatusCode::BAD_REQUEST);
+}
