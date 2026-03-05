@@ -11,6 +11,7 @@ COPY packages/server/package.json packages/server/
 COPY packages/cli/package.json packages/cli/
 COPY packages/redis/package.json packages/redis/
 COPY packages/postgres/package.json packages/postgres/
+COPY packages/sqlite/package.json packages/sqlite/
 COPY packages/sentry/package.json packages/sentry/
 COPY packages/client/package.json packages/client/
 COPY packages/server-sdk/package.json packages/server-sdk/
