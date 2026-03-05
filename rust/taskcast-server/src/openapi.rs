@@ -11,6 +11,7 @@ use crate::routes::{sse, tasks, workers};
         description = "Unified long-lifecycle task tracking service for LLM streaming, agents, and async workloads."
     ),
     paths(
+        tasks::list_tasks,
         tasks::create_task,
         tasks::get_task,
         tasks::transition_task,

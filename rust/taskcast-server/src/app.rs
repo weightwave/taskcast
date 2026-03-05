@@ -41,7 +41,7 @@ pub fn create_app(
     let auth_mode = Arc::new(auth_mode);
 
     let task_routes = Router::new()
-        .route("/", post(tasks::create_task))
+        .route("/", get(tasks::list_tasks).post(tasks::create_task))
         .route("/{task_id}", get(tasks::get_task))
         .route("/{task_id}/status", patch(tasks::transition_task))
         .route("/{task_id}/resolve", post(tasks::resolve_task))

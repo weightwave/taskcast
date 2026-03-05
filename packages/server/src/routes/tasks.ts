@@ -11,7 +11,7 @@ import {
   TaskEventSchema,
   ErrorSchema,
 } from '../schemas.js'
-import type { TaskEngine, CreateTaskInput, PublishEventInput, SinceCursor, TaskError, BlockedRequest } from '@taskcast/core'
+import type { TaskEngine, CreateTaskInput, PublishEventInput, SinceCursor, TaskError, BlockedRequest, TaskFilter, TaskStatus } from '@taskcast/core'
 
 // ─── Route Definitions ─────────────────────────────────────────────────────
 
@@ -27,6 +27,25 @@ const createTaskRoute = createRoute({
   responses: {
     201: { description: 'Task created', content: { 'application/json': { schema: TaskSchema } } },
     400: { description: 'Validation error', content: { 'application/json': { schema: ErrorSchema } } },
+    403: { description: 'Forbidden', content: { 'application/json': { schema: ErrorSchema } } },
+  },
+})
+
+const listTasksRoute = createRoute({
+  method: 'get',
+  path: '/',
+  tags: ['Tasks'],
+  summary: 'List tasks',
+  description: 'List tasks with optional status and type filters.',
+  security: [{ Bearer: [] }],
+  request: {
+    query: z.object({
+      status: z.string().optional().openapi({ description: 'Comma-separated status filter' }),
+      type: z.string().optional().openapi({ description: 'Task type filter' }),
+    }),
+  },
+  responses: {
+    200: { description: 'Task list', content: { 'application/json': { schema: z.object({ tasks: z.array(TaskSchema) }) } } },
     403: { description: 'Forbidden', content: { 'application/json': { schema: ErrorSchema } } },
   },
 })
@@ -146,6 +165,27 @@ export function createTasksRouter(engine: TaskEngine): Hono {
 
     const task = await engine.createTask(input)
     return c.json(task, 201)
+  })
+
+  register(listTasksRoute, async (c) => {
+    const auth = c.get('auth')
+    if (!checkScope(auth, 'event:subscribe')) return c.json({ error: 'Forbidden' }, 403)
+
+    const status = c.req.query('status')
+    const type = c.req.query('type')
+
+    const filter: TaskFilter = {}
+    if (status) filter.status = status.split(',').filter(Boolean) as TaskStatus[]
+    if (type) filter.types = [type]
+
+    const tasks = await engine.listTasks(filter)
+    const enriched = tasks.map(t => ({
+      ...t,
+      hot: true,
+      subscriberCount: getSubscriberCount(t.id),
+    }))
+
+    return c.json({ tasks: enriched })
   })
 
   register(getTaskRoute, async (c) => {
