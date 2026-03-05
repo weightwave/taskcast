@@ -5,6 +5,8 @@ export interface TaskcastConfig {
   port?: number
   logLevel?: 'debug' | 'info' | 'warn' | 'error'
   adminToken?: string
+  /** Enable the admin API endpoint (POST /admin/token). Defaults to false. */
+  adminApi?: boolean
   auth?: {
     mode: 'none' | 'jwt' | 'custom'
     jwt?: {
@@ -171,11 +173,16 @@ export async function loadConfigFile(
 }
 
 /**
- * Ensures the config has an adminToken. If one is not explicitly provided,
- * a ULID is auto-generated and logged to the terminal.
- * Mutates the config in place and returns the resolved token.
+ * Resolves the admin token based on config.
+ * - If `adminApi` is false/unset, returns null (admin API disabled, no token needed).
+ * - If `adminApi` is true and `adminToken` is set, returns it.
+ * - If `adminApi` is true and `adminToken` is not set, auto-generates a ULID and logs it.
+ * Mutates the config in place.
  */
-export function resolveAdminToken(config: TaskcastConfig): string {
+export function resolveAdminToken(config: TaskcastConfig): string | null {
+  if (!config.adminApi) {
+    return null
+  }
   if (!config.adminToken) {
     const token = ulid()
     config.adminToken = token

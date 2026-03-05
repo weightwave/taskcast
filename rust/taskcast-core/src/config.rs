@@ -13,6 +13,9 @@ pub struct TaskcastConfig {
     pub log_level: Option<LogLevel>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub admin_token: Option<String>,
+    /// Enable the admin API endpoint (POST /admin/token). Defaults to false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admin_api: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth: Option<AuthConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -271,17 +274,22 @@ fn coerce_port(mut value: serde_json::Value) -> serde_json::Value {
 
 // ─── Admin Token Resolution ──────────────────────────────────────────────────
 
-/// Ensures the config has an admin_token. If one is not explicitly provided,
-/// a ULID is auto-generated and logged to the terminal.
-/// Mutates the config in place and returns the resolved token.
-pub fn resolve_admin_token(config: &mut TaskcastConfig) -> String {
+/// Resolves the admin token based on config.
+/// - If `admin_api` is false/unset, returns None (admin API disabled, no token needed).
+/// - If `admin_api` is true and `admin_token` is set, returns it.
+/// - If `admin_api` is true and `admin_token` is not set, auto-generates a ULID and logs it.
+/// Mutates the config in place.
+pub fn resolve_admin_token(config: &mut TaskcastConfig) -> Option<String> {
+    if config.admin_api != Some(true) {
+        return None;
+    }
     if let Some(ref token) = config.admin_token {
-        return token.clone();
+        return Some(token.clone());
     }
     let token = ulid::Ulid::new().to_string();
     println!("[taskcast] Admin token (auto-generated): {}", token);
     config.admin_token = Some(token.clone());
-    token
+    Some(token)
 }
 
 // ─── File Loading ────────────────────────────────────────────────────────────
@@ -773,47 +781,92 @@ auth:
     // ─── resolve_admin_token ─────────────────────────────────────────────────
 
     #[test]
-    fn resolve_admin_token_generates_when_not_set() {
+    fn resolve_admin_token_returns_none_when_admin_api_not_enabled() {
         let mut config = TaskcastConfig::default();
-        assert!(config.admin_token.is_none());
+        assert!(config.admin_api.is_none());
 
         let token = resolve_admin_token(&mut config);
-
-        assert!(!token.is_empty());
-        assert_eq!(token.len(), 26); // ULID is 26 chars
-        assert_eq!(config.admin_token, Some(token));
+        assert!(token.is_none());
+        assert!(config.admin_token.is_none());
     }
 
     #[test]
-    fn resolve_admin_token_preserves_explicit_value() {
+    fn resolve_admin_token_returns_none_when_admin_api_false() {
         let mut config = TaskcastConfig {
+            admin_api: Some(false),
+            ..Default::default()
+        };
+
+        let token = resolve_admin_token(&mut config);
+        assert!(token.is_none());
+    }
+
+    #[test]
+    fn resolve_admin_token_returns_none_when_admin_api_false_even_with_token() {
+        let mut config = TaskcastConfig {
+            admin_api: Some(false),
+            admin_token: Some("my-token".to_string()),
+            ..Default::default()
+        };
+
+        let token = resolve_admin_token(&mut config);
+        assert!(token.is_none());
+    }
+
+    #[test]
+    fn resolve_admin_token_generates_when_admin_api_true_and_no_token() {
+        let mut config = TaskcastConfig {
+            admin_api: Some(true),
+            ..Default::default()
+        };
+
+        let token = resolve_admin_token(&mut config);
+
+        assert!(token.is_some());
+        let t = token.unwrap();
+        assert_eq!(t.len(), 26); // ULID is 26 chars
+        assert_eq!(config.admin_token, Some(t));
+    }
+
+    #[test]
+    fn resolve_admin_token_preserves_explicit_value_when_admin_api_true() {
+        let mut config = TaskcastConfig {
+            admin_api: Some(true),
             admin_token: Some("my-secret-token".to_string()),
             ..Default::default()
         };
 
         let token = resolve_admin_token(&mut config);
 
-        assert_eq!(token, "my-secret-token");
-        assert_eq!(config.admin_token, Some("my-secret-token".to_string()));
+        assert_eq!(token, Some("my-secret-token".to_string()));
     }
 
     #[test]
     fn resolve_admin_token_generates_unique_tokens() {
-        let mut config1 = TaskcastConfig::default();
-        let mut config2 = TaskcastConfig::default();
+        let mut config1 = TaskcastConfig {
+            admin_api: Some(true),
+            ..Default::default()
+        };
+        let mut config2 = TaskcastConfig {
+            admin_api: Some(true),
+            ..Default::default()
+        };
 
-        let token1 = resolve_admin_token(&mut config1);
-        let token2 = resolve_admin_token(&mut config2);
+        let token1 = resolve_admin_token(&mut config1).unwrap();
+        let token2 = resolve_admin_token(&mut config2).unwrap();
 
         assert_ne!(token1, token2);
     }
 
     #[test]
     fn resolve_admin_token_idempotent_on_same_config() {
-        let mut config = TaskcastConfig::default();
+        let mut config = TaskcastConfig {
+            admin_api: Some(true),
+            ..Default::default()
+        };
 
-        let token1 = resolve_admin_token(&mut config);
-        let token2 = resolve_admin_token(&mut config);
+        let token1 = resolve_admin_token(&mut config).unwrap();
+        let token2 = resolve_admin_token(&mut config).unwrap();
 
         assert_eq!(token1, token2);
     }
@@ -830,5 +883,28 @@ auth:
         let yaml = "adminToken: from-yaml-config\n";
         let config = parse_config(yaml, ConfigFormat::Yaml).unwrap();
         assert_eq!(config.admin_token, Some("from-yaml-config".to_string()));
+    }
+
+    #[test]
+    fn admin_api_parsed_from_json_config() {
+        let json = r#"{"adminApi": true, "adminToken": "test"}"#;
+        let config = parse_config(json, ConfigFormat::Json).unwrap();
+        assert_eq!(config.admin_api, Some(true));
+        assert_eq!(config.admin_token, Some("test".to_string()));
+    }
+
+    #[test]
+    fn admin_api_parsed_from_yaml_config() {
+        let yaml = "adminApi: true\nadminToken: from-yaml\n";
+        let config = parse_config(yaml, ConfigFormat::Yaml).unwrap();
+        assert_eq!(config.admin_api, Some(true));
+        assert_eq!(config.admin_token, Some("from-yaml".to_string()));
+    }
+
+    #[test]
+    fn admin_api_defaults_to_none_when_not_specified() {
+        let json = r#"{"port": 3000}"#;
+        let config = parse_config(json, ConfigFormat::Json).unwrap();
+        assert!(config.admin_api.is_none());
     }
 }
