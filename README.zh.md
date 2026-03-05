@@ -147,48 +147,60 @@ import { TaskEngine, MemoryBroadcastProvider, MemoryShortTermStore } from '@task
 import { createTaskcastApp } from '@taskcast/server'
 import { Hono } from 'hono'
 
+// 创建任务引擎，使用内存适配器（生产环境可替换为 Redis/SQLite）
 const engine = new TaskEngine({
-  broadcast: new MemoryBroadcastProvider(),
-  shortTermStore: new MemoryShortTermStore(),
+  broadcast: new MemoryBroadcastProvider(),   // 实时事件广播层 —— 将事件扇出给所有 SSE 订阅者
+  shortTermStore: new MemoryShortTermStore(), // 任务状态 + 事件缓冲层（同步写入保证顺序）
 })
 
 const app = new Hono()
+// 挂载 Taskcast HTTP 路由 —— 提供 REST API + SSE 端点，路径前缀为 /taskcast
 app.route('/taskcast', createTaskcastApp({ engine }))
 
 // 你的 API 端点 —— 直接创建并处理任务
 app.post('/api/chat', async (c) => {
   const { prompt } = await c.req.json()
+
+  // 创建任务，初始状态为 "pending"。客户端可以立即开始订阅 ——
+  // SSE 会保持连接等待，任务转为 "running" 后自动开始推送事件。
   const task = await engine.createTask({
-    type: 'llm.chat',
-    params: { prompt },
-    ttl: 600,
+    type: 'llm.chat',       // 任务类型，用于事件过滤（支持通配符如 "llm.*"）
+    params: { prompt },      // 任意参数，原样传递给消费者
+    ttl: 600,                // 10 分钟未完成则自动超时
   })
 
-  // 后台处理 —— 这个服务本身就是 Worker
+  // 后台处理 —— 这个服务本身就是 Worker。
+  // 客户端立即拿到 taskId，通过 SSE 订阅结果。
   processChat(task.id, prompt)
   return c.json({ taskId: task.id })
 })
 
 async function processChat(taskId: string, prompt: string) {
+  // pending → running：等待中的 SSE 订阅者将开始接收事件
   await engine.transitionTask(taskId, 'running')
 
   for await (const chunk of callLLM(prompt)) {
+    // 发布流式事件。seriesMode: 'accumulate' 表示引擎会将所有 delta 合并
+    // 为一条累积的系列记录（类似 ChatCompletion 流式输出）。
+    // 后加入的订阅者看到的是已累积的完整文本，而非单独的 chunk。
     await engine.publishEvent(taskId, {
       type: 'llm.delta',
       level: 'info',
       data: { delta: chunk },
-      seriesId: 'response',
-      seriesMode: 'accumulate',
+      seriesId: 'response',       // 将事件归入命名的系列
+      seriesMode: 'accumulate',   // 'accumulate' | 'latest' | 'keep-all'
     })
   }
 
+  // running → completed：SSE 连接收到完成事件后自动关闭。
+  // 终态转换具有并发安全性 —— 只允许一次终态转换。
   await engine.transitionTask(taskId, 'completed', {
     result: { output: '完整响应文本' },
   })
 }
 ```
 
-客户端通过 `GET /taskcast/tasks/{taskId}/events`（SSE）订阅流式结果。
+客户端通过 `GET /taskcast/tasks/{taskId}/events`（SSE）订阅流式结果。任务为 `pending` 时连接会保持等待；转为 `running` 后自动推流；若任务已 `completed`，客户端会收到完整的历史回放后断开。
 
 ### 模式二：后端 + Worker 分离
 
@@ -201,17 +213,19 @@ import { TaskcastServerClient } from '@taskcast/server-sdk'
 
 const taskcast = new TaskcastServerClient({
   baseUrl: 'http://taskcast-service:3721',
-  token: process.env.TASKCAST_TOKEN,
+  token: process.env.TASKCAST_TOKEN, // 携带 task:create + event:subscribe 权限的 JWT
 })
 
-// 创建任务 —— 由 Worker 领取
+// 创建任务 —— 初始状态为 "pending"，等待 Worker 领取。
+// assignMode 决定引擎如何将任务分发给 Worker。
 const task = await taskcast.createTask({
   type: 'llm.chat',
   params: { prompt: '给我讲个故事' },
-  assignMode: 'pull', // 或 'ws-offer' / 'ws-race'
+  assignMode: 'pull',    // 'pull' = Worker 长轮询领取；'ws-offer' = 服务端推送给 WS Worker；
+                         // 'ws-race' = 推送给多个 WS Worker，先接受者获得任务
 })
 
-// 将 taskId 返回给客户端，用于 SSE 订阅
+// 将 taskId 返回给客户端 —— 客户端通过 SSE 订阅流式结果
 return { taskId: task.id }
 ```
 
@@ -223,28 +237,31 @@ const WORKER_ID = 'worker-1'
 
 async function workerLoop() {
   while (true) {
-    // 长轮询等待任务分配
+    // 长轮询：服务端会保持连接直到有匹配的任务可用，或超时返回。
+    // 匹配成功时，任务会被原子性地分配给该 Worker（pending → assigned），
+    // 其他 Worker 无法再领取同一任务。
     const res = await fetch(
       `${TASKCAST_URL}/workers/pull?workerId=${WORKER_ID}&timeout=30000`,
       { headers: { Authorization: `Bearer ${WORKER_TOKEN}` } },
     )
 
-    if (res.status === 204) continue // 无可用任务，重试
+    if (res.status === 204) continue // 超时，没有匹配的任务 —— 重试
 
-    const task = await res.json()
+    const task = await res.json() // { id, type, params, ... }
     await processAndComplete(task.id, task.params)
   }
 }
 
 async function processAndComplete(taskId: string, params: Record<string, unknown>) {
-  // 转换为运行状态
+  // assigned → running：通知所有订阅者任务已开始处理
   await fetch(`${TASKCAST_URL}/tasks/${taskId}/status`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${WORKER_TOKEN}` },
     body: JSON.stringify({ status: 'running' }),
   })
 
-  // 推送流式结果
+  // 发布流式事件 —— 每个事件会实时广播给所有 SSE 订阅者。
+  // seriesMode: 'accumulate' 会合并 delta，后加入的订阅者看到的是完整文本。
   for await (const chunk of callLLM(params.prompt as string)) {
     await fetch(`${TASKCAST_URL}/tasks/${taskId}/events`, {
       method: 'POST',
@@ -257,7 +274,8 @@ async function processAndComplete(taskId: string, params: Record<string, unknown
     })
   }
 
-  // 完成任务
+  // running → completed：SSE 订阅者收到终态事件后自动断开。
+  // Worker 的并发容量槽位会被自动释放，可以领取下一个任务。
   await fetch(`${TASKCAST_URL}/tasks/${taskId}/status`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${WORKER_TOKEN}` },
@@ -272,11 +290,11 @@ async function processAndComplete(taskId: string, params: Record<string, unknown
 const ws = new WebSocket('ws://taskcast-service:3721/workers/ws')
 
 ws.addEventListener('open', () => {
-  // 注册 Worker，设置匹配规则和并发容量
+  // 注册 Worker：matchRule 过滤要接收的任务类型；capacity 限制最大并发数。
   ws.send(JSON.stringify({
     type: 'register',
-    matchRule: { types: ['llm.*'] },
-    capacity: 5,
+    matchRule: { types: ['llm.*'] }, // 只接收 type 匹配 "llm.*" 的任务
+    capacity: 5,                     // 最多同时处理 5 个任务
   }))
 })
 
@@ -284,7 +302,9 @@ ws.addEventListener('message', async (event) => {
   const msg = JSON.parse(event.data)
 
   if (msg.type === 'offer') {
-    // 接受分配的任务
+    // 服务端推送任务给该 Worker（ws-offer 模式：独占推送；
+    // ws-race 模式：同时推送给多个 Worker，先 accept 者获得任务）。
+    // msg.task 包含 { id, type, params, tags, cost }。
     ws.send(JSON.stringify({ type: 'accept', taskId: msg.task.id }))
     await processAndComplete(msg.task.id, msg.task.params)
   }
@@ -301,12 +321,16 @@ const client = new TaskcastClient({
   token: 'user-jwt-token',
 })
 
+// 订阅任务的 SSE 事件流。
+// filter 支持通配符匹配，只接收感兴趣的事件类型。
 await client.subscribe(taskId, {
-  filter: { types: ['llm.*'] },
+  filter: { types: ['llm.*'] },  // 只接收 type 匹配 "llm.*" 的事件
   onEvent: (envelope) => {
+    // envelope 包含完整的事件信封：{ eventId, type, level, data, seriesId, ... }
     console.log(envelope.data.delta) // 流式片段
   },
   onDone: (reason) => {
+    // reason: 'completed' | 'failed' | 'timeout' | 'cancelled'
     console.log('任务完成：', reason)
   },
 })
