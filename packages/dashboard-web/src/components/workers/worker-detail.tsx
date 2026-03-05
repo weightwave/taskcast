@@ -3,22 +3,10 @@ import { Badge } from '@/components/ui/badge'
 import { Separator } from '@/components/ui/separator'
 import { formatRelativeTime, cn } from '@/lib/utils'
 import { workerStatusColor } from '@/lib/status'
+import type { Worker } from '@taskcast/core'
 
-interface WorkerData {
-  id: string
-  status: string
-  capacity: number
-  usedSlots: number
-  mode?: string
-  weight?: number
-  lastHeartbeat?: number
-  connectedAt?: number
-  matchRule?: unknown
-  metadata?: Record<string, unknown>
-}
-
-export function WorkerDetail({ worker }: { worker: unknown }) {
-  const w = worker as WorkerData
+export function WorkerDetail({ worker }: { worker: Worker }) {
+  const w = worker
 
   return (
     <div className="space-y-4">
@@ -37,11 +25,11 @@ export function WorkerDetail({ worker }: { worker: unknown }) {
         </CardHeader>
         <CardContent className="space-y-2 text-sm">
           <InfoRow label="ID" value={w.id} mono />
-          <InfoRow label="Mode" value={w.mode ?? '-'} />
+          <InfoRow label="Mode" value={w.connectionMode ?? '-'} />
           <InfoRow label="Weight" value={w.weight != null ? String(w.weight) : '-'} />
           <InfoRow label="Capacity" value={`${w.usedSlots} / ${w.capacity} slots`} />
           {w.connectedAt && <InfoRow label="Connected" value={formatRelativeTime(w.connectedAt)} />}
-          {w.lastHeartbeat && <InfoRow label="Last Heartbeat" value={formatRelativeTime(w.lastHeartbeat)} />}
+          {w.lastHeartbeatAt && <InfoRow label="Last Heartbeat" value={formatRelativeTime(w.lastHeartbeatAt)} />}
         </CardContent>
       </Card>
 

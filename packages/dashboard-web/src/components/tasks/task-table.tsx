@@ -9,29 +9,18 @@ import {
 } from '@/components/ui/table'
 import { formatRelativeTime } from '@/lib/utils'
 import { statusBadgeVariant } from '@/lib/status'
-
-interface TaskRow {
-  id: string
-  type?: string
-  status: string
-  hot?: boolean
-  subscriberCount?: number
-  workerId?: string
-  createdAt?: number
-}
+import type { DashboardTask } from '@/types'
 
 export function TaskTable({
   tasks,
   selectedTaskId,
   onSelect,
 }: {
-  tasks: unknown[]
+  tasks: DashboardTask[]
   selectedTaskId: string | null
   onSelect: (taskId: string) => void
 }) {
-  const typedTasks = tasks as TaskRow[]
-
-  if (typedTasks.length === 0) {
+  if (tasks.length === 0) {
     return (
       <div className="flex h-40 items-center justify-center text-sm text-muted-foreground">
         No tasks found.
@@ -53,7 +42,7 @@ export function TaskTable({
         </TableRow>
       </TableHeader>
       <TableBody>
-        {typedTasks.map((task) => (
+        {tasks.map((task) => (
           <TableRow
             key={task.id}
             className="cursor-pointer"

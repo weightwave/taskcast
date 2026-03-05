@@ -8,22 +8,7 @@ import { formatRelativeTime } from '@/lib/utils'
 import { statusBadgeVariant } from '@/lib/status'
 import { TaskActions } from './task-actions'
 import { EventTimeline } from './event-timeline'
-
-interface TaskData {
-  id: string
-  type?: string
-  status: string
-  hot?: boolean
-  subscriberCount?: number
-  workerId?: string
-  ttl?: number
-  params?: unknown
-  result?: unknown
-  error?: unknown
-  createdAt?: number
-  updatedAt?: number
-  completedAt?: number
-}
+import type { DashboardTask } from '@/types'
 
 export function TaskDetail({ taskId }: { taskId: string }) {
   const { data, isLoading } = useTaskQuery(taskId)
@@ -43,7 +28,7 @@ export function TaskDetail({ taskId }: { taskId: string }) {
     return <p className="text-sm text-muted-foreground">Task not found.</p>
   }
 
-  const task = data as TaskData
+  const task = data as DashboardTask
 
   return (
     <div className="space-y-4 overflow-auto">

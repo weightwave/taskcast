@@ -10,18 +10,10 @@ import {
 } from '@/components/ui/table'
 import { formatRelativeTime } from '@/lib/utils'
 import { statusBadgeVariant } from '@/lib/status'
+import type { DashboardTask } from '@/types'
 
-interface RecentTask {
-  id: string
-  type?: string
-  status: string
-  createdAt: number
-}
-
-export function RecentTasks({ tasks }: { tasks: unknown[] }) {
-  const typedTasks = tasks as RecentTask[]
-
-  if (typedTasks.length === 0) {
+export function RecentTasks({ tasks }: { tasks: DashboardTask[] }) {
+  if (tasks.length === 0) {
     return (
       <Card>
         <CardHeader>
@@ -50,7 +42,7 @@ export function RecentTasks({ tasks }: { tasks: unknown[] }) {
             </TableRow>
           </TableHeader>
           <TableBody>
-            {typedTasks.map((task) => (
+            {tasks.map((task) => (
               <TableRow key={task.id}>
                 <TableCell className="font-mono text-xs">{task.id.slice(-8)}</TableCell>
                 <TableCell className="text-sm">{task.type ?? '-'}</TableCell>

@@ -1,5 +1,6 @@
 import { BrowserRouter, Routes, Route } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { ErrorBoundary } from './components/error-boundary'
 import { Shell } from './components/layout/shell'
 import { OverviewPage } from './pages/overview'
 import { TasksPage } from './pages/tasks'
@@ -25,18 +26,20 @@ export function App() {
   }
 
   return (
-    <QueryClientProvider client={queryClient}>
-      <BrowserRouter>
-        <Shell>
-          <Routes>
-            <Route path="/" element={<OverviewPage />} />
-            <Route path="/tasks" element={<TasksPage />} />
-            <Route path="/tasks/:taskId" element={<TasksPage />} />
-            <Route path="/events" element={<EventsPage />} />
-            <Route path="/workers" element={<WorkersPage />} />
-          </Routes>
-        </Shell>
-      </BrowserRouter>
-    </QueryClientProvider>
+    <ErrorBoundary>
+      <QueryClientProvider client={queryClient}>
+        <BrowserRouter>
+          <Shell>
+            <Routes>
+              <Route path="/" element={<OverviewPage />} />
+              <Route path="/tasks" element={<TasksPage />} />
+              <Route path="/tasks/:taskId" element={<TasksPage />} />
+              <Route path="/events" element={<EventsPage />} />
+              <Route path="/workers" element={<WorkersPage />} />
+            </Routes>
+          </Shell>
+        </BrowserRouter>
+      </QueryClientProvider>
+    </ErrorBoundary>
   )
 }

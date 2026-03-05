@@ -1,4 +1,5 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import type { DashboardTask } from '@/types'
 import { apiFetch } from '@/lib/api'
 
 interface TaskFilter {
@@ -7,7 +8,7 @@ interface TaskFilter {
 }
 
 export function useTasksQuery(filter?: TaskFilter) {
-  return useQuery({
+  return useQuery<DashboardTask[]>({
     queryKey: ['tasks', filter],
     queryFn: async () => {
       const params = new URLSearchParams()
@@ -17,7 +18,7 @@ export function useTasksQuery(filter?: TaskFilter) {
       const res = await apiFetch(`/tasks${qs ? `?${qs}` : ''}`)
       if (!res.ok) throw new Error(`Failed to fetch tasks: ${res.status}`)
       const body = await res.json()
-      return body.tasks as unknown[]
+      return body.tasks as DashboardTask[]
     },
     refetchInterval: 3000,
   })

@@ -5,9 +5,9 @@ import { RecentTasks } from '@/components/overview/recent-tasks'
 import { Skeleton } from '@/components/ui/skeleton'
 
 export function OverviewPage() {
-  const { statusCounts, totalTasks, onlineWorkers, totalCapacity, usedCapacity, recentTasks } = useStats()
+  const { statusCounts, totalTasks, onlineWorkers, totalCapacity, usedCapacity, recentTasks, isPending } = useStats()
 
-  const isLoading = totalTasks === 0 && Object.keys(statusCounts).length === 0
+  const isLoading = isPending
 
   return (
     <div className="space-y-6">

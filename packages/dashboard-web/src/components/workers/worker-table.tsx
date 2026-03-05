@@ -21,32 +21,22 @@ import {
 import { formatRelativeTime, cn } from '@/lib/utils'
 import { workerStatusColor } from '@/lib/status'
 import { useDrainWorker, useDisconnectWorker } from '@/hooks/use-workers'
-
-interface Worker {
-  id: string
-  status: string
-  capacity: number
-  usedSlots: number
-  mode?: string
-  weight?: number
-  lastHeartbeat?: number
-}
+import type { Worker } from '@taskcast/core'
 
 export function WorkerTable({
   workers,
   selectedWorkerId,
   onSelect,
 }: {
-  workers: unknown[]
+  workers: Worker[]
   selectedWorkerId: string | null
   onSelect: (workerId: string) => void
 }) {
-  const typedWorkers = workers as Worker[]
   const drain = useDrainWorker()
   const disconnect = useDisconnectWorker()
   const [disconnectTarget, setDisconnectTarget] = useState<string | null>(null)
 
-  if (typedWorkers.length === 0) {
+  if (workers.length === 0) {
     return (
       <div className="flex h-40 items-center justify-center text-sm text-muted-foreground">
         No workers connected.
@@ -82,7 +72,7 @@ export function WorkerTable({
           </TableRow>
         </TableHeader>
         <TableBody>
-          {typedWorkers.map((worker) => {
+          {workers.map((worker) => {
             const utilization = worker.capacity > 0 ? Math.round((worker.usedSlots / worker.capacity) * 100) : 0
             return (
               <TableRow
@@ -105,10 +95,10 @@ export function WorkerTable({
                     </span>
                   </div>
                 </TableCell>
-                <TableCell className="text-sm">{worker.mode ?? '-'}</TableCell>
+                <TableCell className="text-sm">{worker.connectionMode ?? '-'}</TableCell>
                 <TableCell className="text-sm">{worker.weight ?? '-'}</TableCell>
                 <TableCell className="text-sm text-muted-foreground">
-                  {worker.lastHeartbeat ? formatRelativeTime(worker.lastHeartbeat) : '-'}
+                  {worker.lastHeartbeatAt ? formatRelativeTime(worker.lastHeartbeatAt) : '-'}
                 </TableCell>
                 <TableCell>
                   <div className="flex gap-1" onClick={(e) => e.stopPropagation()}>

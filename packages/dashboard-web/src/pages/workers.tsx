@@ -8,9 +8,8 @@ export function WorkersPage() {
   const { data: workers = [] } = useWorkersQuery()
   const [selectedWorkerId, setSelectedWorkerId] = useState<string | null>(null)
 
-  const typedWorkers = workers as Array<{ id: string }>
   const selectedWorker = selectedWorkerId
-    ? typedWorkers.find((w) => w.id === selectedWorkerId) ?? null
+    ? workers.find((w) => w.id === selectedWorkerId) ?? null
     : null
 
   return (

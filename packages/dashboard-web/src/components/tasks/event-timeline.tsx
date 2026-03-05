@@ -3,25 +3,17 @@ import { Badge } from '@/components/ui/badge'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { cn } from '@/lib/utils'
 import { levelBadgeClass } from '@/lib/status'
+import type { SSEEnvelope } from '@taskcast/core'
 
-interface TaskEvent {
-  type?: string
-  level?: string
-  rawIndex?: number
-  data?: unknown
-}
-
-export function EventTimeline({ events }: { events: unknown[] }) {
-  const typedEvents = events as TaskEvent[]
-
-  if (typedEvents.length === 0) {
+export function EventTimeline({ events }: { events: SSEEnvelope[] }) {
+  if (events.length === 0) {
     return <p className="text-sm text-muted-foreground">No events yet.</p>
   }
 
   return (
     <ScrollArea className="h-[400px]">
       <div className="space-y-1 pr-4">
-        {typedEvents.map((event, i) => (
+        {events.map((event, i) => (
           <EventRow key={i} event={event} />
         ))}
       </div>
@@ -29,7 +21,7 @@ export function EventTimeline({ events }: { events: unknown[] }) {
   )
 }
 
-function EventRow({ event }: { event: TaskEvent }) {
+function EventRow({ event }: { event: SSEEnvelope }) {
   const [expanded, setExpanded] = useState(false)
   const level = event.level ?? 'info'
 
