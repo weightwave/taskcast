@@ -7,6 +7,27 @@ import { checkScope } from '../auth.js'
 import { ErrorSchema } from '../schemas.js'
 import type { TaskEngine, TaskEvent, SubscribeFilter, SSEEnvelope, Level } from '@taskcast/core'
 
+// ─── Subscriber Tracking ─────────────────────────────────────────────────────
+
+const subscriberCounts = new Map<string, number>()
+
+export function getSubscriberCount(taskId: string): number {
+  return subscriberCounts.get(taskId) ?? 0
+}
+
+function incrementSubscriberCount(taskId: string): void {
+  subscriberCounts.set(taskId, (subscriberCounts.get(taskId) ?? 0) + 1)
+}
+
+function decrementSubscriberCount(taskId: string): void {
+  const count = (subscriberCounts.get(taskId) ?? 1) - 1
+  if (count <= 0) {
+    subscriberCounts.delete(taskId)
+  } else {
+    subscriberCounts.set(taskId, count)
+  }
+}
+
 // ─── Route Definition ──────────────────────────────────────────────────────
 
 const sseRoute = createRoute({
@@ -107,6 +128,8 @@ export function createSSERouter(engine: TaskEngine): Hono {
     const wrap = filter.wrap !== false // default true
 
     return streamSSE(c, async (stream) => {
+      incrementSubscriberCount(taskId)
+
       const sendEvent = async (event: TaskEvent, filteredIndex: number) => {
         const payload = wrap ? toEnvelope(event, filteredIndex) : event
         await stream.writeSSE({
@@ -133,6 +156,7 @@ export function createSSERouter(engine: TaskEngine): Hono {
       // If task is already terminal, send done and close
       if (TERMINAL.has(task.status)) {
         await sendDone(task.status)
+        decrementSubscriberCount(taskId)
         return
       }
 
@@ -141,6 +165,7 @@ export function createSSERouter(engine: TaskEngine): Hono {
         ? (filtered[filtered.length - 1]!.filteredIndex + 1)
         : 0
 
+      let decremented = false
       await new Promise<void>((resolve) => {
         const unsub = engine.subscribe(taskId, async (event) => {
           if (!matchesFilter(event, filter)) return
@@ -150,6 +175,7 @@ export function createSSERouter(engine: TaskEngine): Hono {
             const status = (event.data as { status: string }).status
             if (TERMINAL.has(status)) {
               await sendDone(status)
+              if (!decremented) { decremented = true; decrementSubscriberCount(taskId) }
               unsub()
               resolve()
             }
@@ -157,6 +183,7 @@ export function createSSERouter(engine: TaskEngine): Hono {
         })
 
         stream.onAbort(() => {
+          if (!decremented) { decremented = true; decrementSubscriberCount(taskId) }
           unsub()
           resolve()
         })

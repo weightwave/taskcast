@@ -2,6 +2,7 @@ import type { Hono } from 'hono'
 import { OpenAPIHono, createRoute, z } from '@hono/zod-openapi'
 import type { Context } from 'hono'
 import { checkScope } from '../auth.js'
+import { getSubscriberCount } from './sse.js'
 import {
   CreateTaskSchema,
   PublishEventSchema,
@@ -154,7 +155,7 @@ export function createTasksRouter(engine: TaskEngine): Hono {
 
     const task = await engine.getTask(taskId)
     if (!task) return c.json({ error: 'Task not found' }, 404)
-    return c.json(task)
+    return c.json({ ...task, hot: true, subscriberCount: getSubscriberCount(taskId) })
   })
 
   register(transitionRoute, async (c) => {

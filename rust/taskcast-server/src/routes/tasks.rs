@@ -15,6 +15,7 @@ use taskcast_core::{
 
 use crate::auth::{check_scope, AuthContext};
 use crate::error::AppError;
+use crate::routes::sse::get_subscriber_count;
 
 // ─── Request Bodies ──────────────────────────────────────────────────────────
 
@@ -161,7 +162,14 @@ pub async fn get_task(
         .await?
         .ok_or_else(|| AppError::NotFound("Task not found".to_string()))?;
 
-    Ok(axum::Json(task))
+    let subscriber_count = get_subscriber_count(&task_id).await;
+    let mut task_json = serde_json::to_value(&task).unwrap();
+    if let Some(obj) = task_json.as_object_mut() {
+        obj.insert("hot".to_string(), json!(true));
+        obj.insert("subscriberCount".to_string(), json!(subscriber_count));
+    }
+
+    Ok(axum::Json(task_json))
 }
 
 #[utoipa::path(

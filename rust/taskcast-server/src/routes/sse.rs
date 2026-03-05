@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 
@@ -6,6 +7,7 @@ use axum::response::sse::{Event, Sse};
 use axum::Extension;
 use futures::stream::Stream;
 use serde::Deserialize;
+use tokio::sync::Mutex;
 use tokio_stream::wrappers::ReceiverStream;
 
 use taskcast_core::{
@@ -15,6 +17,31 @@ use taskcast_core::{
 
 use crate::auth::{check_scope, AuthContext};
 use crate::error::AppError;
+
+// ─── Subscriber Tracking ─────────────────────────────────────────────────────
+
+static SUBSCRIBER_COUNTS: std::sync::LazyLock<Mutex<HashMap<String, usize>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+pub async fn get_subscriber_count(task_id: &str) -> usize {
+    let counts = SUBSCRIBER_COUNTS.lock().await;
+    counts.get(task_id).copied().unwrap_or(0)
+}
+
+async fn increment_subscriber_count(task_id: &str) {
+    let mut counts = SUBSCRIBER_COUNTS.lock().await;
+    *counts.entry(task_id.to_string()).or_insert(0) += 1;
+}
+
+async fn decrement_subscriber_count(task_id: &str) {
+    let mut counts = SUBSCRIBER_COUNTS.lock().await;
+    if let Some(count) = counts.get_mut(task_id) {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            counts.remove(task_id);
+        }
+    }
+}
 
 // ─── Query Parameters ───────────────────────────────────────────────────────
 
@@ -141,6 +168,8 @@ pub async fn sse_events(
     let task_id_clone = task_id.clone();
 
     tokio::spawn(async move {
+        increment_subscriber_count(&task_id_clone).await;
+
         // Helper closures
         let send_event = |tx: &tokio::sync::mpsc::Sender<Result<Event, Infallible>>,
                           event: &TaskEvent,
@@ -183,6 +212,7 @@ pub async fn sse_events(
             let status_str =
                 serde_json::to_value(&task_status).unwrap_or(serde_json::Value::Null);
             send_done(&tx, status_str.as_str().unwrap_or("completed"));
+            decrement_subscriber_count(&task_id_clone).await;
             return;
         }
 
@@ -235,6 +265,7 @@ pub async fn sse_events(
         // Wait for terminal event or channel close
         let _ = done_rx.await;
         unsub();
+        decrement_subscriber_count(&task_id_clone).await;
     });
 
     let stream = ReceiverStream::new(rx);
