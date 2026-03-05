@@ -4,6 +4,12 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release Rust/Docker (e.g. 0.3.0)'
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -19,6 +25,7 @@ env:
 jobs:
   # ── npm publish via changesets ────────────────────────────────────────────
   release:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     environment: npm
     outputs:
@@ -61,10 +68,14 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  # ── Extract version from changesets output ────────────────────────────────
+  # ── Extract version from changesets output or dispatch input ──────────────
   get-version:
     needs: release
-    if: needs.release.outputs.published == 'true'
+    if: |
+      always() && (
+        (needs.release.result == 'success' && needs.release.outputs.published == 'true') ||
+        (needs.release.result == 'skipped' && github.event_name == 'workflow_dispatch')
+      )
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.extract.outputs.version }}
@@ -72,10 +83,14 @@ jobs:
       - name: Extract version
         id: extract
         run: |
-          VERSION=$(echo '${{ needs.release.outputs.publishedPackages }}' \
-            | jq -r '.[] | select(.name == "@taskcast/cli") | .version')
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION=$(echo '${{ needs.release.outputs.publishedPackages }}' \
+              | jq -r '.[] | select(.name == "@taskcast/cli") | .version')
+          fi
           if [ -z "$VERSION" ]; then
-            echo "ERROR: @taskcast/cli not found in published packages" >&2
+            echo "ERROR: version not found" >&2
             exit 1
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
