@@ -83,6 +83,11 @@ async fn handle_task_with_no_optional_fields() {
         updated_at: 1000.0,
         completed_at: None,
         ttl: None,
+        tags: None,
+        assign_mode: None,
+        cost: None,
+        assigned_worker: None,
+        disconnect_policy: None,
     };
     ctx.short.save_task(task.clone()).await.unwrap();
     let retrieved = ctx.short.get_task("minimal").await.unwrap().unwrap();

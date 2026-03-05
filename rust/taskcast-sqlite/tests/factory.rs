@@ -26,14 +26,19 @@ async fn returns_working_adapters() {
         updated_at: 1000.0,
         completed_at: None,
         ttl: None,
+        tags: None,
+        assign_mode: None,
+        cost: None,
+        assigned_worker: None,
+        disconnect_policy: None,
     };
 
-    adapters.short_term.save_task(task.clone()).await.unwrap();
-    let retrieved = adapters.short_term.get_task("factory-1").await.unwrap();
+    adapters.short_term_store.save_task(task.clone()).await.unwrap();
+    let retrieved = adapters.short_term_store.get_task("factory-1").await.unwrap();
     assert_eq!(retrieved, Some(task.clone()));
 
-    adapters.long_term.save_task(task.clone()).await.unwrap();
-    let retrieved = adapters.long_term.get_task("factory-1").await.unwrap();
+    adapters.long_term_store.save_task(task.clone()).await.unwrap();
+    let retrieved = adapters.long_term_store.get_task("factory-1").await.unwrap();
     assert_eq!(retrieved, Some(task));
 }
 

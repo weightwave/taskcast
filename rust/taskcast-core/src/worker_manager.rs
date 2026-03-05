@@ -21,9 +21,9 @@ pub type ManagerResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 pub struct WorkerManagerOptions {
     pub engine: Arc<TaskEngine>,
-    pub short_term: Arc<dyn ShortTermStore>,
+    pub short_term_store: Arc<dyn ShortTermStore>,
     pub broadcast: Arc<dyn BroadcastProvider>,
-    pub long_term: Option<Arc<dyn LongTermStore>>,
+    pub long_term_store: Option<Arc<dyn LongTermStore>>,
     pub hooks: Option<Arc<dyn TaskcastHooks>>,
     pub defaults: Option<WorkerManagerDefaults>,
 }
@@ -113,9 +113,9 @@ pub struct DeclineOptions {
 
 pub struct WorkerManager {
     engine: Arc<TaskEngine>,
-    short_term: Arc<dyn ShortTermStore>,
+    short_term_store: Arc<dyn ShortTermStore>,
     broadcast: Arc<dyn BroadcastProvider>,
-    long_term: Option<Arc<dyn LongTermStore>>,
+    long_term_store: Option<Arc<dyn LongTermStore>>,
     hooks: Option<Arc<dyn TaskcastHooks>>,
     defaults: WorkerManagerDefaults,
 }
@@ -124,9 +124,9 @@ impl WorkerManager {
     pub fn new(opts: WorkerManagerOptions) -> Self {
         Self {
             engine: opts.engine,
-            short_term: opts.short_term,
+            short_term_store: opts.short_term_store,
             broadcast: opts.broadcast,
-            long_term: opts.long_term,
+            long_term_store: opts.long_term_store,
             hooks: opts.hooks,
             defaults: opts.defaults.unwrap_or_default(),
         }
@@ -176,7 +176,7 @@ impl WorkerManager {
         worker_id: &str,
         data: Option<HashMap<String, serde_json::Value>>,
     ) {
-        let Some(ref long_term) = self.long_term else {
+        let Some(ref long_term_store) = self.long_term_store else {
             return;
         };
         let event = WorkerAuditEvent {
@@ -186,7 +186,7 @@ impl WorkerManager {
             action,
             data,
         };
-        let lt = Arc::clone(long_term);
+        let lt = Arc::clone(long_term_store);
         tokio::spawn(async move {
             let _ = lt.save_worker_event(event).await;
         });
@@ -208,7 +208,7 @@ impl WorkerManager {
             last_heartbeat_at: now,
             metadata: config.metadata,
         };
-        self.short_term.save_worker(worker.clone()).await?;
+        self.short_term_store.save_worker(worker.clone()).await?;
         self.emit_worker_audit(WorkerAuditAction::Connected, &worker.id, None);
         if let Some(ref hooks) = self.hooks {
             hooks.on_worker_connected(&worker);
@@ -217,8 +217,8 @@ impl WorkerManager {
     }
 
     pub async fn unregister_worker(&self, worker_id: &str) -> ManagerResult<()> {
-        let worker = self.short_term.get_worker(worker_id).await?;
-        self.short_term.delete_worker(worker_id).await?;
+        let worker = self.short_term_store.get_worker(worker_id).await?;
+        self.short_term_store.delete_worker(worker_id).await?;
         if let Some(worker) = worker {
             let mut data = HashMap::new();
             data.insert(
@@ -238,7 +238,7 @@ impl WorkerManager {
         worker_id: &str,
         update: WorkerUpdate,
     ) -> ManagerResult<Option<Worker>> {
-        let worker = self.short_term.get_worker(worker_id).await?;
+        let worker = self.short_term_store.get_worker(worker_id).await?;
         let Some(mut worker) = worker else {
             return Ok(None);
         };
@@ -260,7 +260,7 @@ impl WorkerManager {
             }
         }
 
-        self.short_term.save_worker(worker.clone()).await?;
+        self.short_term_store.save_worker(worker.clone()).await?;
 
         self.emit_worker_audit(WorkerAuditAction::Updated, worker_id, None);
         if update.status.is_some() {
@@ -271,21 +271,21 @@ impl WorkerManager {
     }
 
     pub async fn heartbeat(&self, worker_id: &str) -> ManagerResult<()> {
-        let worker = self.short_term.get_worker(worker_id).await?;
+        let worker = self.short_term_store.get_worker(worker_id).await?;
         let Some(mut worker) = worker else {
             return Ok(());
         };
         worker.last_heartbeat_at = now_millis();
-        self.short_term.save_worker(worker).await?;
+        self.short_term_store.save_worker(worker).await?;
         Ok(())
     }
 
     pub async fn get_worker(&self, worker_id: &str) -> ManagerResult<Option<Worker>> {
-        self.short_term.get_worker(worker_id).await
+        self.short_term_store.get_worker(worker_id).await
     }
 
     pub async fn list_workers(&self, filter: Option<WorkerFilter>) -> ManagerResult<Vec<Worker>> {
-        self.short_term.list_workers(filter).await
+        self.short_term_store.list_workers(filter).await
     }
 
     // ─── Task Dispatch ─────────────────────────────────────────────────
@@ -300,7 +300,7 @@ impl WorkerManager {
         let blacklist = get_blacklist(&task);
 
         let workers = self
-            .short_term
+            .short_term_store
             .list_workers(Some(WorkerFilter {
                 status: Some(vec![WorkerStatus::Idle, WorkerStatus::Busy]),
                 connection_mode: None,
@@ -366,7 +366,7 @@ impl WorkerManager {
         }
 
         let cost = task.cost.unwrap_or(1);
-        let claimed = self.short_term.claim_task(task_id, worker_id, cost).await?;
+        let claimed = self.short_term_store.claim_task(task_id, worker_id, cost).await?;
         if !claimed {
             return Ok(ClaimResult::Failed {
                 reason: "Claim failed (concurrent modification)".to_string(),
@@ -374,9 +374,9 @@ impl WorkerManager {
         }
 
         // Re-read the authoritative state after atomic claim
-        let updated_task = self.short_term.get_task(task_id).await?.unwrap();
-        if let Some(ref long_term) = self.long_term {
-            long_term.save_task(updated_task.clone()).await?;
+        let updated_task = self.short_term_store.get_task(task_id).await?.unwrap();
+        if let Some(ref long_term_store) = self.long_term_store {
+            long_term_store.save_task(updated_task.clone()).await?;
         }
 
         // Emit audit events
@@ -406,17 +406,17 @@ impl WorkerManager {
             assigned_at: now_millis(),
             status: WorkerAssignmentStatus::Assigned,
         };
-        self.short_term.add_assignment(assignment).await?;
+        self.short_term_store.add_assignment(assignment).await?;
 
         // Update worker status (used_slots already updated by claim_task)
-        let worker = self.short_term.get_worker(worker_id).await?;
+        let worker = self.short_term_store.get_worker(worker_id).await?;
         if let Some(mut worker) = worker {
             worker.status = if worker.used_slots >= worker.capacity {
                 WorkerStatus::Busy
             } else {
                 WorkerStatus::Idle
             };
-            self.short_term.save_worker(worker.clone()).await?;
+            self.short_term_store.save_worker(worker.clone()).await?;
 
             if let Some(ref hooks) = self.hooks {
                 hooks.on_task_assigned(&updated_task, &worker);
@@ -434,21 +434,21 @@ impl WorkerManager {
         worker_id: &str,
         opts: Option<DeclineOptions>,
     ) -> ManagerResult<()> {
-        let assignment = self.short_term.get_task_assignment(task_id).await?;
+        let assignment = self.short_term_store.get_task_assignment(task_id).await?;
         let assignment = match assignment {
             Some(a) if a.worker_id == worker_id => a,
             _ => return Ok(()),
         };
 
         // Remove assignment
-        self.short_term.remove_assignment(task_id).await?;
+        self.short_term_store.remove_assignment(task_id).await?;
 
         // Restore worker capacity
-        let worker = self.short_term.get_worker(worker_id).await?;
+        let worker = self.short_term_store.get_worker(worker_id).await?;
         let worker = if let Some(mut w) = worker {
             w.used_slots = w.used_slots.saturating_sub(assignment.cost);
             w.status = WorkerStatus::Idle;
-            self.short_term.save_worker(w.clone()).await?;
+            self.short_term_store.save_worker(w.clone()).await?;
             Some(w)
         } else {
             None
@@ -513,9 +513,9 @@ impl WorkerManager {
                 );
             }
 
-            self.short_term.save_task(task.clone()).await?;
-            if let Some(ref long_term) = self.long_term {
-                long_term.save_task(task.clone()).await?;
+            self.short_term_store.save_task(task.clone()).await?;
+            if let Some(ref long_term_store) = self.long_term_store {
+                long_term_store.save_task(task.clone()).await?;
             }
 
             if let Some(ref hooks) = self.hooks {
@@ -534,7 +534,7 @@ impl WorkerManager {
         &self,
         worker_id: &str,
     ) -> ManagerResult<Vec<WorkerAssignment>> {
-        self.short_term.get_worker_assignments(worker_id).await
+        self.short_term_store.get_worker_assignments(worker_id).await
     }
 
     // ─── Pull Mode (Long-Poll) ─────────────────────────────────────────
@@ -547,14 +547,14 @@ impl WorkerManager {
         // Heartbeat first
         self.heartbeat(worker_id).await?;
 
-        let worker = self.short_term.get_worker(worker_id).await?;
+        let worker = self.short_term_store.get_worker(worker_id).await?;
         let Some(worker) = worker else {
             return Err(format!("Worker not found: {}", worker_id).into());
         };
 
         // Check existing pending pull-mode tasks
         let pending_tasks = self
-            .short_term
+            .short_term_store
             .list_tasks(TaskFilter {
                 status: Some(vec![TaskStatus::Pending]),
                 assign_mode: Some(vec![AssignMode::Pull]),
@@ -599,7 +599,7 @@ impl WorkerManager {
         let (tx, rx) = tokio::sync::oneshot::channel::<Option<Task>>();
         let tx = Arc::new(tokio::sync::Mutex::new(Some(tx)));
 
-        let short_term = Arc::clone(&self.short_term);
+        let short_term_store = Arc::clone(&self.short_term_store);
         let engine = Arc::clone(&self.engine);
         let worker_id_owned = worker_id.to_string();
         let worker_match_rule = worker.match_rule.clone();
@@ -615,7 +615,7 @@ impl WorkerManager {
                         None => return,
                     };
 
-                    let short_term = Arc::clone(&short_term);
+                    let short_term_store = Arc::clone(&short_term_store);
                     let engine = Arc::clone(&engine);
                     let wid = worker_id_owned.clone();
                     let rule = worker_match_rule.clone();
@@ -639,7 +639,7 @@ impl WorkerManager {
                             return;
                         }
                         // Re-fetch worker to get current capacity (avoid stale data)
-                        let Ok(Some(current_worker)) = short_term.get_worker(&wid).await else {
+                        let Ok(Some(current_worker)) = short_term_store.get_worker(&wid).await else {
                             return;
                         };
                         let task_cost = task.cost.unwrap_or(1);
@@ -648,7 +648,7 @@ impl WorkerManager {
                         }
 
                         // Try atomic claim
-                        let claimed = short_term.claim_task(&task_id, &wid, task_cost).await;
+                        let claimed = short_term_store.claim_task(&task_id, &wid, task_cost).await;
                         if let Ok(true) = claimed {
                             let claimed_task = engine.get_task(&task_id).await.ok().flatten();
                             let mut guard = tx.lock().await;
@@ -747,19 +747,19 @@ mod tests {
     }
 
     fn make_context() -> TestContext {
-        let short_term = Arc::new(MemoryShortTermStore::new());
+        let short_term_store = Arc::new(MemoryShortTermStore::new());
         let broadcast = Arc::new(MemoryBroadcastProvider::new());
         let engine = Arc::new(TaskEngine::new(TaskEngineOptions {
-            short_term: Arc::clone(&short_term) as Arc<dyn ShortTermStore>,
+            short_term_store: Arc::clone(&short_term_store) as Arc<dyn ShortTermStore>,
             broadcast: Arc::clone(&broadcast) as Arc<dyn BroadcastProvider>,
-            long_term: None,
+            long_term_store: None,
             hooks: None,
         }));
         let manager = WorkerManager::new(WorkerManagerOptions {
             engine: Arc::clone(&engine),
-            short_term: short_term as Arc<dyn ShortTermStore>,
+            short_term_store: short_term_store as Arc<dyn ShortTermStore>,
             broadcast: broadcast as Arc<dyn BroadcastProvider>,
-            long_term: None,
+            long_term_store: None,
             hooks: None,
             defaults: None,
         });
@@ -1587,12 +1587,12 @@ mod tests {
 
     #[tokio::test]
     async fn notify_new_task_broadcasts_event() {
-        let short_term = Arc::new(MemoryShortTermStore::new());
+        let short_term_store = Arc::new(MemoryShortTermStore::new());
         let broadcast = Arc::new(MemoryBroadcastProvider::new());
         let engine = Arc::new(TaskEngine::new(TaskEngineOptions {
-            short_term: Arc::clone(&short_term) as Arc<dyn ShortTermStore>,
+            short_term_store: Arc::clone(&short_term_store) as Arc<dyn ShortTermStore>,
             broadcast: Arc::clone(&broadcast) as Arc<dyn BroadcastProvider>,
-            long_term: None,
+            long_term_store: None,
             hooks: None,
         }));
 
@@ -1611,9 +1611,9 @@ mod tests {
 
         let manager = WorkerManager::new(WorkerManagerOptions {
             engine,
-            short_term: short_term as Arc<dyn ShortTermStore>,
+            short_term_store: short_term_store as Arc<dyn ShortTermStore>,
             broadcast: broadcast as Arc<dyn BroadcastProvider>,
-            long_term: None,
+            long_term_store: None,
             hooks: None,
             defaults: None,
         });
@@ -1742,19 +1742,19 @@ mod tests {
 
     #[tokio::test]
     async fn wait_for_task_claims_on_broadcast_notification() {
-        let short_term = Arc::new(MemoryShortTermStore::new());
+        let short_term_store = Arc::new(MemoryShortTermStore::new());
         let broadcast = Arc::new(MemoryBroadcastProvider::new());
         let engine = Arc::new(TaskEngine::new(TaskEngineOptions {
-            short_term: Arc::clone(&short_term) as Arc<dyn ShortTermStore>,
+            short_term_store: Arc::clone(&short_term_store) as Arc<dyn ShortTermStore>,
             broadcast: Arc::clone(&broadcast) as Arc<dyn BroadcastProvider>,
-            long_term: None,
+            long_term_store: None,
             hooks: None,
         }));
         let manager = Arc::new(WorkerManager::new(WorkerManagerOptions {
             engine: Arc::clone(&engine),
-            short_term: Arc::clone(&short_term) as Arc<dyn ShortTermStore>,
+            short_term_store: Arc::clone(&short_term_store) as Arc<dyn ShortTermStore>,
             broadcast: Arc::clone(&broadcast) as Arc<dyn BroadcastProvider>,
-            long_term: None,
+            long_term_store: None,
             hooks: None,
             defaults: None,
         }));
@@ -1876,12 +1876,12 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_claims_only_one_succeeds() {
-        let short_term = Arc::new(MemoryShortTermStore::new());
+        let short_term_store = Arc::new(MemoryShortTermStore::new());
         let broadcast = Arc::new(MemoryBroadcastProvider::new());
         let engine = Arc::new(TaskEngine::new(TaskEngineOptions {
-            short_term: Arc::clone(&short_term) as Arc<dyn ShortTermStore>,
+            short_term_store: Arc::clone(&short_term_store) as Arc<dyn ShortTermStore>,
             broadcast: Arc::clone(&broadcast) as Arc<dyn BroadcastProvider>,
-            long_term: None,
+            long_term_store: None,
             hooks: None,
         }));
 
@@ -1895,9 +1895,9 @@ mod tests {
 
         let manager = Arc::new(WorkerManager::new(WorkerManagerOptions {
             engine: Arc::clone(&engine),
-            short_term: short_term as Arc<dyn ShortTermStore>,
+            short_term_store: short_term_store as Arc<dyn ShortTermStore>,
             broadcast: broadcast as Arc<dyn BroadcastProvider>,
-            long_term: None,
+            long_term_store: None,
             hooks: None,
             defaults: None,
         }));

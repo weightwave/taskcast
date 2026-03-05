@@ -141,8 +141,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("[taskcast] Using SQLite storage at {db_path}");
                     (
                         Arc::new(taskcast_core::MemoryBroadcastProvider::new()),
-                        Arc::new(adapters.short_term),
-                        Some(Arc::new(adapters.long_term) as Arc<dyn taskcast_core::LongTermStore>),
+                        Arc::new(adapters.short_term_store),
+                        Some(Arc::new(adapters.long_term_store) as Arc<dyn taskcast_core::LongTermStore>),
                     )
                 }
                 "redis" => {
@@ -197,9 +197,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             // 6. Build engine (clone adapters for WorkerManager before moving into engine)
-            let short_term_for_wm = Arc::clone(&short_term);
+            let short_term_for_wm = Arc::clone(&short_term_store);
             let broadcast_for_wm = Arc::clone(&broadcast);
-            let long_term_for_wm = long_term.clone();
+            let long_term_for_wm = long_term_store.clone();
 
             let engine = Arc::new(taskcast_core::TaskEngine::new(
                 taskcast_core::TaskEngineOptions {
@@ -282,9 +282,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(Arc::new(taskcast_core::worker_manager::WorkerManager::new(
                     taskcast_core::worker_manager::WorkerManagerOptions {
                         engine: Arc::clone(&engine),
-                        short_term: short_term_for_wm,
+                        short_term_store: short_term_for_wm,
                         broadcast: broadcast_for_wm,
-                        long_term: long_term_for_wm,
+                        long_term_store: long_term_for_wm,
                         hooks: None,
                         defaults: Some(wm_defaults),
                     },

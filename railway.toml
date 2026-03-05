@@ -1,8 +1,6 @@
 [build]
 builder = "dockerfile"
-dockerfilePath = "rust/Dockerfile"
-dockerContext = "rust"
-watchPatterns = ["rust/**"]
+dockerfilePath = "Dockerfile.railway"
 
 [deploy]
 startCommand = "taskcast start --port ${PORT:-3721} --storage memory"

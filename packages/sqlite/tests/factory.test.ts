@@ -22,12 +22,12 @@ describe('createSqliteAdapters', () => {
     return result
   }
 
-  it('should return shortTerm, longTerm, and db', () => {
+  it('should return shortTermStore, longTermStore, and db', () => {
     dir = mkdtempSync(join(tmpdir(), 'taskcast-factory-'))
-    const { shortTerm, longTerm, db } = makeFactory(join(dir, 'test.db'))
+    const { shortTermStore, longTermStore, db } = makeFactory(join(dir, 'test.db'))
 
-    expect(shortTerm).toBeInstanceOf(SqliteShortTermStore)
-    expect(longTerm).toBeInstanceOf(SqliteLongTermStore)
+    expect(shortTermStore).toBeInstanceOf(SqliteShortTermStore)
+    expect(longTermStore).toBeInstanceOf(SqliteLongTermStore)
     expect(db).toBeDefined()
     expect(db.open).toBe(true)
   })
@@ -65,15 +65,15 @@ describe('createSqliteAdapters', () => {
 
   it('should produce working adapters (round-trip)', async () => {
     dir = mkdtempSync(join(tmpdir(), 'taskcast-factory-'))
-    const { shortTerm, longTerm } = makeFactory(join(dir, 'test.db'))
+    const { shortTermStore, longTermStore } = makeFactory(join(dir, 'test.db'))
 
     const task = { id: 'factory-1', status: 'pending' as const, createdAt: 1000, updatedAt: 1000 }
 
-    await shortTerm.saveTask(task)
-    expect(await shortTerm.getTask('factory-1')).toEqual(task)
+    await shortTermStore.saveTask(task)
+    expect(await shortTermStore.getTask('factory-1')).toEqual(task)
 
-    await longTerm.saveTask(task)
-    expect(await longTerm.getTask('factory-1')).toEqual(task)
+    await longTermStore.saveTask(task)
+    expect(await longTermStore.getTask('factory-1')).toEqual(task)
   })
 
   it('should use TASKCAST_SQLITE_PATH env var as default', () => {

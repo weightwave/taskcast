@@ -8,8 +8,8 @@ import type { WorkerRegistration } from '../../src/worker-manager.js'
 function makeSetup(hooks?: TaskcastHooks) {
   const store = new MemoryShortTermStore()
   const broadcast = new MemoryBroadcastProvider()
-  const engine = new TaskEngine({ shortTerm: store, broadcast, hooks })
-  const manager = new WorkerManager({ engine, shortTerm: store, broadcast, hooks })
+  const engine = new TaskEngine({ shortTermStore: store, broadcast, hooks })
+  const manager = new WorkerManager({ engine, shortTermStore: store, broadcast, hooks })
   return { store, broadcast, engine, manager }
 }
 
@@ -541,10 +541,10 @@ describe('WorkerManager — Dispatch, Claim & Decline', () => {
       )
     })
 
-    it('saves to longTerm when configured', async () => {
+    it('saves to longTermStore when configured', async () => {
       const store = new MemoryShortTermStore()
       const broadcast = new MemoryBroadcastProvider()
-      const longTerm = {
+      const longTermStore = {
         saveTask: vi.fn().mockResolvedValue(undefined),
         getTask: vi.fn().mockResolvedValue(null),
         saveEvent: vi.fn().mockResolvedValue(undefined),
@@ -552,17 +552,17 @@ describe('WorkerManager — Dispatch, Claim & Decline', () => {
         saveWorkerEvent: vi.fn().mockResolvedValue(undefined),
         getWorkerEvents: vi.fn().mockResolvedValue([]),
       }
-      const engine = new TaskEngine({ shortTerm: store, broadcast, longTerm })
-      const manager = new WorkerManager({ engine, shortTerm: store, broadcast, longTerm })
+      const engine = new TaskEngine({ shortTermStore: store, broadcast, longTermStore })
+      const manager = new WorkerManager({ engine, shortTermStore: store, broadcast, longTermStore })
 
       const worker = await manager.registerWorker(defaultRegistration)
       const task = await engine.createTask({ type: 'test' })
-      vi.mocked(longTerm.saveTask).mockClear()
+      vi.mocked(longTermStore.saveTask).mockClear()
 
       await manager.claimTask(task.id, worker.id)
 
       // Should have been called for the assigned task
-      expect(longTerm.saveTask).toHaveBeenCalled()
+      expect(longTermStore.saveTask).toHaveBeenCalled()
     })
   })
 
@@ -917,10 +917,10 @@ describe('WorkerManager — Audit Events', () => {
   function makeSetupWithLongTerm(hooks?: TaskcastHooks) {
     const store = new MemoryShortTermStore()
     const broadcast = new MemoryBroadcastProvider()
-    const longTerm = makeLongTermMock()
-    const engine = new TaskEngine({ shortTerm: store, broadcast, longTerm, hooks })
-    const manager = new WorkerManager({ engine, shortTerm: store, broadcast, longTerm, hooks })
-    return { store, broadcast, engine, manager, longTerm }
+    const longTermStore = makeLongTermMock()
+    const engine = new TaskEngine({ shortTermStore: store, broadcast, longTermStore, hooks })
+    const manager = new WorkerManager({ engine, shortTermStore: store, broadcast, longTermStore, hooks })
+    return { store, broadcast, engine, manager, longTermStore }
   }
 
   describe('task audit events', () => {
@@ -961,14 +961,14 @@ describe('WorkerManager — Audit Events', () => {
   })
 
   describe('worker audit events', () => {
-    it('emits worker audit event to longTerm on register', async () => {
-      const { manager, longTerm } = makeSetupWithLongTerm()
+    it('emits worker audit event to longTermStore on register', async () => {
+      const { manager, longTermStore } = makeSetupWithLongTerm()
       const worker = await manager.registerWorker(defaultRegistration)
 
       // Allow async saveWorkerEvent to settle
       await new Promise((r) => setTimeout(r, 10))
 
-      expect(longTerm.saveWorkerEvent).toHaveBeenCalledWith(
+      expect(longTermStore.saveWorkerEvent).toHaveBeenCalledWith(
         expect.objectContaining({
           workerId: worker.id,
           action: 'connected',
@@ -977,16 +977,16 @@ describe('WorkerManager — Audit Events', () => {
     })
 
     it('emits worker audit event on unregister', async () => {
-      const { manager, longTerm } = makeSetupWithLongTerm()
+      const { manager, longTermStore } = makeSetupWithLongTerm()
       const worker = await manager.registerWorker(defaultRegistration)
-      vi.mocked(longTerm.saveWorkerEvent).mockClear()
+      vi.mocked(longTermStore.saveWorkerEvent).mockClear()
 
       await manager.unregisterWorker(worker.id)
 
       // Allow async saveWorkerEvent to settle
       await new Promise((r) => setTimeout(r, 10))
 
-      expect(longTerm.saveWorkerEvent).toHaveBeenCalledWith(
+      expect(longTermStore.saveWorkerEvent).toHaveBeenCalledWith(
         expect.objectContaining({
           workerId: worker.id,
           action: 'disconnected',
@@ -996,17 +996,17 @@ describe('WorkerManager — Audit Events', () => {
     })
 
     it('emits task_assigned worker audit event on claim', async () => {
-      const { manager, engine, longTerm } = makeSetupWithLongTerm()
+      const { manager, engine, longTermStore } = makeSetupWithLongTerm()
       const worker = await manager.registerWorker(defaultRegistration)
       const task = await engine.createTask({ type: 'test' })
-      vi.mocked(longTerm.saveWorkerEvent).mockClear()
+      vi.mocked(longTermStore.saveWorkerEvent).mockClear()
 
       await manager.claimTask(task.id, worker.id)
 
       // Allow async saveWorkerEvent to settle
       await new Promise((r) => setTimeout(r, 10))
 
-      expect(longTerm.saveWorkerEvent).toHaveBeenCalledWith(
+      expect(longTermStore.saveWorkerEvent).toHaveBeenCalledWith(
         expect.objectContaining({
           workerId: worker.id,
           action: 'task_assigned',
@@ -1016,18 +1016,18 @@ describe('WorkerManager — Audit Events', () => {
     })
 
     it('emits task_declined worker audit event on decline', async () => {
-      const { manager, engine, longTerm } = makeSetupWithLongTerm()
+      const { manager, engine, longTermStore } = makeSetupWithLongTerm()
       const worker = await manager.registerWorker({ ...defaultRegistration, capacity: 5 })
       const task = await engine.createTask({ type: 'test', cost: 1 })
       await manager.claimTask(task.id, worker.id)
-      vi.mocked(longTerm.saveWorkerEvent).mockClear()
+      vi.mocked(longTermStore.saveWorkerEvent).mockClear()
 
       await manager.declineTask(task.id, worker.id)
 
       // Allow async saveWorkerEvent to settle
       await new Promise((r) => setTimeout(r, 10))
 
-      expect(longTerm.saveWorkerEvent).toHaveBeenCalledWith(
+      expect(longTermStore.saveWorkerEvent).toHaveBeenCalledWith(
         expect.objectContaining({
           workerId: worker.id,
           action: 'task_declined',
@@ -1037,21 +1037,21 @@ describe('WorkerManager — Audit Events', () => {
     })
 
     it('emits pull_request audit event', async () => {
-      const { manager, engine, longTerm } = makeSetupWithLongTerm()
+      const { manager, engine, longTermStore } = makeSetupWithLongTerm()
       const worker = await manager.registerWorker({
         ...defaultRegistration,
         id: 'w1',
         connectionMode: 'pull',
       })
       const task = await engine.createTask({ type: 'test', assignMode: 'pull' })
-      vi.mocked(longTerm.saveWorkerEvent).mockClear()
+      vi.mocked(longTermStore.saveWorkerEvent).mockClear()
 
       await manager.waitForTask('w1')
 
       // Allow async saveWorkerEvent to settle
       await new Promise((r) => setTimeout(r, 10))
 
-      expect(longTerm.saveWorkerEvent).toHaveBeenCalledWith(
+      expect(longTermStore.saveWorkerEvent).toHaveBeenCalledWith(
         expect.objectContaining({
           workerId: 'w1',
           action: 'pull_request',
@@ -1060,9 +1060,9 @@ describe('WorkerManager — Audit Events', () => {
       )
     })
 
-    it('does not emit worker audit events without longTerm', async () => {
+    it('does not emit worker audit events without longTermStore', async () => {
       const { manager } = makeSetup()
-      // registerWorker should not throw without longTerm
+      // registerWorker should not throw without longTermStore
       await expect(manager.registerWorker(defaultRegistration)).resolves.not.toThrow()
     })
   })
@@ -1092,11 +1092,11 @@ describe('WorkerManager — emitTaskAudit catch block', () => {
 })
 
 describe('WorkerManager — claimTask concurrent modification failure', () => {
-  it('returns failure when shortTerm.claimTask returns false', async () => {
+  it('returns failure when shortTermStore.claimTask returns false', async () => {
     const store = new MemoryShortTermStore()
     const broadcast = new MemoryBroadcastProvider()
-    const engine = new TaskEngine({ shortTerm: store, broadcast })
-    const manager = new WorkerManager({ engine, shortTerm: store, broadcast })
+    const engine = new TaskEngine({ shortTermStore: store, broadcast })
+    const manager = new WorkerManager({ engine, shortTermStore: store, broadcast })
 
     const worker = await manager.registerWorker(defaultRegistration)
     const task = await engine.createTask({ type: 'test' })
@@ -1140,8 +1140,8 @@ describe('WorkerManager — waitForTask broadcast edge cases', () => {
   it('catches errors thrown in the broadcast handler', async () => {
     const store = new MemoryShortTermStore()
     const broadcast = new MemoryBroadcastProvider()
-    const engine = new TaskEngine({ shortTerm: store, broadcast })
-    const manager = new WorkerManager({ engine, shortTerm: store, broadcast })
+    const engine = new TaskEngine({ shortTermStore: store, broadcast })
+    const manager = new WorkerManager({ engine, shortTermStore: store, broadcast })
 
     await manager.registerWorker({
       ...defaultRegistration,
@@ -1178,11 +1178,11 @@ describe('WorkerManager — waitForTask broadcast edge cases', () => {
   })
 })
 
-describe('WorkerManager — declineTask with longTerm', () => {
-  it('saves task to longTerm when configured', async () => {
+describe('WorkerManager — declineTask with longTermStore', () => {
+  it('saves task to longTermStore when configured', async () => {
     const store = new MemoryShortTermStore()
     const broadcast = new MemoryBroadcastProvider()
-    const longTerm: LongTermStore = {
+    const longTermStore: LongTermStore = {
       saveTask: vi.fn().mockResolvedValue(undefined),
       getTask: vi.fn().mockResolvedValue(null),
       saveEvent: vi.fn().mockResolvedValue(undefined),
@@ -1190,20 +1190,20 @@ describe('WorkerManager — declineTask with longTerm', () => {
       saveWorkerEvent: vi.fn().mockResolvedValue(undefined),
       getWorkerEvents: vi.fn().mockResolvedValue([]),
     }
-    const engine = new TaskEngine({ shortTerm: store, broadcast, longTerm })
-    const manager = new WorkerManager({ engine, shortTerm: store, broadcast, longTerm })
+    const engine = new TaskEngine({ shortTermStore: store, broadcast, longTermStore })
+    const manager = new WorkerManager({ engine, shortTermStore: store, broadcast, longTermStore })
 
     const worker = await manager.registerWorker({ ...defaultRegistration, capacity: 5 })
     const task = await engine.createTask({ type: 'test', cost: 1 })
     await manager.claimTask(task.id, worker.id)
 
-    vi.mocked(longTerm.saveTask).mockClear()
+    vi.mocked(longTermStore.saveTask).mockClear()
 
     await manager.declineTask(task.id, worker.id)
 
-    // declineTask should call longTerm.saveTask to persist the declined task
-    expect(longTerm.saveTask).toHaveBeenCalled()
-    const savedTask = vi.mocked(longTerm.saveTask).mock.calls.find(
+    // declineTask should call longTermStore.saveTask to persist the declined task
+    expect(longTermStore.saveTask).toHaveBeenCalled()
+    const savedTask = vi.mocked(longTermStore.saveTask).mock.calls.find(
       (call) => (call[0] as { id: string }).id === task.id && (call[0] as { status: string }).status === 'pending'
     )
     expect(savedTask).toBeDefined()

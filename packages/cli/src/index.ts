@@ -31,10 +31,10 @@ port: 3721
 #   broadcast:
 #     provider: memory  # memory | redis
 #     # url: redis://localhost:6379
-#   shortTerm:
+#   shortTermStore:
 #     provider: memory  # memory | redis
 #     # url: redis://localhost:6379
-#   longTerm:
+#   longTermStore:
 #     provider: postgres
 #     # url: postgresql://localhost:5432/taskcast
 `
@@ -102,7 +102,7 @@ program
 
     const port = Number(options.port ?? fileConfig.port ?? 3721)
     const redisUrl = process.env['TASKCAST_REDIS_URL'] ?? fileConfig.adapters?.broadcast?.url
-    const postgresUrl = process.env['TASKCAST_POSTGRES_URL'] ?? fileConfig.adapters?.longTerm?.url
+    const postgresUrl = process.env['TASKCAST_POSTGRES_URL'] ?? fileConfig.adapters?.longTermStore?.url
 
     let shortTermStore: ShortTermStore
     let broadcast: BroadcastProvider
@@ -114,8 +114,8 @@ program
       const sqliteOpts = options.dbPath ? { path: options.dbPath } : {}
       const adapters = createSqliteAdapters(sqliteOpts)
       broadcast = new MemoryBroadcastProvider()
-      shortTermStore = adapters.shortTerm
-      longTermStore = adapters.longTerm
+      shortTermStore = adapters.shortTermStore
+      longTermStore = adapters.longTermStore
       console.log(`[taskcast] Using SQLite storage at ${options.dbPath ?? './taskcast.db'}`)
     } else if (storage === 'redis' || redisUrl) {
       const pubClient = new Redis(redisUrl!)
@@ -148,10 +148,10 @@ program
       console.log('[taskcast] Worker assignment system enabled')
       const wmOpts: ConstructorParameters<typeof WorkerManager>[0] = {
         engine,
-        shortTerm,
+        shortTermStore,
         broadcast,
       }
-      if (longTerm !== undefined) wmOpts.longTerm = longTerm
+      if (longTermStore !== undefined) wmOpts.longTermStore = longTermStore
       if (fileConfig.workers?.defaults) wmOpts.defaults = fileConfig.workers.defaults
       workerManager = new WorkerManager(wmOpts)
     }

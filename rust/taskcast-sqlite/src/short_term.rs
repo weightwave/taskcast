@@ -1,11 +1,16 @@
 use async_trait::async_trait;
 use sqlx::{Row, SqlitePool};
 
-use taskcast_core::types::{EventQueryOptions, ShortTermStore, Task, TaskEvent};
+use taskcast_core::types::{
+    EventQueryOptions, ShortTermStore, Task, TaskEvent, TaskFilter, TaskStatus, Worker,
+    WorkerAssignment, WorkerFilter,
+};
 
 use crate::row_helpers::{
-    json_value_to_string, level_to_string, row_to_event, row_to_task, series_mode_to_string,
-    status_to_string, to_json_string,
+    assign_mode_to_string, assignment_status_to_string, connection_mode_to_string,
+    disconnect_policy_to_string, json_value_to_string, level_to_string, row_to_event, row_to_task,
+    row_to_worker, row_to_worker_assignment, series_mode_to_string, status_to_string, to_json_string,
+    worker_status_to_string,
 };
 
 pub struct SqliteShortTermStore {
@@ -32,6 +37,13 @@ impl ShortTermStore for SqliteShortTermStore {
         let auth_config_json = to_json_string(&task.auth_config);
         let webhooks_json = to_json_string(&task.webhooks);
         let cleanup_json = to_json_string(&task.cleanup);
+        let tags_json = to_json_string(&task.tags);
+        let assign_mode_str: Option<String> = task.assign_mode.as_ref().map(assign_mode_to_string);
+        let cost = task.cost.map(|v| v as i32);
+        let disconnect_policy_str: Option<String> = task
+            .disconnect_policy
+            .as_ref()
+            .map(disconnect_policy_to_string);
 
         let created_at = task.created_at as i64;
         let updated_at = task.updated_at as i64;
@@ -42,9 +54,11 @@ impl ShortTermStore for SqliteShortTermStore {
             r#"
             INSERT INTO taskcast_tasks (
                 id, type, status, params, result, error, metadata,
-                auth_config, webhooks, cleanup, created_at, updated_at, completed_at, ttl
+                auth_config, webhooks, cleanup, created_at, updated_at, completed_at, ttl,
+                tags, assign_mode, cost, assigned_worker, disconnect_policy
             ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                ?15, ?16, ?17, ?18, ?19
             )
             ON CONFLICT (id) DO UPDATE SET
                 status = excluded.status,
@@ -52,7 +66,9 @@ impl ShortTermStore for SqliteShortTermStore {
                 error = excluded.error,
                 metadata = excluded.metadata,
                 updated_at = excluded.updated_at,
-                completed_at = excluded.completed_at
+                completed_at = excluded.completed_at,
+                cost = excluded.cost,
+                assigned_worker = excluded.assigned_worker
             "#,
         )
         .bind(&task.id)
@@ -69,6 +85,11 @@ impl ShortTermStore for SqliteShortTermStore {
         .bind(updated_at)
         .bind(completed_at)
         .bind(ttl)
+        .bind(&tags_json)
+        .bind(&assign_mode_str)
+        .bind(cost)
+        .bind(&task.assigned_worker)
+        .bind(&disconnect_policy_str)
         .execute(&self.pool)
         .await?;
 
@@ -339,5 +360,355 @@ impl ShortTermStore for SqliteShortTermStore {
         self.set_series_latest(task_id, series_id, event).await?;
 
         Ok(())
+    }
+
+    async fn list_tasks(
+        &self,
+        filter: TaskFilter,
+    ) -> Result<Vec<Task>, Box<dyn std::error::Error + Send + Sync>> {
+        // Build query dynamically based on filter.
+        // SQLite doesn't support array parameters, so we build WHERE clauses with
+        // comma-separated IN lists and apply tag matching in Rust post-fetch.
+        let mut conditions: Vec<String> = Vec::new();
+
+        if let Some(ref statuses) = filter.status {
+            if !statuses.is_empty() {
+                let placeholders: Vec<String> = statuses
+                    .iter()
+                    .map(|s| format!("'{}'", status_to_string(s)))
+                    .collect();
+                conditions.push(format!("status IN ({})", placeholders.join(",")));
+            }
+        }
+
+        if let Some(ref types) = filter.types {
+            if !types.is_empty() {
+                let placeholders: Vec<String> =
+                    types.iter().map(|t| format!("'{}'", t.replace('\'', "''"))).collect();
+                conditions.push(format!("type IN ({})", placeholders.join(",")));
+            }
+        }
+
+        if let Some(ref modes) = filter.assign_mode {
+            if !modes.is_empty() {
+                let placeholders: Vec<String> = modes
+                    .iter()
+                    .map(|m| format!("'{}'", assign_mode_to_string(m)))
+                    .collect();
+                conditions.push(format!("assign_mode IN ({})", placeholders.join(",")));
+            }
+        }
+
+        if let Some(ref exclude) = filter.exclude_task_ids {
+            if !exclude.is_empty() {
+                let placeholders: Vec<String> =
+                    exclude.iter().map(|id| format!("'{}'", id.replace('\'', "''"))).collect();
+                conditions.push(format!("id NOT IN ({})", placeholders.join(",")));
+            }
+        }
+
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", conditions.join(" AND "))
+        };
+
+        let limit_val = filter.limit.unwrap_or(u64::MAX) as i64;
+        let query_str = format!(
+            "SELECT * FROM taskcast_tasks{} LIMIT {}",
+            where_clause, limit_val
+        );
+
+        let rows = sqlx::query(&query_str)
+            .fetch_all(&self.pool)
+            .await?;
+
+        let mut tasks: Vec<Task> = rows.iter().map(row_to_task).collect();
+
+        // Apply tag filtering in Rust since it requires JSON parsing
+        if let Some(ref tag_matcher) = filter.tags {
+            tasks.retain(|t| {
+                taskcast_core::worker_matching::matches_tag(t.tags.as_deref(), tag_matcher)
+            });
+        }
+
+        Ok(tasks)
+    }
+
+    async fn save_worker(
+        &self,
+        worker: Worker,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let status_str = worker_status_to_string(&worker.status);
+        let match_rule_json = serde_json::to_string(&worker.match_rule)?;
+        let connection_mode_str = connection_mode_to_string(&worker.connection_mode);
+        let metadata_json = to_json_string(&worker.metadata);
+        let connected_at = worker.connected_at as i64;
+        let last_heartbeat_at = worker.last_heartbeat_at as i64;
+
+        sqlx::query(
+            r#"
+            INSERT INTO taskcast_workers (
+                id, status, match_rule, capacity, used_slots, weight,
+                connection_mode, connected_at, last_heartbeat_at, metadata
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+            )
+            ON CONFLICT (id) DO UPDATE SET
+                status = excluded.status,
+                match_rule = excluded.match_rule,
+                capacity = excluded.capacity,
+                used_slots = excluded.used_slots,
+                weight = excluded.weight,
+                connection_mode = excluded.connection_mode,
+                last_heartbeat_at = excluded.last_heartbeat_at,
+                metadata = excluded.metadata
+            "#,
+        )
+        .bind(&worker.id)
+        .bind(&status_str)
+        .bind(&match_rule_json)
+        .bind(worker.capacity as i32)
+        .bind(worker.used_slots as i32)
+        .bind(worker.weight as i32)
+        .bind(&connection_mode_str)
+        .bind(connected_at)
+        .bind(last_heartbeat_at)
+        .bind(&metadata_json)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    async fn get_worker(
+        &self,
+        worker_id: &str,
+    ) -> Result<Option<Worker>, Box<dyn std::error::Error + Send + Sync>> {
+        let row = sqlx::query("SELECT * FROM taskcast_workers WHERE id = ?1")
+            .bind(worker_id)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        Ok(row.as_ref().map(row_to_worker))
+    }
+
+    async fn list_workers(
+        &self,
+        filter: Option<WorkerFilter>,
+    ) -> Result<Vec<Worker>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut conditions: Vec<String> = Vec::new();
+
+        if let Some(ref f) = filter {
+            if let Some(ref statuses) = f.status {
+                if !statuses.is_empty() {
+                    let placeholders: Vec<String> = statuses
+                        .iter()
+                        .map(|s| format!("'{}'", worker_status_to_string(s)))
+                        .collect();
+                    conditions.push(format!("status IN ({})", placeholders.join(",")));
+                }
+            }
+            if let Some(ref modes) = f.connection_mode {
+                if !modes.is_empty() {
+                    let placeholders: Vec<String> = modes
+                        .iter()
+                        .map(|m| format!("'{}'", connection_mode_to_string(m)))
+                        .collect();
+                    conditions.push(format!("connection_mode IN ({})", placeholders.join(",")));
+                }
+            }
+        }
+
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", conditions.join(" AND "))
+        };
+
+        let query_str = format!("SELECT * FROM taskcast_workers{}", where_clause);
+
+        let rows = sqlx::query(&query_str)
+            .fetch_all(&self.pool)
+            .await?;
+
+        Ok(rows.iter().map(row_to_worker).collect())
+    }
+
+    async fn delete_worker(
+        &self,
+        worker_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        sqlx::query("DELETE FROM taskcast_workers WHERE id = ?1")
+            .bind(worker_id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
+    }
+
+    async fn claim_task(
+        &self,
+        task_id: &str,
+        worker_id: &str,
+        cost: u32,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        // Use a transaction for atomicity
+        let mut tx = self.pool.begin().await?;
+
+        // Check worker exists and has capacity
+        let worker_row = sqlx::query(
+            "SELECT capacity, used_slots FROM taskcast_workers WHERE id = ?1",
+        )
+        .bind(worker_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let (capacity, used_slots) = match worker_row {
+            Some(row) => {
+                let cap: i32 = row.get("capacity");
+                let used: i32 = row.get("used_slots");
+                (cap as u32, used as u32)
+            }
+            None => {
+                tx.rollback().await?;
+                return Ok(false);
+            }
+        };
+
+        if used_slots + cost > capacity {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+
+        // Check task exists and is in a claimable state (Pending or Assigned)
+        let task_row = sqlx::query(
+            "SELECT status FROM taskcast_tasks WHERE id = ?1",
+        )
+        .bind(task_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        match task_row {
+            Some(row) => {
+                let status_str: String = row.get("status");
+                let status: TaskStatus = serde_json::from_value(
+                    serde_json::Value::String(status_str),
+                )
+                .unwrap_or(TaskStatus::Running);
+
+                if status != TaskStatus::Pending && status != TaskStatus::Assigned {
+                    tx.rollback().await?;
+                    return Ok(false);
+                }
+            }
+            None => {
+                tx.rollback().await?;
+                return Ok(false);
+            }
+        }
+
+        // Update worker used_slots
+        sqlx::query("UPDATE taskcast_workers SET used_slots = used_slots + ?1 WHERE id = ?2")
+            .bind(cost as i32)
+            .bind(worker_id)
+            .execute(&mut *tx)
+            .await?;
+
+        // Update task: set status to assigned, set assigned_worker and cost
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        let assigned_status = status_to_string(&TaskStatus::Assigned);
+        sqlx::query(
+            r#"
+            UPDATE taskcast_tasks SET
+                status = ?1,
+                assigned_worker = ?2,
+                cost = ?3,
+                updated_at = ?4
+            WHERE id = ?5
+            "#,
+        )
+        .bind(&assigned_status)
+        .bind(worker_id)
+        .bind(cost as i32)
+        .bind(now)
+        .bind(task_id)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    async fn add_assignment(
+        &self,
+        assignment: WorkerAssignment,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let status_str = assignment_status_to_string(&assignment.status);
+        let assigned_at = assignment.assigned_at as i64;
+
+        sqlx::query(
+            r#"
+            INSERT INTO taskcast_worker_assignments (
+                task_id, worker_id, cost, assigned_at, status
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5
+            )
+            ON CONFLICT (task_id) DO UPDATE SET
+                worker_id = excluded.worker_id,
+                cost = excluded.cost,
+                assigned_at = excluded.assigned_at,
+                status = excluded.status
+            "#,
+        )
+        .bind(&assignment.task_id)
+        .bind(&assignment.worker_id)
+        .bind(assignment.cost as i32)
+        .bind(assigned_at)
+        .bind(&status_str)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    async fn remove_assignment(
+        &self,
+        task_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        sqlx::query("DELETE FROM taskcast_worker_assignments WHERE task_id = ?1")
+            .bind(task_id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
+    }
+
+    async fn get_worker_assignments(
+        &self,
+        worker_id: &str,
+    ) -> Result<Vec<WorkerAssignment>, Box<dyn std::error::Error + Send + Sync>> {
+        let rows = sqlx::query("SELECT * FROM taskcast_worker_assignments WHERE worker_id = ?1")
+            .bind(worker_id)
+            .fetch_all(&self.pool)
+            .await?;
+
+        Ok(rows.iter().map(row_to_worker_assignment).collect())
+    }
+
+    async fn get_task_assignment(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<WorkerAssignment>, Box<dyn std::error::Error + Send + Sync>> {
+        let row = sqlx::query("SELECT * FROM taskcast_worker_assignments WHERE task_id = ?1")
+            .bind(task_id)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        Ok(row.as_ref().map(row_to_worker_assignment))
     }
 }

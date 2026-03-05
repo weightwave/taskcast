@@ -52,10 +52,10 @@ beforeAll(async () => {
   await sql.unsafe(migration002)
 
   const broadcast = new RedisBroadcastProvider(pubClient, subClient)
-  const shortTerm = new RedisShortTermStore(storeClient)
-  const longTerm = new PostgresLongTermStore(sql)
+  const shortTermStore = new RedisShortTermStore(storeClient)
+  const longTermStore = new PostgresLongTermStore(sql)
 
-  engine = new TaskEngine({ broadcast, shortTermStore: shortTerm, longTermStore: longTerm })
+  engine = new TaskEngine({ broadcast, shortTermStore: shortTermStore, longTermStore: longTermStore })
 }, 120000)
 
 afterAll(async () => {

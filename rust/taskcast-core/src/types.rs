@@ -1349,6 +1349,8 @@ mod tests {
             params: None, result: None, error: None, metadata: None,
             created_at: 0.0, updated_at: 0.0, completed_at: None, ttl: None,
             auth_config: None, webhooks: None, cleanup: None,
+            tags: None, assign_mode: None, cost: None,
+            assigned_worker: None, disconnect_policy: None,
         };
         let err = TaskError { code: None, message: "boom".to_string(), details: None };
         let event = TaskEvent {

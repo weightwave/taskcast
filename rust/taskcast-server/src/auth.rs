@@ -226,6 +226,8 @@ mod tests {
             aud: None,
             exp: Some(exp),
             iat: None,
+            jti: None,
+            worker_id: None,
         }
     }
 
@@ -246,6 +248,8 @@ mod tests {
             sub: None,
             task_ids: TaskIdAccess::All,
             scope: vec![PermissionScope::All],
+            jti: None,
+            worker_id: None,
         };
         assert!(check_scope(&auth, PermissionScope::TaskCreate, None));
         assert!(check_scope(&auth, PermissionScope::EventPublish, None));
@@ -258,6 +262,8 @@ mod tests {
             sub: None,
             task_ids: TaskIdAccess::All,
             scope: vec![PermissionScope::TaskCreate],
+            jti: None,
+            worker_id: None,
         };
         assert!(check_scope(&auth, PermissionScope::TaskCreate, None));
     }
@@ -268,6 +274,8 @@ mod tests {
             sub: None,
             task_ids: TaskIdAccess::All,
             scope: vec![PermissionScope::TaskCreate],
+            jti: None,
+            worker_id: None,
         };
         assert!(!check_scope(&auth, PermissionScope::EventPublish, None));
     }
@@ -278,6 +286,8 @@ mod tests {
             sub: None,
             task_ids: TaskIdAccess::All,
             scope: vec![],
+            jti: None,
+            worker_id: None,
         };
         assert!(!check_scope(&auth, PermissionScope::TaskCreate, None));
         assert!(!check_scope(&auth, PermissionScope::EventPublish, None));
@@ -290,6 +300,8 @@ mod tests {
             sub: None,
             task_ids: TaskIdAccess::All,
             scope: vec![PermissionScope::TaskCreate],
+            jti: None,
+            worker_id: None,
         };
         assert!(check_scope(&auth, PermissionScope::TaskCreate, Some("any-task-id")));
         assert!(check_scope(&auth, PermissionScope::TaskCreate, Some("another-task")));
@@ -301,6 +313,8 @@ mod tests {
             sub: None,
             task_ids: TaskIdAccess::List(vec!["task-1".to_string(), "task-2".to_string()]),
             scope: vec![PermissionScope::TaskCreate],
+            jti: None,
+            worker_id: None,
         };
         assert!(check_scope(&auth, PermissionScope::TaskCreate, Some("task-1")));
         assert!(check_scope(&auth, PermissionScope::TaskCreate, Some("task-2")));
@@ -312,6 +326,8 @@ mod tests {
             sub: None,
             task_ids: TaskIdAccess::List(vec!["task-1".to_string()]),
             scope: vec![PermissionScope::TaskCreate],
+            jti: None,
+            worker_id: None,
         };
         assert!(!check_scope(&auth, PermissionScope::TaskCreate, Some("task-999")));
     }
@@ -323,6 +339,8 @@ mod tests {
             sub: None,
             task_ids: TaskIdAccess::List(vec!["task-1".to_string()]),
             scope: vec![PermissionScope::TaskCreate],
+            jti: None,
+            worker_id: None,
         };
         assert!(!check_scope(&auth, PermissionScope::TaskCreate, Some("task-999")));
 
@@ -331,6 +349,8 @@ mod tests {
             sub: None,
             task_ids: TaskIdAccess::List(vec!["task-1".to_string()]),
             scope: vec![PermissionScope::EventPublish],
+            jti: None,
+            worker_id: None,
         };
         assert!(!check_scope(&auth, PermissionScope::TaskCreate, Some("task-1")));
 
@@ -339,6 +359,8 @@ mod tests {
             sub: None,
             task_ids: TaskIdAccess::List(vec!["task-1".to_string()]),
             scope: vec![PermissionScope::TaskCreate],
+            jti: None,
+            worker_id: None,
         };
         assert!(check_scope(&auth, PermissionScope::TaskCreate, Some("task-1")));
     }

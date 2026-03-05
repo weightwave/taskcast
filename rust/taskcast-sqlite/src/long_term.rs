@@ -1,11 +1,14 @@
 use async_trait::async_trait;
 use sqlx::SqlitePool;
 
-use taskcast_core::types::{EventQueryOptions, LongTermStore, Task, TaskEvent};
+use taskcast_core::types::{
+    EventQueryOptions, LongTermStore, Task, TaskEvent, WorkerAuditEvent,
+};
 
 use crate::row_helpers::{
-    json_value_to_string, level_to_string, row_to_event, row_to_task, series_mode_to_string,
-    status_to_string, to_json_string,
+    assign_mode_to_string, audit_action_to_string, disconnect_policy_to_string,
+    json_value_to_string, level_to_string, row_to_event, row_to_task,
+    row_to_worker_audit_event, series_mode_to_string, status_to_string, to_json_string,
 };
 
 pub struct SqliteLongTermStore {
@@ -32,6 +35,13 @@ impl LongTermStore for SqliteLongTermStore {
         let auth_config_json = to_json_string(&task.auth_config);
         let webhooks_json = to_json_string(&task.webhooks);
         let cleanup_json = to_json_string(&task.cleanup);
+        let tags_json = to_json_string(&task.tags);
+        let assign_mode_str: Option<String> = task.assign_mode.as_ref().map(assign_mode_to_string);
+        let cost = task.cost.map(|v| v as i32);
+        let disconnect_policy_str: Option<String> = task
+            .disconnect_policy
+            .as_ref()
+            .map(disconnect_policy_to_string);
 
         let created_at = task.created_at as i64;
         let updated_at = task.updated_at as i64;
@@ -42,9 +52,11 @@ impl LongTermStore for SqliteLongTermStore {
             r#"
             INSERT INTO taskcast_tasks (
                 id, type, status, params, result, error, metadata,
-                auth_config, webhooks, cleanup, created_at, updated_at, completed_at, ttl
+                auth_config, webhooks, cleanup, created_at, updated_at, completed_at, ttl,
+                tags, assign_mode, cost, assigned_worker, disconnect_policy
             ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                ?15, ?16, ?17, ?18, ?19
             )
             ON CONFLICT (id) DO UPDATE SET
                 status = excluded.status,
@@ -52,7 +64,9 @@ impl LongTermStore for SqliteLongTermStore {
                 error = excluded.error,
                 metadata = excluded.metadata,
                 updated_at = excluded.updated_at,
-                completed_at = excluded.completed_at
+                completed_at = excluded.completed_at,
+                cost = excluded.cost,
+                assigned_worker = excluded.assigned_worker
             "#,
         )
         .bind(&task.id)
@@ -69,6 +83,11 @@ impl LongTermStore for SqliteLongTermStore {
         .bind(updated_at)
         .bind(completed_at)
         .bind(ttl)
+        .bind(&tags_json)
+        .bind(&assign_mode_str)
+        .bind(cost)
+        .bind(&task.assigned_worker)
+        .bind(&disconnect_policy_str)
         .execute(&self.pool)
         .await?;
 
@@ -212,5 +231,111 @@ impl LongTermStore for SqliteLongTermStore {
         };
 
         Ok(rows.iter().map(row_to_event).collect())
+    }
+
+    async fn save_worker_event(
+        &self,
+        event: WorkerAuditEvent,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let action_str = audit_action_to_string(&event.action);
+        let timestamp = event.timestamp as i64;
+        let data_json = to_json_string(&event.data);
+
+        sqlx::query(
+            r#"
+            INSERT INTO taskcast_worker_events (
+                id, worker_id, timestamp, action, data
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5
+            )
+            ON CONFLICT (id) DO NOTHING
+            "#,
+        )
+        .bind(&event.id)
+        .bind(&event.worker_id)
+        .bind(timestamp)
+        .bind(&action_str)
+        .bind(&data_json)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    async fn get_worker_events(
+        &self,
+        worker_id: &str,
+        opts: Option<EventQueryOptions>,
+    ) -> Result<Vec<WorkerAuditEvent>, Box<dyn std::error::Error + Send + Sync>> {
+        let since = opts.as_ref().and_then(|o| o.since.as_ref());
+        let limit = opts.as_ref().and_then(|o| o.limit);
+
+        let limit_val = limit.map(|l| l as i64).unwrap_or(i64::MAX);
+
+        let rows = if let Some(since) = since {
+            if let Some(ref id) = since.id {
+                // since.id takes priority: look up the anchor's timestamp, then fetch events after it.
+                sqlx::query(
+                    r#"
+                    SELECT * FROM taskcast_worker_events
+                    WHERE worker_id = ?1
+                      AND timestamp > COALESCE(
+                          (SELECT timestamp FROM taskcast_worker_events WHERE id = ?2),
+                          -1
+                      )
+                    ORDER BY timestamp ASC
+                    LIMIT ?3
+                    "#,
+                )
+                .bind(worker_id)
+                .bind(id)
+                .bind(limit_val)
+                .fetch_all(&self.pool)
+                .await?
+            } else if let Some(timestamp) = since.timestamp {
+                sqlx::query(
+                    r#"
+                    SELECT * FROM taskcast_worker_events
+                    WHERE worker_id = ?1 AND timestamp > ?2
+                    ORDER BY timestamp ASC
+                    LIMIT ?3
+                    "#,
+                )
+                .bind(worker_id)
+                .bind(timestamp as i64)
+                .bind(limit_val)
+                .fetch_all(&self.pool)
+                .await?
+            } else {
+                // since exists but has no usable cursor fields
+                sqlx::query(
+                    r#"
+                    SELECT * FROM taskcast_worker_events
+                    WHERE worker_id = ?1
+                    ORDER BY timestamp ASC
+                    LIMIT ?2
+                    "#,
+                )
+                .bind(worker_id)
+                .bind(limit_val)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        } else {
+            sqlx::query(
+                r#"
+                SELECT * FROM taskcast_worker_events
+                WHERE worker_id = ?1
+                ORDER BY timestamp ASC
+                LIMIT ?2
+                "#,
+            )
+            .bind(worker_id)
+            .bind(limit_val)
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        Ok(rows.iter().map(row_to_worker_audit_event).collect())
     }
 }

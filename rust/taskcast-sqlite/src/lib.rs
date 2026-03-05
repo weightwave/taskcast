@@ -9,8 +9,8 @@ use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::SqlitePool;
 
 pub struct SqliteAdapters {
-    pub short_term: SqliteShortTermStore,
-    pub long_term: SqliteLongTermStore,
+    pub short_term_store: SqliteShortTermStore,
+    pub long_term_store: SqliteLongTermStore,
 }
 
 pub async fn create_sqlite_adapters(
@@ -34,8 +34,8 @@ pub async fn create_sqlite_adapters(
     run_migrations(&pool).await?;
 
     Ok(SqliteAdapters {
-        short_term: SqliteShortTermStore::new(pool.clone()),
-        long_term: SqliteLongTermStore::new(pool),
+        short_term_store: SqliteShortTermStore::new(pool.clone()),
+        long_term_store: SqliteLongTermStore::new(pool),
     })
 }
 

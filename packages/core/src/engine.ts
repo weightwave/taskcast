@@ -22,6 +22,7 @@ interface TaskEngineOptionsCanonical extends TaskEngineOptionsBase {
   longTermStore?: LongTermStore
 }
 
+/** @deprecated Use shortTermStore/longTermStore instead */
 interface TaskEngineOptionsLegacy extends TaskEngineOptionsBase {
   shortTerm: ShortTermStore
   longTerm?: LongTermStore
@@ -59,11 +60,11 @@ export class TaskEngine {
   private hooks: TaskcastHooks | undefined
 
   constructor(opts: TaskEngineOptions) {
-    if ('shortTermStore' in opts && 'shortTerm' in opts) {
-      throw new Error('Cannot specify both shortTermStore and shortTerm')
+    if ('shortTerm' in opts && 'shortTermStore' in opts) {
+      throw new Error('Cannot specify both shortTerm and shortTermStore')
     }
-    if ('longTermStore' in opts && 'longTerm' in opts) {
-      throw new Error('Cannot specify both longTermStore and longTerm')
+    if ('longTerm' in opts && 'longTermStore' in opts) {
+      throw new Error('Cannot specify both longTerm and longTermStore')
     }
     this.shortTermStore = 'shortTermStore' in opts ? opts.shortTermStore : opts.shortTerm
     this.longTermStore = 'longTermStore' in opts

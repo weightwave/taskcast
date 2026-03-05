@@ -20,8 +20,8 @@ function mockWS(): WSLike & { sent: unknown[]; close: ReturnType<typeof vi.fn> }
 function makeEnv() {
   const store = new MemoryShortTermStore()
   const broadcast = new MemoryBroadcastProvider()
-  const engine = new TaskEngine({ shortTerm: store, broadcast })
-  const manager = new WorkerManager({ engine, shortTerm: store, broadcast })
+  const engine = new TaskEngine({ shortTermStore: store, broadcast })
+  const manager = new WorkerManager({ engine, shortTermStore: store, broadcast })
   const ws = mockWS()
   const handler = new WorkerWSHandler(manager, ws)
   return { store, broadcast, engine, manager, ws, handler }

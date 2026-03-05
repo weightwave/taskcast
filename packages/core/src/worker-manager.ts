@@ -21,9 +21,9 @@ import { matchesWorkerRule } from './worker-matching.js'
 
 export interface WorkerManagerOptions {
   engine: TaskEngine
-  shortTerm: ShortTermStore
+  shortTermStore: ShortTermStore
   broadcast: BroadcastProvider
-  longTerm?: LongTermStore
+  longTermStore?: LongTermStore
   hooks?: TaskcastHooks
   defaults?: WorkerManagerDefaults
 }
@@ -75,14 +75,14 @@ export interface DeclineOptions {
 
 export class WorkerManager {
   private engine: TaskEngine
-  private shortTerm: ShortTermStore
-  private longTerm?: LongTermStore
+  private shortTermStore: ShortTermStore
+  private longTermStore?: LongTermStore
   private hooks?: TaskcastHooks
 
   constructor(private opts: WorkerManagerOptions) {
     this.engine = opts.engine
-    this.shortTerm = opts.shortTerm
-    if (opts.longTerm) this.longTerm = opts.longTerm
+    this.shortTermStore = opts.shortTermStore
+    if (opts.longTermStore) this.longTermStore = opts.longTermStore
     if (opts.hooks) this.hooks = opts.hooks
   }
 
@@ -105,7 +105,7 @@ export class WorkerManager {
   }
 
   private emitWorkerAudit(action: WorkerAuditEvent['action'], workerId: string, data?: Record<string, unknown>): void {
-    if (!this.opts.longTerm) return
+    if (!this.opts.longTermStore) return
     const event: WorkerAuditEvent = {
       id: ulid(),
       workerId,
@@ -113,7 +113,7 @@ export class WorkerManager {
       action,
       ...(data !== undefined && { data }),
     }
-    this.opts.longTerm.saveWorkerEvent(event).catch(() => {})
+    this.opts.longTermStore.saveWorkerEvent(event).catch(() => {})
   }
 
   // ─── Worker Registration & Lifecycle ────────────────────────────────────
@@ -132,15 +132,15 @@ export class WorkerManager {
       lastHeartbeatAt: now,
       ...(config.metadata !== undefined && { metadata: config.metadata }),
     }
-    await this.shortTerm.saveWorker(worker)
+    await this.shortTermStore.saveWorker(worker)
     this.emitWorkerAudit('connected', worker.id)
     this.hooks?.onWorkerConnected?.(worker)
     return worker
   }
 
   async unregisterWorker(workerId: string): Promise<void> {
-    const worker = await this.shortTerm.getWorker(workerId)
-    await this.shortTerm.deleteWorker(workerId)
+    const worker = await this.shortTermStore.getWorker(workerId)
+    await this.shortTermStore.deleteWorker(workerId)
     if (worker) {
       this.emitWorkerAudit('disconnected', workerId, { reason: 'unregistered' })
       this.hooks?.onWorkerDisconnected?.(worker, 'unregistered')
@@ -148,7 +148,7 @@ export class WorkerManager {
   }
 
   async updateWorker(workerId: string, update: WorkerUpdate): Promise<Worker | null> {
-    const worker = await this.shortTerm.getWorker(workerId)
+    const worker = await this.shortTermStore.getWorker(workerId)
     if (!worker) return null
 
     if (update.weight !== undefined) worker.weight = update.weight
@@ -156,23 +156,23 @@ export class WorkerManager {
     if (update.matchRule !== undefined) worker.matchRule = update.matchRule
     if (update.status !== undefined) worker.status = update.status
 
-    await this.shortTerm.saveWorker(worker)
+    await this.shortTermStore.saveWorker(worker)
     return worker
   }
 
   async heartbeat(workerId: string): Promise<void> {
-    const worker = await this.shortTerm.getWorker(workerId)
+    const worker = await this.shortTermStore.getWorker(workerId)
     if (!worker) return
     worker.lastHeartbeatAt = Date.now()
-    await this.shortTerm.saveWorker(worker)
+    await this.shortTermStore.saveWorker(worker)
   }
 
   async getWorker(workerId: string): Promise<Worker | null> {
-    return this.shortTerm.getWorker(workerId)
+    return this.shortTermStore.getWorker(workerId)
   }
 
   async listWorkers(filter?: WorkerFilter): Promise<Worker[]> {
-    return this.shortTerm.listWorkers(filter)
+    return this.shortTermStore.listWorkers(filter)
   }
 
   // ─── Task Dispatch ─────────────────────────────────────────────────────
@@ -185,7 +185,7 @@ export class WorkerManager {
 
     const blacklist = (task.metadata?._blacklistedWorkers as string[] | undefined) ?? []
 
-    const workers = await this.shortTerm.listWorkers({ status: ['idle', 'busy'] })
+    const workers = await this.shortTermStore.listWorkers({ status: ['idle', 'busy'] })
 
     const taskCost = task.cost ?? 1
     const candidates = workers.filter((w) => {
@@ -223,15 +223,15 @@ export class WorkerManager {
     }
 
     const cost = task.cost ?? 1
-    const claimed = await this.shortTerm.claimTask(taskId, workerId, cost)
+    const claimed = await this.shortTermStore.claimTask(taskId, workerId, cost)
     if (!claimed) {
       return { success: false, reason: 'Claim failed (concurrent modification)' }
     }
 
     // claimTask atomically sets status to 'assigned' and assignedWorker on the
-    // store.  Re-read to get the authoritative state, then persist to longTerm.
-    const updatedTask = (await this.shortTerm.getTask(taskId))!
-    if (this.longTerm) await this.longTerm.saveTask(updatedTask)
+    // store.  Re-read to get the authoritative state, then persist to longTermStore.
+    const updatedTask = (await this.shortTermStore.getTask(taskId))!
+    if (this.longTermStore) await this.longTermStore.saveTask(updatedTask)
 
     // Emit audit events for the claim
     this.emitWorkerAudit('task_assigned', workerId, { taskId })
@@ -245,13 +245,13 @@ export class WorkerManager {
       assignedAt: Date.now(),
       status: 'assigned',
     }
-    await this.shortTerm.addAssignment(assignment)
+    await this.shortTermStore.addAssignment(assignment)
 
     // Update worker status (usedSlots already updated by claimTask)
-    const worker = await this.shortTerm.getWorker(workerId)
+    const worker = await this.shortTermStore.getWorker(workerId)
     if (worker) {
       worker.status = worker.usedSlots >= worker.capacity ? 'busy' : 'idle'
-      await this.shortTerm.saveWorker(worker)
+      await this.shortTermStore.saveWorker(worker)
 
       this.hooks?.onTaskAssigned?.(updatedTask, worker)
     }
@@ -262,18 +262,18 @@ export class WorkerManager {
   // ─── Task Decline ──────────────────────────────────────────────────────
 
   async declineTask(taskId: string, workerId: string, opts?: DeclineOptions): Promise<void> {
-    const assignment = await this.shortTerm.getTaskAssignment(taskId)
+    const assignment = await this.shortTermStore.getTaskAssignment(taskId)
     if (!assignment || assignment.workerId !== workerId) return
 
     // Remove assignment
-    await this.shortTerm.removeAssignment(taskId)
+    await this.shortTermStore.removeAssignment(taskId)
 
     // Restore worker capacity
-    const worker = await this.shortTerm.getWorker(workerId)
+    const worker = await this.shortTermStore.getWorker(workerId)
     if (worker) {
       worker.usedSlots = Math.max(0, worker.usedSlots - assignment.cost)
       worker.status = 'idle'
-      await this.shortTerm.saveWorker(worker)
+      await this.shortTermStore.saveWorker(worker)
     }
 
     // Transition task back to pending
@@ -297,8 +297,8 @@ export class WorkerManager {
         task.metadata = metadata
       }
 
-      await this.shortTerm.saveTask(task)
-      if (this.longTerm) await this.longTerm.saveTask(task)
+      await this.shortTermStore.saveTask(task)
+      if (this.longTermStore) await this.longTermStore.saveTask(task)
 
       if (worker) {
         this.hooks?.onTaskDeclined?.(task, worker, blacklisted)
@@ -309,13 +309,13 @@ export class WorkerManager {
   // ─── Worker Tasks ──────────────────────────────────────────────────────
 
   async getWorkerTasks(workerId: string): Promise<WorkerAssignment[]> {
-    return this.shortTerm.getWorkerAssignments(workerId)
+    return this.shortTermStore.getWorkerAssignments(workerId)
   }
 
   // ─── Pull Mode (Long-Poll) ─────────────────────────────────────────────
 
   async waitForTask(workerId: string, signal?: AbortSignal): Promise<Task> {
-    const worker = await this.shortTerm.getWorker(workerId)
+    const worker = await this.shortTermStore.getWorker(workerId)
     if (!worker) throw new Error(`Worker not found: ${workerId}`)
 
     // Check if already aborted
@@ -324,7 +324,7 @@ export class WorkerManager {
     }
 
     // Check existing pending pull tasks
-    const pendingTasks = await this.shortTerm.listTasks({ status: ['pending'], assignMode: ['pull'] })
+    const pendingTasks = await this.shortTermStore.listTasks({ status: ['pending'], assignMode: ['pull'] })
     const blacklist = new Set<string>()
     for (const task of pendingTasks) {
       const taskBlacklist = (task.metadata?._blacklistedWorkers as string[] | undefined) ?? []
@@ -364,7 +364,7 @@ export class WorkerManager {
         const taskId = event.data as string
         try {
           // Re-fetch the worker to get current state
-          const currentWorker = await this.shortTerm.getWorker(workerId)
+          const currentWorker = await this.shortTermStore.getWorker(workerId)
           if (!currentWorker) {
             cleanup()
             reject(new Error(`Worker not found: ${workerId}`))

@@ -7,7 +7,7 @@ import type { AuthContext } from '../src/auth.js'
 function makeApp() {
   const store = new MemoryShortTermStore()
   const broadcast = new MemoryBroadcastProvider()
-  const engine = new TaskEngine({ shortTerm: store, broadcast })
+  const engine = new TaskEngine({ shortTermStore: store, broadcast })
   const app = new Hono()
   app.use('*', async (c, next) => {
     const auth: AuthContext = { taskIds: '*', scope: ['*'] }

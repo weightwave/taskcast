@@ -6,8 +6,8 @@ import { WorkerManager } from '../../src/worker-manager.js'
 function makeSetup() {
   const store = new MemoryShortTermStore()
   const broadcast = new MemoryBroadcastProvider()
-  const engine = new TaskEngine({ shortTerm: store, broadcast })
-  const manager = new WorkerManager({ engine, shortTerm: store, broadcast })
+  const engine = new TaskEngine({ shortTermStore: store, broadcast })
+  const manager = new WorkerManager({ engine, shortTermStore: store, broadcast })
   return { store, broadcast, engine, manager }
 }
 

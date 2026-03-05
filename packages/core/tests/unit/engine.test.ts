@@ -51,16 +51,16 @@ describe('TaskEngine.createTask', () => {
     expect(task.type).toBe('test')
   })
 
-  it('saves to longTerm when configured', async () => {
+  it('saves to longTermStore when configured', async () => {
     const store = new MemoryShortTermStore()
     const broadcast = new MemoryBroadcastProvider()
-    const longTerm = makeLongTermStore()
-    const engine = new TaskEngine({ shortTermStore: store, broadcast, longTermStore: longTerm })
+    const longTermStore = makeLongTermStore()
+    const engine = new TaskEngine({ shortTermStore: store, broadcast, longTermStore: longTermStore })
     const task = await engine.createTask({ type: 'test' })
-    expect(longTerm.saveTask).toHaveBeenCalledWith(expect.objectContaining({ id: task.id }))
+    expect(longTermStore.saveTask).toHaveBeenCalledWith(expect.objectContaining({ id: task.id }))
   })
 
-  it('calls setTTL on shortTerm when ttl is provided', async () => {
+  it('calls setTTL on shortTermStore when ttl is provided', async () => {
     const store = new MemoryShortTermStore()
     const broadcast = new MemoryBroadcastProvider()
     const setTTLSpy = vi.spyOn(store, 'setTTL')
@@ -102,7 +102,7 @@ describe('TaskEngine.createTask', () => {
     const onTaskCreated = vi.fn()
     const store = new MemoryShortTermStore()
     const broadcast = new MemoryBroadcastProvider()
-    const engine = new TaskEngine({ shortTerm: store, broadcast, hooks: { onTaskCreated } })
+    const engine = new TaskEngine({ shortTermStore: store, broadcast, hooks: { onTaskCreated } })
     const task = await engine.createTask({ type: 'test' })
     expect(onTaskCreated).toHaveBeenCalledOnce()
     expect(onTaskCreated).toHaveBeenCalledWith(expect.objectContaining({ id: task.id, status: 'pending' }))
@@ -148,15 +148,15 @@ describe('TaskEngine.transitionTask', () => {
     expect(updated?.completedAt).toBeGreaterThan(0)
   })
 
-  it('saves to longTerm on transition', async () => {
+  it('saves to longTermStore on transition', async () => {
     const store = new MemoryShortTermStore()
     const broadcast = new MemoryBroadcastProvider()
-    const longTerm = makeLongTermStore()
-    const engine = new TaskEngine({ shortTermStore: store, broadcast, longTermStore: longTerm })
+    const longTermStore = makeLongTermStore()
+    const engine = new TaskEngine({ shortTermStore: store, broadcast, longTermStore: longTermStore })
     const task = await engine.createTask({})
-    vi.mocked(longTerm.saveTask).mockClear()
+    vi.mocked(longTermStore.saveTask).mockClear()
     await engine.transitionTask(task.id, 'running')
-    expect(longTerm.saveTask).toHaveBeenCalledWith(expect.objectContaining({ status: 'running' }))
+    expect(longTermStore.saveTask).toHaveBeenCalledWith(expect.objectContaining({ status: 'running' }))
   })
 
   it('calls onTaskTimeout hook when transitioning to timeout', async () => {
@@ -209,7 +209,7 @@ describe('TaskEngine.transitionTask', () => {
     const onTaskTransitioned = vi.fn()
     const store = new MemoryShortTermStore()
     const broadcast = new MemoryBroadcastProvider()
-    const engine = new TaskEngine({ shortTerm: store, broadcast, hooks: { onTaskTransitioned } })
+    const engine = new TaskEngine({ shortTermStore: store, broadcast, hooks: { onTaskTransitioned } })
     const task = await engine.createTask({})
 
     await engine.transitionTask(task.id, 'running')
@@ -298,28 +298,28 @@ describe('TaskEngine.publishEvent', () => {
     ).rejects.toThrow(/terminal/i)
   })
 
-  it('saves event to longTerm when configured', async () => {
+  it('saves event to longTermStore when configured', async () => {
     const store = new MemoryShortTermStore()
     const broadcast = new MemoryBroadcastProvider()
-    const longTerm = makeLongTermStore()
-    const engine = new TaskEngine({ shortTermStore: store, broadcast, longTermStore: longTerm })
+    const longTermStore = makeLongTermStore()
+    const engine = new TaskEngine({ shortTermStore: store, broadcast, longTermStore: longTermStore })
     const task = await engine.createTask({})
     await engine.transitionTask(task.id, 'running')
     await engine.publishEvent(task.id, { type: 'llm.delta', level: 'info', data: { text: 'hi' } })
     // saveEvent is fire-and-forget so flush microtasks
     await Promise.resolve()
     await Promise.resolve()
-    expect(longTerm.saveEvent).toHaveBeenCalled()
+    expect(longTermStore.saveEvent).toHaveBeenCalled()
   })
 
-  it('calls onEventDropped hook when longTerm saveEvent rejects', async () => {
+  it('calls onEventDropped hook when longTermStore saveEvent rejects', async () => {
     const onEventDropped = vi.fn()
     const store = new MemoryShortTermStore()
     const broadcast = new MemoryBroadcastProvider()
-    const longTerm = makeLongTermStore({
+    const longTermStore = makeLongTermStore({
       saveEvent: vi.fn().mockRejectedValue(new Error('storage unavailable')),
     })
-    const engine = new TaskEngine({ shortTermStore: store, broadcast, longTermStore: longTerm, hooks: { onEventDropped } })
+    const engine = new TaskEngine({ shortTermStore: store, broadcast, longTermStore: longTermStore, hooks: { onEventDropped } })
     const task = await engine.createTask({})
     await engine.transitionTask(task.id, 'running')
     await engine.publishEvent(task.id, { type: 'llm.delta', level: 'info', data: null })
@@ -343,7 +343,7 @@ describe('TaskEngine.getTask', () => {
     expect(found?.id).toBe(task.id)
   })
 
-  it('falls back to longTerm when shortTerm returns null', async () => {
+  it('falls back to longTermStore when shortTermStore returns null', async () => {
     const store = new MemoryShortTermStore()
     const broadcast = new MemoryBroadcastProvider()
     const fallbackTask = {
@@ -353,13 +353,13 @@ describe('TaskEngine.getTask', () => {
       updatedAt: 1000,
       completedAt: 1000,
     }
-    const longTerm = makeLongTermStore({
+    const longTermStore = makeLongTermStore({
       getTask: vi.fn().mockResolvedValue(fallbackTask),
     })
-    const engine = new TaskEngine({ shortTermStore: store, broadcast, longTermStore: longTerm })
+    const engine = new TaskEngine({ shortTermStore: store, broadcast, longTermStore: longTermStore })
     const found = await engine.getTask('archived-task')
     expect(found).toEqual(fallbackTask)
-    expect(longTerm.getTask).toHaveBeenCalledWith('archived-task')
+    expect(longTermStore.getTask).toHaveBeenCalledWith('archived-task')
   })
 })
 
@@ -397,18 +397,25 @@ describe('TaskEngine constructor validation', () => {
       shortTerm: store,
       shortTermStore: store,
       broadcast,
-    } as any)).toThrow('Cannot specify both shortTermStore and shortTerm')
+    } as any)).toThrow('Cannot specify both shortTerm and shortTermStore')
   })
 
   it('throws when both longTerm and longTermStore are provided', () => {
     const store = new MemoryShortTermStore()
     const broadcast = new MemoryBroadcastProvider()
-    const longTerm = makeLongTermStore()
+    const longTermStore = makeLongTermStore()
     expect(() => new TaskEngine({
       shortTermStore: store,
-      longTerm,
-      longTermStore: longTerm,
+      longTerm: longTermStore,
+      longTermStore: longTermStore,
       broadcast,
-    } as any)).toThrow('Cannot specify both longTermStore and longTerm')
+    } as any)).toThrow('Cannot specify both longTerm and longTermStore')
+  })
+
+  it('accepts legacy shortTerm/longTerm option names', () => {
+    const store = new MemoryShortTermStore()
+    const broadcast = new MemoryBroadcastProvider()
+    const engine = new TaskEngine({ shortTerm: store, broadcast } as any)
+    expect(engine).toBeInstanceOf(TaskEngine)
   })
 })

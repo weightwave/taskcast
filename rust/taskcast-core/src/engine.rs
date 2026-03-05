@@ -112,8 +112,8 @@ impl TaskEngine {
 
         self.short_term_store.save_task(task.clone()).await?;
 
-        if let Some(ref long_term) = self.long_term_store {
-            long_term.save_task(task.clone()).await?;
+        if let Some(ref long_term_store) = self.long_term_store {
+            long_term_store.save_task(task.clone()).await?;
         }
 
         if let Some(ttl) = task.ttl {
@@ -132,8 +132,8 @@ impl TaskEngine {
         if from_short.is_some() {
             return Ok(from_short);
         }
-        if let Some(ref long_term) = self.long_term_store {
-            return Ok(long_term.get_task(task_id).await?);
+        if let Some(ref long_term_store) = self.long_term_store {
+            return Ok(long_term_store.get_task(task_id).await?);
         }
         Ok(None)
     }
@@ -181,8 +181,8 @@ impl TaskEngine {
 
         self.short_term_store.save_task(updated.clone()).await?;
 
-        if let Some(ref long_term) = self.long_term_store {
-            long_term.save_task(updated.clone()).await?;
+        if let Some(ref long_term_store) = self.long_term_store {
+            long_term_store.save_task(updated.clone()).await?;
         }
 
         self.emit(
@@ -234,7 +234,7 @@ impl TaskEngine {
     }
 
     pub async fn list_tasks(&self, filter: TaskFilter) -> Result<Vec<Task>, EngineError> {
-        Ok(self.short_term.list_tasks(filter).await?)
+        Ok(self.short_term_store.list_tasks(filter).await?)
     }
 
     pub async fn subscribe(
@@ -272,12 +272,12 @@ impl TaskEngine {
             .await?;
         self.broadcast.publish(task_id, event.clone()).await?;
 
-        if let Some(ref long_term) = self.long_term_store {
-            let long_term = Arc::clone(long_term);
+        if let Some(ref long_term_store) = self.long_term_store {
+            let long_term_store = Arc::clone(long_term_store);
             let event_clone = event.clone();
             let hooks = self.hooks.clone();
             tokio::spawn(async move {
-                if let Err(err) = long_term.save_event(event_clone.clone()).await {
+                if let Err(err) = long_term_store.save_event(event_clone.clone()).await {
                     if let Some(hooks) = hooks {
                         hooks.on_event_dropped(&event_clone, &err.to_string());
                     }
@@ -303,7 +303,7 @@ fn now_millis() -> f64 {
 mod tests {
     use super::*;
     use crate::memory_adapters::{MemoryBroadcastProvider, MemoryShortTermStore};
-    use crate::types::LongTermStore;
+    use crate::types::{LongTermStore, WorkerAuditEvent};
     use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::sync::RwLock as TokioRwLock;
 
@@ -354,6 +354,14 @@ mod tests {
 
         async fn get_events(&self, _task_id: &str, _opts: Option<EventQueryOptions>) -> Result<Vec<TaskEvent>, Box<dyn std::error::Error + Send + Sync>> {
             Ok(self.events.read().await.clone())
+        }
+
+        async fn save_worker_event(&self, _event: WorkerAuditEvent) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+
+        async fn get_worker_events(&self, _worker_id: &str, _opts: Option<EventQueryOptions>) -> Result<Vec<WorkerAuditEvent>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(Vec::new())
         }
     }
 
@@ -1158,36 +1166,36 @@ mod tests {
         }
     }
 
-    // ─── long_term integration ────────────────────────────────────────
+    // ─── long_term_store integration ────────────────────────────────────────
 
-    fn make_engine_with_long_term(long_term: Arc<dyn LongTermStore>) -> TaskEngine {
+    fn make_engine_with_long_term(long_term_store: Arc<dyn LongTermStore>) -> TaskEngine {
         TaskEngine::new(TaskEngineOptions {
             short_term_store: Arc::new(MemoryShortTermStore::new()),
             broadcast: Arc::new(MemoryBroadcastProvider::new()),
-            long_term_store: Some(long_term),
+            long_term_store: Some(long_term_store),
             hooks: None,
         })
     }
 
     #[tokio::test]
     async fn create_task_saves_to_long_term() {
-        let long_term = Arc::new(MockLongTermStore::new());
-        let engine = make_engine_with_long_term(Arc::clone(&long_term) as Arc<dyn LongTermStore>);
+        let long_term_store = Arc::new(MockLongTermStore::new());
+        let engine = make_engine_with_long_term(Arc::clone(&long_term_store) as Arc<dyn LongTermStore>);
 
         let task = engine.create_task(CreateTaskInput {
             id: Some("lt-1".to_string()),
             ..Default::default()
         }).await.unwrap();
 
-        let retrieved = long_term.get_task(&task.id).await.unwrap();
+        let retrieved = long_term_store.get_task(&task.id).await.unwrap();
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().id, "lt-1");
     }
 
     #[tokio::test]
     async fn get_task_falls_back_to_long_term() {
-        let long_term = Arc::new(MockLongTermStore::new());
-        // Save directly to long_term, bypassing short_term
+        let long_term_store = Arc::new(MockLongTermStore::new());
+        // Save directly to long_term_store, bypassing short_term_store
         let task = Task {
             id: "lt-only".to_string(),
             status: TaskStatus::Completed,
@@ -1196,10 +1204,12 @@ mod tests {
             r#type: None, params: None, result: None, error: None,
             metadata: None, completed_at: None, ttl: None,
             auth_config: None, webhooks: None, cleanup: None,
+            tags: None, assign_mode: None, cost: None,
+            assigned_worker: None, disconnect_policy: None,
         };
-        long_term.save_task(task).await.unwrap();
+        long_term_store.save_task(task).await.unwrap();
 
-        let engine = make_engine_with_long_term(long_term);
+        let engine = make_engine_with_long_term(long_term_store);
         let retrieved = engine.get_task("lt-only").await.unwrap();
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().id, "lt-only");
@@ -1207,8 +1217,8 @@ mod tests {
 
     #[tokio::test]
     async fn transition_task_saves_to_long_term() {
-        let long_term = Arc::new(MockLongTermStore::new());
-        let engine = make_engine_with_long_term(Arc::clone(&long_term) as Arc<dyn LongTermStore>);
+        let long_term_store = Arc::new(MockLongTermStore::new());
+        let engine = make_engine_with_long_term(Arc::clone(&long_term_store) as Arc<dyn LongTermStore>);
 
         engine.create_task(CreateTaskInput {
             id: Some("lt-2".to_string()),
@@ -1217,14 +1227,14 @@ mod tests {
 
         engine.transition_task("lt-2", TaskStatus::Running, None).await.unwrap();
 
-        let retrieved = long_term.get_task("lt-2").await.unwrap().unwrap();
+        let retrieved = long_term_store.get_task("lt-2").await.unwrap().unwrap();
         assert_eq!(retrieved.status, TaskStatus::Running);
     }
 
     #[tokio::test]
     async fn emit_saves_event_to_long_term_async() {
-        let long_term = Arc::new(MockLongTermStore::new());
-        let engine = make_engine_with_long_term(Arc::clone(&long_term) as Arc<dyn LongTermStore>);
+        let long_term_store = Arc::new(MockLongTermStore::new());
+        let engine = make_engine_with_long_term(Arc::clone(&long_term_store) as Arc<dyn LongTermStore>);
 
         engine.create_task(CreateTaskInput {
             id: Some("lt-3".to_string()),
@@ -1240,23 +1250,23 @@ mod tests {
             series_mode: None,
         }).await.unwrap();
 
-        // The long_term save is async (tokio::spawn), give it a moment
+        // The long_term_store save is async (tokio::spawn), give it a moment
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        let events = long_term.get_events("lt-3", None).await.unwrap();
+        let events = long_term_store.get_events("lt-3", None).await.unwrap();
         // transition emits a status event + our event = at least 2
         assert!(events.len() >= 2);
     }
 
     #[tokio::test]
     async fn emit_calls_on_event_dropped_when_long_term_fails() {
-        let long_term = Arc::new(MockLongTermStore::failing_save_event());
+        let long_term_store = Arc::new(MockLongTermStore::failing_save_event());
         let hooks = Arc::new(MockHooks::new());
 
         let engine = TaskEngine::new(TaskEngineOptions {
             short_term_store: Arc::new(MemoryShortTermStore::new()),
             broadcast: Arc::new(MemoryBroadcastProvider::new()),
-            long_term_store: Some(long_term),
+            long_term_store: Some(long_term_store),
             hooks: Some(Arc::clone(&hooks) as Arc<dyn TaskcastHooks>),
         });
 

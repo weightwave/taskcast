@@ -16,8 +16,8 @@ pub async fn setup() -> TestContext {
         .unwrap();
 
     TestContext {
-        short: adapters.short_term,
-        long: adapters.long_term,
+        short: adapters.short_term_store,
+        long: adapters.long_term_store,
         _dir: dir,
     }
 }
@@ -42,6 +42,11 @@ pub fn make_task(id: &str) -> Task {
         updated_at: 1000.0,
         completed_at: None,
         ttl: None,
+        tags: None,
+        assign_mode: None,
+        cost: None,
+        assigned_worker: None,
+        disconnect_policy: None,
     }
 }
 

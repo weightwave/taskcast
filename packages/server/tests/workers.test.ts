@@ -12,8 +12,8 @@ import type { AuthContext } from '../src/auth.js'
 function makeApp(authOverride?: Partial<AuthContext>) {
   const store = new MemoryShortTermStore()
   const broadcast = new MemoryBroadcastProvider()
-  const engine = new TaskEngine({ shortTerm: store, broadcast })
-  const manager = new WorkerManager({ engine, shortTerm: store, broadcast })
+  const engine = new TaskEngine({ shortTermStore: store, broadcast })
+  const manager = new WorkerManager({ engine, shortTermStore: store, broadcast })
   const app = new Hono()
   app.use('*', async (c, next) => {
     c.set('auth', { taskIds: '*', scope: ['*'], ...authOverride } as AuthContext)

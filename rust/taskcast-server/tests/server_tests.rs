@@ -1698,7 +1698,7 @@ async fn sse_level_filter_only_returns_matching_levels() {
 #[tokio::test]
 async fn sse_live_streaming_receives_events_and_done() {
     let engine = make_engine();
-    let app = create_app(Arc::clone(&engine), AuthMode::None);
+    let app = create_app(Arc::clone(&engine), AuthMode::None, None);
 
     // Bind to a random port
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

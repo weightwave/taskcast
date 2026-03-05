@@ -16,8 +16,8 @@ export interface TaskcastConfig {
   }
   adapters?: {
     broadcast?: { provider: string; url?: string }
-    shortTerm?: { provider: string; url?: string }
-    longTerm?: { provider: string; url?: string }
+    shortTermStore?: { provider: string; url?: string }
+    longTermStore?: { provider: string; url?: string }
   }
   sentry?: {
     dsn?: string
