@@ -3,11 +3,11 @@ use std::sync::Arc;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use axum::Extension;
 use serde::Deserialize;
 use serde_json::json;
-use taskcast_core::worker_manager::{DeclineOptions, WorkerManager, WorkerUpdate};
+use taskcast_core::worker_manager::{DeclineOptions, WorkerManager, WorkerUpdate, WorkerUpdateStatus};
 use taskcast_core::PermissionScope;
 
 use crate::auth::{check_scope, AuthContext};
@@ -32,6 +32,19 @@ pub struct DeclineBody {
     pub worker_id: String,
     #[serde(default)]
     pub blacklist: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerStatusUpdateBody {
+    pub status: WorkerStatusUpdateValue,
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum WorkerStatusUpdateValue {
+    Draining,
+    Idle,
 }
 
 // ─── Handlers ───────────────────────────────────────────────────────────────
@@ -191,6 +204,51 @@ pub async fn delete_worker(
 }
 
 #[utoipa::path(
+    patch,
+    path = "/workers/{worker_id}/status",
+    tag = "Workers",
+    summary = "Update worker status (drain/resume)",
+    description = "Set worker to draining or idle. Cannot manually set busy.",
+    security(("Bearer" = [])),
+    params(("worker_id" = String, Path, description = "Worker ID")),
+    request_body = WorkerStatusUpdateBody,
+    responses(
+        (status = 200, description = "Updated worker", body = taskcast_core::Worker),
+        (status = 400, description = "Invalid status"),
+        (status = 404, description = "Not found"),
+        (status = 403, description = "Forbidden"),
+    )
+)]
+pub async fn update_worker_status(
+    State(manager): State<Arc<WorkerManager>>,
+    Extension(auth): Extension<AuthContext>,
+    Path(worker_id): Path<String>,
+    axum::Json(body): axum::Json<WorkerStatusUpdateBody>,
+) -> Result<impl IntoResponse, AppError> {
+    if !check_scope(&auth, PermissionScope::WorkerManage, None) {
+        return Err(AppError::Forbidden);
+    }
+
+    let update_status = match body.status {
+        WorkerStatusUpdateValue::Draining => WorkerUpdateStatus::Draining,
+        WorkerStatusUpdateValue::Idle => WorkerUpdateStatus::Idle,
+    };
+
+    let update = WorkerUpdate {
+        status: Some(update_status),
+        ..Default::default()
+    };
+
+    let worker = manager
+        .update_worker(&worker_id, update)
+        .await
+        .map_err(manager_error)?
+        .ok_or_else(|| AppError::NotFound("Worker not found".to_string()))?;
+
+    Ok(axum::Json(worker))
+}
+
+#[utoipa::path(
     post,
     path = "/workers/tasks/{task_id}/decline",
     tag = "Workers",
@@ -237,6 +295,7 @@ pub fn workers_router() -> axum::Router<Arc<WorkerManager>> {
         .route("/", get(list_workers))
         .route("/pull", get(pull_task))
         .route("/{worker_id}", get(get_worker).delete(delete_worker))
+        .route("/{worker_id}/status", patch(update_worker_status))
         .route("/tasks/{task_id}/decline", post(decline_task))
 }
 

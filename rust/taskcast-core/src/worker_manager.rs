@@ -81,11 +81,12 @@ pub struct WorkerUpdate {
     pub status: Option<WorkerUpdateStatus>,
 }
 
-/// Only "draining" is a valid status update via WorkerUpdate.
+/// Valid status values that can be set via WorkerUpdate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum WorkerUpdateStatus {
     Draining,
+    Idle,
 }
 
 // ─── Dispatch / Claim / Decline ─────────────────────────────────────────────
@@ -258,14 +259,24 @@ impl WorkerManager {
                 WorkerUpdateStatus::Draining => {
                     worker.status = WorkerStatus::Draining;
                 }
+                WorkerUpdateStatus::Idle => {
+                    worker.status = WorkerStatus::Idle;
+                }
             }
         }
 
         self.short_term_store.save_worker(worker.clone()).await?;
 
         self.emit_worker_audit(WorkerAuditAction::Updated, worker_id, None);
-        if update.status.is_some() {
-            self.emit_worker_audit(WorkerAuditAction::Draining, worker_id, None);
+        if let Some(ref status) = update.status {
+            match status {
+                WorkerUpdateStatus::Draining => {
+                    self.emit_worker_audit(WorkerAuditAction::Draining, worker_id, None);
+                }
+                WorkerUpdateStatus::Idle => {
+                    // No specific audit action for resuming to idle
+                }
+            }
         }
 
         Ok(Some(worker))

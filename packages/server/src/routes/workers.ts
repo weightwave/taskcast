@@ -2,7 +2,7 @@ import type { Hono } from 'hono'
 import { OpenAPIHono, createRoute, z } from '@hono/zod-openapi'
 import type { Context } from 'hono'
 import { checkScope } from '../auth.js'
-import { DeclineSchema, WorkerSchema, TaskSchema, ErrorSchema } from '../schemas.js'
+import { DeclineSchema, WorkerSchema, WorkerStatusUpdateSchema, TaskSchema, ErrorSchema } from '../schemas.js'
 import type { WorkerManager, TaskEngine } from '@taskcast/core'
 
 export { WorkerWSHandler, WorkerWSRegistry } from './worker-ws.js'
@@ -71,6 +71,25 @@ const deleteWorkerRoute = createRoute({
   },
   responses: {
     204: { description: 'Worker removed' },
+    404: { description: 'Worker not found', content: { 'application/json': { schema: ErrorSchema } } },
+    403: { description: 'Forbidden', content: { 'application/json': { schema: ErrorSchema } } },
+  },
+})
+
+const updateWorkerStatusRoute = createRoute({
+  method: 'patch',
+  path: '/{workerId}/status',
+  tags: ['Workers'],
+  summary: 'Update worker status (drain/resume)',
+  description: 'Set worker to draining or idle. Cannot manually set busy.',
+  security: [{ Bearer: [] }],
+  request: {
+    params: z.object({ workerId: z.string() }),
+    body: { content: { 'application/json': { schema: WorkerStatusUpdateSchema } } },
+  },
+  responses: {
+    200: { description: 'Updated worker', content: { 'application/json': { schema: WorkerSchema } } },
+    400: { description: 'Invalid status', content: { 'application/json': { schema: ErrorSchema } } },
     404: { description: 'Worker not found', content: { 'application/json': { schema: ErrorSchema } } },
     403: { description: 'Forbidden', content: { 'application/json': { schema: ErrorSchema } } },
   },
@@ -158,6 +177,21 @@ export function createWorkersRouter(manager: WorkerManager, engine: TaskEngine):
     if (!worker) return c.json({ error: 'Worker not found' }, 404)
     await manager.unregisterWorker(workerId)
     return c.body(null, 204)
+  })
+
+  // PATCH /{workerId}/status — drain or resume worker
+  register(updateWorkerStatusRoute, async (c) => {
+    const workerId = c.req.param('workerId') as string
+    const auth = c.get('auth')
+    if (!checkScope(auth, 'worker:manage')) return c.json({ error: 'Forbidden' }, 403)
+
+    const body = await c.req.json()
+    const parsed = WorkerStatusUpdateSchema.safeParse(body)
+    if (!parsed.success) return c.json({ error: parsed.error.flatten() }, 400)
+
+    const worker = await manager.updateWorker(workerId, { status: parsed.data.status as 'draining' | 'idle' })
+    if (!worker) return c.json({ error: 'Worker not found' }, 404)
+    return c.json(worker)
   })
 
   // POST /tasks/{taskId}/decline — worker declines a task
