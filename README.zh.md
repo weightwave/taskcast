@@ -297,7 +297,7 @@ ws.addEventListener('message', async (event) => {
 import { TaskcastClient } from '@taskcast/client'
 
 const client = new TaskcastClient({
-  baseUrl: 'http://taskcast-service:3721',
+  baseUrl: 'http://taskcast-service:3721', // 直接使用外部地址，或部署在 API Gateway 后，鉴权交给 Gateway
   token: 'user-jwt-token',
 })
 
