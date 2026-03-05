@@ -12,6 +12,8 @@ pub struct TaskcastConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub log_level: Option<LogLevel>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub admin_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub auth: Option<AuthConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub adapters: Option<AdaptersConfig>,
@@ -265,6 +267,21 @@ fn coerce_port(mut value: serde_json::Value) -> serde_json::Value {
         }
     }
     value
+}
+
+// ─── Admin Token Resolution ──────────────────────────────────────────────────
+
+/// Ensures the config has an admin_token. If one is not explicitly provided,
+/// a ULID is auto-generated and logged to the terminal.
+/// Mutates the config in place and returns the resolved token.
+pub fn resolve_admin_token(config: &mut TaskcastConfig) -> String {
+    if let Some(ref token) = config.admin_token {
+        return token.clone();
+    }
+    let token = ulid::Ulid::new().to_string();
+    println!("[taskcast] Admin token (auto-generated): {}", token);
+    config.admin_token = Some(token.clone());
+    token
 }
 
 // ─── File Loading ────────────────────────────────────────────────────────────
@@ -751,5 +768,67 @@ auth:
         // YAML parser sees "port: 42" and parses it as a number
         assert_eq!(config.port, Some(42));
         env::remove_var("TASKCAST_TEST_YAML_NUM");
+    }
+
+    // ─── resolve_admin_token ─────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_admin_token_generates_when_not_set() {
+        let mut config = TaskcastConfig::default();
+        assert!(config.admin_token.is_none());
+
+        let token = resolve_admin_token(&mut config);
+
+        assert!(!token.is_empty());
+        assert_eq!(token.len(), 26); // ULID is 26 chars
+        assert_eq!(config.admin_token, Some(token));
+    }
+
+    #[test]
+    fn resolve_admin_token_preserves_explicit_value() {
+        let mut config = TaskcastConfig {
+            admin_token: Some("my-secret-token".to_string()),
+            ..Default::default()
+        };
+
+        let token = resolve_admin_token(&mut config);
+
+        assert_eq!(token, "my-secret-token");
+        assert_eq!(config.admin_token, Some("my-secret-token".to_string()));
+    }
+
+    #[test]
+    fn resolve_admin_token_generates_unique_tokens() {
+        let mut config1 = TaskcastConfig::default();
+        let mut config2 = TaskcastConfig::default();
+
+        let token1 = resolve_admin_token(&mut config1);
+        let token2 = resolve_admin_token(&mut config2);
+
+        assert_ne!(token1, token2);
+    }
+
+    #[test]
+    fn resolve_admin_token_idempotent_on_same_config() {
+        let mut config = TaskcastConfig::default();
+
+        let token1 = resolve_admin_token(&mut config);
+        let token2 = resolve_admin_token(&mut config);
+
+        assert_eq!(token1, token2);
+    }
+
+    #[test]
+    fn admin_token_parsed_from_json_config() {
+        let json = r#"{"adminToken": "from-config-file"}"#;
+        let config = parse_config(json, ConfigFormat::Json).unwrap();
+        assert_eq!(config.admin_token, Some("from-config-file".to_string()));
+    }
+
+    #[test]
+    fn admin_token_parsed_from_yaml_config() {
+        let yaml = "adminToken: from-yaml-config\n";
+        let config = parse_config(yaml, ConfigFormat::Yaml).unwrap();
+        assert_eq!(config.admin_token, Some("from-yaml-config".to_string()));
     }
 }

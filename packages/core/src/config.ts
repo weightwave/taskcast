@@ -1,8 +1,10 @@
 import { load as yamlLoad } from 'js-yaml'
+import { ulid } from 'ulidx'
 
 export interface TaskcastConfig {
   port?: number
   logLevel?: 'debug' | 'info' | 'warn' | 'error'
+  adminToken?: string
   auth?: {
     mode: 'none' | 'jwt' | 'custom'
     jwt?: {
@@ -166,4 +168,19 @@ export async function loadConfigFile(
   }
 
   return { config: {}, source: 'none' }
+}
+
+/**
+ * Ensures the config has an adminToken. If one is not explicitly provided,
+ * a ULID is auto-generated and logged to the terminal.
+ * Mutates the config in place and returns the resolved token.
+ */
+export function resolveAdminToken(config: TaskcastConfig): string {
+  if (!config.adminToken) {
+    const token = ulid()
+    config.adminToken = token
+    console.log(`[taskcast] Admin token (auto-generated): ${token}`)
+    return token
+  }
+  return config.adminToken
 }

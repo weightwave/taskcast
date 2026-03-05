@@ -1,8 +1,9 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { writeFileSync, unlinkSync, mkdirSync, rmSync } from 'fs'
 import { join } from 'path'
 import { tmpdir } from 'os'
-import { interpolateEnvVars, parseConfig, loadConfigFile } from '../../src/config.js'
+import { interpolateEnvVars, parseConfig, loadConfigFile, resolveAdminToken } from '../../src/config.js'
+import type { TaskcastConfig } from '../../src/config.js'
 
 describe('interpolateEnvVars', () => {
   it('replaces ${VAR} with env value', () => {
@@ -145,5 +146,96 @@ describe('loadConfigFile - global fallback', () => {
     writeFileSync(join(globalDir, 'taskcast.config.js'), 'export default { port: 1234 }')
     const result = await loadConfigFile(undefined, globalDir)
     expect(result.source).toBe('none')
+  })
+})
+
+describe('resolveAdminToken', () => {
+  it('auto-generates a ULID token when adminToken is not set', () => {
+    const config: TaskcastConfig = {}
+    const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+
+    const token = resolveAdminToken(config)
+
+    expect(token).toBeDefined()
+    expect(typeof token).toBe('string')
+    expect(token.length).toBeGreaterThan(0)
+    // ULID is 26 characters
+    expect(token).toMatch(/^[0-9A-Z]{26}$/)
+    // Config should be mutated
+    expect(config.adminToken).toBe(token)
+    // Should have logged
+    expect(consoleSpy).toHaveBeenCalledOnce()
+    expect(consoleSpy).toHaveBeenCalledWith(
+      `[taskcast] Admin token (auto-generated): ${token}`,
+    )
+
+    consoleSpy.mockRestore()
+  })
+
+  it('preserves explicitly provided adminToken without logging', () => {
+    const config: TaskcastConfig = { adminToken: 'my-secret-token' }
+    const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+
+    const token = resolveAdminToken(config)
+
+    expect(token).toBe('my-secret-token')
+    expect(config.adminToken).toBe('my-secret-token')
+    // Should NOT have logged
+    expect(consoleSpy).not.toHaveBeenCalled()
+
+    consoleSpy.mockRestore()
+  })
+
+  it('generates unique tokens on each call', () => {
+    const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+
+    const config1: TaskcastConfig = {}
+    const config2: TaskcastConfig = {}
+    const token1 = resolveAdminToken(config1)
+    const token2 = resolveAdminToken(config2)
+
+    expect(token1).not.toBe(token2)
+
+    consoleSpy.mockRestore()
+  })
+
+  it('returns existing token on repeated calls to the same config', () => {
+    const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+
+    const config: TaskcastConfig = {}
+    const token1 = resolveAdminToken(config)
+    const token2 = resolveAdminToken(config)
+
+    expect(token1).toBe(token2)
+    // Should only log once (on the first call)
+    expect(consoleSpy).toHaveBeenCalledOnce()
+
+    consoleSpy.mockRestore()
+  })
+
+  it('treats empty string adminToken as unset', () => {
+    const config: TaskcastConfig = { adminToken: '' }
+    const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+
+    const token = resolveAdminToken(config)
+
+    // Empty string is falsy, so it should auto-generate
+    expect(token).toMatch(/^[0-9A-Z]{26}$/)
+    expect(config.adminToken).toBe(token)
+    expect(consoleSpy).toHaveBeenCalledOnce()
+
+    consoleSpy.mockRestore()
+  })
+
+  it('parses adminToken from JSON config', () => {
+    const json = JSON.stringify({ port: 3000, adminToken: 'from-config-file' })
+    const config = parseConfig(json, 'json')
+    expect(config.adminToken).toBe('from-config-file')
+  })
+
+  it('parses adminToken from YAML config', () => {
+    const yaml = 'port: 3000\nadminToken: from-yaml-config\n'
+    const config = parseConfig(yaml, 'yaml')
+    expect(config.adminToken).toBe('from-yaml-config')
   })
 })
