@@ -1,6 +1,6 @@
 {
   "name": "@taskcast/server-sdk",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "HTTP client SDK for Taskcast remote server mode.",
   "repository": {
     "type": "git",
