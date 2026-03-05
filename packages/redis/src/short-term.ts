@@ -134,12 +134,20 @@ export class RedisShortTermStore implements ShortTermStore {
     const results = await pipeline.exec()
 
     let tasks: Task[] = []
+    const staleIds: string[] = []
     if (results) {
-      for (const [err, raw] of results) {
+      for (let i = 0; i < results.length; i++) {
+        const entry = results[i]!
+        const [err, raw] = entry
         if (!err && typeof raw === 'string') {
           tasks.push(JSON.parse(raw) as Task)
+        } else if (!err) {
+          staleIds.push(taskIds[i]!)
         }
       }
+    }
+    if (staleIds.length > 0) {
+      await this.redis.srem(this.KEY.taskSet, ...staleIds)
     }
 
     if (filter.status?.length) {

@@ -14,8 +14,8 @@ pub const SUSPENDED_STATUSES: &[TaskStatus] = &[
 
 pub fn allowed_transitions(from: &TaskStatus) -> &'static [TaskStatus] {
     match from {
-        TaskStatus::Pending => &[TaskStatus::Assigned, TaskStatus::Running, TaskStatus::Cancelled],
-        TaskStatus::Assigned => &[TaskStatus::Running, TaskStatus::Pending, TaskStatus::Cancelled],
+        TaskStatus::Pending => &[TaskStatus::Assigned, TaskStatus::Running, TaskStatus::Paused, TaskStatus::Cancelled],
+        TaskStatus::Assigned => &[TaskStatus::Running, TaskStatus::Pending, TaskStatus::Paused, TaskStatus::Cancelled],
         TaskStatus::Running => &[
             TaskStatus::Paused,
             TaskStatus::Blocked,
@@ -24,8 +24,8 @@ pub fn allowed_transitions(from: &TaskStatus) -> &'static [TaskStatus] {
             TaskStatus::Timeout,
             TaskStatus::Cancelled,
         ],
-        TaskStatus::Paused => &[TaskStatus::Running, TaskStatus::Blocked, TaskStatus::Cancelled],
-        TaskStatus::Blocked => &[TaskStatus::Running, TaskStatus::Paused, TaskStatus::Cancelled, TaskStatus::Failed],
+        TaskStatus::Paused => &[TaskStatus::Running, TaskStatus::Assigned, TaskStatus::Blocked, TaskStatus::Cancelled],
+        TaskStatus::Blocked => &[TaskStatus::Running, TaskStatus::Assigned, TaskStatus::Paused, TaskStatus::Cancelled, TaskStatus::Failed],
         TaskStatus::Completed
         | TaskStatus::Failed
         | TaskStatus::Timeout
@@ -71,6 +71,11 @@ mod tests {
         assert!(can_transition(&TaskStatus::Pending, &TaskStatus::Cancelled));
     }
 
+    #[test]
+    fn pending_to_paused_is_valid() {
+        assert!(can_transition(&TaskStatus::Pending, &TaskStatus::Paused));
+    }
+
     // ─── can_transition: invalid transitions from Pending ────────────────
 
     #[test]
@@ -86,6 +91,11 @@ mod tests {
     #[test]
     fn pending_to_timeout_is_invalid() {
         assert!(!can_transition(&TaskStatus::Pending, &TaskStatus::Timeout));
+    }
+
+    #[test]
+    fn pending_to_blocked_is_invalid() {
+        assert!(!can_transition(&TaskStatus::Pending, &TaskStatus::Blocked));
     }
 
     // ─── can_transition: valid transitions from Pending to Assigned ──────
@@ -105,6 +115,11 @@ mod tests {
     #[test]
     fn assigned_to_pending_is_valid() {
         assert!(can_transition(&TaskStatus::Assigned, &TaskStatus::Pending));
+    }
+
+    #[test]
+    fn assigned_to_paused_is_valid() {
+        assert!(can_transition(&TaskStatus::Assigned, &TaskStatus::Paused));
     }
 
     #[test]
@@ -133,6 +148,11 @@ mod tests {
     #[test]
     fn assigned_to_timeout_is_invalid() {
         assert!(!can_transition(&TaskStatus::Assigned, &TaskStatus::Timeout));
+    }
+
+    #[test]
+    fn assigned_to_blocked_is_invalid() {
+        assert!(!can_transition(&TaskStatus::Assigned, &TaskStatus::Blocked));
     }
 
     // ─── is_terminal: Assigned is not terminal ──────────────────────────
@@ -189,6 +209,11 @@ mod tests {
     }
 
     #[test]
+    fn paused_to_assigned_is_valid() {
+        assert!(can_transition(&TaskStatus::Paused, &TaskStatus::Assigned));
+    }
+
+    #[test]
     fn paused_to_blocked_is_valid() {
         assert!(can_transition(&TaskStatus::Paused, &TaskStatus::Blocked));
     }
@@ -210,11 +235,26 @@ mod tests {
         assert!(!can_transition(&TaskStatus::Paused, &TaskStatus::Failed));
     }
 
+    #[test]
+    fn paused_to_pending_is_invalid() {
+        assert!(!can_transition(&TaskStatus::Paused, &TaskStatus::Pending));
+    }
+
+    #[test]
+    fn paused_to_timeout_is_invalid() {
+        assert!(!can_transition(&TaskStatus::Paused, &TaskStatus::Timeout));
+    }
+
     // ─── can_transition: valid transitions from Blocked ─────────────────
 
     #[test]
     fn blocked_to_running_is_valid() {
         assert!(can_transition(&TaskStatus::Blocked, &TaskStatus::Running));
+    }
+
+    #[test]
+    fn blocked_to_assigned_is_valid() {
+        assert!(can_transition(&TaskStatus::Blocked, &TaskStatus::Assigned));
     }
 
     #[test]
@@ -237,6 +277,16 @@ mod tests {
     #[test]
     fn blocked_to_completed_is_invalid() {
         assert!(!can_transition(&TaskStatus::Blocked, &TaskStatus::Completed));
+    }
+
+    #[test]
+    fn blocked_to_pending_is_invalid() {
+        assert!(!can_transition(&TaskStatus::Blocked, &TaskStatus::Pending));
+    }
+
+    #[test]
+    fn blocked_to_timeout_is_invalid() {
+        assert!(!can_transition(&TaskStatus::Blocked, &TaskStatus::Timeout));
     }
 
     // ─── can_transition: terminal states cannot transition ────────────────
@@ -390,6 +440,12 @@ mod tests {
     }
 
     #[test]
+    fn apply_transition_pending_to_paused_succeeds() {
+        let result = apply_transition(&TaskStatus::Pending, TaskStatus::Paused);
+        assert_eq!(result.unwrap(), TaskStatus::Paused);
+    }
+
+    #[test]
     fn apply_transition_pending_to_cancelled_succeeds() {
         let result = apply_transition(&TaskStatus::Pending, TaskStatus::Cancelled);
         assert_eq!(result.unwrap(), TaskStatus::Cancelled);
@@ -405,6 +461,12 @@ mod tests {
     fn apply_transition_assigned_to_pending_succeeds() {
         let result = apply_transition(&TaskStatus::Assigned, TaskStatus::Pending);
         assert_eq!(result.unwrap(), TaskStatus::Pending);
+    }
+
+    #[test]
+    fn apply_transition_assigned_to_paused_succeeds() {
+        let result = apply_transition(&TaskStatus::Assigned, TaskStatus::Paused);
+        assert_eq!(result.unwrap(), TaskStatus::Paused);
     }
 
     #[test]
@@ -437,6 +499,60 @@ mod tests {
         assert_eq!(result.unwrap(), TaskStatus::Cancelled);
     }
 
+    #[test]
+    fn apply_transition_paused_to_assigned_succeeds() {
+        let result = apply_transition(&TaskStatus::Paused, TaskStatus::Assigned);
+        assert_eq!(result.unwrap(), TaskStatus::Assigned);
+    }
+
+    #[test]
+    fn apply_transition_paused_to_running_succeeds() {
+        let result = apply_transition(&TaskStatus::Paused, TaskStatus::Running);
+        assert_eq!(result.unwrap(), TaskStatus::Running);
+    }
+
+    #[test]
+    fn apply_transition_paused_to_blocked_succeeds() {
+        let result = apply_transition(&TaskStatus::Paused, TaskStatus::Blocked);
+        assert_eq!(result.unwrap(), TaskStatus::Blocked);
+    }
+
+    #[test]
+    fn apply_transition_paused_to_cancelled_succeeds() {
+        let result = apply_transition(&TaskStatus::Paused, TaskStatus::Cancelled);
+        assert_eq!(result.unwrap(), TaskStatus::Cancelled);
+    }
+
+    #[test]
+    fn apply_transition_blocked_to_assigned_succeeds() {
+        let result = apply_transition(&TaskStatus::Blocked, TaskStatus::Assigned);
+        assert_eq!(result.unwrap(), TaskStatus::Assigned);
+    }
+
+    #[test]
+    fn apply_transition_blocked_to_running_succeeds() {
+        let result = apply_transition(&TaskStatus::Blocked, TaskStatus::Running);
+        assert_eq!(result.unwrap(), TaskStatus::Running);
+    }
+
+    #[test]
+    fn apply_transition_blocked_to_paused_succeeds() {
+        let result = apply_transition(&TaskStatus::Blocked, TaskStatus::Paused);
+        assert_eq!(result.unwrap(), TaskStatus::Paused);
+    }
+
+    #[test]
+    fn apply_transition_blocked_to_cancelled_succeeds() {
+        let result = apply_transition(&TaskStatus::Blocked, TaskStatus::Cancelled);
+        assert_eq!(result.unwrap(), TaskStatus::Cancelled);
+    }
+
+    #[test]
+    fn apply_transition_blocked_to_failed_succeeds() {
+        let result = apply_transition(&TaskStatus::Blocked, TaskStatus::Failed);
+        assert_eq!(result.unwrap(), TaskStatus::Failed);
+    }
+
     // ─── apply_transition: error cases ───────────────────────────────────
 
     #[test]
@@ -466,18 +582,20 @@ mod tests {
     #[test]
     fn allowed_transitions_from_pending() {
         let transitions = allowed_transitions(&TaskStatus::Pending);
-        assert_eq!(transitions.len(), 3);
+        assert_eq!(transitions.len(), 4);
         assert!(transitions.contains(&TaskStatus::Assigned));
         assert!(transitions.contains(&TaskStatus::Running));
+        assert!(transitions.contains(&TaskStatus::Paused));
         assert!(transitions.contains(&TaskStatus::Cancelled));
     }
 
     #[test]
     fn allowed_transitions_from_assigned() {
         let transitions = allowed_transitions(&TaskStatus::Assigned);
-        assert_eq!(transitions.len(), 3);
+        assert_eq!(transitions.len(), 4);
         assert!(transitions.contains(&TaskStatus::Running));
         assert!(transitions.contains(&TaskStatus::Pending));
+        assert!(transitions.contains(&TaskStatus::Paused));
         assert!(transitions.contains(&TaskStatus::Cancelled));
     }
 
@@ -496,8 +614,9 @@ mod tests {
     #[test]
     fn allowed_transitions_from_paused() {
         let transitions = allowed_transitions(&TaskStatus::Paused);
-        assert_eq!(transitions.len(), 3);
+        assert_eq!(transitions.len(), 4);
         assert!(transitions.contains(&TaskStatus::Running));
+        assert!(transitions.contains(&TaskStatus::Assigned));
         assert!(transitions.contains(&TaskStatus::Blocked));
         assert!(transitions.contains(&TaskStatus::Cancelled));
     }
@@ -505,8 +624,9 @@ mod tests {
     #[test]
     fn allowed_transitions_from_blocked() {
         let transitions = allowed_transitions(&TaskStatus::Blocked);
-        assert_eq!(transitions.len(), 4);
+        assert_eq!(transitions.len(), 5);
         assert!(transitions.contains(&TaskStatus::Running));
+        assert!(transitions.contains(&TaskStatus::Assigned));
         assert!(transitions.contains(&TaskStatus::Paused));
         assert!(transitions.contains(&TaskStatus::Cancelled));
         assert!(transitions.contains(&TaskStatus::Failed));

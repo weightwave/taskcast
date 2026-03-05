@@ -125,7 +125,7 @@ pub async fn ws_handler(
 
 // ─── Socket Loop ────────────────────────────────────────────────────────────
 
-async fn handle_socket(mut socket: WebSocket, manager: Arc<WorkerManager>, _auth: AuthContext) {
+async fn handle_socket(mut socket: WebSocket, manager: Arc<WorkerManager>, auth: AuthContext) {
     let mut worker_id: Option<String> = None;
     let interval_ms = manager.heartbeat_interval_ms();
     let mut ping_interval = tokio::time::interval(tokio::time::Duration::from_millis(interval_ms));
@@ -175,6 +175,23 @@ async fn handle_socket(mut socket: WebSocket, manager: Arc<WorkerManager>, _auth
                 worker_id: requested_id,
                 weight,
             } => {
+                // Enforce auth.worker_id matches requested workerId
+                if let Some(ref token_worker_id) = auth.worker_id {
+                    if let Some(ref req_id) = requested_id {
+                        if token_worker_id != req_id {
+                            let _ = send_message(
+                                &mut socket,
+                                &ServerMessage::Error {
+                                    message: "Forbidden: worker ID mismatch".to_string(),
+                                    code: Some("FORBIDDEN".to_string()),
+                                },
+                            )
+                            .await;
+                            continue;
+                        }
+                    }
+                }
+
                 let registration = WorkerRegistration {
                     worker_id: requested_id,
                     match_rule,

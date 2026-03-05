@@ -413,10 +413,9 @@ impl ShortTermStore for SqliteShortTermStore {
             format!(" WHERE {}", conditions.join(" AND "))
         };
 
-        let limit_val = filter.limit.unwrap_or(u64::MAX) as i64;
         let query_str = format!(
-            "SELECT * FROM taskcast_tasks{} LIMIT {}",
-            where_clause, limit_val
+            "SELECT * FROM taskcast_tasks{}",
+            where_clause
         );
 
         let rows = sqlx::query(&query_str)
@@ -430,6 +429,11 @@ impl ShortTermStore for SqliteShortTermStore {
             tasks.retain(|t| {
                 taskcast_core::worker_matching::matches_tag(t.tags.as_deref(), tag_matcher)
             });
+        }
+
+        // Apply limit AFTER tag filtering to ensure correct result count
+        if let Some(limit) = filter.limit {
+            tasks.truncate(limit as usize);
         }
 
         Ok(tasks)

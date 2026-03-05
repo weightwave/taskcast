@@ -223,7 +223,7 @@ describe('matchesWorkerRule', () => {
       expect(matchesWorkerRule(task, {})).toBe(true)
     })
 
-    it('empty taskTypes array matches nothing (matchesType behavior)', () => {
+    it('empty taskTypes array matches everything', () => {
       const task = makeTask({ type: 'llm.chat' })
       expect(matchesWorkerRule(task, { taskTypes: [] })).toBe(true)
     })

@@ -313,6 +313,16 @@ impl ShortTermStore for RedisShortTermStore {
         let task_keys: Vec<String> = task_ids.iter().map(|id| self.keys.task(id)).collect();
         let raw: Vec<Option<String>> = conn.mget(&task_keys).await?;
 
+        // Collect stale IDs (task expired but ID still in SET) for passive cleanup
+        let stale_ids: Vec<&str> = raw
+            .iter()
+            .enumerate()
+            .filter_map(|(i, opt)| if opt.is_none() { Some(task_ids[i].as_str()) } else { None })
+            .collect();
+        if !stale_ids.is_empty() {
+            conn.srem::<_, _, ()>(&tasks_set_key, &stale_ids).await?;
+        }
+
         let mut tasks: Vec<Task> = raw
             .into_iter()
             .filter_map(|opt| opt.and_then(|s| serde_json::from_str(&s).ok()))

@@ -29,6 +29,9 @@ export function createWorkersRouter(manager: WorkerManager, engine: TaskEngine) 
     if (!checkScope(auth, 'worker:connect')) return c.json({ error: 'Forbidden' }, 403)
     const workerId = c.req.query('workerId')
     if (!workerId) return c.json({ error: 'workerId query param required' }, 400)
+    if (auth.workerId && auth.workerId !== workerId) {
+      return c.json({ error: 'Forbidden: worker ID mismatch' }, 403)
+    }
     const weight = c.req.query('weight')
     if (weight) await manager.updateWorker(workerId, { weight: Number(weight) })
     await manager.heartbeat(workerId)
@@ -77,6 +80,9 @@ export function createWorkersRouter(manager: WorkerManager, engine: TaskEngine) 
     const body = await c.req.json()
     const parsed = DeclineSchema.safeParse(body)
     if (!parsed.success) return c.json({ error: parsed.error.flatten() }, 400)
+    if (auth.workerId && auth.workerId !== parsed.data.workerId) {
+      return c.json({ error: 'Forbidden: worker ID mismatch' }, 403)
+    }
     const declineOpts = parsed.data.blacklist !== undefined ? { blacklist: parsed.data.blacklist } : {}
     await manager.declineTask(taskId, parsed.data.workerId, declineOpts)
     return c.json({ ok: true })

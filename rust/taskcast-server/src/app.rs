@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use axum::middleware;
+use axum::response::IntoResponse;
 use axum::routing::{get, patch, post};
 use axum::Router;
 use taskcast_core::worker_manager::WorkerManager;
@@ -35,7 +36,9 @@ pub fn create_app(
         .route("/{task_id}/events/history", get(tasks::get_event_history))
         .with_state(Arc::clone(&engine));
 
-    let mut app = Router::new().nest("/tasks", task_routes);
+    let mut app = Router::new()
+        .route("/health", get(health))
+        .nest("/tasks", task_routes);
 
     // Conditionally mount worker routes if a WorkerManager is provided
     if let Some(manager) = worker_manager {
@@ -56,4 +59,8 @@ pub fn create_app(
         Arc::clone(&auth_mode),
         auth_middleware,
     ))
+}
+
+async fn health() -> impl IntoResponse {
+    axum::Json(serde_json::json!({ "ok": true }))
 }

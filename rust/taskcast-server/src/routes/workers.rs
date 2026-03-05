@@ -61,6 +61,13 @@ pub async fn pull_task(
 
     let worker_id = &query.worker_id;
 
+    // Enforce auth.worker_id matches requested workerId
+    if let Some(ref token_worker_id) = auth.worker_id {
+        if token_worker_id != worker_id {
+            return Err(AppError::Forbidden);
+        }
+    }
+
     // If weight provided, update the worker
     if let Some(weight) = query.weight {
         let update = WorkerUpdate {
@@ -146,6 +153,13 @@ pub async fn decline_task(
 ) -> Result<impl IntoResponse, AppError> {
     if !check_scope(&auth, PermissionScope::WorkerConnect, None) {
         return Err(AppError::Forbidden);
+    }
+
+    // Enforce auth.worker_id matches requested workerId
+    if let Some(ref token_worker_id) = auth.worker_id {
+        if token_worker_id != &body.worker_id {
+            return Err(AppError::Forbidden);
+        }
     }
 
     let opts = body.blacklist.map(|blacklist| DeclineOptions { blacklist });

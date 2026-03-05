@@ -233,10 +233,6 @@ export class SqliteShortTermStore implements ShortTermStore {
       sql += ` AND id NOT IN (${filter.excludeTaskIds.map(() => '?').join(', ')})`
       params.push(...filter.excludeTaskIds)
     }
-    if (filter.limit !== undefined) {
-      sql += ' LIMIT ?'
-      params.push(filter.limit)
-    }
 
     const rows = this.db.prepare(sql).all(...params) as Record<string, unknown>[]
     let tasks = rows.map(rowToTask)
@@ -251,6 +247,11 @@ export class SqliteShortTermStore implements ShortTermStore {
         if (none && none.some((tag) => taskTags.includes(tag))) return false
         return true
       })
+    }
+
+    // Apply limit AFTER tag filtering to ensure correct result count
+    if (filter.limit !== undefined) {
+      tasks = tasks.slice(0, filter.limit)
     }
 
     return tasks

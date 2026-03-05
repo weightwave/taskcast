@@ -1,4 +1,5 @@
 import type { Task, WorkerManager, WorkerRegistration, WorkerUpdate, WorkerMatchRule, DeclineOptions } from '@taskcast/core'
+import type { AuthContext } from '../auth.js'
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -36,6 +37,7 @@ export class WorkerWSHandler {
   constructor(
     private manager: WorkerManager,
     private ws: WSLike,
+    private auth?: AuthContext,
   ) {}
 
   // ─── Public API ─────────────────────────────────────────────────────────
@@ -108,6 +110,10 @@ export class WorkerWSHandler {
   // ─── Message Handlers ──────────────────────────────────────────────────
 
   private async handleRegister(msg: Record<string, unknown>): Promise<void> {
+    if (typeof msg.workerId === 'string' && this.auth?.workerId && this.auth.workerId !== msg.workerId) {
+      this.send({ type: 'error', message: 'Forbidden: worker ID mismatch', code: 'FORBIDDEN' })
+      return
+    }
     const reg: WorkerRegistration = {
       matchRule: (msg.matchRule as Record<string, unknown> | undefined) ?? {},
       capacity: (msg.capacity as number | undefined) ?? 10,
@@ -132,6 +138,10 @@ export class WorkerWSHandler {
 
   private async handleAccept(msg: Record<string, unknown>): Promise<void> {
     if (!this.requireRegistered()) return
+    if (typeof msg.taskId !== 'string') {
+      this.send({ type: 'error', message: 'taskId is required and must be a string', code: 'INVALID_MESSAGE' })
+      return
+    }
     const taskId = msg.taskId as string
     const result = await this.manager.claimTask(taskId, this.workerId!)
     if (result.success) {
@@ -144,6 +154,10 @@ export class WorkerWSHandler {
 
   private async handleDecline(msg: Record<string, unknown>): Promise<void> {
     if (!this.requireRegistered()) return
+    if (typeof msg.taskId !== 'string') {
+      this.send({ type: 'error', message: 'taskId is required and must be a string', code: 'INVALID_MESSAGE' })
+      return
+    }
     const taskId = msg.taskId as string
     this.pendingOffers.delete(taskId)
     const opts: DeclineOptions = {}
@@ -154,6 +168,10 @@ export class WorkerWSHandler {
 
   private async handleClaim(msg: Record<string, unknown>): Promise<void> {
     if (!this.requireRegistered()) return
+    if (typeof msg.taskId !== 'string') {
+      this.send({ type: 'error', message: 'taskId is required and must be a string', code: 'INVALID_MESSAGE' })
+      return
+    }
     const taskId = msg.taskId as string
     const result = await this.manager.claimTask(taskId, this.workerId!)
     this.send({ type: 'claimed', taskId, success: result.success })
