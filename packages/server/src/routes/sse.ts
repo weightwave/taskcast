@@ -1,6 +1,6 @@
 import { Hono } from 'hono'
 import { streamSSE } from 'hono/streaming'
-import { applyFilteredIndex, matchesFilter } from '@taskcast/core'
+import { applyFilteredIndex, matchesFilter, TERMINAL_STATUSES } from '@taskcast/core'
 import { checkScope } from '../auth.js'
 import type { TaskEngine, TaskEvent, SubscribeFilter, SSEEnvelope, Level } from '@taskcast/core'
 
@@ -50,7 +50,7 @@ function toEnvelope(event: TaskEvent, filteredIndex: number): SSEEnvelope {
   return env
 }
 
-const TERMINAL = new Set(['completed', 'failed', 'timeout', 'cancelled'])
+const TERMINAL: Set<string> = new Set(TERMINAL_STATUSES)
 
 export function createSSERouter(engine: TaskEngine) {
   const router = new Hono()

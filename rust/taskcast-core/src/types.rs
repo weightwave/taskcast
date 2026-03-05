@@ -8,6 +8,7 @@ use std::collections::HashMap;
 #[serde(rename_all = "camelCase")]
 pub enum TaskStatus {
     Pending,
+    Assigned,
     Running,
     Paused,
     Blocked,
@@ -41,6 +42,10 @@ pub enum PermissionScope {
     EventHistory,
     #[serde(rename = "webhook:create")]
     WebhookCreate,
+    #[serde(rename = "worker:connect")]
+    WorkerConnect,
+    #[serde(rename = "worker:manage")]
+    WorkerManage,
     #[serde(rename = "*")]
     All,
 }
@@ -178,6 +183,149 @@ pub struct CleanupConfig {
     pub rules: Vec<CleanupRule>,
 }
 
+// ─── Worker Assignment ──────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AssignMode {
+    #[serde(rename = "external")]
+    External,
+    #[serde(rename = "pull")]
+    Pull,
+    #[serde(rename = "ws-offer")]
+    WsOffer,
+    #[serde(rename = "ws-race")]
+    WsRace,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DisconnectPolicy {
+    Reassign,
+    Mark,
+    Fail,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WorkerStatus {
+    Idle,
+    Busy,
+    Draining,
+    Offline,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TagMatcher {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub all: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub any: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub none: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerMatchRule {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_types: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tags: Option<TagMatcher>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ConnectionMode {
+    Pull,
+    Websocket,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Worker {
+    pub id: String,
+    pub status: WorkerStatus,
+    pub match_rule: WorkerMatchRule,
+    pub capacity: u32,
+    pub used_slots: u32,
+    pub weight: u32,
+    pub connection_mode: ConnectionMode,
+    pub connected_at: f64,
+    pub last_heartbeat_at: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<HashMap<String, serde_json::Value>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WorkerAssignmentStatus {
+    Offered,
+    Assigned,
+    Running,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerAssignment {
+    pub task_id: String,
+    pub worker_id: String,
+    pub cost: u32,
+    pub assigned_at: f64,
+    pub status: WorkerAssignmentStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerAuditAction {
+    Connected,
+    Disconnected,
+    Updated,
+    TaskAssigned,
+    TaskDeclined,
+    TaskReclaimed,
+    Draining,
+    HeartbeatTimeout,
+    PullRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerAuditEvent {
+    pub id: String,
+    pub worker_id: String,
+    pub timestamp: f64,
+    pub action: WorkerAuditAction,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<HashMap<String, serde_json::Value>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerFilter {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<Vec<WorkerStatus>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connection_mode: Option<Vec<ConnectionMode>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskFilter {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<Vec<TaskStatus>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub types: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tags: Option<TagMatcher>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assign_mode: Option<Vec<AssignMode>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exclude_task_ids: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Task {
@@ -205,6 +353,16 @@ pub struct Task {
     pub webhooks: Option<Vec<WebhookConfig>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cleanup: Option<CleanupConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assign_mode: Option<AssignMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assigned_worker: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disconnect_policy: Option<DisconnectPolicy>,
 }
 
 // ─── Events ─────────────────────────────────────────────────────────────────
@@ -302,6 +460,24 @@ pub trait ShortTermStore: Send + Sync {
     async fn set_series_latest(&self, task_id: &str, series_id: &str, event: TaskEvent) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
     async fn replace_last_series_event(&self, task_id: &str, series_id: &str, event: TaskEvent) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
     async fn next_index(&self, task_id: &str) -> Result<u64, Box<dyn std::error::Error + Send + Sync>>;
+
+    // Task query
+    async fn list_tasks(&self, filter: TaskFilter) -> Result<Vec<Task>, Box<dyn std::error::Error + Send + Sync>>;
+
+    // Worker state
+    async fn save_worker(&self, worker: Worker) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn get_worker(&self, worker_id: &str) -> Result<Option<Worker>, Box<dyn std::error::Error + Send + Sync>>;
+    async fn list_workers(&self, filter: Option<WorkerFilter>) -> Result<Vec<Worker>, Box<dyn std::error::Error + Send + Sync>>;
+    async fn delete_worker(&self, worker_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    // Atomic claim
+    async fn claim_task(&self, task_id: &str, worker_id: &str, cost: u32) -> Result<bool, Box<dyn std::error::Error + Send + Sync>>;
+
+    // Worker assignments
+    async fn add_assignment(&self, assignment: WorkerAssignment) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn remove_assignment(&self, task_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn get_worker_assignments(&self, worker_id: &str) -> Result<Vec<WorkerAssignment>, Box<dyn std::error::Error + Send + Sync>>;
+    async fn get_task_assignment(&self, task_id: &str) -> Result<Option<WorkerAssignment>, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 #[async_trait]
@@ -310,6 +486,10 @@ pub trait LongTermStore: Send + Sync {
     async fn get_task(&self, task_id: &str) -> Result<Option<Task>, Box<dyn std::error::Error + Send + Sync>>;
     async fn save_event(&self, event: TaskEvent) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
     async fn get_events(&self, task_id: &str, opts: Option<EventQueryOptions>) -> Result<Vec<TaskEvent>, Box<dyn std::error::Error + Send + Sync>>;
+
+    // Worker audit
+    async fn save_worker_event(&self, event: WorkerAuditEvent) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn get_worker_events(&self, worker_id: &str, opts: Option<EventQueryOptions>) -> Result<Vec<WorkerAuditEvent>, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 // ─── Hooks ───────────────────────────────────────────────────────────────────
@@ -334,6 +514,12 @@ pub trait TaskcastHooks: Send + Sync {
     fn on_webhook_failed(&self, _config: &WebhookConfig, _err: &(dyn std::error::Error + Send + Sync)) {}
     fn on_sse_connect(&self, _task_id: &str, _client_id: &str) {}
     fn on_sse_disconnect(&self, _task_id: &str, _client_id: &str, _duration: f64) {}
+    fn on_task_created(&self, _task: &Task) {}
+    fn on_task_transitioned(&self, _task: &Task, _from: &TaskStatus, _to: &TaskStatus) {}
+    fn on_worker_connected(&self, _worker: &Worker) {}
+    fn on_worker_disconnected(&self, _worker: &Worker, _reason: &str) {}
+    fn on_task_assigned(&self, _task: &Task, _worker: &Worker) {}
+    fn on_task_declined(&self, _task: &Task, _worker: &Worker, _blacklisted: bool) {}
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -348,6 +534,7 @@ mod tests {
     #[test]
     fn task_status_serializes_to_camel_case() {
         assert_eq!(serde_json::to_string(&TaskStatus::Pending).unwrap(), "\"pending\"");
+        assert_eq!(serde_json::to_string(&TaskStatus::Assigned).unwrap(), "\"assigned\"");
         assert_eq!(serde_json::to_string(&TaskStatus::Running).unwrap(), "\"running\"");
         assert_eq!(serde_json::to_string(&TaskStatus::Paused).unwrap(), "\"paused\"");
         assert_eq!(serde_json::to_string(&TaskStatus::Blocked).unwrap(), "\"blocked\"");
@@ -360,6 +547,7 @@ mod tests {
     #[test]
     fn task_status_deserializes_from_camel_case() {
         assert_eq!(serde_json::from_str::<TaskStatus>("\"pending\"").unwrap(), TaskStatus::Pending);
+        assert_eq!(serde_json::from_str::<TaskStatus>("\"assigned\"").unwrap(), TaskStatus::Assigned);
         assert_eq!(serde_json::from_str::<TaskStatus>("\"paused\"").unwrap(), TaskStatus::Paused);
         assert_eq!(serde_json::from_str::<TaskStatus>("\"blocked\"").unwrap(), TaskStatus::Blocked);
         assert_eq!(serde_json::from_str::<TaskStatus>("\"cancelled\"").unwrap(), TaskStatus::Cancelled);
@@ -402,6 +590,8 @@ mod tests {
         assert_eq!(serde_json::to_string(&PermissionScope::EventSubscribe).unwrap(), "\"event:subscribe\"");
         assert_eq!(serde_json::to_string(&PermissionScope::EventHistory).unwrap(), "\"event:history\"");
         assert_eq!(serde_json::to_string(&PermissionScope::WebhookCreate).unwrap(), "\"webhook:create\"");
+        assert_eq!(serde_json::to_string(&PermissionScope::WorkerConnect).unwrap(), "\"worker:connect\"");
+        assert_eq!(serde_json::to_string(&PermissionScope::WorkerManage).unwrap(), "\"worker:manage\"");
         assert_eq!(serde_json::to_string(&PermissionScope::All).unwrap(), "\"*\"");
     }
 
@@ -480,6 +670,11 @@ mod tests {
             auth_config: None,
             webhooks: None,
             cleanup: None,
+            tags: None,
+            assign_mode: None,
+            cost: None,
+            assigned_worker: None,
+            disconnect_policy: None,
         };
         let json = serde_json::to_value(&task).unwrap();
         // Check camelCase field names
@@ -561,6 +756,11 @@ mod tests {
                     event_filter: None,
                 }],
             }),
+            tags: None,
+            assign_mode: None,
+            cost: None,
+            assigned_worker: None,
+            disconnect_policy: None,
         };
 
         let json = serde_json::to_value(&task).unwrap();
@@ -616,6 +816,11 @@ mod tests {
             auth_config: None,
             webhooks: None,
             cleanup: None,
+            tags: None,
+            assign_mode: None,
+            cost: None,
+            assigned_worker: None,
+            disconnect_policy: None,
         };
         let json_str = serde_json::to_string(&task).unwrap();
         let back: Task = serde_json::from_str(&json_str).unwrap();
@@ -1008,6 +1213,11 @@ mod tests {
             auth_config: None,
             webhooks: None,
             cleanup: None,
+            tags: None,
+            assign_mode: None,
+            cost: None,
+            assigned_worker: None,
+            disconnect_policy: None,
         };
         let json_str = serde_json::to_string(&task).unwrap();
         // These keys must NOT appear at all
@@ -1021,6 +1231,11 @@ mod tests {
         assert!(!json_str.contains("\"authConfig\""));
         assert!(!json_str.contains("\"webhooks\""));
         assert!(!json_str.contains("\"cleanup\""));
+        assert!(!json_str.contains("\"tags\""));
+        assert!(!json_str.contains("\"assignMode\""));
+        assert!(!json_str.contains("\"cost\""));
+        assert!(!json_str.contains("\"assignedWorker\""));
+        assert!(!json_str.contains("\"disconnectPolicy\""));
     }
 
     #[test]
@@ -1087,6 +1302,11 @@ mod tests {
                     event_filter: None,
                 }],
             }),
+            tags: None,
+            assign_mode: None,
+            cost: None,
+            assigned_worker: None,
+            disconnect_policy: None,
         };
         let json = serde_json::to_value(&task).unwrap();
         assert_eq!(json["cleanup"]["rules"][0]["trigger"]["afterMs"], 1000);
@@ -1129,6 +1349,8 @@ mod tests {
             params: None, result: None, error: None, metadata: None,
             created_at: 0.0, updated_at: 0.0, completed_at: None, ttl: None,
             auth_config: None, webhooks: None, cleanup: None,
+            tags: None, assign_mode: None, cost: None,
+            assigned_worker: None, disconnect_policy: None,
         };
         let err = TaskError { code: None, message: "boom".to_string(), details: None };
         let event = TaskEvent {

@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import type { Task, TaskEvent } from '@taskcast/core'
+import type { Task, TaskEvent, WorkerAuditEvent } from '@taskcast/core'
 import { SqliteLongTermStore } from '../src/long-term.js'
 
 function makeTask(id = 'task-1'): Task {
@@ -235,5 +235,168 @@ describe('SqliteLongTermStore', () => {
     expect(events[0]).toEqual(event)
     expect(events[0]!.seriesId).toBe('my-series')
     expect(events[0]!.seriesMode).toBe('accumulate')
+  })
+})
+
+// ─── Worker Event helpers ───────────────────────────────────────────────────
+
+function makeWorkerEvent(overrides: Partial<WorkerAuditEvent> = {}): WorkerAuditEvent {
+  return {
+    id: 'we-1',
+    workerId: 'w1',
+    timestamp: 5000,
+    action: 'connected',
+    ...overrides,
+  }
+}
+
+describe('SqliteLongTermStore - saveWorkerEvent / getWorkerEvents', () => {
+  let dir: string
+  let db: InstanceType<typeof Database>
+  let store: SqliteLongTermStore
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'taskcast-sqlite-lt-worker-'))
+    db = new Database(join(dir, 'test.db'))
+    const migration = readFileSync(
+      join(import.meta.dirname, '../migrations/001_initial.sql'),
+      'utf8',
+    )
+    db.exec(migration)
+    db.pragma('journal_mode = WAL')
+    db.pragma('foreign_keys = ON')
+    store = new SqliteLongTermStore(db)
+  })
+
+  afterEach(() => {
+    db.close()
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  // ─── save and retrieve ──────────────────────────────────────────────────
+
+  it('saves and retrieves a worker event', async () => {
+    const event = makeWorkerEvent({ id: 'we-1', workerId: 'w1', timestamp: 5000, action: 'connected' })
+    await store.saveWorkerEvent(event)
+    const events = await store.getWorkerEvents('w1')
+    expect(events).toHaveLength(1)
+    expect(events[0]).toEqual(event)
+  })
+
+  it('returns multiple events for same worker ordered by timestamp', async () => {
+    await store.saveWorkerEvent(makeWorkerEvent({ id: 'we-1', workerId: 'w1', timestamp: 1000, action: 'connected' }))
+    await store.saveWorkerEvent(makeWorkerEvent({ id: 'we-2', workerId: 'w1', timestamp: 2000, action: 'updated' }))
+    await store.saveWorkerEvent(makeWorkerEvent({ id: 'we-3', workerId: 'w1', timestamp: 3000, action: 'disconnected' }))
+    const events = await store.getWorkerEvents('w1')
+    expect(events).toHaveLength(3)
+    expect(events[0]!.id).toBe('we-1')
+    expect(events[1]!.id).toBe('we-2')
+    expect(events[2]!.id).toBe('we-3')
+  })
+
+  // ─── since.timestamp filter ─────────────────────────────────────────────
+
+  it('filters by since.timestamp', async () => {
+    await store.saveWorkerEvent(makeWorkerEvent({ id: 'we-1', workerId: 'w1', timestamp: 1000, action: 'connected' }))
+    await store.saveWorkerEvent(makeWorkerEvent({ id: 'we-2', workerId: 'w1', timestamp: 2000, action: 'updated' }))
+    await store.saveWorkerEvent(makeWorkerEvent({ id: 'we-3', workerId: 'w1', timestamp: 3000, action: 'disconnected' }))
+    const events = await store.getWorkerEvents('w1', { since: { timestamp: 1000 } })
+    expect(events).toHaveLength(2)
+    expect(events[0]!.id).toBe('we-2')
+    expect(events[1]!.id).toBe('we-3')
+  })
+
+  // ─── since.id filter ───────────────────────────────────────────────────
+
+  it('filters by since.id', async () => {
+    await store.saveWorkerEvent(makeWorkerEvent({ id: 'we-1', workerId: 'w1', timestamp: 1000, action: 'connected' }))
+    await store.saveWorkerEvent(makeWorkerEvent({ id: 'we-2', workerId: 'w1', timestamp: 2000, action: 'updated' }))
+    await store.saveWorkerEvent(makeWorkerEvent({ id: 'we-3', workerId: 'w1', timestamp: 3000, action: 'disconnected' }))
+    const events = await store.getWorkerEvents('w1', { since: { id: 'we-1' } })
+    expect(events).toHaveLength(2)
+    expect(events[0]!.id).toBe('we-2')
+    expect(events[1]!.id).toBe('we-3')
+  })
+
+  it('returns all events when since.id is not found', async () => {
+    await store.saveWorkerEvent(makeWorkerEvent({ id: 'we-1', workerId: 'w1', timestamp: 1000, action: 'connected' }))
+    await store.saveWorkerEvent(makeWorkerEvent({ id: 'we-2', workerId: 'w1', timestamp: 2000, action: 'updated' }))
+    const events = await store.getWorkerEvents('w1', { since: { id: 'nonexistent-id' } })
+    expect(events).toHaveLength(2)
+  })
+
+  // ─── limit ─────────────────────────────────────────────────────────────
+
+  it('respects limit parameter', async () => {
+    await store.saveWorkerEvent(makeWorkerEvent({ id: 'we-1', workerId: 'w1', timestamp: 1000, action: 'connected' }))
+    await store.saveWorkerEvent(makeWorkerEvent({ id: 'we-2', workerId: 'w1', timestamp: 2000, action: 'updated' }))
+    await store.saveWorkerEvent(makeWorkerEvent({ id: 'we-3', workerId: 'w1', timestamp: 3000, action: 'disconnected' }))
+    const events = await store.getWorkerEvents('w1', { limit: 2 })
+    expect(events).toHaveLength(2)
+    expect(events[0]!.id).toBe('we-1')
+    expect(events[1]!.id).toBe('we-2')
+  })
+
+  // ─── combined filters ─────────────────────────────────────────────────
+
+  it('combines since.id and limit', async () => {
+    for (let i = 0; i < 5; i++) {
+      await store.saveWorkerEvent(makeWorkerEvent({ id: `we-${i}`, workerId: 'w1', timestamp: 1000 + i * 100, action: 'connected' }))
+    }
+    const events = await store.getWorkerEvents('w1', { since: { id: 'we-1' }, limit: 2 })
+    expect(events).toHaveLength(2)
+    expect(events[0]!.id).toBe('we-2')
+    expect(events[1]!.id).toBe('we-3')
+  })
+
+  it('combines since.timestamp and limit', async () => {
+    for (let i = 0; i < 5; i++) {
+      await store.saveWorkerEvent(makeWorkerEvent({ id: `we-${i}`, workerId: 'w1', timestamp: 1000 + i * 100, action: 'connected' }))
+    }
+    const events = await store.getWorkerEvents('w1', { since: { timestamp: 1100 }, limit: 2 })
+    expect(events).toHaveLength(2)
+    expect(events[0]!.id).toBe('we-2')
+    expect(events[1]!.id).toBe('we-3')
+  })
+
+  // ─── duplicates ────────────────────────────────────────────────────────
+
+  it('ignores duplicate worker event id (ON CONFLICT DO NOTHING)', async () => {
+    const event = makeWorkerEvent({ id: 'we-dup', workerId: 'w1', timestamp: 5000, action: 'connected' })
+    await store.saveWorkerEvent(event)
+    await store.saveWorkerEvent(event) // should not throw
+    const events = await store.getWorkerEvents('w1')
+    expect(events).toHaveLength(1)
+  })
+
+  // ─── data field ────────────────────────────────────────────────────────
+
+  it('saves worker event with data field', async () => {
+    const event = makeWorkerEvent({
+      id: 'we-data',
+      workerId: 'w1',
+      timestamp: 5000,
+      action: 'task_assigned',
+      data: { taskId: 'task-99', reason: 'manual' },
+    })
+    await store.saveWorkerEvent(event)
+    const events = await store.getWorkerEvents('w1')
+    expect(events).toHaveLength(1)
+    expect(events[0]!.data).toEqual({ taskId: 'task-99', reason: 'manual' })
+  })
+
+  it('saves worker event without data field', async () => {
+    const event = makeWorkerEvent({ id: 'we-nodata', workerId: 'w1', timestamp: 5000, action: 'connected' })
+    await store.saveWorkerEvent(event)
+    const events = await store.getWorkerEvents('w1')
+    expect(events).toHaveLength(1)
+    expect(events[0]!.data).toBeUndefined()
+  })
+
+  // ─── empty result ─────────────────────────────────────────────────────
+
+  it('returns empty array for unknown worker', async () => {
+    const events = await store.getWorkerEvents('unknown-worker')
+    expect(events).toEqual([])
   })
 })

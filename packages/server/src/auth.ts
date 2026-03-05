@@ -21,6 +21,8 @@ export interface AuthConfig {
 
 export interface AuthContext {
   sub?: string
+  jti?: string              // JWT unique ID for revocation
+  workerId?: string          // from JWT payload
   taskIds: string[] | '*'
   scope: PermissionScope[]
 }
@@ -64,6 +66,8 @@ export function createAuthMiddleware(config: AuthConfig) {
           scope: (payload['scope'] as PermissionScope[]) ?? [],
         }
         if (payload.sub !== undefined) ctx.sub = payload.sub
+        if (payload.jti !== undefined) ctx.jti = payload.jti as string
+        if (payload['workerId'] !== undefined) ctx.workerId = payload['workerId'] as string
         c.set('auth', ctx)
         return next()
       } catch {

@@ -141,8 +141,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("[taskcast] Using SQLite storage at {db_path}");
                     (
                         Arc::new(taskcast_core::MemoryBroadcastProvider::new()),
-                        Arc::new(adapters.short_term),
-                        Some(Arc::new(adapters.long_term) as Arc<dyn taskcast_core::LongTermStore>),
+                        Arc::new(adapters.short_term_store),
+                        Some(Arc::new(adapters.long_term_store) as Arc<dyn taskcast_core::LongTermStore>),
                     )
                 }
                 "redis" => {
@@ -161,7 +161,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if let Some(ref pg_url) = postgres_url {
                             let pool = sqlx::PgPool::connect(pg_url).await?;
                             let store =
-                                taskcast_postgres::PostgresLongTermStore::new(pool, None);
+                                taskcast_postgres::PostgresLongTermStore::new(pool);
                             Some(Arc::new(store))
                         } else {
                             None
@@ -182,7 +182,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if let Some(ref pg_url) = postgres_url {
                             let pool = sqlx::PgPool::connect(pg_url).await?;
                             let store =
-                                taskcast_postgres::PostgresLongTermStore::new(pool, None);
+                                taskcast_postgres::PostgresLongTermStore::new(pool);
                             Some(Arc::new(store))
                         } else {
                             None
@@ -196,7 +196,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
 
-            // 6. Build engine
+            // 6. Build engine (clone adapters for WorkerManager before moving into engine)
+            let short_term_for_wm = Arc::clone(&short_term_store);
+            let broadcast_for_wm = Arc::clone(&broadcast);
+            let long_term_for_wm = long_term_store.clone();
+
             let engine = Arc::new(taskcast_core::TaskEngine::new(
                 taskcast_core::TaskEngineOptions {
                     short_term_store,
@@ -234,8 +238,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 _ => taskcast_server::AuthMode::None,
             };
 
-            // 8. Create and serve app
-            let app = taskcast_server::create_app(engine, auth_mode);
+            // 8. Create WorkerManager if workers enabled in config
+            let workers_enabled = file_config
+                .workers
+                .as_ref()
+                .and_then(|w| w.enabled)
+                .unwrap_or(false);
+
+            let worker_manager = if workers_enabled {
+                println!("[taskcast] Worker assignment system enabled");
+
+                let mut wm_defaults = taskcast_core::worker_manager::WorkerManagerDefaults::default();
+                if let Some(cfg_defaults) = file_config.workers.as_ref().and_then(|w| w.defaults.as_ref()) {
+                    if let Some(v) = cfg_defaults.heartbeat_interval_ms {
+                        wm_defaults.heartbeat_interval_ms = Some(v);
+                    }
+                    if let Some(v) = cfg_defaults.heartbeat_timeout_ms {
+                        wm_defaults.heartbeat_timeout_ms = Some(v);
+                    }
+                    if let Some(v) = cfg_defaults.offer_timeout_ms {
+                        wm_defaults.offer_timeout_ms = Some(v);
+                    }
+                    if let Some(v) = cfg_defaults.disconnect_grace_ms {
+                        wm_defaults.disconnect_grace_ms = Some(v);
+                    }
+                    if let Some(ref mode) = cfg_defaults.assign_mode {
+                        wm_defaults.assign_mode = match mode.as_str() {
+                            "pull" => Some(taskcast_core::AssignMode::Pull),
+                            "ws-offer" => Some(taskcast_core::AssignMode::WsOffer),
+                            "ws-race" => Some(taskcast_core::AssignMode::WsRace),
+                            _ => Some(taskcast_core::AssignMode::External),
+                        };
+                    }
+                    if let Some(ref policy) = cfg_defaults.disconnect_policy {
+                        wm_defaults.disconnect_policy = match policy.as_str() {
+                            "mark" => Some(taskcast_core::DisconnectPolicy::Mark),
+                            "fail" => Some(taskcast_core::DisconnectPolicy::Fail),
+                            _ => Some(taskcast_core::DisconnectPolicy::Reassign),
+                        };
+                    }
+                }
+
+                Some(Arc::new(taskcast_core::worker_manager::WorkerManager::new(
+                    taskcast_core::worker_manager::WorkerManagerOptions {
+                        engine: Arc::clone(&engine),
+                        short_term_store: short_term_for_wm,
+                        broadcast: broadcast_for_wm,
+                        long_term_store: long_term_for_wm,
+                        hooks: None,
+                        defaults: Some(wm_defaults),
+                    },
+                )))
+            } else {
+                None
+            };
+
+            // 9. Create and serve app
+            let app = taskcast_server::create_app(engine, auth_mode, worker_manager);
             let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await?;
             println!("[taskcast] Server started on http://localhost:{port}");
             axum::serve(listener, app).await?;

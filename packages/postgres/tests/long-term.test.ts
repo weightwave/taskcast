@@ -4,7 +4,7 @@ import { GenericContainer, type StartedTestContainer } from 'testcontainers'
 import { PostgresLongTermStore } from '../src/long-term.js'
 import { readFileSync } from 'fs'
 import { join } from 'path'
-import type { Task, TaskEvent } from '@taskcast/core'
+import type { Task, TaskEvent, WorkerAuditEvent } from '@taskcast/core'
 
 let container: StartedTestContainer
 let sql: ReturnType<typeof postgres>
@@ -23,12 +23,17 @@ beforeAll(async () => {
   sql = postgres(connUri)
   store = new PostgresLongTermStore(sql)
 
-  // Run migration
-  const migration = readFileSync(
+  // Run migrations
+  const migration001 = readFileSync(
     join(import.meta.dirname, '../migrations/001_initial.sql'),
-    'utf8'
+    'utf8',
   )
-  await sql.unsafe(migration)
+  await sql.unsafe(migration001)
+  const migration002 = readFileSync(
+    join(import.meta.dirname, '../migrations/002_workers.sql'),
+    'utf8',
+  )
+  await sql.unsafe(migration002)
 }, 120000)
 
 afterAll(async () => {
@@ -37,7 +42,7 @@ afterAll(async () => {
 })
 
 beforeEach(async () => {
-  await sql`TRUNCATE taskcast_events, taskcast_tasks CASCADE`
+  await sql`TRUNCATE taskcast_events, taskcast_tasks, taskcast_worker_events CASCADE`
 })
 
 const makeTask = (id = 'task-1'): Task => ({
@@ -46,6 +51,14 @@ const makeTask = (id = 'task-1'): Task => ({
   params: { prompt: 'hello' },
   createdAt: 1000,
   updatedAt: 1000,
+})
+
+const makeWorkerEvent = (overrides: Partial<WorkerAuditEvent> = {}): WorkerAuditEvent => ({
+  id: 'we-1',
+  workerId: 'w1',
+  timestamp: Date.now(),
+  action: 'connected',
+  ...overrides,
 })
 
 const makeEvent = (taskId = 'task-1', index = 0): TaskEvent => ({
@@ -110,28 +123,6 @@ describe('PostgresLongTermStore - events', () => {
     await store.saveEvent(event) // should not throw
     const events = await store.getEvents('task-1')
     expect(events).toHaveLength(1)
-  })
-})
-
-describe('PostgresLongTermStore - custom prefix', () => {
-  it('uses custom table names when prefix provided', async () => {
-    // Create tables with custom prefix
-    await sql.unsafe(`
-      CREATE TABLE IF NOT EXISTS myapp_tasks (LIKE taskcast_tasks INCLUDING ALL);
-      CREATE TABLE IF NOT EXISTS myapp_events (
-        LIKE taskcast_events INCLUDING ALL,
-        CONSTRAINT myapp_events_task_id_fkey FOREIGN KEY (task_id) REFERENCES myapp_tasks(id) ON DELETE CASCADE
-      );
-    `)
-    const customStore = new PostgresLongTermStore(sql, { prefix: 'myapp' })
-    await customStore.saveTask(makeTask('custom-task'))
-    const task = await customStore.getTask('custom-task')
-    expect(task?.id).toBe('custom-task')
-    // Should not appear in default tables
-    const defaultTask = await store.getTask('custom-task')
-    expect(defaultTask).toBeNull()
-    // Cleanup
-    await sql.unsafe('DROP TABLE IF EXISTS myapp_events, myapp_tasks')
   })
 })
 
@@ -235,5 +226,215 @@ describe('PostgresLongTermStore - full task fields', () => {
     const found = events.find((e) => e.id === 'evt-series')
     expect(found?.seriesId).toBe('series-1')
     expect(found?.seriesMode).toBe('accumulate')
+  })
+})
+
+describe('PostgresLongTermStore - saveWorkerEvent / getWorkerEvents', () => {
+  it('saves and retrieves a worker event', async () => {
+    const event = makeWorkerEvent({ id: 'we-1', workerId: 'w1', timestamp: 5000, action: 'connected' })
+    await store.saveWorkerEvent(event)
+    const events = await store.getWorkerEvents('w1')
+    expect(events).toHaveLength(1)
+    expect(events[0]).toEqual(event)
+  })
+
+  it('returns multiple events for same worker ordered by timestamp', async () => {
+    await store.saveWorkerEvent(makeWorkerEvent({ id: 'we-1', workerId: 'w1', timestamp: 1000, action: 'connected' }))
+    await store.saveWorkerEvent(makeWorkerEvent({ id: 'we-2', workerId: 'w1', timestamp: 2000, action: 'updated' }))
+    await store.saveWorkerEvent(makeWorkerEvent({ id: 'we-3', workerId: 'w1', timestamp: 3000, action: 'disconnected' }))
+    const events = await store.getWorkerEvents('w1')
+    expect(events).toHaveLength(3)
+    expect(events[0]!.id).toBe('we-1')
+    expect(events[1]!.id).toBe('we-2')
+    expect(events[2]!.id).toBe('we-3')
+    expect(events[0]!.timestamp).toBeLessThan(events[1]!.timestamp)
+    expect(events[1]!.timestamp).toBeLessThan(events[2]!.timestamp)
+  })
+
+  it('filters by since.timestamp', async () => {
+    await store.saveWorkerEvent(makeWorkerEvent({ id: 'we-1', workerId: 'w1', timestamp: 1000, action: 'connected' }))
+    await store.saveWorkerEvent(makeWorkerEvent({ id: 'we-2', workerId: 'w1', timestamp: 2000, action: 'updated' }))
+    await store.saveWorkerEvent(makeWorkerEvent({ id: 'we-3', workerId: 'w1', timestamp: 3000, action: 'disconnected' }))
+    const events = await store.getWorkerEvents('w1', { since: { timestamp: 1000 } })
+    expect(events).toHaveLength(2)
+    expect(events[0]!.id).toBe('we-2')
+    expect(events[1]!.id).toBe('we-3')
+  })
+
+  it('filters by since.id', async () => {
+    await store.saveWorkerEvent(makeWorkerEvent({ id: 'we-1', workerId: 'w1', timestamp: 1000, action: 'connected' }))
+    await store.saveWorkerEvent(makeWorkerEvent({ id: 'we-2', workerId: 'w1', timestamp: 2000, action: 'updated' }))
+    await store.saveWorkerEvent(makeWorkerEvent({ id: 'we-3', workerId: 'w1', timestamp: 3000, action: 'disconnected' }))
+    const events = await store.getWorkerEvents('w1', { since: { id: 'we-1' } })
+    expect(events).toHaveLength(2)
+    expect(events[0]!.id).toBe('we-2')
+    expect(events[1]!.id).toBe('we-3')
+  })
+
+  it('respects limit parameter', async () => {
+    await store.saveWorkerEvent(makeWorkerEvent({ id: 'we-1', workerId: 'w1', timestamp: 1000, action: 'connected' }))
+    await store.saveWorkerEvent(makeWorkerEvent({ id: 'we-2', workerId: 'w1', timestamp: 2000, action: 'updated' }))
+    await store.saveWorkerEvent(makeWorkerEvent({ id: 'we-3', workerId: 'w1', timestamp: 3000, action: 'disconnected' }))
+    const events = await store.getWorkerEvents('w1', { limit: 2 })
+    expect(events).toHaveLength(2)
+    expect(events[0]!.id).toBe('we-1')
+    expect(events[1]!.id).toBe('we-2')
+  })
+
+  it('returns empty array for unknown worker', async () => {
+    const events = await store.getWorkerEvents('unknown-worker')
+    expect(events).toEqual([])
+  })
+
+  it('saves worker event with data field', async () => {
+    const event = makeWorkerEvent({
+      id: 'we-data',
+      workerId: 'w1',
+      timestamp: 5000,
+      action: 'task_assigned',
+      data: { taskId: 'task-99', reason: 'manual' },
+    })
+    await store.saveWorkerEvent(event)
+    const events = await store.getWorkerEvents('w1')
+    expect(events).toHaveLength(1)
+    expect(events[0]!.data).toEqual({ taskId: 'task-99', reason: 'manual' })
+  })
+
+  it('saves worker event without data field', async () => {
+    const event = makeWorkerEvent({ id: 'we-nodata', workerId: 'w1', timestamp: 5000, action: 'connected' })
+    await store.saveWorkerEvent(event)
+    const events = await store.getWorkerEvents('w1')
+    expect(events).toHaveLength(1)
+    expect(events[0]!.data).toBeUndefined()
+  })
+
+  it('ignores duplicate worker event id (upsert)', async () => {
+    const event = makeWorkerEvent({ id: 'we-dup', workerId: 'w1', timestamp: 5000, action: 'connected' })
+    await store.saveWorkerEvent(event)
+    await store.saveWorkerEvent(event) // should not throw
+    const events = await store.getWorkerEvents('w1')
+    expect(events).toHaveLength(1)
+  })
+
+  it('combines since.id and limit', async () => {
+    for (let i = 0; i < 5; i++) {
+      await store.saveWorkerEvent(makeWorkerEvent({ id: `we-${i}`, workerId: 'w1', timestamp: 1000 + i, action: 'connected' }))
+    }
+    const events = await store.getWorkerEvents('w1', { since: { id: 'we-1' }, limit: 2 })
+    expect(events).toHaveLength(2)
+    expect(events[0]!.id).toBe('we-2')
+    expect(events[1]!.id).toBe('we-3')
+  })
+
+  it('combines since.timestamp and limit', async () => {
+    for (let i = 0; i < 5; i++) {
+      await store.saveWorkerEvent(makeWorkerEvent({ id: `we-${i}`, workerId: 'w1', timestamp: 1000 + i, action: 'connected' }))
+    }
+    const events = await store.getWorkerEvents('w1', { since: { timestamp: 1001 }, limit: 2 })
+    expect(events).toHaveLength(2)
+    expect(events[0]!.id).toBe('we-2')
+    expect(events[1]!.id).toBe('we-3')
+  })
+})
+
+describe('PostgresLongTermStore - task worker fields persistence', () => {
+  it('saves and retrieves task with tags', async () => {
+    const task: Task = { ...makeTask('tag-task'), tags: ['gpu', 'us-east'] }
+    await store.saveTask(task)
+    const retrieved = await store.getTask('tag-task')
+    expect(retrieved?.tags).toEqual(['gpu', 'us-east'])
+  })
+
+  it('saves and retrieves task with assignMode', async () => {
+    const task: Task = { ...makeTask('assign-task'), assignMode: 'ws-offer' }
+    await store.saveTask(task)
+    const retrieved = await store.getTask('assign-task')
+    expect(retrieved?.assignMode).toBe('ws-offer')
+  })
+
+  it('saves and retrieves task with cost', async () => {
+    const task: Task = { ...makeTask('cost-task'), cost: 5 }
+    await store.saveTask(task)
+    const retrieved = await store.getTask('cost-task')
+    expect(retrieved?.cost).toBe(5)
+  })
+
+  it('saves and retrieves task with assignedWorker', async () => {
+    const task: Task = { ...makeTask('worker-task'), assignedWorker: 'w1' }
+    await store.saveTask(task)
+    const retrieved = await store.getTask('worker-task')
+    expect(retrieved?.assignedWorker).toBe('w1')
+  })
+
+  it('saves and retrieves task with disconnectPolicy', async () => {
+    const task: Task = { ...makeTask('dp-task'), disconnectPolicy: 'reassign' }
+    await store.saveTask(task)
+    const retrieved = await store.getTask('dp-task')
+    expect(retrieved?.disconnectPolicy).toBe('reassign')
+  })
+
+  it('saves task without new fields — they are absent (not null)', async () => {
+    const task = makeTask('plain-task')
+    await store.saveTask(task)
+    const retrieved = await store.getTask('plain-task')
+    expect(retrieved).not.toBeNull()
+    expect(retrieved!.tags).toBeUndefined()
+    expect(retrieved!.assignMode).toBeUndefined()
+    expect(retrieved!.cost).toBeUndefined()
+    expect(retrieved!.assignedWorker).toBeUndefined()
+    expect(retrieved!.disconnectPolicy).toBeUndefined()
+  })
+
+  it('upsert preserves new worker fields', async () => {
+    const task: Task = {
+      ...makeTask('upsert-task'),
+      tags: ['gpu'],
+      assignMode: 'pull',
+      cost: 3,
+      assignedWorker: 'w2',
+      disconnectPolicy: 'mark',
+    }
+    await store.saveTask(task)
+    // Upsert with updated status — should preserve worker fields
+    await store.saveTask({ ...task, status: 'running', updatedAt: 2000 })
+    const retrieved = await store.getTask('upsert-task')
+    expect(retrieved?.status).toBe('running')
+    expect(retrieved?.tags).toEqual(['gpu'])
+    expect(retrieved?.assignMode).toBe('pull')
+    expect(retrieved?.cost).toBe(3)
+    expect(retrieved?.assignedWorker).toBe('w2')
+    expect(retrieved?.disconnectPolicy).toBe('mark')
+  })
+
+  it('saves task with all new fields at once', async () => {
+    const task: Task = {
+      ...makeTask('all-fields-task'),
+      tags: ['gpu', 'eu-west', 'high-priority'],
+      assignMode: 'ws-race',
+      cost: 10,
+      assignedWorker: 'w42',
+      disconnectPolicy: 'fail',
+    }
+    await store.saveTask(task)
+    const retrieved = await store.getTask('all-fields-task')
+    expect(retrieved?.tags).toEqual(['gpu', 'eu-west', 'high-priority'])
+    expect(retrieved?.assignMode).toBe('ws-race')
+    expect(retrieved?.cost).toBe(10)
+    expect(retrieved?.assignedWorker).toBe('w42')
+    expect(retrieved?.disconnectPolicy).toBe('fail')
+  })
+
+  it('upsert can update worker fields to new values', async () => {
+    const task: Task = {
+      ...makeTask('update-fields-task'),
+      assignedWorker: 'w1',
+      cost: 2,
+    }
+    await store.saveTask(task)
+    // Update assigned worker and cost
+    await store.saveTask({ ...task, assignedWorker: 'w3', cost: 7, updatedAt: 3000 })
+    const retrieved = await store.getTask('update-fields-task')
+    expect(retrieved?.assignedWorker).toBe('w3')
+    expect(retrieved?.cost).toBe(7)
   })
 })

@@ -22,6 +22,7 @@ interface TaskEngineOptionsCanonical extends TaskEngineOptionsBase {
   longTermStore?: LongTermStore
 }
 
+/** @deprecated Use shortTermStore/longTermStore instead */
 interface TaskEngineOptionsLegacy extends TaskEngineOptionsBase {
   shortTerm: ShortTermStore
   longTerm?: LongTermStore
@@ -46,6 +47,10 @@ export interface CreateTaskInput {
   webhooks?: Task['webhooks']
   cleanup?: Task['cleanup']
   authConfig?: Task['authConfig']
+  tags?: string[]
+  assignMode?: Task['assignMode']
+  cost?: number
+  disconnectPolicy?: Task['disconnectPolicy']
 }
 
 export class TaskEngine {
@@ -55,11 +60,11 @@ export class TaskEngine {
   private hooks: TaskcastHooks | undefined
 
   constructor(opts: TaskEngineOptions) {
-    if ('shortTermStore' in opts && 'shortTerm' in opts) {
-      throw new Error('Cannot specify both shortTermStore and shortTerm')
+    if ('shortTerm' in opts && 'shortTermStore' in opts) {
+      throw new Error('Cannot specify both shortTerm and shortTermStore')
     }
-    if ('longTermStore' in opts && 'longTerm' in opts) {
-      throw new Error('Cannot specify both longTermStore and longTerm')
+    if ('longTerm' in opts && 'longTermStore' in opts) {
+      throw new Error('Cannot specify both longTerm and longTermStore')
     }
     this.shortTermStore = 'shortTermStore' in opts ? opts.shortTermStore : opts.shortTerm
     this.longTermStore = 'longTermStore' in opts
@@ -85,10 +90,15 @@ export class TaskEngine {
       ...(input.webhooks !== undefined && { webhooks: input.webhooks }),
       ...(input.cleanup !== undefined && { cleanup: input.cleanup }),
       ...(input.authConfig !== undefined && { authConfig: input.authConfig }),
+      ...(input.tags !== undefined && { tags: input.tags }),
+      ...(input.assignMode !== undefined && { assignMode: input.assignMode }),
+      ...(input.cost !== undefined && { cost: input.cost }),
+      ...(input.disconnectPolicy !== undefined && { disconnectPolicy: input.disconnectPolicy }),
     }
     await this.shortTermStore.saveTask(task)
     if (this.longTermStore) await this.longTermStore.saveTask(task)
     if (task.ttl) await this.shortTermStore.setTTL(task.id, task.ttl)
+    this.hooks?.onTaskCreated?.(task)
     return task
   }
 
@@ -137,6 +147,8 @@ export class TaskEngine {
     if (to === 'timeout') {
       this.hooks?.onTaskTimeout?.(updated)
     }
+
+    this.hooks?.onTaskTransitioned?.(updated, task.status, to)
 
     return updated
   }

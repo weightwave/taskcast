@@ -13,8 +13,8 @@ export interface SqliteAdapterOptions {
 }
 
 export function createSqliteAdapters(options: SqliteAdapterOptions = {}): {
-  shortTerm: SqliteShortTermStore
-  longTerm: SqliteLongTermStore
+  shortTermStore: SqliteShortTermStore
+  longTermStore: SqliteLongTermStore
   db: DatabaseType
 } {
   const dbPath = options.path ?? process.env['TASKCAST_SQLITE_PATH'] ?? './taskcast.db'
@@ -27,8 +27,8 @@ export function createSqliteAdapters(options: SqliteAdapterOptions = {}): {
   db.exec(migration)
 
   return {
-    shortTerm: new SqliteShortTermStore(db),
-    longTerm: new SqliteLongTermStore(db),
+    shortTermStore: new SqliteShortTermStore(db),
+    longTermStore: new SqliteLongTermStore(db),
     db,
   }
 }

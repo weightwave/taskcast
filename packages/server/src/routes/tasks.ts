@@ -11,6 +11,10 @@ const CreateTaskSchema = z.object({
   ttl: z.number().int().positive().optional(),
   webhooks: z.array(z.unknown()).optional(),
   cleanup: z.object({ rules: z.array(z.unknown()) }).optional(),
+  tags: z.array(z.string()).optional(),
+  assignMode: z.enum(['external', 'pull', 'ws-offer', 'ws-race']).optional(),
+  cost: z.number().int().positive().optional(),
+  disconnectPolicy: z.enum(['reassign', 'mark', 'fail']).optional(),
 })
 
 const PublishEventSchema = z.object({
@@ -39,6 +43,10 @@ export function createTasksRouter(engine: TaskEngine) {
     if (d.params !== undefined) input.params = d.params
     if (d.metadata !== undefined) input.metadata = d.metadata
     if (d.ttl !== undefined) input.ttl = d.ttl
+    if (d.tags !== undefined) input.tags = d.tags
+    if (d.assignMode !== undefined) input.assignMode = d.assignMode
+    if (d.cost !== undefined) input.cost = d.cost
+    if (d.disconnectPolicy !== undefined) input.disconnectPolicy = d.disconnectPolicy
 
     const task = await engine.createTask(input)
     return c.json(task, 201)
@@ -61,7 +69,7 @@ export function createTasksRouter(engine: TaskEngine) {
 
     const body = await c.req.json()
     const schema = z.object({
-      status: z.enum(['running', 'paused', 'blocked', 'completed', 'failed', 'timeout', 'cancelled']),
+      status: z.enum(['pending', 'assigned', 'running', 'paused', 'blocked', 'completed', 'failed', 'timeout', 'cancelled']),
       result: z.record(z.unknown()).optional(),
       error: z.object({
         code: z.string().optional(),

@@ -4,7 +4,10 @@ use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 
-use crate::types::{BroadcastProvider, EventQueryOptions, ShortTermStore, Task, TaskEvent};
+use crate::types::{
+    BroadcastProvider, EventQueryOptions, ShortTermStore, Task, TaskEvent, TaskFilter, TaskStatus,
+    Worker, WorkerAssignment, WorkerFilter,
+};
 
 // ─── MemoryBroadcastProvider ────────────────────────────────────────────────
 
@@ -83,6 +86,8 @@ pub struct MemoryShortTermStore {
     events: RwLock<HashMap<String, Vec<TaskEvent>>>,
     series_latest: RwLock<HashMap<String, TaskEvent>>,
     index_counters: RwLock<HashMap<String, Arc<AtomicU64>>>,
+    workers: RwLock<HashMap<String, Worker>>,
+    assignments: RwLock<Vec<WorkerAssignment>>,
 }
 
 impl MemoryShortTermStore {
@@ -92,6 +97,8 @@ impl MemoryShortTermStore {
             events: RwLock::new(HashMap::new()),
             series_latest: RwLock::new(HashMap::new()),
             index_counters: RwLock::new(HashMap::new()),
+            workers: RwLock::new(HashMap::new()),
+            assignments: RwLock::new(Vec::new()),
         }
     }
 }
@@ -246,6 +253,185 @@ impl ShortTermStore for MemoryShortTermStore {
         };
         Ok(counter.fetch_add(1, Ordering::SeqCst))
     }
+
+    async fn list_tasks(
+        &self,
+        filter: TaskFilter,
+    ) -> Result<Vec<Task>, Box<dyn std::error::Error + Send + Sync>> {
+        let tasks = self.tasks.read().unwrap();
+        Ok(tasks
+            .values()
+            .filter(|t| {
+                if let Some(ref statuses) = filter.status {
+                    if !statuses.contains(&t.status) {
+                        return false;
+                    }
+                }
+                if let Some(ref types) = filter.types {
+                    if let Some(ref task_type) = t.r#type {
+                        if !types.iter().any(|ty| ty == task_type) {
+                            return false;
+                        }
+                    } else {
+                        return false;
+                    }
+                }
+                if let Some(ref modes) = filter.assign_mode {
+                    if let Some(ref am) = t.assign_mode {
+                        if !modes.contains(am) {
+                            return false;
+                        }
+                    } else {
+                        return false;
+                    }
+                }
+                if let Some(ref tag_matcher) = filter.tags {
+                    if !crate::worker_matching::matches_tag(t.tags.as_deref(), tag_matcher) {
+                        return false;
+                    }
+                }
+                if let Some(ref exclude) = filter.exclude_task_ids {
+                    if exclude.contains(&t.id) {
+                        return false;
+                    }
+                }
+                true
+            })
+            .take(filter.limit.unwrap_or(u64::MAX) as usize)
+            .cloned()
+            .collect())
+    }
+
+    async fn save_worker(
+        &self,
+        worker: Worker,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut workers = self.workers.write().unwrap();
+        workers.insert(worker.id.clone(), worker);
+        Ok(())
+    }
+
+    async fn get_worker(
+        &self,
+        worker_id: &str,
+    ) -> Result<Option<Worker>, Box<dyn std::error::Error + Send + Sync>> {
+        let workers = self.workers.read().unwrap();
+        Ok(workers.get(worker_id).cloned())
+    }
+
+    async fn list_workers(
+        &self,
+        filter: Option<WorkerFilter>,
+    ) -> Result<Vec<Worker>, Box<dyn std::error::Error + Send + Sync>> {
+        let workers = self.workers.read().unwrap();
+        Ok(workers
+            .values()
+            .filter(|w| {
+                if let Some(ref f) = filter {
+                    if let Some(ref statuses) = f.status {
+                        if !statuses.contains(&w.status) {
+                            return false;
+                        }
+                    }
+                    if let Some(ref modes) = f.connection_mode {
+                        if !modes.contains(&w.connection_mode) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
+            .cloned()
+            .collect())
+    }
+
+    async fn delete_worker(
+        &self,
+        worker_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut workers = self.workers.write().unwrap();
+        workers.remove(worker_id);
+        Ok(())
+    }
+
+    async fn claim_task(
+        &self,
+        task_id: &str,
+        worker_id: &str,
+        cost: u32,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        // Phase 1: Check and update worker capacity (write lock, then release)
+        {
+            let mut workers = self.workers.write().unwrap();
+            match workers.get_mut(worker_id) {
+                Some(w) if w.used_slots + cost <= w.capacity => {
+                    w.used_slots += cost;
+                }
+                _ => return Ok(false),
+            }
+        }
+
+        // Phase 2: Update task (write lock only)
+        let mut tasks = self.tasks.write().unwrap();
+        let task = match tasks.get_mut(task_id) {
+            Some(t) if t.status == TaskStatus::Pending || t.status == TaskStatus::Assigned => t,
+            _ => {
+                // Rollback worker used_slots
+                let mut workers = self.workers.write().unwrap();
+                if let Some(w) = workers.get_mut(worker_id) {
+                    w.used_slots = w.used_slots.saturating_sub(cost);
+                }
+                return Ok(false);
+            }
+        };
+        task.status = TaskStatus::Assigned;
+        task.assigned_worker = Some(worker_id.to_string());
+        task.cost = Some(cost);
+        task.updated_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as f64;
+
+        Ok(true)
+    }
+
+    async fn add_assignment(
+        &self,
+        assignment: WorkerAssignment,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut assignments = self.assignments.write().unwrap();
+        assignments.push(assignment);
+        Ok(())
+    }
+
+    async fn remove_assignment(
+        &self,
+        task_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut assignments = self.assignments.write().unwrap();
+        assignments.retain(|a| a.task_id != task_id);
+        Ok(())
+    }
+
+    async fn get_worker_assignments(
+        &self,
+        worker_id: &str,
+    ) -> Result<Vec<WorkerAssignment>, Box<dyn std::error::Error + Send + Sync>> {
+        let assignments = self.assignments.read().unwrap();
+        Ok(assignments
+            .iter()
+            .filter(|a| a.worker_id == worker_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn get_task_assignment(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<WorkerAssignment>, Box<dyn std::error::Error + Send + Sync>> {
+        let assignments = self.assignments.read().unwrap();
+        Ok(assignments.iter().find(|a| a.task_id == task_id).cloned())
+    }
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -253,7 +439,10 @@ impl ShortTermStore for MemoryShortTermStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Level, TaskStatus};
+    use crate::types::{
+        AssignMode, ConnectionMode, Level, TagMatcher, TaskStatus, Worker, WorkerAssignment,
+        WorkerAssignmentStatus, WorkerFilter, WorkerMatchRule, WorkerStatus,
+    };
     use serde_json::json;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -273,6 +462,11 @@ mod tests {
             auth_config: None,
             webhooks: None,
             cleanup: None,
+            tags: None,
+            assign_mode: None,
+            cost: None,
+            assigned_worker: None,
+            disconnect_policy: None,
         }
     }
 
@@ -894,5 +1088,548 @@ mod tests {
     #[test]
     fn memory_short_term_store_default_works() {
         let _store: MemoryShortTermStore = Default::default();
+    }
+
+    // ─── Helper: make_worker ────────────────────────────────────────────
+
+    fn make_worker(id: &str) -> Worker {
+        Worker {
+            id: id.to_string(),
+            status: WorkerStatus::Idle,
+            match_rule: WorkerMatchRule::default(),
+            capacity: 5,
+            used_slots: 0,
+            weight: 1,
+            connection_mode: ConnectionMode::Pull,
+            connected_at: 1000.0,
+            last_heartbeat_at: 1000.0,
+            metadata: None,
+        }
+    }
+
+    fn make_assignment(task_id: &str, worker_id: &str) -> WorkerAssignment {
+        WorkerAssignment {
+            task_id: task_id.to_string(),
+            worker_id: worker_id.to_string(),
+            cost: 1,
+            assigned_at: 1000.0,
+            status: WorkerAssignmentStatus::Assigned,
+        }
+    }
+
+    // ─── Worker CRUD ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn worker_save_and_get() {
+        let store = MemoryShortTermStore::new();
+        let worker = make_worker("w1");
+        store.save_worker(worker.clone()).await.unwrap();
+
+        let retrieved = store.get_worker("w1").await.unwrap();
+        assert!(retrieved.is_some());
+        let retrieved = retrieved.unwrap();
+        assert_eq!(retrieved.id, "w1");
+        assert_eq!(retrieved.status, WorkerStatus::Idle);
+        assert_eq!(retrieved.capacity, 5);
+    }
+
+    #[tokio::test]
+    async fn worker_get_nonexistent_returns_none() {
+        let store = MemoryShortTermStore::new();
+        let result = store.get_worker("nonexistent").await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn worker_save_overwrites_existing() {
+        let store = MemoryShortTermStore::new();
+        let worker = make_worker("w1");
+        store.save_worker(worker).await.unwrap();
+
+        let mut updated = make_worker("w1");
+        updated.status = WorkerStatus::Busy;
+        updated.used_slots = 3;
+        store.save_worker(updated).await.unwrap();
+
+        let retrieved = store.get_worker("w1").await.unwrap().unwrap();
+        assert_eq!(retrieved.status, WorkerStatus::Busy);
+        assert_eq!(retrieved.used_slots, 3);
+    }
+
+    #[tokio::test]
+    async fn worker_delete_removes_worker() {
+        let store = MemoryShortTermStore::new();
+        store.save_worker(make_worker("w1")).await.unwrap();
+        store.delete_worker("w1").await.unwrap();
+
+        let result = store.get_worker("w1").await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn worker_delete_nonexistent_is_noop() {
+        let store = MemoryShortTermStore::new();
+        let result = store.delete_worker("nonexistent").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn worker_list_returns_all() {
+        let store = MemoryShortTermStore::new();
+        store.save_worker(make_worker("w1")).await.unwrap();
+        store.save_worker(make_worker("w2")).await.unwrap();
+        store.save_worker(make_worker("w3")).await.unwrap();
+
+        let workers = store.list_workers(None).await.unwrap();
+        assert_eq!(workers.len(), 3);
+
+        let mut ids: Vec<String> = workers.iter().map(|w| w.id.clone()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["w1", "w2", "w3"]);
+    }
+
+    #[tokio::test]
+    async fn worker_list_with_status_filter() {
+        let store = MemoryShortTermStore::new();
+
+        let mut w1 = make_worker("w1");
+        w1.status = WorkerStatus::Idle;
+        store.save_worker(w1).await.unwrap();
+
+        let mut w2 = make_worker("w2");
+        w2.status = WorkerStatus::Busy;
+        store.save_worker(w2).await.unwrap();
+
+        let mut w3 = make_worker("w3");
+        w3.status = WorkerStatus::Draining;
+        store.save_worker(w3).await.unwrap();
+
+        // Filter for Idle only
+        let filter = WorkerFilter {
+            status: Some(vec![WorkerStatus::Idle]),
+            connection_mode: None,
+        };
+        let workers = store.list_workers(Some(filter)).await.unwrap();
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].id, "w1");
+
+        // Filter for Idle and Busy
+        let filter = WorkerFilter {
+            status: Some(vec![WorkerStatus::Idle, WorkerStatus::Busy]),
+            connection_mode: None,
+        };
+        let workers = store.list_workers(Some(filter)).await.unwrap();
+        assert_eq!(workers.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn worker_list_with_connection_mode_filter() {
+        let store = MemoryShortTermStore::new();
+
+        let mut w1 = make_worker("w1");
+        w1.connection_mode = ConnectionMode::Pull;
+        store.save_worker(w1).await.unwrap();
+
+        let mut w2 = make_worker("w2");
+        w2.connection_mode = ConnectionMode::Websocket;
+        store.save_worker(w2).await.unwrap();
+
+        // Filter for Pull only
+        let filter = WorkerFilter {
+            status: None,
+            connection_mode: Some(vec![ConnectionMode::Pull]),
+        };
+        let workers = store.list_workers(Some(filter)).await.unwrap();
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].id, "w1");
+
+        // Filter for Websocket only
+        let filter = WorkerFilter {
+            status: None,
+            connection_mode: Some(vec![ConnectionMode::Websocket]),
+        };
+        let workers = store.list_workers(Some(filter)).await.unwrap();
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].id, "w2");
+    }
+
+    // ─── claim_task ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn claim_task_succeeds_for_pending_task() {
+        let store = MemoryShortTermStore::new();
+
+        let mut task = make_task("t1");
+        task.status = TaskStatus::Pending;
+        store.save_task(task).await.unwrap();
+
+        store.save_worker(make_worker("w1")).await.unwrap();
+
+        let result = store.claim_task("t1", "w1", 1).await.unwrap();
+        assert!(result);
+
+        // Verify task is now Assigned
+        let task = store.get_task("t1").await.unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::Assigned);
+        assert_eq!(task.assigned_worker, Some("w1".to_string()));
+        assert_eq!(task.cost, Some(1));
+
+        // Verify worker used_slots incremented
+        let worker = store.get_worker("w1").await.unwrap().unwrap();
+        assert_eq!(worker.used_slots, 1);
+    }
+
+    #[tokio::test]
+    async fn claim_task_fails_when_worker_has_no_capacity() {
+        let store = MemoryShortTermStore::new();
+
+        let mut task = make_task("t1");
+        task.status = TaskStatus::Pending;
+        store.save_task(task).await.unwrap();
+
+        let mut worker = make_worker("w1");
+        worker.capacity = 2;
+        worker.used_slots = 2; // already at capacity
+        store.save_worker(worker).await.unwrap();
+
+        let result = store.claim_task("t1", "w1", 1).await.unwrap();
+        assert!(!result);
+
+        // Task should remain Pending
+        let task = store.get_task("t1").await.unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn claim_task_fails_for_non_pending_non_assigned_task() {
+        let store = MemoryShortTermStore::new();
+
+        // Task is Running, not Pending or Assigned
+        let mut task = make_task("t1");
+        task.status = TaskStatus::Running;
+        store.save_task(task).await.unwrap();
+
+        store.save_worker(make_worker("w1")).await.unwrap();
+
+        let result = store.claim_task("t1", "w1", 1).await.unwrap();
+        assert!(!result);
+
+        // Worker used_slots should be rolled back to 0
+        let worker = store.get_worker("w1").await.unwrap().unwrap();
+        assert_eq!(worker.used_slots, 0);
+    }
+
+    #[tokio::test]
+    async fn claim_task_rollback_restores_worker_slots() {
+        let store = MemoryShortTermStore::new();
+
+        // Task is Completed (invalid for claiming)
+        let mut task = make_task("t1");
+        task.status = TaskStatus::Completed;
+        store.save_task(task).await.unwrap();
+
+        let mut worker = make_worker("w1");
+        worker.used_slots = 2;
+        worker.capacity = 5;
+        store.save_worker(worker).await.unwrap();
+
+        let result = store.claim_task("t1", "w1", 1).await.unwrap();
+        assert!(!result);
+
+        // Worker used_slots should be rolled back to original value
+        let worker = store.get_worker("w1").await.unwrap().unwrap();
+        assert_eq!(worker.used_slots, 2);
+    }
+
+    #[tokio::test]
+    async fn claim_task_fails_for_nonexistent_worker() {
+        let store = MemoryShortTermStore::new();
+
+        let mut task = make_task("t1");
+        task.status = TaskStatus::Pending;
+        store.save_task(task).await.unwrap();
+
+        let result = store.claim_task("t1", "nonexistent", 1).await.unwrap();
+        assert!(!result);
+
+        // Task should remain Pending
+        let task = store.get_task("t1").await.unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn claim_task_fails_for_nonexistent_task() {
+        let store = MemoryShortTermStore::new();
+
+        store.save_worker(make_worker("w1")).await.unwrap();
+
+        let result = store.claim_task("nonexistent", "w1", 1).await.unwrap();
+        assert!(!result);
+
+        // Worker used_slots should be rolled back
+        let worker = store.get_worker("w1").await.unwrap().unwrap();
+        assert_eq!(worker.used_slots, 0);
+    }
+
+    // ─── Assignments ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn add_assignment_and_get_worker_assignments() {
+        let store = MemoryShortTermStore::new();
+
+        let a1 = make_assignment("t1", "w1");
+        let a2 = make_assignment("t2", "w1");
+        store.add_assignment(a1).await.unwrap();
+        store.add_assignment(a2).await.unwrap();
+
+        let assignments = store.get_worker_assignments("w1").await.unwrap();
+        assert_eq!(assignments.len(), 2);
+
+        let mut task_ids: Vec<String> = assignments.iter().map(|a| a.task_id.clone()).collect();
+        task_ids.sort();
+        assert_eq!(task_ids, vec!["t1", "t2"]);
+    }
+
+    #[tokio::test]
+    async fn get_worker_assignments_returns_empty_for_unknown_worker() {
+        let store = MemoryShortTermStore::new();
+        let assignments = store.get_worker_assignments("unknown").await.unwrap();
+        assert!(assignments.is_empty());
+    }
+
+    #[tokio::test]
+    async fn remove_assignment_removes_by_task_id() {
+        let store = MemoryShortTermStore::new();
+
+        store.add_assignment(make_assignment("t1", "w1")).await.unwrap();
+        store.add_assignment(make_assignment("t2", "w1")).await.unwrap();
+        store.add_assignment(make_assignment("t3", "w2")).await.unwrap();
+
+        store.remove_assignment("t2").await.unwrap();
+
+        // w1 should only have t1 left
+        let w1_assignments = store.get_worker_assignments("w1").await.unwrap();
+        assert_eq!(w1_assignments.len(), 1);
+        assert_eq!(w1_assignments[0].task_id, "t1");
+
+        // w2 should still have t3
+        let w2_assignments = store.get_worker_assignments("w2").await.unwrap();
+        assert_eq!(w2_assignments.len(), 1);
+        assert_eq!(w2_assignments[0].task_id, "t3");
+    }
+
+    #[tokio::test]
+    async fn remove_assignment_nonexistent_is_noop() {
+        let store = MemoryShortTermStore::new();
+        let result = store.remove_assignment("nonexistent").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn get_task_assignment_returns_assignment() {
+        let store = MemoryShortTermStore::new();
+
+        store.add_assignment(make_assignment("t1", "w1")).await.unwrap();
+        store.add_assignment(make_assignment("t2", "w2")).await.unwrap();
+
+        let assignment = store.get_task_assignment("t1").await.unwrap();
+        assert!(assignment.is_some());
+        let assignment = assignment.unwrap();
+        assert_eq!(assignment.task_id, "t1");
+        assert_eq!(assignment.worker_id, "w1");
+    }
+
+    #[tokio::test]
+    async fn get_task_assignment_returns_none_for_unknown() {
+        let store = MemoryShortTermStore::new();
+        let result = store.get_task_assignment("unknown").await.unwrap();
+        assert!(result.is_none());
+    }
+
+    // ─── list_tasks with filters ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn list_tasks_filter_by_status() {
+        let store = MemoryShortTermStore::new();
+
+        let mut t1 = make_task("t1");
+        t1.status = TaskStatus::Pending;
+        store.save_task(t1).await.unwrap();
+
+        let mut t2 = make_task("t2");
+        t2.status = TaskStatus::Running;
+        store.save_task(t2).await.unwrap();
+
+        let mut t3 = make_task("t3");
+        t3.status = TaskStatus::Completed;
+        store.save_task(t3).await.unwrap();
+
+        let filter = TaskFilter {
+            status: Some(vec![TaskStatus::Pending, TaskStatus::Running]),
+            ..Default::default()
+        };
+        let tasks = store.list_tasks(filter).await.unwrap();
+        assert_eq!(tasks.len(), 2);
+
+        let mut ids: Vec<String> = tasks.iter().map(|t| t.id.clone()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["t1", "t2"]);
+    }
+
+    #[tokio::test]
+    async fn list_tasks_filter_by_types() {
+        let store = MemoryShortTermStore::new();
+
+        let mut t1 = make_task("t1");
+        t1.r#type = Some("llm".to_string());
+        store.save_task(t1).await.unwrap();
+
+        let mut t2 = make_task("t2");
+        t2.r#type = Some("image".to_string());
+        store.save_task(t2).await.unwrap();
+
+        let mut t3 = make_task("t3");
+        t3.r#type = None; // no type
+        store.save_task(t3).await.unwrap();
+
+        let filter = TaskFilter {
+            types: Some(vec!["llm".to_string()]),
+            ..Default::default()
+        };
+        let tasks = store.list_tasks(filter).await.unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, "t1");
+    }
+
+    #[tokio::test]
+    async fn list_tasks_filter_by_types_excludes_tasks_with_no_type() {
+        let store = MemoryShortTermStore::new();
+
+        let mut t1 = make_task("t1");
+        t1.r#type = None;
+        store.save_task(t1).await.unwrap();
+
+        let filter = TaskFilter {
+            types: Some(vec!["llm".to_string()]),
+            ..Default::default()
+        };
+        let tasks = store.list_tasks(filter).await.unwrap();
+        assert!(tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_tasks_filter_by_assign_mode() {
+        let store = MemoryShortTermStore::new();
+
+        let mut t1 = make_task("t1");
+        t1.assign_mode = Some(AssignMode::Pull);
+        store.save_task(t1).await.unwrap();
+
+        let mut t2 = make_task("t2");
+        t2.assign_mode = Some(AssignMode::External);
+        store.save_task(t2).await.unwrap();
+
+        let mut t3 = make_task("t3");
+        t3.assign_mode = None; // no assign_mode
+        store.save_task(t3).await.unwrap();
+
+        let filter = TaskFilter {
+            assign_mode: Some(vec![AssignMode::Pull]),
+            ..Default::default()
+        };
+        let tasks = store.list_tasks(filter).await.unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, "t1");
+    }
+
+    #[tokio::test]
+    async fn list_tasks_filter_by_assign_mode_excludes_none() {
+        let store = MemoryShortTermStore::new();
+
+        let mut t1 = make_task("t1");
+        t1.assign_mode = None;
+        store.save_task(t1).await.unwrap();
+
+        let filter = TaskFilter {
+            assign_mode: Some(vec![AssignMode::Pull]),
+            ..Default::default()
+        };
+        let tasks = store.list_tasks(filter).await.unwrap();
+        assert!(tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_tasks_filter_by_tags() {
+        let store = MemoryShortTermStore::new();
+
+        let mut t1 = make_task("t1");
+        t1.tags = Some(vec!["gpu".to_string(), "fast".to_string()]);
+        store.save_task(t1).await.unwrap();
+
+        let mut t2 = make_task("t2");
+        t2.tags = Some(vec!["cpu".to_string()]);
+        store.save_task(t2).await.unwrap();
+
+        let mut t3 = make_task("t3");
+        t3.tags = None;
+        store.save_task(t3).await.unwrap();
+
+        // Filter: must have "gpu" tag
+        let filter = TaskFilter {
+            tags: Some(TagMatcher {
+                all: Some(vec!["gpu".to_string()]),
+                any: None,
+                none: None,
+            }),
+            ..Default::default()
+        };
+        let tasks = store.list_tasks(filter).await.unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, "t1");
+    }
+
+    #[tokio::test]
+    async fn list_tasks_filter_by_exclude_task_ids() {
+        let store = MemoryShortTermStore::new();
+
+        store.save_task(make_task("t1")).await.unwrap();
+        store.save_task(make_task("t2")).await.unwrap();
+        store.save_task(make_task("t3")).await.unwrap();
+
+        let filter = TaskFilter {
+            exclude_task_ids: Some(vec!["t1".to_string(), "t3".to_string()]),
+            ..Default::default()
+        };
+        let tasks = store.list_tasks(filter).await.unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, "t2");
+    }
+
+    #[tokio::test]
+    async fn list_tasks_with_limit() {
+        let store = MemoryShortTermStore::new();
+
+        store.save_task(make_task("t1")).await.unwrap();
+        store.save_task(make_task("t2")).await.unwrap();
+        store.save_task(make_task("t3")).await.unwrap();
+
+        let filter = TaskFilter {
+            limit: Some(2),
+            ..Default::default()
+        };
+        let tasks = store.list_tasks(filter).await.unwrap();
+        assert_eq!(tasks.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn list_tasks_no_filter_returns_all() {
+        let store = MemoryShortTermStore::new();
+
+        store.save_task(make_task("t1")).await.unwrap();
+        store.save_task(make_task("t2")).await.unwrap();
+
+        let filter = TaskFilter::default();
+        let tasks = store.list_tasks(filter).await.unwrap();
+        assert_eq!(tasks.len(), 2);
     }
 }

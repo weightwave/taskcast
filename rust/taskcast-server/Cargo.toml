@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 taskcast-core = { path = "../taskcast-core" }
-axum = { version = "0.8", features = ["macros"] }
+axum = { version = "0.8", features = ["macros", "ws"] }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -22,5 +22,5 @@ sha2 = "0.10"
 hex = "0.4"
 
 [dev-dependencies]
-axum-test = "19"
+axum-test = { version = "19", features = ["ws"] }
 tempfile = { workspace = true }

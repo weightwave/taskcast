@@ -2,6 +2,7 @@
 
 export type TaskStatus =
   | 'pending'
+  | 'assigned'
   | 'running'
   | 'paused'
   | 'blocked'
@@ -53,6 +54,8 @@ export type PermissionScope =
   | 'event:subscribe'
   | 'event:history'
   | 'webhook:create'
+  | 'worker:connect'
+  | 'worker:manage'
   | '*'
 
 export interface CleanupRule {
@@ -73,6 +76,65 @@ export interface CleanupRule {
   }
 }
 
+// ─── Worker Assignment ──────────────────────────────────────────────────────
+
+export type AssignMode = 'external' | 'pull' | 'ws-offer' | 'ws-race'
+
+export type DisconnectPolicy = 'reassign' | 'mark' | 'fail'
+
+export type WorkerStatus = 'idle' | 'busy' | 'draining' | 'offline'
+
+export interface TagMatcher {
+  all?: string[]
+  any?: string[]
+  none?: string[]
+}
+
+export interface WorkerMatchRule {
+  taskTypes?: string[]
+  tags?: TagMatcher
+}
+
+export interface Worker {
+  id: string
+  status: WorkerStatus
+  matchRule: WorkerMatchRule
+  capacity: number
+  usedSlots: number
+  weight: number
+  connectionMode: 'pull' | 'websocket'
+  connectedAt: number
+  lastHeartbeatAt: number
+  metadata?: Record<string, unknown>
+}
+
+export type WorkerAssignmentStatus = 'offered' | 'assigned' | 'running'
+
+export interface WorkerAssignment {
+  taskId: string
+  workerId: string
+  cost: number
+  assignedAt: number
+  status: WorkerAssignmentStatus
+}
+
+export interface WorkerAuditEvent {
+  id: string
+  workerId: string
+  timestamp: number
+  action:
+    | 'connected'
+    | 'disconnected'
+    | 'updated'
+    | 'task_assigned'
+    | 'task_declined'
+    | 'task_reclaimed'
+    | 'draining'
+    | 'heartbeat_timeout'
+    | 'pull_request'
+  data?: Record<string, unknown>
+}
+
 export interface Task {
   id: string
   type?: string
@@ -88,6 +150,11 @@ export interface Task {
   authConfig?: TaskAuthConfig
   webhooks?: WebhookConfig[]
   cleanup?: { rules: CleanupRule[] }
+  tags?: string[]
+  assignMode?: AssignMode
+  cost?: number
+  assignedWorker?: string
+  disconnectPolicy?: DisconnectPolicy
 }
 
 // ─── Events ─────────────────────────────────────────────────────────────────
@@ -156,6 +223,24 @@ export interface ShortTermStore {
   getSeriesLatest(taskId: string, seriesId: string): Promise<TaskEvent | null>
   setSeriesLatest(taskId: string, seriesId: string, event: TaskEvent): Promise<void>
   replaceLastSeriesEvent(taskId: string, seriesId: string, event: TaskEvent): Promise<void>
+
+  // Task query
+  listTasks(filter: TaskFilter): Promise<Task[]>
+
+  // Worker state
+  saveWorker(worker: Worker): Promise<void>
+  getWorker(workerId: string): Promise<Worker | null>
+  listWorkers(filter?: WorkerFilter): Promise<Worker[]>
+  deleteWorker(workerId: string): Promise<void>
+
+  // Atomic claim
+  claimTask(taskId: string, workerId: string, cost: number): Promise<boolean>
+
+  // Worker assignments
+  addAssignment(assignment: WorkerAssignment): Promise<void>
+  removeAssignment(taskId: string): Promise<void>
+  getWorkerAssignments(workerId: string): Promise<WorkerAssignment[]>
+  getTaskAssignment(taskId: string): Promise<WorkerAssignment | null>
 }
 
 export interface LongTermStore {
@@ -163,6 +248,22 @@ export interface LongTermStore {
   getTask(taskId: string): Promise<Task | null>
   saveEvent(event: TaskEvent): Promise<void>
   getEvents(taskId: string, opts?: EventQueryOptions): Promise<TaskEvent[]>
+  saveWorkerEvent(event: WorkerAuditEvent): Promise<void>
+  getWorkerEvents(workerId: string, opts?: EventQueryOptions): Promise<WorkerAuditEvent[]>
+}
+
+export interface TaskFilter {
+  status?: TaskStatus[]
+  types?: string[]
+  tags?: TagMatcher
+  assignMode?: AssignMode[]
+  excludeTaskIds?: string[]
+  limit?: number
+}
+
+export interface WorkerFilter {
+  status?: WorkerStatus[]
+  connectionMode?: ('pull' | 'websocket')[]
 }
 
 // ─── Hooks ───────────────────────────────────────────────────────────────────
@@ -180,4 +281,10 @@ export interface TaskcastHooks {
   onWebhookFailed?(config: WebhookConfig, err: unknown): void
   onSSEConnect?(taskId: string, clientId: string): void
   onSSEDisconnect?(taskId: string, clientId: string, duration: number): void
+  onTaskCreated?(task: Task): void
+  onTaskTransitioned?(task: Task, from: TaskStatus, to: TaskStatus): void
+  onWorkerConnected?(worker: Worker): void
+  onWorkerDisconnected?(worker: Worker, reason: string): void
+  onTaskAssigned?(task: Task, worker: Worker): void
+  onTaskDeclined?(task: Task, worker: Worker, blacklisted: boolean): void
 }

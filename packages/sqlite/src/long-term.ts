@@ -1,6 +1,6 @@
 import type Database from 'better-sqlite3'
-import type { Task, TaskEvent, LongTermStore, EventQueryOptions } from '@taskcast/core'
-import { rowToTask, rowToEvent } from './row-mappers.js'
+import type { Task, TaskEvent, LongTermStore, EventQueryOptions, WorkerAuditEvent } from '@taskcast/core'
+import { rowToTask, rowToEvent, rowToWorkerEvent } from './row-mappers.js'
 
 // ─── SqliteLongTermStore ──────────────────────────────────────────────────
 
@@ -9,8 +9,8 @@ export class SqliteLongTermStore implements LongTermStore {
 
   async saveTask(task: Task): Promise<void> {
     const stmt = this.db.prepare(`
-      INSERT INTO taskcast_tasks (id, type, status, params, result, error, metadata, auth_config, webhooks, cleanup, created_at, updated_at, completed_at, ttl)
-      VALUES (@id, @type, @status, @params, @result, @error, @metadata, @auth_config, @webhooks, @cleanup, @created_at, @updated_at, @completed_at, @ttl)
+      INSERT INTO taskcast_tasks (id, type, status, params, result, error, metadata, auth_config, webhooks, cleanup, created_at, updated_at, completed_at, ttl, tags, assign_mode, cost, assigned_worker, disconnect_policy)
+      VALUES (@id, @type, @status, @params, @result, @error, @metadata, @auth_config, @webhooks, @cleanup, @created_at, @updated_at, @completed_at, @ttl, @tags, @assign_mode, @cost, @assigned_worker, @disconnect_policy)
       ON CONFLICT (id) DO UPDATE SET
         type = excluded.type,
         status = excluded.status,
@@ -23,7 +23,12 @@ export class SqliteLongTermStore implements LongTermStore {
         cleanup = excluded.cleanup,
         updated_at = excluded.updated_at,
         completed_at = excluded.completed_at,
-        ttl = excluded.ttl
+        ttl = excluded.ttl,
+        tags = excluded.tags,
+        assign_mode = excluded.assign_mode,
+        cost = excluded.cost,
+        assigned_worker = excluded.assigned_worker,
+        disconnect_policy = excluded.disconnect_policy
     `)
 
     stmt.run({
@@ -41,6 +46,11 @@ export class SqliteLongTermStore implements LongTermStore {
       updated_at: task.updatedAt,
       completed_at: task.completedAt ?? null,
       ttl: task.ttl ?? null,
+      tags: task.tags ? JSON.stringify(task.tags) : null,
+      assign_mode: task.assignMode ?? null,
+      cost: task.cost ?? null,
+      assigned_worker: task.assignedWorker ?? null,
+      disconnect_policy: task.disconnectPolicy ?? null,
     })
   }
 
@@ -119,5 +129,65 @@ export class SqliteLongTermStore implements LongTermStore {
 
     const rows = this.db.prepare(sql).all(...params) as Record<string, unknown>[]
     return rows.map(rowToEvent)
+  }
+
+  // ─── Worker audit events ─────────────────────────────────────────────────
+
+  async saveWorkerEvent(event: WorkerAuditEvent): Promise<void> {
+    this.db
+      .prepare(
+        `INSERT INTO taskcast_worker_events (id, worker_id, timestamp, action, data)
+         VALUES (@id, @worker_id, @timestamp, @action, @data)
+         ON CONFLICT (id) DO NOTHING`,
+      )
+      .run({
+        id: event.id,
+        worker_id: event.workerId,
+        timestamp: event.timestamp,
+        action: event.action,
+        data: event.data ? JSON.stringify(event.data) : null,
+      })
+  }
+
+  async getWorkerEvents(workerId: string, opts?: EventQueryOptions): Promise<WorkerAuditEvent[]> {
+    const since = opts?.since
+    const limit = opts?.limit
+
+    let sql: string
+    const params: unknown[] = [workerId]
+
+    if (since?.timestamp !== undefined) {
+      sql = `
+        SELECT * FROM taskcast_worker_events
+        WHERE worker_id = ? AND timestamp > ?
+        ORDER BY timestamp ASC
+      `
+      params.push(since.timestamp)
+    } else if (since?.id) {
+      sql = `
+        SELECT * FROM taskcast_worker_events
+        WHERE worker_id = ?
+          AND timestamp > COALESCE(
+            (SELECT timestamp FROM taskcast_worker_events WHERE id = ?),
+            0
+          )
+        ORDER BY timestamp ASC
+      `
+      params.push(since.id)
+    } else {
+      sql = `
+        SELECT * FROM taskcast_worker_events
+        WHERE worker_id = ?
+        ORDER BY timestamp ASC
+      `
+    }
+
+    if (limit) {
+      sql += ' LIMIT ?'
+      params.push(limit)
+    }
+
+    const rows = this.db.prepare(sql).all(...params) as Record<string, unknown>[]
+    return rows.map(rowToWorkerEvent)
   }
 }

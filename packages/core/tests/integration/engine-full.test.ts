@@ -39,18 +39,23 @@ beforeAll(async () => {
   const pgPort = pgContainer.getMappedPort(5432)
   sql = postgres(`postgres://test:test@localhost:${pgPort}/testdb`)
 
-  // Run migration
-  const migration = readFileSync(
+  // Run migrations
+  const migration001 = readFileSync(
     join(import.meta.dirname, '../../../postgres/migrations/001_initial.sql'),
     'utf8',
   )
-  await sql.unsafe(migration)
+  await sql.unsafe(migration001)
+  const migration002 = readFileSync(
+    join(import.meta.dirname, '../../../postgres/migrations/002_workers.sql'),
+    'utf8',
+  )
+  await sql.unsafe(migration002)
 
   const broadcast = new RedisBroadcastProvider(pubClient, subClient)
-  const shortTerm = new RedisShortTermStore(storeClient)
-  const longTerm = new PostgresLongTermStore(sql)
+  const shortTermStore = new RedisShortTermStore(storeClient)
+  const longTermStore = new PostgresLongTermStore(sql)
 
-  engine = new TaskEngine({ broadcast, shortTermStore: shortTerm, longTermStore: longTerm })
+  engine = new TaskEngine({ broadcast, shortTermStore: shortTermStore, longTermStore: longTermStore })
 }, 120000)
 
 afterAll(async () => {

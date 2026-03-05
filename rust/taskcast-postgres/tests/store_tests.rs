@@ -4,8 +4,11 @@ use testcontainers_modules::postgres::Postgres;
 
 use taskcast_core::types::{
     EventQueryOptions, Level, LongTermStore, SinceCursor, Task, TaskEvent, TaskStatus,
+    WorkerAuditAction, WorkerAuditEvent,
 };
 use taskcast_postgres::PostgresLongTermStore;
+
+use std::collections::HashMap;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -24,7 +27,7 @@ async fn setup() -> (
         .connect(&database_url)
         .await
         .unwrap();
-    let store = PostgresLongTermStore::new(pool, None);
+    let store = PostgresLongTermStore::new(pool);
     store.migrate().await.unwrap();
     (store, container)
 }
@@ -45,6 +48,11 @@ fn make_task(id: &str) -> Task {
         auth_config: None,
         webhooks: None,
         cleanup: None,
+        tags: None,
+        assign_mode: None,
+        cost: None,
+        assigned_worker: None,
+        disconnect_policy: None,
         created_at: 1000.0,
         updated_at: 1000.0,
         completed_at: None,
@@ -142,6 +150,11 @@ async fn handle_task_with_no_optional_fields() {
         auth_config: None,
         webhooks: None,
         cleanup: None,
+        tags: None,
+        assign_mode: None,
+        cost: None,
+        assigned_worker: None,
+        disconnect_policy: None,
         created_at: 1000.0,
         updated_at: 1000.0,
         completed_at: None,
@@ -330,4 +343,262 @@ async fn preserve_series_fields_on_events() {
     store.save_event(event.clone()).await.unwrap();
     let events = store.get_events("task-1", None).await.unwrap();
     assert_eq!(events[0], event);
+}
+
+// ─── Worker event helpers ─────────────────────────────────────────────────
+
+fn make_worker_event(id: &str, worker_id: &str, index: u64) -> WorkerAuditEvent {
+    WorkerAuditEvent {
+        id: id.to_string(),
+        worker_id: worker_id.to_string(),
+        timestamp: 1000.0 + index as f64 * 100.0,
+        action: WorkerAuditAction::Connected,
+        data: None,
+    }
+}
+
+// ─── save_worker_event / get_worker_events ────────────────────────────────
+
+#[tokio::test]
+async fn save_and_retrieve_worker_events() {
+    let (store, _container) = setup().await;
+
+    let e0 = make_worker_event("we-1", "worker-1", 0);
+    let e1 = make_worker_event("we-2", "worker-1", 1);
+
+    store.save_worker_event(e0.clone()).await.unwrap();
+    store.save_worker_event(e1.clone()).await.unwrap();
+
+    let events = store.get_worker_events("worker-1", None).await.unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0], e0);
+    assert_eq!(events[1], e1);
+}
+
+#[tokio::test]
+async fn return_empty_when_no_worker_events() {
+    let (store, _container) = setup().await;
+
+    let events = store
+        .get_worker_events("nonexistent-worker", None)
+        .await
+        .unwrap();
+    assert!(events.is_empty());
+}
+
+#[tokio::test]
+async fn save_multiple_worker_events_verify_ordering() {
+    let (store, _container) = setup().await;
+
+    // Insert events out of timestamp order
+    let e2 = make_worker_event("we-3", "worker-1", 2);
+    let e0 = make_worker_event("we-1", "worker-1", 0);
+    let e1 = make_worker_event("we-2", "worker-1", 1);
+
+    store.save_worker_event(e2.clone()).await.unwrap();
+    store.save_worker_event(e0.clone()).await.unwrap();
+    store.save_worker_event(e1.clone()).await.unwrap();
+
+    let events = store.get_worker_events("worker-1", None).await.unwrap();
+    assert_eq!(events.len(), 3);
+    // Should be ordered by timestamp ASC regardless of insertion order
+    assert_eq!(events[0].id, "we-1");
+    assert_eq!(events[1].id, "we-2");
+    assert_eq!(events[2].id, "we-3");
+}
+
+#[tokio::test]
+async fn save_worker_event_with_data_field() {
+    let (store, _container) = setup().await;
+
+    let mut data = HashMap::new();
+    data.insert("reason".to_string(), serde_json::json!("timeout"));
+    data.insert("duration_ms".to_string(), serde_json::json!(5000));
+
+    let event = WorkerAuditEvent {
+        id: "we-data-1".to_string(),
+        worker_id: "worker-1".to_string(),
+        timestamp: 1000.0,
+        action: WorkerAuditAction::HeartbeatTimeout,
+        data: Some(data),
+    };
+
+    store.save_worker_event(event.clone()).await.unwrap();
+
+    let events = store.get_worker_events("worker-1", None).await.unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0], event);
+    let retrieved_data = events[0].data.as_ref().unwrap();
+    assert_eq!(retrieved_data["reason"], serde_json::json!("timeout"));
+    assert_eq!(retrieved_data["duration_ms"], serde_json::json!(5000));
+}
+
+#[tokio::test]
+async fn duplicate_worker_event_id_is_ignored() {
+    let (store, _container) = setup().await;
+
+    let event = make_worker_event("we-dup", "worker-1", 0);
+    store.save_worker_event(event.clone()).await.unwrap();
+    // Saving the same event again should not error (ON CONFLICT DO NOTHING)
+    store.save_worker_event(event.clone()).await.unwrap();
+
+    let events = store.get_worker_events("worker-1", None).await.unwrap();
+    assert_eq!(events.len(), 1);
+}
+
+// ─── Worker event filtering ──────────────────────────────────────────────
+
+#[tokio::test]
+async fn filter_worker_events_by_since_timestamp() {
+    let (store, _container) = setup().await;
+
+    for i in 0..5 {
+        store
+            .save_worker_event(make_worker_event(
+                &format!("we-{}", i),
+                "worker-1",
+                i,
+            ))
+            .await
+            .unwrap();
+    }
+
+    let opts = EventQueryOptions {
+        since: Some(SinceCursor {
+            index: None,
+            timestamp: Some(1200.0),
+            id: None,
+        }),
+        limit: None,
+    };
+    let events = store
+        .get_worker_events("worker-1", Some(opts))
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].timestamp, 1300.0);
+    assert_eq!(events[1].timestamp, 1400.0);
+}
+
+#[tokio::test]
+async fn filter_worker_events_by_since_id() {
+    let (store, _container) = setup().await;
+
+    for i in 0..5 {
+        store
+            .save_worker_event(make_worker_event(
+                &format!("we-{}", i),
+                "worker-1",
+                i,
+            ))
+            .await
+            .unwrap();
+    }
+
+    let opts = EventQueryOptions {
+        since: Some(SinceCursor {
+            index: None,
+            timestamp: None,
+            id: Some("we-2".to_string()),
+        }),
+        limit: None,
+    };
+    let events = store
+        .get_worker_events("worker-1", Some(opts))
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].id, "we-3");
+    assert_eq!(events[1].id, "we-4");
+}
+
+#[tokio::test]
+async fn return_all_worker_events_when_since_id_not_found() {
+    let (store, _container) = setup().await;
+
+    for i in 0..3 {
+        store
+            .save_worker_event(make_worker_event(
+                &format!("we-{}", i),
+                "worker-1",
+                i,
+            ))
+            .await
+            .unwrap();
+    }
+
+    let opts = EventQueryOptions {
+        since: Some(SinceCursor {
+            index: None,
+            timestamp: None,
+            id: Some("nonexistent-id".to_string()),
+        }),
+        limit: None,
+    };
+    let events = store
+        .get_worker_events("worker-1", Some(opts))
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 3);
+}
+
+#[tokio::test]
+async fn respect_limit_on_worker_events() {
+    let (store, _container) = setup().await;
+
+    for i in 0..10 {
+        store
+            .save_worker_event(make_worker_event(
+                &format!("we-{}", i),
+                "worker-1",
+                i,
+            ))
+            .await
+            .unwrap();
+    }
+
+    let opts = EventQueryOptions {
+        since: None,
+        limit: Some(3),
+    };
+    let events = store
+        .get_worker_events("worker-1", Some(opts))
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0].id, "we-0");
+    assert_eq!(events[2].id, "we-2");
+}
+
+#[tokio::test]
+async fn combine_since_timestamp_and_limit_on_worker_events() {
+    let (store, _container) = setup().await;
+
+    for i in 0..10 {
+        store
+            .save_worker_event(make_worker_event(
+                &format!("we-{}", i),
+                "worker-1",
+                i,
+            ))
+            .await
+            .unwrap();
+    }
+
+    let opts = EventQueryOptions {
+        since: Some(SinceCursor {
+            index: None,
+            timestamp: Some(1400.0),
+            id: None,
+        }),
+        limit: Some(2),
+    };
+    let events = store
+        .get_worker_events("worker-1", Some(opts))
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 2);
+    // Events after timestamp 1400.0 are indices 5,6,7,8,9 (timestamps 1500,1600,...,1900)
+    assert_eq!(events[0].timestamp, 1500.0);
+    assert_eq!(events[1].timestamp, 1600.0);
 }

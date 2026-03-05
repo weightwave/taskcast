@@ -16,8 +16,8 @@ export interface TaskcastConfig {
   }
   adapters?: {
     broadcast?: { provider: string; url?: string }
-    shortTerm?: { provider: string; url?: string }
-    longTerm?: { provider: string; url?: string }
+    shortTermStore?: { provider: string; url?: string }
+    longTermStore?: { provider: string; url?: string }
   }
   sentry?: {
     dsn?: string
@@ -41,6 +41,17 @@ export interface TaskcastConfig {
   }
   cleanup?: {
     rules?: unknown[]
+  }
+  workers?: {
+    enabled?: boolean
+    defaults?: {
+      assignMode?: 'external' | 'pull' | 'ws-offer' | 'ws-race'
+      heartbeatIntervalMs?: number
+      heartbeatTimeoutMs?: number
+      offerTimeoutMs?: number
+      disconnectPolicy?: 'reassign' | 'mark' | 'fail'
+      disconnectGraceMs?: number
+    }
   }
 }
 

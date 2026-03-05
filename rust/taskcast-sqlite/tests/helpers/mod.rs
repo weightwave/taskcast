@@ -1,4 +1,4 @@
-use taskcast_core::types::{Level, Task, TaskEvent, TaskStatus};
+use taskcast_core::types::{Level, Task, TaskEvent, TaskStatus, WorkerAuditAction, WorkerAuditEvent};
 use taskcast_sqlite::{SqliteLongTermStore, SqliteShortTermStore};
 use tempfile::TempDir;
 
@@ -16,8 +16,8 @@ pub async fn setup() -> TestContext {
         .unwrap();
 
     TestContext {
-        short: adapters.short_term,
-        long: adapters.long_term,
+        short: adapters.short_term_store,
+        long: adapters.long_term_store,
         _dir: dir,
     }
 }
@@ -42,6 +42,11 @@ pub fn make_task(id: &str) -> Task {
         updated_at: 1000.0,
         completed_at: None,
         ttl: None,
+        tags: None,
+        assign_mode: None,
+        cost: None,
+        assigned_worker: None,
+        disconnect_policy: None,
     }
 }
 
@@ -56,5 +61,15 @@ pub fn make_event(task_id: &str, index: u64) -> TaskEvent {
         data: serde_json::json!({"text": format!("msg-{}", index)}),
         series_id: None,
         series_mode: None,
+    }
+}
+
+pub fn make_worker_event(worker_id: &str, seq: u64, action: WorkerAuditAction) -> WorkerAuditEvent {
+    WorkerAuditEvent {
+        id: format!("wevt-{}-{}", worker_id, seq),
+        worker_id: worker_id.to_string(),
+        timestamp: 1000.0 + seq as f64 * 100.0,
+        action,
+        data: None,
     }
 }

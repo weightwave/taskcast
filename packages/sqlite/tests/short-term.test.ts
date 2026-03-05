@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import type { Task, TaskEvent } from '@taskcast/core'
+import type { Task, TaskEvent, Worker, WorkerAssignment } from '@taskcast/core'
 import { SqliteShortTermStore } from '../src/short-term.js'
 
 function makeTask(id = 'task-1'): Task {
@@ -344,5 +344,520 @@ describe('SqliteShortTermStore', () => {
     expect(events[0]).toEqual(event)
     expect(events[0]!.seriesId).toBe('my-series')
     expect(events[0]!.seriesMode).toBe('accumulate')
+  })
+
+  // ─── listTasks ──────────────────────────────────────────────────────────
+
+  describe('listTasks', () => {
+    it('should return all tasks with empty filter', async () => {
+      await store.saveTask(makeTask('task-1'))
+      await store.saveTask(makeTask('task-2'))
+      await store.saveTask(makeTask('task-3'))
+
+      const tasks = await store.listTasks({})
+      expect(tasks).toHaveLength(3)
+    })
+
+    it('should return empty array when no tasks exist', async () => {
+      const tasks = await store.listTasks({})
+      expect(tasks).toEqual([])
+    })
+
+    it('should filter tasks by status', async () => {
+      const t1: Task = { ...makeTask('task-1'), status: 'pending' }
+      const t2: Task = { ...makeTask('task-2'), status: 'running' }
+      const t3: Task = { ...makeTask('task-3'), status: 'completed' }
+      await store.saveTask(t1)
+      await store.saveTask(t2)
+      await store.saveTask(t3)
+
+      const pending = await store.listTasks({ status: ['pending'] })
+      expect(pending).toHaveLength(1)
+      expect(pending[0]!.id).toBe('task-1')
+
+      const activeStatuses = await store.listTasks({ status: ['pending', 'running'] })
+      expect(activeStatuses).toHaveLength(2)
+    })
+
+    it('should filter tasks by types', async () => {
+      const t1: Task = { ...makeTask('task-1'), type: 'llm' }
+      const t2: Task = { ...makeTask('task-2'), type: 'image' }
+      const t3: Task = { ...makeTask('task-3'), type: 'llm' }
+      await store.saveTask(t1)
+      await store.saveTask(t2)
+      await store.saveTask(t3)
+
+      const llmTasks = await store.listTasks({ types: ['llm'] })
+      expect(llmTasks).toHaveLength(2)
+      expect(llmTasks.every((t) => t.type === 'llm')).toBe(true)
+    })
+
+    it('should filter tasks by assignMode', async () => {
+      const t1: Task = { ...makeTask('task-1'), assignMode: 'pull' }
+      const t2: Task = { ...makeTask('task-2'), assignMode: 'ws-offer' }
+      const t3: Task = { ...makeTask('task-3'), assignMode: 'external' }
+      await store.saveTask(t1)
+      await store.saveTask(t2)
+      await store.saveTask(t3)
+
+      const pullTasks = await store.listTasks({ assignMode: ['pull'] })
+      expect(pullTasks).toHaveLength(1)
+      expect(pullTasks[0]!.id).toBe('task-1')
+    })
+
+    it('should exclude tasks by excludeTaskIds', async () => {
+      await store.saveTask(makeTask('task-1'))
+      await store.saveTask(makeTask('task-2'))
+      await store.saveTask(makeTask('task-3'))
+
+      const tasks = await store.listTasks({ excludeTaskIds: ['task-1', 'task-3'] })
+      expect(tasks).toHaveLength(1)
+      expect(tasks[0]!.id).toBe('task-2')
+    })
+
+    it('should respect limit parameter', async () => {
+      for (let i = 0; i < 5; i++) {
+        await store.saveTask(makeTask(`task-${i}`))
+      }
+
+      const tasks = await store.listTasks({ limit: 2 })
+      expect(tasks).toHaveLength(2)
+    })
+
+    it('should filter tasks by tags (all)', async () => {
+      const t1: Task = { ...makeTask('task-1'), tags: ['a', 'b', 'c'] }
+      const t2: Task = { ...makeTask('task-2'), tags: ['a', 'b'] }
+      const t3: Task = { ...makeTask('task-3'), tags: ['a'] }
+      await store.saveTask(t1)
+      await store.saveTask(t2)
+      await store.saveTask(t3)
+
+      const tasks = await store.listTasks({ tags: { all: ['a', 'b'] } })
+      expect(tasks).toHaveLength(2)
+      expect(tasks.map((t) => t.id).sort()).toEqual(['task-1', 'task-2'])
+    })
+
+    it('should filter tasks by tags (any)', async () => {
+      const t1: Task = { ...makeTask('task-1'), tags: ['x'] }
+      const t2: Task = { ...makeTask('task-2'), tags: ['y'] }
+      const t3: Task = { ...makeTask('task-3'), tags: ['z'] }
+      await store.saveTask(t1)
+      await store.saveTask(t2)
+      await store.saveTask(t3)
+
+      const tasks = await store.listTasks({ tags: { any: ['x', 'z'] } })
+      expect(tasks).toHaveLength(2)
+      expect(tasks.map((t) => t.id).sort()).toEqual(['task-1', 'task-3'])
+    })
+
+    it('should filter tasks by tags (none)', async () => {
+      const t1: Task = { ...makeTask('task-1'), tags: ['a', 'b'] }
+      const t2: Task = { ...makeTask('task-2'), tags: ['c'] }
+      const t3: Task = { ...makeTask('task-3'), tags: ['a'] }
+      await store.saveTask(t1)
+      await store.saveTask(t2)
+      await store.saveTask(t3)
+
+      const tasks = await store.listTasks({ tags: { none: ['a'] } })
+      expect(tasks).toHaveLength(1)
+      expect(tasks[0]!.id).toBe('task-2')
+    })
+
+    it('should combine multiple filters', async () => {
+      const t1: Task = { ...makeTask('task-1'), status: 'pending', type: 'llm' }
+      const t2: Task = { ...makeTask('task-2'), status: 'running', type: 'llm' }
+      const t3: Task = { ...makeTask('task-3'), status: 'pending', type: 'image' }
+      await store.saveTask(t1)
+      await store.saveTask(t2)
+      await store.saveTask(t3)
+
+      const tasks = await store.listTasks({ status: ['pending'], types: ['llm'] })
+      expect(tasks).toHaveLength(1)
+      expect(tasks[0]!.id).toBe('task-1')
+    })
+  })
+
+  // ─── Worker state ───────────────────────────────────────────────────────
+
+  describe('worker state', () => {
+    function makeWorker(id = 'worker-1'): Worker {
+      return {
+        id,
+        status: 'idle',
+        matchRule: { taskTypes: ['llm'] },
+        capacity: 5,
+        usedSlots: 0,
+        weight: 1,
+        connectionMode: 'pull',
+        connectedAt: 1000,
+        lastHeartbeatAt: 1000,
+      }
+    }
+
+    // ─── saveWorker / getWorker ───────────────────────────────────────────
+
+    it('should save and retrieve a worker', async () => {
+      const worker = makeWorker()
+      await store.saveWorker(worker)
+      const retrieved = await store.getWorker('worker-1')
+      expect(retrieved).toEqual(worker)
+    })
+
+    it('should return null for a missing worker', async () => {
+      const result = await store.getWorker('nonexistent')
+      expect(result).toBeNull()
+    })
+
+    it('should upsert worker on conflict (update status)', async () => {
+      const worker = makeWorker()
+      await store.saveWorker(worker)
+
+      const updated: Worker = { ...worker, status: 'busy', usedSlots: 3, lastHeartbeatAt: 2000 }
+      await store.saveWorker(updated)
+
+      const retrieved = await store.getWorker('worker-1')
+      expect(retrieved).toEqual(updated)
+      expect(retrieved!.status).toBe('busy')
+      expect(retrieved!.usedSlots).toBe(3)
+    })
+
+    it('should preserve optional metadata on worker round-trip', async () => {
+      const worker: Worker = {
+        ...makeWorker(),
+        metadata: { region: 'us-east', gpu: true },
+      }
+      await store.saveWorker(worker)
+      const retrieved = await store.getWorker('worker-1')
+      expect(retrieved).toEqual(worker)
+      expect(retrieved!.metadata).toEqual({ region: 'us-east', gpu: true })
+    })
+
+    it('should handle worker with no metadata', async () => {
+      const worker = makeWorker()
+      await store.saveWorker(worker)
+      const retrieved = await store.getWorker('worker-1')
+      expect(retrieved!.metadata).toBeUndefined()
+    })
+
+    it('should preserve matchRule with tags', async () => {
+      const worker: Worker = {
+        ...makeWorker(),
+        matchRule: {
+          taskTypes: ['llm', 'image'],
+          tags: { all: ['gpu'], none: ['deprecated'] },
+        },
+      }
+      await store.saveWorker(worker)
+      const retrieved = await store.getWorker('worker-1')
+      expect(retrieved!.matchRule).toEqual({
+        taskTypes: ['llm', 'image'],
+        tags: { all: ['gpu'], none: ['deprecated'] },
+      })
+    })
+
+    it('should preserve websocket connectionMode', async () => {
+      const worker: Worker = { ...makeWorker(), connectionMode: 'websocket' }
+      await store.saveWorker(worker)
+      const retrieved = await store.getWorker('worker-1')
+      expect(retrieved!.connectionMode).toBe('websocket')
+    })
+
+    // ─── listWorkers ──────────────────────────────────────────────────────
+
+    it('should list all workers with no filter', async () => {
+      await store.saveWorker(makeWorker('worker-1'))
+      await store.saveWorker(makeWorker('worker-2'))
+      await store.saveWorker(makeWorker('worker-3'))
+
+      const workers = await store.listWorkers()
+      expect(workers).toHaveLength(3)
+    })
+
+    it('should return empty array when no workers exist', async () => {
+      const workers = await store.listWorkers()
+      expect(workers).toEqual([])
+    })
+
+    it('should filter workers by status', async () => {
+      await store.saveWorker({ ...makeWorker('worker-1'), status: 'idle' })
+      await store.saveWorker({ ...makeWorker('worker-2'), status: 'busy' })
+      await store.saveWorker({ ...makeWorker('worker-3'), status: 'draining' })
+
+      const idle = await store.listWorkers({ status: ['idle'] })
+      expect(idle).toHaveLength(1)
+      expect(idle[0]!.id).toBe('worker-1')
+
+      const idleOrBusy = await store.listWorkers({ status: ['idle', 'busy'] })
+      expect(idleOrBusy).toHaveLength(2)
+    })
+
+    it('should filter workers by connectionMode', async () => {
+      await store.saveWorker({ ...makeWorker('worker-1'), connectionMode: 'pull' })
+      await store.saveWorker({ ...makeWorker('worker-2'), connectionMode: 'websocket' })
+      await store.saveWorker({ ...makeWorker('worker-3'), connectionMode: 'pull' })
+
+      const pullWorkers = await store.listWorkers({ connectionMode: ['pull'] })
+      expect(pullWorkers).toHaveLength(2)
+      expect(pullWorkers.every((w) => w.connectionMode === 'pull')).toBe(true)
+    })
+
+    it('should combine status and connectionMode filters', async () => {
+      await store.saveWorker({ ...makeWorker('worker-1'), status: 'idle', connectionMode: 'pull' })
+      await store.saveWorker({ ...makeWorker('worker-2'), status: 'busy', connectionMode: 'websocket' })
+      await store.saveWorker({ ...makeWorker('worker-3'), status: 'idle', connectionMode: 'websocket' })
+
+      const result = await store.listWorkers({ status: ['idle'], connectionMode: ['websocket'] })
+      expect(result).toHaveLength(1)
+      expect(result[0]!.id).toBe('worker-3')
+    })
+
+    // ─── deleteWorker ─────────────────────────────────────────────────────
+
+    it('should delete a worker', async () => {
+      await store.saveWorker(makeWorker('worker-1'))
+      await store.deleteWorker('worker-1')
+      const result = await store.getWorker('worker-1')
+      expect(result).toBeNull()
+    })
+
+    it('should not throw when deleting a nonexistent worker', async () => {
+      await expect(store.deleteWorker('nonexistent')).resolves.toBeUndefined()
+    })
+
+    it('should only delete the specified worker', async () => {
+      await store.saveWorker(makeWorker('worker-1'))
+      await store.saveWorker(makeWorker('worker-2'))
+      await store.deleteWorker('worker-1')
+
+      expect(await store.getWorker('worker-1')).toBeNull()
+      expect(await store.getWorker('worker-2')).not.toBeNull()
+    })
+
+    // ─── claimTask ────────────────────────────────────────────────────────
+
+    describe('claimTask', () => {
+      it('should successfully claim a pending task', async () => {
+        await store.saveTask(makeTask('task-1'))
+        await store.saveWorker(makeWorker('worker-1'))
+
+        const result = await store.claimTask('task-1', 'worker-1', 1)
+        expect(result).toBe(true)
+
+        const task = await store.getTask('task-1')
+        expect(task!.status).toBe('assigned')
+        expect(task!.assignedWorker).toBe('worker-1')
+        expect(task!.cost).toBe(1)
+
+        const worker = await store.getWorker('worker-1')
+        expect(worker!.usedSlots).toBe(1)
+      })
+
+      it('should fail to claim when worker does not exist', async () => {
+        await store.saveTask(makeTask('task-1'))
+
+        const result = await store.claimTask('task-1', 'nonexistent', 1)
+        expect(result).toBe(false)
+
+        // Task should remain unchanged
+        const task = await store.getTask('task-1')
+        expect(task!.status).toBe('pending')
+      })
+
+      it('should fail to claim when task does not exist', async () => {
+        await store.saveWorker(makeWorker('worker-1'))
+
+        const result = await store.claimTask('nonexistent', 'worker-1', 1)
+        expect(result).toBe(false)
+      })
+
+      it('should fail to claim when worker has insufficient capacity', async () => {
+        await store.saveTask(makeTask('task-1'))
+        await store.saveWorker({ ...makeWorker('worker-1'), capacity: 3, usedSlots: 2 })
+
+        const result = await store.claimTask('task-1', 'worker-1', 2)
+        expect(result).toBe(false)
+
+        // Task should remain unchanged
+        const task = await store.getTask('task-1')
+        expect(task!.status).toBe('pending')
+      })
+
+      it('should fail to claim a task that is already running', async () => {
+        const task: Task = { ...makeTask('task-1'), status: 'running' }
+        await store.saveTask(task)
+        await store.saveWorker(makeWorker('worker-1'))
+
+        const result = await store.claimTask('task-1', 'worker-1', 1)
+        expect(result).toBe(false)
+      })
+
+      it('should fail to claim a completed task', async () => {
+        const task: Task = { ...makeTask('task-1'), status: 'completed' }
+        await store.saveTask(task)
+        await store.saveWorker(makeWorker('worker-1'))
+
+        const result = await store.claimTask('task-1', 'worker-1', 1)
+        expect(result).toBe(false)
+      })
+
+      it('should allow claiming an already-assigned task (reassignment)', async () => {
+        const task: Task = { ...makeTask('task-1'), status: 'assigned', assignedWorker: 'worker-old' }
+        await store.saveTask(task)
+        await store.saveWorker(makeWorker('worker-1'))
+
+        const result = await store.claimTask('task-1', 'worker-1', 1)
+        expect(result).toBe(true)
+
+        const updated = await store.getTask('task-1')
+        expect(updated!.assignedWorker).toBe('worker-1')
+      })
+
+      it('should claim exactly at capacity boundary', async () => {
+        await store.saveTask(makeTask('task-1'))
+        await store.saveWorker({ ...makeWorker('worker-1'), capacity: 5, usedSlots: 3 })
+
+        const result = await store.claimTask('task-1', 'worker-1', 2)
+        expect(result).toBe(true)
+
+        const worker = await store.getWorker('worker-1')
+        expect(worker!.usedSlots).toBe(5)
+      })
+
+      it('should fail when cost exceeds remaining capacity by 1', async () => {
+        await store.saveTask(makeTask('task-1'))
+        await store.saveWorker({ ...makeWorker('worker-1'), capacity: 5, usedSlots: 3 })
+
+        const result = await store.claimTask('task-1', 'worker-1', 3)
+        expect(result).toBe(false)
+      })
+
+      it('should handle multiple claims on different tasks', async () => {
+        await store.saveTask(makeTask('task-1'))
+        await store.saveTask(makeTask('task-2'))
+        await store.saveWorker({ ...makeWorker('worker-1'), capacity: 10, usedSlots: 0 })
+
+        const r1 = await store.claimTask('task-1', 'worker-1', 3)
+        expect(r1).toBe(true)
+
+        const r2 = await store.claimTask('task-2', 'worker-1', 4)
+        expect(r2).toBe(true)
+
+        const worker = await store.getWorker('worker-1')
+        expect(worker!.usedSlots).toBe(7)
+      })
+    })
+
+    // ─── Worker assignments ───────────────────────────────────────────────
+
+    describe('worker assignments', () => {
+      function makeAssignment(taskId: string, workerId: string): WorkerAssignment {
+        return {
+          taskId,
+          workerId,
+          cost: 1,
+          assignedAt: 2000,
+          status: 'assigned',
+        }
+      }
+
+      // ─── addAssignment ────────────────────────────────────────────────
+
+      it('should save and retrieve an assignment by task', async () => {
+        const assignment = makeAssignment('task-1', 'worker-1')
+        await store.addAssignment(assignment)
+
+        const retrieved = await store.getTaskAssignment('task-1')
+        expect(retrieved).toEqual(assignment)
+      })
+
+      it('should upsert assignment on conflict (same taskId)', async () => {
+        const a1 = makeAssignment('task-1', 'worker-1')
+        await store.addAssignment(a1)
+
+        const a2: WorkerAssignment = { ...a1, workerId: 'worker-2', cost: 3, status: 'running' }
+        await store.addAssignment(a2)
+
+        const retrieved = await store.getTaskAssignment('task-1')
+        expect(retrieved!.workerId).toBe('worker-2')
+        expect(retrieved!.cost).toBe(3)
+        expect(retrieved!.status).toBe('running')
+      })
+
+      it('should preserve all assignment statuses', async () => {
+        for (const status of ['offered', 'assigned', 'running'] as const) {
+          const assignment: WorkerAssignment = {
+            taskId: `task-${status}`,
+            workerId: 'worker-1',
+            cost: 1,
+            assignedAt: 2000,
+            status,
+          }
+          await store.addAssignment(assignment)
+          const retrieved = await store.getTaskAssignment(`task-${status}`)
+          expect(retrieved!.status).toBe(status)
+        }
+      })
+
+      // ─── getTaskAssignment ────────────────────────────────────────────
+
+      it('should return null for a task with no assignment', async () => {
+        const result = await store.getTaskAssignment('nonexistent')
+        expect(result).toBeNull()
+      })
+
+      // ─── getWorkerAssignments ─────────────────────────────────────────
+
+      it('should return all assignments for a worker', async () => {
+        await store.addAssignment(makeAssignment('task-1', 'worker-1'))
+        await store.addAssignment(makeAssignment('task-2', 'worker-1'))
+        await store.addAssignment(makeAssignment('task-3', 'worker-2'))
+
+        const assignments = await store.getWorkerAssignments('worker-1')
+        expect(assignments).toHaveLength(2)
+        expect(assignments.map((a) => a.taskId).sort()).toEqual(['task-1', 'task-2'])
+      })
+
+      it('should return empty array for a worker with no assignments', async () => {
+        const assignments = await store.getWorkerAssignments('nonexistent')
+        expect(assignments).toEqual([])
+      })
+
+      // ─── removeAssignment ─────────────────────────────────────────────
+
+      it('should remove an assignment by taskId', async () => {
+        await store.addAssignment(makeAssignment('task-1', 'worker-1'))
+        await store.removeAssignment('task-1')
+
+        const result = await store.getTaskAssignment('task-1')
+        expect(result).toBeNull()
+      })
+
+      it('should not throw when removing a nonexistent assignment', async () => {
+        await expect(store.removeAssignment('nonexistent')).resolves.toBeUndefined()
+      })
+
+      it('should only remove the specified assignment', async () => {
+        await store.addAssignment(makeAssignment('task-1', 'worker-1'))
+        await store.addAssignment(makeAssignment('task-2', 'worker-1'))
+        await store.removeAssignment('task-1')
+
+        expect(await store.getTaskAssignment('task-1')).toBeNull()
+        expect(await store.getTaskAssignment('task-2')).not.toBeNull()
+      })
+
+      it('should reflect removal in getWorkerAssignments', async () => {
+        await store.addAssignment(makeAssignment('task-1', 'worker-1'))
+        await store.addAssignment(makeAssignment('task-2', 'worker-1'))
+
+        let assignments = await store.getWorkerAssignments('worker-1')
+        expect(assignments).toHaveLength(2)
+
+        await store.removeAssignment('task-1')
+
+        assignments = await store.getWorkerAssignments('worker-1')
+        expect(assignments).toHaveLength(1)
+        expect(assignments[0]!.taskId).toBe('task-2')
+      })
+    })
   })
 })

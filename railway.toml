@@ -1,10 +1,14 @@
 [build]
 builder = "dockerfile"
-dockerfilePath = "Dockerfile"
+dockerfilePath = "Dockerfile.railway"
 
 [deploy]
-startCommand = "node dist/index.js"
+startCommand = "taskcast start --port ${PORT:-3721} --storage redis"
 healthcheckPath = "/health"
-healthcheckTimeout = 5
+healthcheckTimeout = 10
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 3
+
+[variables]
+TASKCAST_REDIS_URL = "${{Redis.REDIS_URL}}"
+TASKCAST_POSTGRES_URL = "${{Postgres.DATABASE_URL}}"

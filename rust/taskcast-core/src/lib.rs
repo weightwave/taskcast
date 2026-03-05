@@ -6,6 +6,8 @@ pub mod memory_adapters;
 pub mod series;
 pub mod state_machine;
 pub mod types;
+pub mod worker_manager;
+pub mod worker_matching;
 
 pub use cleanup::*;
 pub use engine::*;
@@ -14,3 +16,5 @@ pub use memory_adapters::*;
 pub use series::*;
 pub use state_machine::*;
 pub use types::*;
+pub use worker_manager::*;
+pub use worker_matching::*;

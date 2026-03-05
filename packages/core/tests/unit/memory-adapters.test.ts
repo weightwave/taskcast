@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { MemoryBroadcastProvider, MemoryShortTermStore } from '../../src/memory-adapters.js'
-import type { TaskEvent } from '../../src/types.js'
+import type { Task, TaskEvent, Worker, WorkerAssignment } from '../../src/types.js'
 
 const makeEvent = (index = 0): TaskEvent => ({
   id: `evt-${index}`,
@@ -176,5 +176,327 @@ describe('MemoryShortTermStore', () => {
     const events = await store.getEvents('task-1')
     expect(events).toHaveLength(1)
     expect(events[0]?.id).toBe('evt-replaced')
+  })
+})
+
+// ─── Factory helpers ──────────────────────────────────────────────────────────
+
+const makeTask = (overrides: Partial<Task> = {}): Task => ({
+  id: 'task-1',
+  status: 'pending',
+  createdAt: 1000,
+  updatedAt: 1000,
+  ...overrides,
+})
+
+const makeWorker = (overrides: Partial<Worker> = {}): Worker => ({
+  id: 'worker-1',
+  status: 'idle',
+  matchRule: {},
+  capacity: 10,
+  usedSlots: 0,
+  weight: 1,
+  connectionMode: 'pull',
+  connectedAt: 1000,
+  lastHeartbeatAt: 1000,
+  ...overrides,
+})
+
+const makeAssignment = (overrides: Partial<WorkerAssignment> = {}): WorkerAssignment => ({
+  taskId: 'task-1',
+  workerId: 'worker-1',
+  cost: 1,
+  assignedAt: 1000,
+  status: 'assigned',
+  ...overrides,
+})
+
+// ─── listTasks ────────────────────────────────────────────────────────────────
+
+describe('MemoryShortTermStore.listTasks', () => {
+  it('returns all tasks when filter is empty', async () => {
+    const store = new MemoryShortTermStore()
+    await store.saveTask(makeTask({ id: 't1' }))
+    await store.saveTask(makeTask({ id: 't2' }))
+    const result = await store.listTasks({})
+    expect(result).toHaveLength(2)
+  })
+
+  it('filters by status', async () => {
+    const store = new MemoryShortTermStore()
+    await store.saveTask(makeTask({ id: 't1', status: 'pending' }))
+    await store.saveTask(makeTask({ id: 't2', status: 'running' }))
+    await store.saveTask(makeTask({ id: 't3', status: 'completed' }))
+    const result = await store.listTasks({ status: ['pending', 'running'] })
+    expect(result.map((t) => t.id).sort()).toEqual(['t1', 't2'])
+  })
+
+  it('filters by types', async () => {
+    const store = new MemoryShortTermStore()
+    await store.saveTask(makeTask({ id: 't1', type: 'llm' }))
+    await store.saveTask(makeTask({ id: 't2', type: 'agent' }))
+    await store.saveTask(makeTask({ id: 't3' })) // no type
+    const result = await store.listTasks({ types: ['llm'] })
+    expect(result).toHaveLength(1)
+    expect(result[0]!.id).toBe('t1')
+  })
+
+  it('filters by tags.all (all tags must be present)', async () => {
+    const store = new MemoryShortTermStore()
+    await store.saveTask(makeTask({ id: 't1', tags: ['gpu', 'fast'] }))
+    await store.saveTask(makeTask({ id: 't2', tags: ['gpu'] }))
+    const result = await store.listTasks({ tags: { all: ['gpu', 'fast'] } })
+    expect(result).toHaveLength(1)
+    expect(result[0]!.id).toBe('t1')
+  })
+
+  it('filters by tags.any (at least one tag must be present)', async () => {
+    const store = new MemoryShortTermStore()
+    await store.saveTask(makeTask({ id: 't1', tags: ['gpu'] }))
+    await store.saveTask(makeTask({ id: 't2', tags: ['cpu'] }))
+    await store.saveTask(makeTask({ id: 't3', tags: ['disk'] }))
+    const result = await store.listTasks({ tags: { any: ['gpu', 'cpu'] } })
+    expect(result.map((t) => t.id).sort()).toEqual(['t1', 't2'])
+  })
+
+  it('filters by tags.none (none of these tags may be present)', async () => {
+    const store = new MemoryShortTermStore()
+    await store.saveTask(makeTask({ id: 't1', tags: ['gpu'] }))
+    await store.saveTask(makeTask({ id: 't2', tags: ['cpu'] }))
+    await store.saveTask(makeTask({ id: 't3' })) // no tags
+    const result = await store.listTasks({ tags: { none: ['gpu'] } })
+    expect(result.map((t) => t.id).sort()).toEqual(['t2', 't3'])
+  })
+
+  it('filters by assignMode', async () => {
+    const store = new MemoryShortTermStore()
+    await store.saveTask(makeTask({ id: 't1', assignMode: 'pull' }))
+    await store.saveTask(makeTask({ id: 't2', assignMode: 'external' }))
+    await store.saveTask(makeTask({ id: 't3' })) // no assignMode
+    const result = await store.listTasks({ assignMode: ['pull'] })
+    expect(result).toHaveLength(1)
+    expect(result[0]!.id).toBe('t1')
+  })
+
+  it('filters by excludeTaskIds', async () => {
+    const store = new MemoryShortTermStore()
+    await store.saveTask(makeTask({ id: 't1' }))
+    await store.saveTask(makeTask({ id: 't2' }))
+    await store.saveTask(makeTask({ id: 't3' }))
+    const result = await store.listTasks({ excludeTaskIds: ['t1', 't3'] })
+    expect(result).toHaveLength(1)
+    expect(result[0]!.id).toBe('t2')
+  })
+
+  it('applies limit', async () => {
+    const store = new MemoryShortTermStore()
+    for (let i = 0; i < 5; i++) await store.saveTask(makeTask({ id: `t${i}` }))
+    const result = await store.listTasks({ limit: 2 })
+    expect(result).toHaveLength(2)
+  })
+
+  it('returns empty array when no tasks match', async () => {
+    const store = new MemoryShortTermStore()
+    await store.saveTask(makeTask({ id: 't1', status: 'pending' }))
+    const result = await store.listTasks({ status: ['completed'] })
+    expect(result).toEqual([])
+  })
+})
+
+// ─── Worker state ─────────────────────────────────────────────────────────────
+
+describe('MemoryShortTermStore.workers', () => {
+  it('saveWorker and getWorker roundtrip', async () => {
+    const store = new MemoryShortTermStore()
+    const worker = makeWorker()
+    await store.saveWorker(worker)
+    const retrieved = await store.getWorker('worker-1')
+    expect(retrieved).toEqual(worker)
+  })
+
+  it('getWorker returns null for missing worker', async () => {
+    const store = new MemoryShortTermStore()
+    expect(await store.getWorker('missing')).toBeNull()
+  })
+
+  it('saveWorker overwrites existing worker', async () => {
+    const store = new MemoryShortTermStore()
+    await store.saveWorker(makeWorker({ usedSlots: 0 }))
+    await store.saveWorker(makeWorker({ usedSlots: 5 }))
+    const retrieved = await store.getWorker('worker-1')
+    expect(retrieved!.usedSlots).toBe(5)
+  })
+
+  it('listWorkers returns all workers when no filter', async () => {
+    const store = new MemoryShortTermStore()
+    await store.saveWorker(makeWorker({ id: 'w1' }))
+    await store.saveWorker(makeWorker({ id: 'w2' }))
+    const result = await store.listWorkers()
+    expect(result).toHaveLength(2)
+  })
+
+  it('listWorkers filters by status', async () => {
+    const store = new MemoryShortTermStore()
+    await store.saveWorker(makeWorker({ id: 'w1', status: 'idle' }))
+    await store.saveWorker(makeWorker({ id: 'w2', status: 'busy' }))
+    await store.saveWorker(makeWorker({ id: 'w3', status: 'offline' }))
+    const result = await store.listWorkers({ status: ['idle', 'busy'] })
+    expect(result.map((w) => w.id).sort()).toEqual(['w1', 'w2'])
+  })
+
+  it('listWorkers filters by connectionMode', async () => {
+    const store = new MemoryShortTermStore()
+    await store.saveWorker(makeWorker({ id: 'w1', connectionMode: 'pull' }))
+    await store.saveWorker(makeWorker({ id: 'w2', connectionMode: 'websocket' }))
+    const result = await store.listWorkers({ connectionMode: ['websocket'] })
+    expect(result).toHaveLength(1)
+    expect(result[0]!.id).toBe('w2')
+  })
+
+  it('deleteWorker removes the worker', async () => {
+    const store = new MemoryShortTermStore()
+    await store.saveWorker(makeWorker({ id: 'w1' }))
+    await store.deleteWorker('w1')
+    expect(await store.getWorker('w1')).toBeNull()
+  })
+
+  it('deleteWorker is a no-op for missing worker', async () => {
+    const store = new MemoryShortTermStore()
+    // Should not throw
+    await store.deleteWorker('nonexistent')
+    expect(await store.listWorkers()).toHaveLength(0)
+  })
+})
+
+// ─── claimTask ────────────────────────────────────────────────────────────────
+
+describe('MemoryShortTermStore.claimTask', () => {
+  it('successfully claims a pending task', async () => {
+    const store = new MemoryShortTermStore()
+    await store.saveWorker(makeWorker({ id: 'w1', capacity: 10 }))
+    await store.saveTask(makeTask({ id: 't1', status: 'pending' }))
+    const result = await store.claimTask('t1', 'w1', 2)
+    expect(result).toBe(true)
+    const task = await store.getTask('t1')
+    expect(task!.status).toBe('assigned')
+    expect(task!.assignedWorker).toBe('w1')
+    expect(task!.cost).toBe(2)
+    const worker = await store.getWorker('w1')
+    expect(worker!.usedSlots).toBe(2)
+  })
+
+  it('successfully claims an assigned task (re-assignment)', async () => {
+    const store = new MemoryShortTermStore()
+    await store.saveWorker(makeWorker({ id: 'w-new', capacity: 10 }))
+    await store.saveTask(makeTask({ id: 't1', status: 'assigned', assignedWorker: 'w-old' }))
+    const result = await store.claimTask('t1', 'w-new', 1)
+    expect(result).toBe(true)
+    const task = await store.getTask('t1')
+    expect(task!.assignedWorker).toBe('w-new')
+  })
+
+  it('rejects claim when worker capacity exceeded', async () => {
+    const store = new MemoryShortTermStore()
+    await store.saveWorker(makeWorker({ id: 'w1', capacity: 1, usedSlots: 0 }))
+    await store.saveTask(makeTask({ id: 't1', status: 'pending' }))
+    const result = await store.claimTask('t1', 'w1', 2)
+    expect(result).toBe(false)
+  })
+
+  it('rejects claim for unregistered worker', async () => {
+    const store = new MemoryShortTermStore()
+    await store.saveTask(makeTask({ id: 't1', status: 'pending' }))
+    const result = await store.claimTask('t1', 'unknown-worker', 1)
+    expect(result).toBe(false)
+  })
+
+  it('rejects claim for running task', async () => {
+    const store = new MemoryShortTermStore()
+    await store.saveTask(makeTask({ id: 't1', status: 'running' }))
+    const result = await store.claimTask('t1', 'w1', 1)
+    expect(result).toBe(false)
+  })
+
+  it('rejects claim for completed task', async () => {
+    const store = new MemoryShortTermStore()
+    await store.saveTask(makeTask({ id: 't1', status: 'completed' }))
+    const result = await store.claimTask('t1', 'w1', 1)
+    expect(result).toBe(false)
+  })
+
+  it('rejects claim for failed task', async () => {
+    const store = new MemoryShortTermStore()
+    await store.saveTask(makeTask({ id: 't1', status: 'failed' }))
+    const result = await store.claimTask('t1', 'w1', 1)
+    expect(result).toBe(false)
+  })
+
+  it('rejects claim for missing task', async () => {
+    const store = new MemoryShortTermStore()
+    const result = await store.claimTask('nonexistent', 'w1', 1)
+    expect(result).toBe(false)
+  })
+
+  it('updates updatedAt timestamp on successful claim', async () => {
+    const store = new MemoryShortTermStore()
+    await store.saveWorker(makeWorker({ id: 'w1', capacity: 10 }))
+    await store.saveTask(makeTask({ id: 't1', updatedAt: 1000 }))
+    await store.claimTask('t1', 'w1', 1)
+    const task = await store.getTask('t1')
+    expect(task!.updatedAt).toBeGreaterThan(1000)
+  })
+})
+
+// ─── Worker assignments ───────────────────────────────────────────────────────
+
+describe('MemoryShortTermStore.assignments', () => {
+  it('addAssignment and getTaskAssignment roundtrip', async () => {
+    const store = new MemoryShortTermStore()
+    const assignment = makeAssignment()
+    await store.addAssignment(assignment)
+    const retrieved = await store.getTaskAssignment('task-1')
+    expect(retrieved).toEqual(assignment)
+  })
+
+  it('getTaskAssignment returns null for missing task', async () => {
+    const store = new MemoryShortTermStore()
+    expect(await store.getTaskAssignment('nonexistent')).toBeNull()
+  })
+
+  it('getWorkerAssignments returns all assignments for a worker', async () => {
+    const store = new MemoryShortTermStore()
+    await store.addAssignment(makeAssignment({ taskId: 't1', workerId: 'w1' }))
+    await store.addAssignment(makeAssignment({ taskId: 't2', workerId: 'w1' }))
+    await store.addAssignment(makeAssignment({ taskId: 't3', workerId: 'w2' }))
+    const result = await store.getWorkerAssignments('w1')
+    expect(result).toHaveLength(2)
+    expect(result.map((a) => a.taskId).sort()).toEqual(['t1', 't2'])
+  })
+
+  it('getWorkerAssignments returns empty array for worker with no assignments', async () => {
+    const store = new MemoryShortTermStore()
+    const result = await store.getWorkerAssignments('w-no-assignments')
+    expect(result).toEqual([])
+  })
+
+  it('removeAssignment deletes the assignment', async () => {
+    const store = new MemoryShortTermStore()
+    await store.addAssignment(makeAssignment({ taskId: 't1', workerId: 'w1' }))
+    await store.removeAssignment('t1')
+    expect(await store.getTaskAssignment('t1')).toBeNull()
+  })
+
+  it('removeAssignment is a no-op for missing assignment', async () => {
+    const store = new MemoryShortTermStore()
+    // Should not throw
+    await store.removeAssignment('nonexistent')
+  })
+
+  it('addAssignment overwrites existing assignment for same taskId', async () => {
+    const store = new MemoryShortTermStore()
+    await store.addAssignment(makeAssignment({ taskId: 't1', workerId: 'w1' }))
+    await store.addAssignment(makeAssignment({ taskId: 't1', workerId: 'w2' }))
+    const retrieved = await store.getTaskAssignment('t1')
+    expect(retrieved!.workerId).toBe('w2')
   })
 })

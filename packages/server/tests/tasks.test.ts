@@ -7,7 +7,7 @@ import type { AuthContext } from '../src/auth.js'
 function makeApp() {
   const store = new MemoryShortTermStore()
   const broadcast = new MemoryBroadcastProvider()
-  const engine = new TaskEngine({ shortTerm: store, broadcast })
+  const engine = new TaskEngine({ shortTermStore: store, broadcast })
   const app = new Hono()
   app.use('*', async (c, next) => {
     const auth: AuthContext = { taskIds: '*', scope: ['*'] }
@@ -191,6 +191,56 @@ describe('GET /tasks/:taskId/events/history', () => {
     const types = body.map((e: { type: string }) => e.type)
     expect(types).toContain('second')
     expect(types).not.toContain('first')
+  })
+})
+
+describe('POST /tasks - worker assignment fields', () => {
+  it('accepts tags, assignMode, cost, disconnectPolicy', async () => {
+    const { app } = makeApp()
+    const res = await app.request('/tasks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        type: 'gpu-task',
+        tags: ['gpu', 'high-priority'],
+        assignMode: 'pull',
+        cost: 3,
+        disconnectPolicy: 'reassign',
+      }),
+    })
+    expect(res.status).toBe(201)
+    const body = await res.json()
+    expect(body.tags).toEqual(['gpu', 'high-priority'])
+    expect(body.assignMode).toBe('pull')
+    expect(body.cost).toBe(3)
+    expect(body.disconnectPolicy).toBe('reassign')
+  })
+
+  it('rejects invalid assignMode', async () => {
+    const { app } = makeApp()
+    const res = await app.request('/tasks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        assignMode: 'invalid-mode',
+      }),
+    })
+    expect(res.status).toBe(400)
+  })
+})
+
+describe('PATCH /tasks/:taskId/status - assigned status', () => {
+  it('accepts assigned status', async () => {
+    const { app, engine } = makeApp()
+    const task = await engine.createTask({})
+    const res = await app.request(`/tasks/${task.id}/status`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: 'assigned' }),
+    })
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.status).toBe('assigned')
   })
 })
 

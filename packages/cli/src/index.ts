@@ -8,6 +8,7 @@ import { join } from 'path'
 import { homedir } from 'os'
 import {
   TaskEngine,
+  WorkerManager,
   loadConfigFile,
   MemoryBroadcastProvider,
   MemoryShortTermStore,
@@ -30,10 +31,10 @@ port: 3721
 #   broadcast:
 #     provider: memory  # memory | redis
 #     # url: redis://localhost:6379
-#   shortTerm:
+#   shortTermStore:
 #     provider: memory  # memory | redis
 #     # url: redis://localhost:6379
-#   longTerm:
+#   longTermStore:
 #     provider: postgres
 #     # url: postgresql://localhost:5432/taskcast
 `
@@ -101,7 +102,7 @@ program
 
     const port = Number(options.port ?? fileConfig.port ?? 3721)
     const redisUrl = process.env['TASKCAST_REDIS_URL'] ?? fileConfig.adapters?.broadcast?.url
-    const postgresUrl = process.env['TASKCAST_POSTGRES_URL'] ?? fileConfig.adapters?.longTerm?.url
+    const postgresUrl = process.env['TASKCAST_POSTGRES_URL'] ?? fileConfig.adapters?.longTermStore?.url
 
     let shortTermStore: ShortTermStore
     let broadcast: BroadcastProvider
@@ -113,8 +114,8 @@ program
       const sqliteOpts = options.dbPath ? { path: options.dbPath } : {}
       const adapters = createSqliteAdapters(sqliteOpts)
       broadcast = new MemoryBroadcastProvider()
-      shortTermStore = adapters.shortTerm
-      longTermStore = adapters.longTerm
+      shortTermStore = adapters.shortTermStore
+      longTermStore = adapters.longTermStore
       console.log(`[taskcast] Using SQLite storage at ${options.dbPath ?? './taskcast.db'}`)
     } else if (storage === 'redis' || redisUrl) {
       const pubClient = new Redis(redisUrl!)
@@ -139,10 +140,28 @@ program
     const engine = new TaskEngine(engineOpts)
 
     const authMode = (process.env['TASKCAST_AUTH_MODE'] ?? fileConfig.auth?.mode ?? 'none') as 'none' | 'jwt'
-    const app = createTaskcastApp({
+
+    // Worker assignment system
+    const workersEnabled = fileConfig.workers?.enabled ?? false
+    let workerManager: WorkerManager | undefined
+    if (workersEnabled) {
+      console.log('[taskcast] Worker assignment system enabled')
+      const wmOpts: ConstructorParameters<typeof WorkerManager>[0] = {
+        engine,
+        shortTermStore,
+        broadcast,
+      }
+      if (longTermStore !== undefined) wmOpts.longTermStore = longTermStore
+      if (fileConfig.workers?.defaults) wmOpts.defaults = fileConfig.workers.defaults
+      workerManager = new WorkerManager(wmOpts)
+    }
+
+    const serverOpts: Parameters<typeof createTaskcastApp>[0] = {
       engine,
       auth: { mode: authMode },
-    })
+    }
+    if (workerManager !== undefined) serverOpts.workerManager = workerManager
+    const app = createTaskcastApp(serverOpts)
 
     const { serve } = await import('@hono/node-server')
     serve({ fetch: app.fetch, port }, () => {
