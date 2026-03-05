@@ -200,7 +200,7 @@ interface LongTermStore {
 
 在写入短期层前处理：
 - `keep-all`：直接追加，广播原始 delta
-- `accumulate`：读取该 series 最新累积值，拼接 `data.text`，存合并结果，广播 delta
+- `accumulate`：读取该 series 最新累积值，拼接 `data.delta`（可通过 `seriesAccField` 自定义），存合并结果，广播 delta
 - `latest`：替换该 series 上一条记录，广播最新值
 
 ### 适配器
@@ -288,7 +288,7 @@ data: {"reason":"completed"}
 ```typescript
 // 单条
 POST /tasks/:taskId/events
-{ type: "llm.delta", level: "info", data: { text: "hello" },
+{ type: "llm.delta", level: "info", data: { delta: "hello" },
   seriesId: "msg-1", seriesMode: "accumulate" }
 
 // 批量

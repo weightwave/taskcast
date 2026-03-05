@@ -61,6 +61,8 @@ pub fn make_event(task_id: &str, index: u64) -> TaskEvent {
         data: serde_json::json!({"text": format!("msg-{}", index)}),
         series_id: None,
         series_mode: None,
+
+        series_acc_field: None,
     }
 }
 

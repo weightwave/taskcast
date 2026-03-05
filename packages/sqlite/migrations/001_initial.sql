@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS taskcast_events (
   data TEXT,
   series_id TEXT,
   series_mode TEXT,
+  series_acc_field TEXT,
   UNIQUE(task_id, idx)
 );
 

@@ -2,7 +2,7 @@
 
 # Taskcast
 
-**Unified long-lifecycle task tracking service for LLM streaming, agents, and beyond.**
+**Simple mental model. Out-of-the-box task tracking for LLM streaming, agents, and async workloads.**
 
 [![npm version](https://img.shields.io/npm/v/@taskcast/core?label=%40taskcast%2Fcore&color=blue)](https://www.npmjs.com/package/@taskcast/core)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
@@ -16,14 +16,16 @@
 
 ---
 
-Traditional SSE connections lose all state on page refresh. Multiple clients cannot subscribe to the same task stream. Taskcast solves this with a unified task tracking service that provides **persistent state**, **resumable subscriptions**, and **multi-client fan-out** — purpose-built for LLM streaming outputs and agent workflows.
+Create a task, publish events, subscribe — that's the whole mental model. Yet Taskcast ships everything out of the box: **persistent state**, **resumable subscriptions**, **multi-client fan-out**, **optional worker management**, and a pluggable storage stack from a single SQLite file to Redis + PostgreSQL. Purpose-built for LLM streaming outputs and agent workflows.
 
 ## Highlights
 
 - **Resumable SSE Streaming** — Reconnect from any point using event ID, filtered index, or timestamp. Never lose progress on page refresh.
 - **Multi-Client Fan-Out** — Multiple browser tabs, devices, or services subscribe to the same task in real time.
-- **Series Message Merging** — Built-in support for streaming text accumulation (`accumulate`), latest-value replacement (`latest`), and full history (`keep-all`).
-- **Three-Layer Storage** — Broadcast (Redis pub/sub) + Short-term (Redis) + Long-term (PostgreSQL). Each layer is pluggable and optional.
+- **Series Message Merging** — Built-in support for streaming text accumulation (`accumulate`, default field follows ChatCompletion delta format), latest-value replacement (`latest`), and full history (`keep-all`).
+- **Three-Layer Storage** — Broadcast (Redis pub/sub | Memory) + Short-term (Redis | SQLite | Memory) + Long-term (PostgreSQL | SQLite). Each layer is pluggable and independently optional.
+- **Worker Management** *(optional)* — Built-in task assignment with pull (long-poll) and WebSocket (offer/race) modes. Capacity tracking, matching rules, and automatic reassignment on disconnect.
+- **Rust Server** — Drop-in native binary (`taskcast-rs`) for optimal performance and minimal resource usage. Same API, same behavior, zero Node.js dependency.
 - **Flexible Authentication** — No auth, JWT, or custom middleware. Fine-grained permission scopes down to individual tasks.
 - **SDK-First Architecture** — Zero HTTP dependencies in core. Embed into your existing server or run standalone with `npx taskcast`.
 
@@ -32,42 +34,35 @@ Traditional SSE connections lose all state on page refresh. Multiple clients can
 ```mermaid
 graph TB
     subgraph Clients
-        Browser["Browser<br/>@taskcast/client"]
-        ReactApp["React App<br/>@taskcast/react"]
+        Browser["Browser / React App<br/>@taskcast/client · @taskcast/react"]
         Backend["Your Backend<br/>@taskcast/server-sdk"]
     end
 
-    subgraph Server["@taskcast/server (Hono)"]
+    Workers["Workers (optional)<br/>Long-Poll | WebSocket"]
+
+    subgraph Server["@taskcast/server · Auth · Webhooks"]
         REST["REST API"]
         SSE["SSE Streaming"]
-        Auth["Auth Middleware"]
-        Webhook["Webhook Delivery"]
     end
 
-    subgraph Engine["@taskcast/core"]
-        TaskEngine["Task Engine"]
-        StateMachine["State Machine"]
-        Filter["Event Filter"]
-        Series["Series Merger"]
+    subgraph Core["@taskcast/core"]
+        Engine["Task Engine<br/>State Machine · Filter · Series"]
     end
 
-    subgraph Storage
-        Broadcast["Broadcast Layer<br/>Redis Pub/Sub | Memory"]
-        ShortTerm["Short-Term Store<br/>Redis | Memory"]
-        LongTerm["Long-Term Store<br/>PostgreSQL (optional)"]
+    subgraph Storage["Storage (pluggable)"]
+        Broadcast["Broadcast — Redis Pub/Sub | Memory"]
+        ShortTerm["Short-Term — Redis | SQLite | Memory"]
+        LongTerm["Long-Term — PostgreSQL | SQLite (optional)"]
     end
 
     Browser -->|SSE| SSE
-    ReactApp -->|SSE| SSE
     Backend -->|HTTP| REST
-
-    REST --> Auth --> TaskEngine
-    SSE --> Auth --> TaskEngine
-
-    TaskEngine --> Broadcast
-    TaskEngine --> ShortTerm
-    TaskEngine -.->|async| LongTerm
-    TaskEngine --> Webhook
+    Workers -.->|pull / ws| REST
+    REST --> Engine
+    SSE --> Engine
+    Engine --> Broadcast
+    Engine --> ShortTerm
+    Engine -.->|async| LongTerm
 ```
 
 ### Deployment Modes
@@ -78,10 +73,10 @@ graph TB
 Your Server → @taskcast/core + adapters → @taskcast/server (Hono router)
 ```
 
-**Standalone** — Run as an independent service, connect via HTTP SDK:
+**Remote (Recommended)** — Run as an independent microservice, connect via RESTful API. Clean service boundary, independently scalable. Docker ready.
 
 ```
-Your Server → @taskcast/server-sdk → standalone taskcast server ← @taskcast/client (browser)
+Your Server → @taskcast/server-sdk (REST) → taskcast service ← @taskcast/client (browser)
 ```
 
 ## Quick Start
@@ -137,7 +132,7 @@ await engine.transitionTask(task.id, 'running')
 await engine.publishEvent(task.id, {
   type: 'llm.delta',
   level: 'info',
-  data: { text: 'Once upon a time...' },
+  data: { delta: 'Once upon a time...' },
   seriesId: 'response',
   seriesMode: 'accumulate',
 })
@@ -205,9 +200,20 @@ function TaskStream({ taskId }: { taskId: string }) {
 | [`@taskcast/client`](./packages/client) | Browser SSE subscription client | `pnpm add @taskcast/client` |
 | [`@taskcast/react`](./packages/react) | React hooks (`useTaskEvents`) | `pnpm add @taskcast/react` |
 | [`@taskcast/cli`](./packages/cli) | Standalone server CLI | `npx taskcast` |
+| [`@taskcast/sqlite`](./packages/sqlite) | SQLite adapter (short-term + long-term store) | `pnpm add @taskcast/sqlite` |
 | [`@taskcast/redis`](./packages/redis) | Redis adapters (broadcast + short-term store) | `pnpm add @taskcast/redis` |
 | [`@taskcast/postgres`](./packages/postgres) | PostgreSQL adapter (long-term store) | `pnpm add @taskcast/postgres` |
 | [`@taskcast/sentry`](./packages/sentry) | Sentry error monitoring hooks | `pnpm add @taskcast/sentry` |
+
+## Rust Server
+
+A native Rust binary (`taskcast-rs`) is available as a drop-in replacement for the Node.js server. Built with Axum + Tokio + sqlx, it produces identical HTTP behavior — same paths, same JSON format, same SSE events, same status codes. Use it when you need optimal throughput or minimal resource footprint.
+
+Pre-built binaries for Linux (amd64/arm64), macOS (amd64/arm64), and Windows are attached to each [GitHub Release](https://github.com/weightwave/taskcast/releases). A multi-arch Docker image is also available:
+
+```bash
+docker run -p 3721:3721 mwr1998/taskcast-rs
+```
 
 ## Configuration
 
@@ -288,6 +294,9 @@ cleanup:
 | `POST` | `/tasks/:taskId/events` | Publish event(s) |
 | `GET` | `/tasks/:taskId/events` | Subscribe via SSE |
 | `GET` | `/tasks/:taskId/events/history` | Query event history |
+| `POST` | `/workers/register` | Register a worker |
+| `GET` | `/workers/pull` | Long-poll for task assignment |
+| `WS` | `/workers/ws` | WebSocket worker connection |
 
 ### SSE Query Parameters
 
@@ -306,12 +315,18 @@ cleanup:
 ```mermaid
 stateDiagram-v2
     [*] --> pending
+    pending --> assigned : worker claimed
     pending --> running
     pending --> cancelled
+    assigned --> running
+    assigned --> cancelled
+    running --> paused
     running --> completed
     running --> failed
     running --> timeout
     running --> cancelled
+    paused --> running
+    paused --> cancelled
 ```
 
 ### Permission Scopes

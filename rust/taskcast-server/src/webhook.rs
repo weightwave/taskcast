@@ -245,6 +245,7 @@ mod tests {
             data: serde_json::json!({ "percent": 50 }),
             series_id: None,
             series_mode: None,
+            series_acc_field: None,
         }
     }
 

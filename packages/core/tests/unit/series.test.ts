@@ -9,7 +9,7 @@ const makeEvent = (overrides: Partial<TaskEvent> = {}): TaskEvent => ({
   timestamp: 1000,
   type: 'llm.delta',
   level: 'info',
-  data: { text: 'hello' },
+  data: { delta: 'hello' },
   ...overrides,
 })
 
@@ -37,24 +37,24 @@ describe('processSeries - keep-all', () => {
 })
 
 describe('processSeries - accumulate', () => {
-  it('concatenates text when previous exists', async () => {
-    const prev = makeEvent({ data: { text: 'hello ' }, seriesId: 's1', seriesMode: 'accumulate' })
+  it('concatenates delta field when previous exists', async () => {
+    const prev = makeEvent({ data: { delta: 'hello ' }, seriesId: 's1', seriesMode: 'accumulate' })
     const store = makeStore(prev)
-    const event = makeEvent({ data: { text: 'world' }, seriesId: 's1', seriesMode: 'accumulate' })
+    const event = makeEvent({ data: { delta: 'world' }, seriesId: 's1', seriesMode: 'accumulate' })
     const result = await processSeries(event, store)
-    expect((result.data as { text: string }).text).toBe('hello world')
+    expect((result.data as { delta: string }).delta).toBe('hello world')
     expect(store.setSeriesLatest).toHaveBeenCalledWith('task-1', 's1', result)
   })
 
   it('returns event unchanged when no previous', async () => {
     const store = makeStore()
-    const event = makeEvent({ data: { text: 'start' }, seriesId: 's1', seriesMode: 'accumulate' })
+    const event = makeEvent({ data: { delta: 'start' }, seriesId: 's1', seriesMode: 'accumulate' })
     const result = await processSeries(event, store)
-    expect((result.data as { text: string }).text).toBe('start')
+    expect((result.data as { delta: string }).delta).toBe('start')
     expect(store.setSeriesLatest).toHaveBeenCalledWith('task-1', 's1', result)
   })
 
-  it('handles non-text data gracefully (returns event unchanged)', async () => {
+  it('handles non-delta data gracefully (returns event unchanged)', async () => {
     const prev = makeEvent({ data: { count: 1 }, seriesId: 's1', seriesMode: 'accumulate' })
     const store = makeStore(prev)
     const event = makeEvent({ data: { count: 2 }, seriesId: 's1', seriesMode: 'accumulate' })
@@ -63,32 +63,46 @@ describe('processSeries - accumulate', () => {
     expect(store.setSeriesLatest).toHaveBeenCalled()
   })
 
-  it('treats null prev.data as empty object (no text concat)', async () => {
+  it('treats null prev.data as empty object (no concat)', async () => {
     const prev = makeEvent({ data: null, seriesId: 's1', seriesMode: 'accumulate' })
     const store = makeStore(prev)
-    const event = makeEvent({ data: { text: 'world' }, seriesId: 's1', seriesMode: 'accumulate' })
+    const event = makeEvent({ data: { delta: 'world' }, seriesId: 's1', seriesMode: 'accumulate' })
     const result = await processSeries(event, store)
-    // prevData is {} (null -> fallback), newData.text is 'world' but prevData.text is not a string → no concat
-    expect((result.data as { text: string }).text).toBe('world')
+    expect((result.data as { delta: string }).delta).toBe('world')
     expect(store.setSeriesLatest).toHaveBeenCalled()
   })
 
-  it('treats null event.data as empty object (no text concat)', async () => {
-    const prev = makeEvent({ data: { text: 'hello ' }, seriesId: 's1', seriesMode: 'accumulate' })
+  it('treats null event.data as empty object (no concat)', async () => {
+    const prev = makeEvent({ data: { delta: 'hello ' }, seriesId: 's1', seriesMode: 'accumulate' })
     const store = makeStore(prev)
     const event = makeEvent({ data: null, seriesId: 's1', seriesMode: 'accumulate' })
     const result = await processSeries(event, store)
-    // newData is {} (null -> fallback), newData.text is not a string → no concat
     expect(result.data).toBeNull()
     expect(store.setSeriesLatest).toHaveBeenCalled()
+  })
+
+  it('supports custom seriesAccField', async () => {
+    const prev = makeEvent({ data: { content: 'hello ' }, seriesId: 's1', seriesMode: 'accumulate', seriesAccField: 'content' })
+    const store = makeStore(prev)
+    const event = makeEvent({ data: { content: 'world' }, seriesId: 's1', seriesMode: 'accumulate', seriesAccField: 'content' })
+    const result = await processSeries(event, store)
+    expect((result.data as { content: string }).content).toBe('hello world')
+  })
+
+  it('supports legacy text field via seriesAccField', async () => {
+    const prev = makeEvent({ data: { text: 'hello ' }, seriesId: 's1', seriesMode: 'accumulate', seriesAccField: 'text' })
+    const store = makeStore(prev)
+    const event = makeEvent({ data: { text: 'world' }, seriesId: 's1', seriesMode: 'accumulate', seriesAccField: 'text' })
+    const result = await processSeries(event, store)
+    expect((result.data as { text: string }).text).toBe('hello world')
   })
 })
 
 describe('processSeries - latest', () => {
   it('calls replaceLastSeriesEvent with new event', async () => {
-    const prev = makeEvent({ seriesId: 's1', seriesMode: 'latest', data: { text: 'old' } })
+    const prev = makeEvent({ seriesId: 's1', seriesMode: 'latest', data: { delta: 'old' } })
     const store = makeStore(prev)
-    const event = makeEvent({ seriesId: 's1', seriesMode: 'latest', data: { text: 'new' } })
+    const event = makeEvent({ seriesId: 's1', seriesMode: 'latest', data: { delta: 'new' } })
     const result = await processSeries(event, store)
     expect(result).toEqual(event)
     expect(store.replaceLastSeriesEvent).toHaveBeenCalledWith('task-1', 's1', event)
@@ -96,7 +110,7 @@ describe('processSeries - latest', () => {
 
   it('works with no previous event', async () => {
     const store = makeStore()
-    const event = makeEvent({ seriesId: 's1', seriesMode: 'latest', data: { text: 'first' } })
+    const event = makeEvent({ seriesId: 's1', seriesMode: 'latest', data: { delta: 'first' } })
     await processSeries(event, store)
     expect(store.replaceLastSeriesEvent).toHaveBeenCalledWith('task-1', 's1', event)
   })

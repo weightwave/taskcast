@@ -141,11 +141,13 @@ POST /tasks/:taskId/events
 {
   "type": "llm.delta",
   "level": "info",
-  "data": { "text": "Hello" },
+  "data": { "delta": "Hello" },
   "seriesId": "response",
   "seriesMode": "accumulate"
 }
 ```
+
+> **注意：** 在 `accumulate` 模式下，默认拼接的字段为 `delta`。可通过 `seriesAccField` 自定义拼接字段名。
 
 **批量事件：**
 
@@ -165,6 +167,7 @@ POST /tasks/:taskId/events
 | `data` | any | 是 | 事件数据，任意 JSON |
 | `seriesId` | string | 否 | 序列 ID，用于分组 |
 | `seriesMode` | string | 否 | `keep-all`/`accumulate`/`latest` |
+| `seriesAccField` | string | 否 | `accumulate` 模式下拼接的字段名（默认为 `delta`） |
 
 **响应：** `201 Created` — 返回创建的事件（单条）或事件数组（批量）
 
@@ -203,7 +206,7 @@ GET /tasks/:taskId/events/history
     "timestamp": 1700000000000,
     "type": "llm.delta",
     "level": "info",
-    "data": { "text": "Hello" }
+    "data": { "delta": "Hello" }
   }
 ]
 ```

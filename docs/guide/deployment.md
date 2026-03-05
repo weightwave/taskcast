@@ -81,7 +81,7 @@ const task = await taskcast.createTask({
 await taskcast.publishEvent(task.id, {
   type: 'llm.delta',
   level: 'info',
-  data: { text: 'Hello!' },
+  data: { delta: 'Hello!' },
 })
 
 // Complete the task

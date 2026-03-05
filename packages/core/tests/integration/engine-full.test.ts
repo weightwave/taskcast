@@ -79,14 +79,14 @@ describe('Full stack: task lifecycle', () => {
     await engine.publishEvent(task.id, {
       type: 'llm.delta',
       level: 'info',
-      data: { text: 'Hello' },
+      data: { delta: 'Hello' },
       seriesId: 'msg-1',
       seriesMode: 'accumulate',
     })
     await engine.publishEvent(task.id, {
       type: 'llm.delta',
       level: 'info',
-      data: { text: ' World' },
+      data: { delta: ' World' },
       seriesId: 'msg-1',
       seriesMode: 'accumulate',
     })

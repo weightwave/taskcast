@@ -165,6 +165,7 @@ impl WorkerManager {
                     data: serde_json::Value::Object(data),
                     series_id: None,
                     series_mode: None,
+                    series_acc_field: None,
                 },
             )
             .await;
@@ -702,6 +703,7 @@ impl WorkerManager {
             data: serde_json::Value::String(task_id.to_string()),
             series_id: None,
             series_mode: None,
+            series_acc_field: None,
         };
         self.broadcast
             .publish("taskcast:worker:new-task", event)

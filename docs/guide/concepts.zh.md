@@ -65,12 +65,12 @@ pending → cancelled
 
 ### accumulate
 
-文本累加模式。新事件的 `data.text` 会追加到系列已有的文本后面。存储的是累加后的完整文本，广播的是原始增量。
+文本累加模式。新事件的 `data.delta` 字段会追加到系列已有的值后面（类似 ChatCompletion 流式输出）。存储的是累加后的完整文本，广播的是原始增量。累加字段名默认为 `delta`，可通过 `seriesAccField` 自定义（如 `"text"` 或 `"content"`）。
 
 ```
-事件1: { seriesId: "s1", data: { text: "你" }, seriesMode: "accumulate" }
-事件2: { seriesId: "s1", data: { text: "好" }, seriesMode: "accumulate" }
-存储: 累加结果 → data.text = "你好"
+事件1: { seriesId: "s1", data: { delta: "你" }, seriesMode: "accumulate" }
+事件2: { seriesId: "s1", data: { delta: "好" }, seriesMode: "accumulate" }
+存储: 累加结果 → data.delta = "你好"
 广播: 每次发送原始增量
 ```
 

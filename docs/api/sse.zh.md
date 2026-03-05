@@ -56,11 +56,11 @@ GET /tasks/01HXXX/events?includeStatus=false&wrap=false
 ```
 event: taskcast.event
 id: 01HXXX001
-data: {"filteredIndex":0,"rawIndex":0,"eventId":"01HXXX001","taskId":"01HXXX","type":"llm.delta","timestamp":1700000000000,"level":"info","data":{"text":"Hello"},"seriesId":"response","seriesMode":"accumulate"}
+data: {"filteredIndex":0,"rawIndex":0,"eventId":"01HXXX001","taskId":"01HXXX","type":"llm.delta","timestamp":1700000000000,"level":"info","data":{"delta":"Hello"},"seriesId":"response","seriesMode":"accumulate"}
 
 event: taskcast.event
 id: 01HXXX002
-data: {"filteredIndex":1,"rawIndex":1,"eventId":"01HXXX002","taskId":"01HXXX","type":"llm.delta","timestamp":1700000000100,"level":"info","data":{"text":" world!"}}
+data: {"filteredIndex":1,"rawIndex":1,"eventId":"01HXXX002","taskId":"01HXXX","type":"llm.delta","timestamp":1700000000100,"level":"info","data":{"delta":" world!"}}
 ```
 
 ### 普通事件（wrap=false）
@@ -68,7 +68,7 @@ data: {"filteredIndex":1,"rawIndex":1,"eventId":"01HXXX002","taskId":"01HXXX","t
 ```
 event: taskcast.event
 id: 01HXXX001
-data: {"text":"Hello"}
+data: {"delta":"Hello"}
 ```
 
 ### 状态变更事件

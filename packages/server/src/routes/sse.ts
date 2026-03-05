@@ -47,6 +47,7 @@ function toEnvelope(event: TaskEvent, filteredIndex: number): SSEEnvelope {
   }
   if (event.seriesId !== undefined) env.seriesId = event.seriesId
   if (event.seriesMode !== undefined) env.seriesMode = event.seriesMode
+  if (event.seriesAccField !== undefined) env.seriesAccField = event.seriesAccField
   return env
 }
 

@@ -381,6 +381,8 @@ pub struct TaskEvent {
     pub series_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub series_mode: Option<SeriesMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub series_acc_field: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -398,6 +400,8 @@ pub struct SSEEnvelope {
     pub series_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub series_mode: Option<SeriesMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub series_acc_field: Option<String>,
 }
 
 // ─── Subscription ────────────────────────────────────────────────────────────
@@ -844,6 +848,7 @@ mod tests {
             data: json!({ "percent": 50 }),
             series_id: None,
             series_mode: None,
+            series_acc_field: None,
         };
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["id"], "evt_01");
@@ -869,6 +874,7 @@ mod tests {
             data: json!("hello"),
             series_id: Some("series_01".to_string()),
             series_mode: Some(SeriesMode::Accumulate),
+            series_acc_field: None,
         };
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["seriesId"], "series_01");
@@ -887,6 +893,7 @@ mod tests {
             data: json!(null),
             series_id: Some("s1".to_string()),
             series_mode: Some(SeriesMode::Latest),
+            series_acc_field: None,
         };
         let json_str = serde_json::to_string(&event).unwrap();
         let back: TaskEvent = serde_json::from_str(&json_str).unwrap();
@@ -908,6 +915,7 @@ mod tests {
             data: json!({ "done": true }),
             series_id: None,
             series_mode: None,
+            series_acc_field: None,
         };
         let json = serde_json::to_value(&envelope).unwrap();
         assert_eq!(json["filteredIndex"], 3);
@@ -935,6 +943,7 @@ mod tests {
             data: json!(42),
             series_id: Some("s1".to_string()),
             series_mode: Some(SeriesMode::KeepAll),
+            series_acc_field: None,
         };
         let json = serde_json::to_value(&envelope).unwrap();
         assert_eq!(json["seriesId"], "s1");
@@ -1250,6 +1259,7 @@ mod tests {
             data: json!(null),
             series_id: None,
             series_mode: None,
+            series_acc_field: None,
         };
         let json_str = serde_json::to_string(&event).unwrap();
         assert!(!json_str.contains("\"seriesId\""));
@@ -1269,6 +1279,7 @@ mod tests {
             data: json!(null),
             series_id: None,
             series_mode: None,
+            series_acc_field: None,
         };
         let json_str = serde_json::to_string(&envelope).unwrap();
         assert!(!json_str.contains("\"seriesId\""));
@@ -1357,6 +1368,7 @@ mod tests {
             id: "e".to_string(), task_id: "t".to_string(), index: 0,
             timestamp: 0.0, r#type: "x".to_string(), level: Level::Info,
             data: json!(null), series_id: None, series_mode: None,
+            series_acc_field: None,
         };
         let webhook = WebhookConfig {
             url: "https://example.com".to_string(),

@@ -86,6 +86,7 @@ export function rowToEvent(row: Record<string, unknown>): TaskEvent {
 
   if (row['series_id'] != null) event.seriesId = row['series_id'] as string
   if (row['series_mode'] != null) event.seriesMode = row['series_mode'] as SeriesMode
+  if (row['series_acc_field'] != null) event.seriesAccField = row['series_acc_field'] as string
 
   return event
 }

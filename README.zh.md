@@ -2,7 +2,7 @@
 
 # Taskcast
 
-**为 LLM 流式输出、流式 Agent 等场景打造的统一长周期任务追踪与管理服务。**
+**极简心智模型，开箱即用的 LLM 流式输出、Agent 及异步工作负载追踪服务。**
 
 [![npm version](https://img.shields.io/npm/v/@taskcast/core?label=%40taskcast%2Fcore&color=blue)](https://www.npmjs.com/package/@taskcast/core)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
@@ -16,14 +16,16 @@
 
 ---
 
-传统的 SSE 连接在页面刷新后状态全部丢失，多个客户端也无法订阅同一个任务流。Taskcast 通过统一的任务追踪服务解决了这些问题，提供**持久化状态**、**可恢复的订阅**和**多客户端扇出** —— 专为大模型流式输出和 Agent 工作流设计。
+创建任务、发布事件、订阅 —— 这就是全部的心智模型。但 Taskcast 开箱即用地提供了**持久化状态**、**可恢复订阅**、**多客户端扇出**、**可选的 Worker 管理**，以及从单个 SQLite 文件到 Redis + PostgreSQL 的可插拔存储栈。专为大模型流式输出和 Agent 工作流设计。
 
 ## 核心亮点
 
 - **可恢复的 SSE 流** — 通过事件 ID、过滤后索引或时间戳从任意位置重连，刷新页面不丢数据。
 - **多客户端扇出** — 多个浏览器标签页、设备或服务可以同时订阅同一个任务的实时流。
-- **序列消息合并** — 内置支持流式文本累加（`accumulate`）、取最新值替换（`latest`）和全量保留（`keep-all`）。
-- **三层存储架构** — 广播层（Redis Pub/Sub）+ 短期存储层（Redis）+ 长期存储层（PostgreSQL），每层可插拔、可选配。
+- **序列消息合并** — 内置支持流式文本累加（`accumulate`，默认累加字段兼容 ChatCompletion delta 格式）、取最新值替换（`latest`）和全量保留（`keep-all`）。
+- **三层存储架构** — 广播层（Redis Pub/Sub | 内存）+ 短期存储层（Redis | SQLite | 内存）+ 长期存储层（PostgreSQL | SQLite），每层可插拔、独立可选。
+- **Worker 管理**（可选） — 内置任务分配，支持 Pull（长轮询）和 WebSocket（offer/race）模式。容量追踪、匹配规则、断连自动重分配。
+- **Rust 服务端** — 可直接替换的原生 Rust 二进制（`taskcast-rs`），极致性能与最低资源占用。相同 API，相同行为，零 Node.js 依赖。Docker 镜像开箱即用。
 - **灵活的认证** — 无认证、JWT 或自定义中间件，权限粒度细化到单个任务。
 - **SDK-First 架构** — 核心零 HTTP 依赖，可嵌入你现有的服务器，也可用 `npx taskcast` 独立运行。
 
@@ -32,42 +34,35 @@
 ```mermaid
 graph TB
     subgraph 客户端
-        Browser["浏览器<br/>@taskcast/client"]
-        ReactApp["React 应用<br/>@taskcast/react"]
+        Browser["浏览器 / React 应用<br/>@taskcast/client · @taskcast/react"]
         Backend["你的后端<br/>@taskcast/server-sdk"]
     end
 
-    subgraph 服务端["@taskcast/server (Hono)"]
+    Workers["Workers（可选）<br/>长轮询 | WebSocket"]
+
+    subgraph 服务端["@taskcast/server · 认证 · Webhooks"]
         REST["REST API"]
         SSE["SSE 流式推送"]
-        Auth["认证中间件"]
-        Webhook["Webhook 回调"]
     end
 
-    subgraph 引擎["@taskcast/core"]
-        TaskEngine["任务引擎"]
-        StateMachine["状态机"]
-        Filter["事件过滤器"]
-        Series["序列合并器"]
+    subgraph 核心["@taskcast/core"]
+        Engine["任务引擎<br/>状态机 · 过滤器 · 序列合并"]
     end
 
-    subgraph 存储
-        Broadcast["广播层<br/>Redis Pub/Sub | 内存"]
-        ShortTerm["短期存储层<br/>Redis | 内存"]
-        LongTerm["长期存储层<br/>PostgreSQL（可选）"]
+    subgraph 存储["存储（可插拔）"]
+        Broadcast["广播层 — Redis Pub/Sub | 内存"]
+        ShortTerm["短期存储 — Redis | SQLite | 内存"]
+        LongTerm["长期存储 — PostgreSQL | SQLite（可选）"]
     end
 
     Browser -->|SSE| SSE
-    ReactApp -->|SSE| SSE
     Backend -->|HTTP| REST
-
-    REST --> Auth --> TaskEngine
-    SSE --> Auth --> TaskEngine
-
-    TaskEngine --> Broadcast
-    TaskEngine --> ShortTerm
-    TaskEngine -.->|异步| LongTerm
-    TaskEngine --> Webhook
+    Workers -.->|pull / ws| REST
+    REST --> Engine
+    SSE --> Engine
+    Engine --> Broadcast
+    Engine --> ShortTerm
+    Engine -.->|异步| LongTerm
 ```
 
 ### 部署模式
@@ -78,10 +73,10 @@ graph TB
 你的服务器 → @taskcast/core + 适配器 → @taskcast/server（Hono 路由）
 ```
 
-**远程模式** — 作为独立服务运行，通过 HTTP SDK 连接：
+**远程模式（推荐）** — 作为独立微服务运行，通过 RESTful API 连接。清晰的服务边界，独立扩缩容。支持 Docker 部署。
 
 ```
-你的服务器 → @taskcast/server-sdk → 独立 taskcast 服务 ← @taskcast/client（浏览器）
+你的服务器 → @taskcast/server-sdk（REST）→ taskcast 服务 ← @taskcast/client（浏览器）
 ```
 
 ## 快速开始
@@ -137,7 +132,7 @@ await engine.transitionTask(task.id, 'running')
 await engine.publishEvent(task.id, {
   type: 'llm.delta',
   level: 'info',
-  data: { text: '从前有座山...' },
+  data: { delta: '从前有座山...' },
   seriesId: 'response',
   seriesMode: 'accumulate',
 })
@@ -205,9 +200,20 @@ function TaskStream({ taskId }: { taskId: string }) {
 | [`@taskcast/client`](./packages/client) | 浏览器 SSE 订阅客户端 | `pnpm add @taskcast/client` |
 | [`@taskcast/react`](./packages/react) | React Hooks（`useTaskEvents`） | `pnpm add @taskcast/react` |
 | [`@taskcast/cli`](./packages/cli) | 独立服务器 CLI | `npx taskcast` |
+| [`@taskcast/sqlite`](./packages/sqlite) | SQLite 适配器（短期 + 长期存储层） | `pnpm add @taskcast/sqlite` |
 | [`@taskcast/redis`](./packages/redis) | Redis 适配器（广播层 + 短期存储层） | `pnpm add @taskcast/redis` |
 | [`@taskcast/postgres`](./packages/postgres) | PostgreSQL 适配器（长期存储层） | `pnpm add @taskcast/postgres` |
 | [`@taskcast/sentry`](./packages/sentry) | Sentry 错误监控 Hooks | `pnpm add @taskcast/sentry` |
+
+## Rust 服务端
+
+原生 Rust 二进制（`taskcast-rs`）可直接替换 Node.js 服务端。基于 Axum + Tokio + sqlx 构建，HTTP 行为完全一致 —— 相同的路径、相同的 JSON 格式、相同的 SSE 事件、相同的状态码。适用于追求极致吞吐或最小资源占用的场景。
+
+预编译二进制覆盖 Linux（amd64/arm64）、macOS（amd64/arm64）和 Windows，随每个 [GitHub Release](https://github.com/weightwave/taskcast/releases) 发布。多架构 Docker 镜像同步可用：
+
+```bash
+docker run -p 3721:3721 mwr1998/taskcast-rs
+```
 
 ## 配置
 
@@ -288,6 +294,9 @@ cleanup:
 | `POST` | `/tasks/:taskId/events` | 发布事件 |
 | `GET` | `/tasks/:taskId/events` | SSE 订阅 |
 | `GET` | `/tasks/:taskId/events/history` | 查询历史事件 |
+| `POST` | `/workers/register` | 注册 Worker |
+| `GET` | `/workers/pull` | 长轮询获取任务分配 |
+| `WS` | `/workers/ws` | WebSocket Worker 连接 |
 
 ### SSE 查询参数
 
@@ -306,12 +315,18 @@ cleanup:
 ```mermaid
 stateDiagram-v2
     [*] --> pending : 创建
+    pending --> assigned : Worker 认领
     pending --> running : 开始执行
     pending --> cancelled : 取消
+    assigned --> running : 开始执行
+    assigned --> cancelled : 取消
+    running --> paused : 暂停
     running --> completed : 成功完成
     running --> failed : 执行失败
     running --> timeout : 超时
     running --> cancelled : 取消
+    paused --> running : 恢复
+    paused --> cancelled : 取消
 ```
 
 ### 权限范围

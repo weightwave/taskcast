@@ -87,6 +87,7 @@ fn to_envelope(event: &TaskEvent, filtered_index: u64) -> SSEEnvelope {
         data: event.data.clone(),
         series_id: event.series_id.clone(),
         series_mode: event.series_mode.clone(),
+        series_acc_field: event.series_acc_field.clone(),
     }
 }
 

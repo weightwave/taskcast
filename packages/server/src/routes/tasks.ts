@@ -23,6 +23,7 @@ const PublishEventSchema = z.object({
   data: z.unknown(),
   seriesId: z.string().optional(),
   seriesMode: z.enum(['keep-all', 'accumulate', 'latest']).optional(),
+  seriesAccField: z.string().optional(),
 })
 
 export function createTasksRouter(engine: TaskEngine) {
@@ -129,6 +130,7 @@ export function createTasksRouter(engine: TaskEngine) {
         const eventInput: PublishEventInput = { type: d.type, level: d.level, data: d.data }
         if (d.seriesId !== undefined) eventInput.seriesId = d.seriesId
         if (d.seriesMode !== undefined) eventInput.seriesMode = d.seriesMode
+        if (d.seriesAccField !== undefined) eventInput.seriesAccField = d.seriesAccField
         const event = await engine.publishEvent(taskId, eventInput)
         events.push(event)
       } catch (err) {

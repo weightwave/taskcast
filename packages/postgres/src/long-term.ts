@@ -74,12 +74,13 @@ export class PostgresLongTermStore implements LongTermStore {
     const t = EVENTS
     await this.sql`
       INSERT INTO ${this.sql(t)} (
-        id, task_id, idx, timestamp, type, level, data, series_id, series_mode
+        id, task_id, idx, timestamp, type, level, data, series_id, series_mode, series_acc_field
       ) VALUES (
         ${event.id}, ${event.taskId}, ${event.index}, ${event.timestamp},
         ${event.type}, ${event.level},
         ${event.data ? this.sql.json(event.data as never) : null},
-        ${event.seriesId ?? null}, ${event.seriesMode ?? null}
+        ${event.seriesId ?? null}, ${event.seriesMode ?? null},
+        ${event.seriesAccField ?? null}
       )
       ON CONFLICT (id) DO NOTHING
     `
@@ -216,6 +217,7 @@ export class PostgresLongTermStore implements LongTermStore {
     }
     if (row['series_id'] != null) event.seriesId = row['series_id'] as string
     if (row['series_mode'] != null) event.seriesMode = row['series_mode'] as SeriesMode
+    if (row['series_acc_field'] != null) event.seriesAccField = row['series_acc_field'] as string
     return event
   }
 

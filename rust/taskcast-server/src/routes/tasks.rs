@@ -59,6 +59,7 @@ pub struct PublishEventBody {
     pub data: serde_json::Value,
     pub series_id: Option<String>,
     pub series_mode: Option<SeriesMode>,
+    pub series_acc_field: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -207,6 +208,7 @@ pub async fn publish_events(
             data: input.data,
             series_id: input.series_id,
             series_mode: input.series_mode,
+            series_acc_field: input.series_acc_field,
         };
         let event = engine
             .publish_event(&task_id, event_input)

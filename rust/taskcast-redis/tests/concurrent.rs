@@ -28,6 +28,7 @@ fn make_test_event(task_id: &str, event_type: &str) -> TaskEvent {
         data: serde_json::json!(null),
         series_id: None,
         series_mode: None,
+        series_acc_field: None,
     }
 }
 
@@ -110,6 +111,7 @@ async fn two_engine_instances_produce_no_duplicate_event_indices() {
                         data: serde_json::json!({ "i": i }),
                         series_id: None,
                         series_mode: None,
+                        series_acc_field: None,
                     },
                 )
                 .await
@@ -129,6 +131,7 @@ async fn two_engine_instances_produce_no_duplicate_event_indices() {
                         data: serde_json::json!({ "i": i }),
                         series_id: None,
                         series_mode: None,
+                        series_acc_field: None,
                     },
                 )
                 .await
@@ -190,6 +193,7 @@ async fn concurrent_publish_to_redis_maintains_monotonic_index() {
                         data: serde_json::json!({ "i": i }),
                         series_id: None,
                         series_mode: None,
+                        series_acc_field: None,
                     },
                 )
                 .await

@@ -994,6 +994,8 @@ async fn webhook_delivery_sends_to_mock_server() {
         data: json!({ "percent": 50 }),
         series_id: None,
         series_mode: None,
+
+        series_acc_field: None,
     };
     let config = taskcast_core::WebhookConfig {
         url: format!("http://{addr}/hook"),
@@ -1048,6 +1050,8 @@ async fn webhook_delivery_retries_on_failure() {
         data: json!(null),
         series_id: None,
         series_mode: None,
+
+        series_acc_field: None,
     };
     let config = taskcast_core::WebhookConfig {
         url: format!("http://{addr}/hook"),
@@ -1108,6 +1112,8 @@ async fn webhook_delivery_succeeds_on_retry() {
         data: json!({ "step": 1 }),
         series_id: None,
         series_mode: None,
+
+        series_acc_field: None,
     };
     let config = taskcast_core::WebhookConfig {
         url: format!("http://{addr}/hook"),
@@ -1592,6 +1598,8 @@ async fn webhook_uses_default_retry_when_none_provided() {
         data: json!({ "percent": 50 }),
         series_id: None,
         series_mode: None,
+
+        series_acc_field: None,
     };
     let config = taskcast_core::WebhookConfig {
         url: format!("http://{addr}/hook"),
@@ -1621,6 +1629,8 @@ async fn webhook_network_error_captures_error_string() {
         data: json!({ "step": 1 }),
         series_id: None,
         series_mode: None,
+
+        series_acc_field: None,
     };
     // Unreachable address — should trigger a network error (not an HTTP status error)
     let config = taskcast_core::WebhookConfig {
@@ -1741,6 +1751,8 @@ async fn sse_live_streaming_receives_events_and_done() {
                     data: json!({ "step": 1 }),
                     series_id: None,
                     series_mode: None,
+
+                    series_acc_field: None,
                 },
             )
             .await
@@ -1755,6 +1767,8 @@ async fn sse_live_streaming_receives_events_and_done() {
                     data: json!({ "step": 2 }),
                     series_id: None,
                     series_mode: None,
+
+                    series_acc_field: None,
                 },
             )
             .await

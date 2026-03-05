@@ -169,6 +169,7 @@ export interface TaskEvent {
   data: unknown
   seriesId?: string
   seriesMode?: SeriesMode
+  seriesAccField?: string
 }
 
 export interface SSEEnvelope {
@@ -182,6 +183,7 @@ export interface SSEEnvelope {
   data: unknown
   seriesId?: string
   seriesMode?: SeriesMode
+  seriesAccField?: string
 }
 
 // ─── Subscription ────────────────────────────────────────────────────────────

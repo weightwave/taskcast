@@ -141,11 +141,13 @@ POST /tasks/:taskId/events
 {
   "type": "llm.delta",
   "level": "info",
-  "data": { "text": "Hello" },
+  "data": { "delta": "Hello" },
   "seriesId": "response",
   "seriesMode": "accumulate"
 }
 ```
+
+> **Note:** In `accumulate` mode, the field concatenated defaults to `delta`. This can be customized via `seriesAccField`.
 
 **Batch events:**
 
@@ -165,6 +167,7 @@ POST /tasks/:taskId/events
 | `data` | any | Yes | Event payload, arbitrary JSON |
 | `seriesId` | string | No | Series ID for grouping |
 | `seriesMode` | string | No | `keep-all`/`accumulate`/`latest` |
+| `seriesAccField` | string | No | Field name to concatenate in `accumulate` mode (defaults to `delta`) |
 
 **Response:** `201 Created` — returns the created event (single) or event array (batch)
 
@@ -203,7 +206,7 @@ GET /tasks/:taskId/events/history
     "timestamp": 1700000000000,
     "type": "llm.delta",
     "level": "info",
-    "data": { "text": "Hello" }
+    "data": { "delta": "Hello" }
   }
 ]
 ```

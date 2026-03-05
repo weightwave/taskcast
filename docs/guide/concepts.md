@@ -65,12 +65,12 @@ Stored:  [Event 1, Event 2]  ← both retained
 
 ### accumulate
 
-Text accumulation mode. The `data.text` of each new event is appended to the series' existing text. Storage holds the full accumulated text; broadcasts send the original incremental delta.
+Text accumulation mode. The `data.delta` field of each new event is appended to the series' existing value (like ChatCompletion streaming). Storage holds the full accumulated text; broadcasts send the original incremental delta. The field name defaults to `delta` but can be customized via `seriesAccField` (e.g. `"text"` or `"content"`).
 
 ```
-Event 1: { seriesId: "s1", data: { text: "Hello" }, seriesMode: "accumulate" }
-Event 2: { seriesId: "s1", data: { text: " world" }, seriesMode: "accumulate" }
-Stored:  accumulated result → data.text = "Hello world"
+Event 1: { seriesId: "s1", data: { delta: "Hello" }, seriesMode: "accumulate" }
+Event 2: { seriesId: "s1", data: { delta: " world" }, seriesMode: "accumulate" }
+Stored:  accumulated result → data.delta = "Hello world"
 Broadcast: each event sends only the original delta
 ```
 

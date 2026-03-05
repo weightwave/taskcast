@@ -481,6 +481,7 @@ mod tests {
             data: json!({ "index": index }),
             series_id: None,
             series_mode: None,
+            series_acc_field: None,
         }
     }
 

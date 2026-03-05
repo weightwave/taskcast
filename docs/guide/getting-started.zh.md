@@ -91,7 +91,7 @@ curl -X POST http://localhost:3721/tasks/{taskId}/events \
   -d '{
     "type": "llm.delta",
     "level": "info",
-    "data": { "text": "你好" },
+    "data": { "delta": "你好" },
     "seriesId": "response",
     "seriesMode": "accumulate"
   }'
@@ -102,13 +102,15 @@ curl -X POST http://localhost:3721/tasks/{taskId}/events \
   -d '{
     "type": "llm.delta",
     "level": "info",
-    "data": { "text": "世界！" },
+    "data": { "delta": "世界！" },
     "seriesId": "response",
     "seriesMode": "accumulate"
   }'
 ```
 
 订阅终端会实时收到这些事件。
+
+> **注意：** 在 `accumulate` 模式下，默认拼接的字段为 `delta`。可通过 `seriesAccField` 自定义拼接字段名。
 
 ### 6. 完成任务
 
@@ -155,7 +157,7 @@ async function handleChat(prompt: string) {
     await engine.publishEvent(task.id, {
       type: 'llm.delta',
       level: 'info',
-      data: { text: chunk },
+      data: { delta: chunk },
       seriesId: 'response',
       seriesMode: 'accumulate',
     })
@@ -189,7 +191,7 @@ await client.subscribe('task-id', {
   },
   onEvent: (envelope) => {
     // 每收到一个事件都会调用
-    document.getElementById('output')!.textContent += envelope.data.text
+    document.getElementById('output')!.textContent += envelope.data.delta
   },
   onDone: (reason) => {
     console.log('任务完成:', reason)
@@ -220,7 +222,7 @@ function ChatStream({ taskId }: { taskId: string }) {
   return (
     <div>
       {events.map((e) => (
-        <span key={e.eventId}>{e.data.text}</span>
+        <span key={e.eventId}>{e.data.delta}</span>
       ))}
       {isDone && <p>已完成: {doneReason}</p>}
     </div>

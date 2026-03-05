@@ -156,6 +156,7 @@ mod tests {
             data: json!(null),
             series_id: None,
             series_mode: None,
+            series_acc_field: None,
         }
     }
 

@@ -51,6 +51,7 @@ pub struct PublishEventInput {
     pub data: serde_json::Value,
     pub series_id: Option<String>,
     pub series_mode: Option<crate::types::SeriesMode>,
+    pub series_acc_field: Option<String>,
 }
 
 pub struct TransitionPayload {
@@ -197,6 +198,8 @@ impl TaskEngine {
                 }),
                 series_id: None,
                 series_mode: None,
+
+                series_acc_field: None,
             },
         )
         .await?;
@@ -263,6 +266,7 @@ impl TaskEngine {
             data: input.data,
             series_id: input.series_id,
             series_mode: input.series_mode,
+            series_acc_field: input.series_acc_field,
         };
 
         let event = process_series(raw, self.short_term_store.as_ref()).await?;
@@ -746,6 +750,8 @@ mod tests {
                     data: serde_json::json!({ "percent": 50 }),
                     series_id: None,
                     series_mode: None,
+
+                    series_acc_field: None,
                 },
             )
             .await
@@ -791,6 +797,8 @@ mod tests {
                     data: serde_json::json!(null),
                     series_id: None,
                     series_mode: None,
+
+                    series_acc_field: None,
                 },
             )
             .await;
@@ -815,6 +823,8 @@ mod tests {
                     data: serde_json::json!(null),
                     series_id: None,
                     series_mode: None,
+
+                    series_acc_field: None,
                 },
             )
             .await;
@@ -852,6 +862,8 @@ mod tests {
                     data: serde_json::json!(null),
                     series_id: None,
                     series_mode: None,
+
+                    series_acc_field: None,
                 },
             )
             .await
@@ -866,6 +878,8 @@ mod tests {
                     data: serde_json::json!(null),
                     series_id: None,
                     series_mode: None,
+
+                    series_acc_field: None,
                 },
             )
             .await
@@ -880,6 +894,8 @@ mod tests {
                     data: serde_json::json!(null),
                     series_id: None,
                     series_mode: None,
+
+                    series_acc_field: None,
                 },
             )
             .await
@@ -917,6 +933,8 @@ mod tests {
                     data: serde_json::json!({ "percent": 50 }),
                     series_id: None,
                     series_mode: None,
+
+                    series_acc_field: None,
                 },
             )
             .await
@@ -1013,6 +1031,8 @@ mod tests {
                     data: serde_json::json!({ "percent": 75 }),
                     series_id: None,
                     series_mode: None,
+
+                    series_acc_field: None,
                 },
             )
             .await
@@ -1054,6 +1074,8 @@ mod tests {
                             data: serde_json::json!({ "i": i }),
                             series_id: None,
                             series_mode: None,
+
+                            series_acc_field: None,
                         },
                     )
                     .await
@@ -1186,6 +1208,8 @@ mod tests {
                         data: serde_json::json!({ "seq": i }),
                         series_id: None,
                         series_mode: None,
+
+                        series_acc_field: None,
                     },
                 )
                 .await
@@ -1292,6 +1316,8 @@ mod tests {
             data: serde_json::json!(null),
             series_id: None,
             series_mode: None,
+
+            series_acc_field: None,
         }).await.unwrap();
 
         // The long_term_store save is async (tokio::spawn), give it a moment
@@ -1326,6 +1352,8 @@ mod tests {
             data: serde_json::json!(null),
             series_id: None,
             series_mode: None,
+
+            series_acc_field: None,
         }).await.unwrap();
 
         // Give async spawn time to execute

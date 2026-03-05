@@ -4,8 +4,9 @@ use crate::types::{SeriesMode, ShortTermStore, TaskEvent};
 ///
 /// - If the event has no `series_id` or `series_mode`, it is returned unchanged.
 /// - `keep-all`: returned unchanged with no store interaction.
-/// - `accumulate`: merges `data.text` (string concatenation) with the previous
+/// - `accumulate`: merges `data.<field>` (string concatenation) with the previous
 ///   series event, then stores the merged event as the series latest.
+///   The field name is determined by `series_acc_field`, defaulting to `"delta"`.
 /// - `latest`: replaces the last series event in the store and returns the event.
 pub async fn process_series(
     event: TaskEvent,
@@ -20,34 +21,38 @@ pub async fn process_series(
         SeriesMode::KeepAll => Ok(event),
 
         SeriesMode::Accumulate => {
+            let field = event
+                .series_acc_field
+                .as_deref()
+                .unwrap_or("delta");
             let prev = store
                 .get_series_latest(&event.task_id, &series_id)
                 .await?;
 
             let merged = if let Some(prev) = prev {
-                // Try to concatenate text fields if both prev and new data are
-                // objects containing a string "text" key.
+                // Try to concatenate the accumulation field if both prev and
+                // new data are objects containing a string value at that key.
                 let should_concat = prev
                     .data
                     .as_object()
-                    .and_then(|po| po.get("text")?.as_str().map(|s| s.to_string()))
-                    .and_then(|prev_text| {
+                    .and_then(|po| po.get(field)?.as_str().map(|s| s.to_string()))
+                    .and_then(|prev_val| {
                         event
                             .data
                             .as_object()
-                            .and_then(|no| no.get("text")?.as_str().map(|s| s.to_string()))
-                            .map(|new_text| (prev_text, new_text))
+                            .and_then(|no| no.get(field)?.as_str().map(|s| s.to_string()))
+                            .map(|new_val| (prev_val, new_val))
                     });
 
-                if let Some((prev_text, new_text)) = should_concat {
+                if let Some((prev_val, new_val)) = should_concat {
                     let mut new_data = event
                         .data
                         .as_object()
                         .cloned()
                         .unwrap_or_default();
                     new_data.insert(
-                        "text".to_string(),
-                        serde_json::Value::String(prev_text + &new_text),
+                        field.to_string(),
+                        serde_json::Value::String(prev_val + &new_val),
                     );
                     TaskEvent {
                         data: serde_json::Value::Object(new_data),
@@ -98,6 +103,7 @@ mod tests {
             data,
             series_id: None,
             series_mode: None,
+            series_acc_field: None,
         }
     }
 
@@ -176,22 +182,22 @@ mod tests {
             "e1",
             "t1",
             0,
-            json!({ "text": "hello" }),
+            json!({ "delta": "hello" }),
             "s1",
             SeriesMode::Accumulate,
         );
         let result = process_series(event.clone(), &store).await.unwrap();
 
-        // Should return event unchanged (no prior text to concat)
+        // Should return event unchanged (no prior delta to concat)
         assert_eq!(result, event);
 
         // Store should now have the event as series latest
         let latest = store.get_series_latest("t1", "s1").await.unwrap().unwrap();
         assert_eq!(latest.id, "e1");
-        assert_eq!(latest.data, json!({ "text": "hello" }));
+        assert_eq!(latest.data, json!({ "delta": "hello" }));
     }
 
-    // ─── accumulate mode: second event concatenates text ─────────────────
+    // ─── accumulate mode: second event concatenates delta ────────────────
 
     #[tokio::test]
     async fn accumulate_second_event_concatenates_text() {
@@ -202,7 +208,7 @@ mod tests {
             "e1",
             "t1",
             0,
-            json!({ "text": "hello" }),
+            json!({ "delta": "hello" }),
             "s1",
             SeriesMode::Accumulate,
         );
@@ -213,18 +219,18 @@ mod tests {
             "e2",
             "t1",
             1,
-            json!({ "text": " world" }),
+            json!({ "delta": " world" }),
             "s1",
             SeriesMode::Accumulate,
         );
         let result = process_series(event2, &store).await.unwrap();
 
-        assert_eq!(result.data["text"], "hello world");
+        assert_eq!(result.data["delta"], "hello world");
         assert_eq!(result.id, "e2"); // event metadata from the new event
 
         // Series latest should be the merged event
         let latest = store.get_series_latest("t1", "s1").await.unwrap().unwrap();
-        assert_eq!(latest.data["text"], "hello world");
+        assert_eq!(latest.data["delta"], "hello world");
     }
 
     #[tokio::test]
@@ -235,7 +241,7 @@ mod tests {
             "e1",
             "t1",
             0,
-            json!({ "text": "a" }),
+            json!({ "delta": "a" }),
             "s1",
             SeriesMode::Accumulate,
         );
@@ -245,7 +251,7 @@ mod tests {
             "e2",
             "t1",
             1,
-            json!({ "text": "b" }),
+            json!({ "delta": "b" }),
             "s1",
             SeriesMode::Accumulate,
         );
@@ -255,16 +261,16 @@ mod tests {
             "e3",
             "t1",
             2,
-            json!({ "text": "c" }),
+            json!({ "delta": "c" }),
             "s1",
             SeriesMode::Accumulate,
         );
         let result = process_series(e3, &store).await.unwrap();
 
-        assert_eq!(result.data["text"], "abc");
+        assert_eq!(result.data["delta"], "abc");
     }
 
-    // ─── accumulate mode: non-text data → no concatenation ───────────────
+    // ─── accumulate mode: non-matching field data → no concatenation ─────
 
     #[tokio::test]
     async fn accumulate_non_text_data_no_concatenation() {
@@ -292,7 +298,7 @@ mod tests {
         );
         let result = process_series(event2, &store).await.unwrap();
 
-        // Should return second event unchanged since no text field
+        // Should return second event unchanged since no accumulate field
         assert_eq!(result.data, json!({ "count": 2 }));
     }
 
@@ -322,7 +328,7 @@ mod tests {
         );
         let result = process_series(event2, &store).await.unwrap();
 
-        // No concatenation since data is not an object with text field
+        // No concatenation since data is not an object with accumulate field
         assert_eq!(result.data, json!("another string"));
     }
 
@@ -334,7 +340,7 @@ mod tests {
             "e1",
             "t1",
             0,
-            json!({ "text": "hello" }),
+            json!({ "delta": "hello" }),
             "s1",
             SeriesMode::Accumulate,
         );
@@ -350,7 +356,7 @@ mod tests {
         );
         let result = process_series(event2, &store).await.unwrap();
 
-        // No concatenation since new event has no text
+        // No concatenation since new event has no accumulate field
         assert_eq!(result.data, json!({ "count": 42 }));
     }
 
@@ -362,7 +368,7 @@ mod tests {
             "e1",
             "t1",
             0,
-            json!({ "text": "hello" }),
+            json!({ "delta": "hello" }),
             "s1",
             SeriesMode::Accumulate,
         );
@@ -372,14 +378,80 @@ mod tests {
             "e2",
             "t1",
             1,
-            json!({ "text": " world", "extra": true }),
+            json!({ "delta": " world", "extra": true }),
             "s1",
             SeriesMode::Accumulate,
         );
         let result = process_series(event2, &store).await.unwrap();
 
-        assert_eq!(result.data["text"], "hello world");
+        assert_eq!(result.data["delta"], "hello world");
         assert_eq!(result.data["extra"], true);
+    }
+
+    // ─── accumulate mode: custom series_acc_field ─────────────────────────
+
+    #[tokio::test]
+    async fn accumulate_custom_series_acc_field() {
+        let store = MemoryShortTermStore::new();
+
+        let mut event1 = make_series_event(
+            "e1",
+            "t1",
+            0,
+            json!({ "content": "hello" }),
+            "s1",
+            SeriesMode::Accumulate,
+        );
+        event1.series_acc_field = Some("content".to_string());
+        process_series(event1, &store).await.unwrap();
+
+        let mut event2 = make_series_event(
+            "e2",
+            "t1",
+            1,
+            json!({ "content": " world" }),
+            "s1",
+            SeriesMode::Accumulate,
+        );
+        event2.series_acc_field = Some("content".to_string());
+        let result = process_series(event2, &store).await.unwrap();
+
+        assert_eq!(result.data["content"], "hello world");
+
+        let latest = store.get_series_latest("t1", "s1").await.unwrap().unwrap();
+        assert_eq!(latest.data["content"], "hello world");
+    }
+
+    #[tokio::test]
+    async fn accumulate_legacy_text_field() {
+        let store = MemoryShortTermStore::new();
+
+        let mut event1 = make_series_event(
+            "e1",
+            "t1",
+            0,
+            json!({ "text": "hello" }),
+            "s1",
+            SeriesMode::Accumulate,
+        );
+        event1.series_acc_field = Some("text".to_string());
+        process_series(event1, &store).await.unwrap();
+
+        let mut event2 = make_series_event(
+            "e2",
+            "t1",
+            1,
+            json!({ "text": " world" }),
+            "s1",
+            SeriesMode::Accumulate,
+        );
+        event2.series_acc_field = Some("text".to_string());
+        let result = process_series(event2, &store).await.unwrap();
+
+        assert_eq!(result.data["text"], "hello world");
+
+        let latest = store.get_series_latest("t1", "s1").await.unwrap().unwrap();
+        assert_eq!(latest.data["text"], "hello world");
     }
 
     // ─── latest mode → calls replace_last_series_event ───────────────────

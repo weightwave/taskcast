@@ -15,6 +15,7 @@ export async function processSeries(
   }
 
   if (seriesMode === 'accumulate') {
+    const field = event.seriesAccField ?? 'delta'
     const prev = await store.getSeriesLatest(taskId, seriesId)
     let merged = event
 
@@ -25,10 +26,10 @@ export async function processSeries(
       const newData = (typeof event.data === 'object' && event.data !== null)
         ? event.data as Record<string, unknown>
         : {}
-      if (typeof prevData['text'] === 'string' && typeof newData['text'] === 'string') {
+      if (typeof prevData[field] === 'string' && typeof newData[field] === 'string') {
         merged = {
           ...event,
-          data: { ...newData, text: prevData['text'] + newData['text'] },
+          data: { ...newData, [field]: prevData[field] + newData[field] },
         }
       }
     }

@@ -36,6 +36,7 @@ export interface PublishEventInput {
   data: unknown
   seriesId?: string
   seriesMode?: TaskEvent['seriesMode']
+  seriesAccField?: string
 }
 
 export interface CreateTaskInput {
@@ -183,6 +184,7 @@ export class TaskEngine {
       data: input.data,
       ...(input.seriesId !== undefined && { seriesId: input.seriesId }),
       ...(input.seriesMode !== undefined && { seriesMode: input.seriesMode }),
+      ...(input.seriesAccField !== undefined && { seriesAccField: input.seriesAccField }),
     }
 
     const event = await processSeries(raw, this.shortTermStore)

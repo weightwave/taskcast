@@ -143,9 +143,9 @@ impl ShortTermStore for SqliteShortTermStore {
         sqlx::query(
             r#"
             INSERT INTO taskcast_events (
-                id, task_id, idx, timestamp, type, level, data, series_id, series_mode
+                id, task_id, idx, timestamp, type, level, data, series_id, series_mode, series_acc_field
             ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
             )
             "#,
         )
@@ -158,6 +158,7 @@ impl ShortTermStore for SqliteShortTermStore {
         .bind(&data_str)
         .bind(&event.series_id)
         .bind(&series_mode_str)
+        .bind(&event.series_acc_field)
         .execute(&self.pool)
         .await?;
 

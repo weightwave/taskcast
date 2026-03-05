@@ -91,7 +91,7 @@ curl -X POST http://localhost:3721/tasks/{taskId}/events \
   -d '{
     "type": "llm.delta",
     "level": "info",
-    "data": { "text": "你好" },
+    "data": { "delta": "你好" },
     "seriesId": "response",
     "seriesMode": "accumulate"
   }'
@@ -102,13 +102,15 @@ curl -X POST http://localhost:3721/tasks/{taskId}/events \
   -d '{
     "type": "llm.delta",
     "level": "info",
-    "data": { "text": "世界！" },
+    "data": { "delta": "世界！" },
     "seriesId": "response",
     "seriesMode": "accumulate"
   }'
 ```
 
 The subscribing terminal will receive these events in real time.
+
+> **Note:** In `accumulate` mode, the field defaults to `delta` but can be customized via `seriesAccField`.
 
 ### 6. Complete the Task
 
@@ -155,7 +157,7 @@ async function handleChat(prompt: string) {
     await engine.publishEvent(task.id, {
       type: 'llm.delta',
       level: 'info',
-      data: { text: chunk },
+      data: { delta: chunk },
       seriesId: 'response',
       seriesMode: 'accumulate',
     })
@@ -189,7 +191,7 @@ await client.subscribe('task-id', {
   },
   onEvent: (envelope) => {
     // Called for every event received
-    document.getElementById('output')!.textContent += envelope.data.text
+    document.getElementById('output')!.textContent += envelope.data.delta
   },
   onDone: (reason) => {
     console.log('Task completed:', reason)
@@ -220,7 +222,7 @@ function ChatStream({ taskId }: { taskId: string }) {
   return (
     <div>
       {events.map((e) => (
-        <span key={e.eventId}>{e.data.text}</span>
+        <span key={e.eventId}>{e.data.delta}</span>
       ))}
       {isDone && <p>Completed: {doneReason}</p>}
     </div>

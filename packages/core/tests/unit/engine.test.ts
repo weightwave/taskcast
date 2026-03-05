@@ -267,7 +267,7 @@ describe('TaskEngine.publishEvent', () => {
     await engine.publishEvent(task.id, {
       type: 'llm.delta',
       level: 'info',
-      data: { text: 'hello' },
+      data: { delta: 'hello' },
       seriesId: 's1',
       seriesMode: 'accumulate',
     })
@@ -305,7 +305,7 @@ describe('TaskEngine.publishEvent', () => {
     const engine = new TaskEngine({ shortTermStore: store, broadcast, longTermStore: longTermStore })
     const task = await engine.createTask({})
     await engine.transitionTask(task.id, 'running')
-    await engine.publishEvent(task.id, { type: 'llm.delta', level: 'info', data: { text: 'hi' } })
+    await engine.publishEvent(task.id, { type: 'llm.delta', level: 'info', data: { delta: 'hi' } })
     // saveEvent is fire-and-forget so flush microtasks
     await Promise.resolve()
     await Promise.resolve()

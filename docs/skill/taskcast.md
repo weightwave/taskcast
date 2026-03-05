@@ -116,15 +116,15 @@ await engine.transitionTask(task.id, 'running')
 await engine.publishEvent(task.id, {
   type: 'llm.delta',
   level: 'info',
-  data: { text: 'Hello ' },
+  data: { delta: 'Hello ' },
   seriesId: 'response',          // Group streaming chunks
-  seriesMode: 'accumulate',      // Concatenate data.text across events
+  seriesMode: 'accumulate',      // Concatenate data.delta across events
 })
 
 await engine.publishEvent(task.id, {
   type: 'llm.delta',
   level: 'info',
-  data: { text: 'world!' },
+  data: { delta: 'world!' },
   seriesId: 'response',
   seriesMode: 'accumulate',
 })
@@ -142,7 +142,7 @@ Events with the same `seriesId` are grouped:
 | Mode | Behavior | Use Case |
 |------|----------|----------|
 | `keep-all` | Store all events independently | Full history needed |
-| `accumulate` | Concatenate `data.text` across events | LLM streaming text |
+| `accumulate` | Concatenate `data.delta` across events (field customizable via `seriesAccField`) | LLM streaming text |
 | `latest` | Replace previous event in series | Progress bars, status indicators |
 
 ## Browser SSE Subscription
@@ -187,7 +187,7 @@ function TaskStream({ taskId }: { taskId: string }) {
 
   return (
     <div>
-      {events.map((e) => <span key={e.eventId}>{e.data.text}</span>)}
+      {events.map((e) => <span key={e.eventId}>{e.data.delta}</span>)}
       {isDone && <p>Done: {doneReason}</p>}
       {error && <p>Error: {error.message}</p>}
     </div>
@@ -207,7 +207,7 @@ const taskcast = new TaskcastServerClient({
 
 const task = await taskcast.createTask({ type: 'llm.chat', params: { prompt: 'Hi' } })
 await taskcast.transitionTask(task.id, 'running')
-await taskcast.publishEvent(task.id, { type: 'llm.delta', level: 'info', data: { text: 'Hi!' } })
+await taskcast.publishEvent(task.id, { type: 'llm.delta', level: 'info', data: { delta: 'Hi!' } })
 await taskcast.transitionTask(task.id, 'completed', { result: { output: 'Hi!' } })
 ```
 
