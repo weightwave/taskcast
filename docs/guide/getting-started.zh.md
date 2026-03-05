@@ -9,7 +9,7 @@
 无需安装，直接用 npx 启动：
 
 ```bash
-npx taskcast
+npx @taskcast/cli
 ```
 
 服务默认运行在 `http://localhost:3721`。
@@ -25,7 +25,7 @@ pnpm add @taskcast/core @taskcast/server
 ### 1. 启动服务
 
 ```bash
-npx taskcast
+npx @taskcast/cli
 ```
 
 输出类似：

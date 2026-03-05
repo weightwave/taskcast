@@ -9,7 +9,7 @@ This guide will help you get Taskcast running in under 5 minutes — creating yo
 No installation required. Start the server directly with npx:
 
 ```bash
-npx taskcast
+npx @taskcast/cli
 ```
 
 The service runs at `http://localhost:3721` by default.
@@ -25,7 +25,7 @@ pnpm add @taskcast/core @taskcast/server
 ### 1. Start the Server
 
 ```bash
-npx taskcast
+npx @taskcast/cli
 ```
 
 You should see output similar to:

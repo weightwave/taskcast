@@ -58,7 +58,7 @@ Run Taskcast as a standalone service, with your backend communicating with it ov
 **Start the service:**
 
 ```bash
-npx taskcast -c taskcast.config.yaml
+npx @taskcast/cli -c taskcast.config.yaml
 ```
 
 **Backend integration (producer):**
@@ -120,7 +120,7 @@ Taskcast searches for configuration files in the following order (the first one 
 You can also specify a config file explicitly with the `-c` flag:
 
 ```bash
-npx taskcast -c /path/to/config.yaml
+npx @taskcast/cli -c /path/to/config.yaml
 ```
 
 ### TypeScript Configuration (recommended for complex setups)

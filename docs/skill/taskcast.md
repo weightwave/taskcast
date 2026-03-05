@@ -40,9 +40,9 @@ pnpm add @taskcast/react
 
 **Standalone server:**
 ```bash
-npx taskcast              # Start with defaults (port 3721, memory storage)
-npx taskcast -p 8080      # Custom port
-npx taskcast -c config.yaml  # With config file
+npx @taskcast/cli              # Start with defaults (port 3721, memory storage)
+npx @taskcast/cli -p 8080      # Custom port
+npx @taskcast/cli -c config.yaml  # With config file
 ```
 
 ## Embedded Mode Setup

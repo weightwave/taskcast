@@ -59,7 +59,7 @@ packages/
 ├── server-sdk/    @taskcast/server-sdk   HTTP client (server-to-server)
 ├── client/        @taskcast/client       Browser SSE client
 ├── react/         @taskcast/react        useTaskEvents hook
-├── cli/           @taskcast/cli          npx taskcast standalone server
+├── cli/           @taskcast/cli          npx @taskcast/cli standalone server
 ├── redis/         @taskcast/redis        Redis broadcast + short-term store
 ├── postgres/      @taskcast/postgres     PostgreSQL long-term store
 └── sentry/        @taskcast/sentry       Sentry error monitoring hooks
