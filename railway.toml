@@ -3,8 +3,12 @@ builder = "dockerfile"
 dockerfilePath = "Dockerfile.railway"
 
 [deploy]
-startCommand = "taskcast start --port ${PORT:-3721} --storage memory"
+startCommand = "taskcast start --port ${PORT:-3721} --storage redis"
 healthcheckPath = "/health"
 healthcheckTimeout = 10
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 3
+
+[variables]
+TASKCAST_REDIS_URL = "${{Redis.REDIS_URL}}"
+TASKCAST_POSTGRES_URL = "${{Postgres.DATABASE_URL}}"

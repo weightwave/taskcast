@@ -3436,7 +3436,17 @@ async fn ws_accept_pending_task_returns_assigned_v2() {
     ws.close().await;
 }
 
-// ─── Workers REST: manager_error path ────────────────────────────────────
+// ─── Workers REST: pull_task NO_CONTENT and error paths ──────────────────
+
+#[tokio::test]
+async fn pull_task_returns_no_content_when_no_tasks() {
+    let (_engine, manager, server) = make_worker_server();
+    register_test_worker(&manager, "w1").await;
+
+    // Use short timeout=100ms so this test doesn't wait 30s
+    let response = server.get("/workers/pull?workerId=w1&timeout=100").await;
+    response.assert_status(axum_test::http::StatusCode::NO_CONTENT);
+}
 
 #[tokio::test]
 async fn pull_task_returns_400_when_worker_not_registered() {

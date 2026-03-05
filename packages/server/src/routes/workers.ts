@@ -34,7 +34,8 @@ export function createWorkersRouter(manager: WorkerManager, engine: TaskEngine) 
     await manager.heartbeat(workerId)
     try {
       const controller = new AbortController()
-      const timeout = setTimeout(() => controller.abort(), 30000)
+      const timeoutMs = Number(c.req.query('timeout') ?? 30000)
+      const timeout = setTimeout(() => controller.abort(), timeoutMs)
       c.req.raw.signal.addEventListener('abort', () => {
         clearTimeout(timeout)
         controller.abort()

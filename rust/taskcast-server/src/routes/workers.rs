@@ -20,6 +20,8 @@ use crate::error::AppError;
 pub struct PullQuery {
     pub worker_id: String,
     pub weight: Option<u32>,
+    /// Long-poll timeout in milliseconds (default: 30000)
+    pub timeout: Option<u64>,
 }
 
 // ─── Request Bodies ─────────────────────────────────────────────────────────
@@ -77,9 +79,10 @@ pub async fn pull_task(
         .await
         .map_err(manager_error)?;
 
-    // Wait for task with 30s timeout
+    // Wait for task with configurable timeout (default 30s)
+    let timeout_ms = query.timeout.unwrap_or(30_000);
     let task = manager
-        .wait_for_task(worker_id, 30_000)
+        .wait_for_task(worker_id, timeout_ms)
         .await
         .map_err(manager_error)?;
 
