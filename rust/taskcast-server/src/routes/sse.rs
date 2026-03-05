@@ -18,7 +18,7 @@ use crate::error::AppError;
 
 // ─── Query Parameters ───────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
 pub struct SseQuery {
     pub types: Option<String>,
     pub levels: Option<String>,
@@ -99,6 +99,20 @@ fn is_terminal_status(status: &TaskStatus) -> bool {
 
 // ─── SSE Handler ────────────────────────────────────────────────────────────
 
+#[utoipa::path(
+    get,
+    path = "/tasks/{task_id}/events",
+    tag = "Events",
+    summary = "Subscribe to task events via SSE",
+    description = "Server-Sent Events stream. Replays history then streams live events.",
+    security(("Bearer" = [])),
+    params(("task_id" = String, Path, description = "Task ID"), SseQuery),
+    responses(
+        (status = 200, description = "SSE event stream (text/event-stream)"),
+        (status = 404, description = "Task not found"),
+        (status = 403, description = "Forbidden"),
+    )
+)]
 pub async fn sse_events(
     State(engine): State<Arc<TaskEngine>>,
     Extension(auth): Extension<AuthContext>,

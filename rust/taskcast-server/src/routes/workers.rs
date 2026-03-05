@@ -15,7 +15,7 @@ use crate::error::AppError;
 
 // ─── Query Parameters ───────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
 #[serde(rename_all = "camelCase")]
 pub struct PullQuery {
     pub worker_id: String,
@@ -26,7 +26,7 @@ pub struct PullQuery {
 
 // ─── Request Bodies ─────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct DeclineBody {
     pub worker_id: String,
@@ -36,7 +36,17 @@ pub struct DeclineBody {
 
 // ─── Handlers ───────────────────────────────────────────────────────────────
 
-/// GET / — List all workers (scope: WorkerManage)
+#[utoipa::path(
+    get,
+    path = "/workers",
+    tag = "Workers",
+    summary = "List all workers",
+    security(("Bearer" = [])),
+    responses(
+        (status = 200, description = "Worker list", body = Vec<taskcast_core::Worker>),
+        (status = 403, description = "Forbidden"),
+    )
+)]
 pub async fn list_workers(
     State(manager): State<Arc<WorkerManager>>,
     Extension(auth): Extension<AuthContext>,
@@ -49,7 +59,19 @@ pub async fn list_workers(
     Ok(axum::Json(workers))
 }
 
-/// GET /pull — Long-poll for task (scope: WorkerConnect)
+#[utoipa::path(
+    get,
+    path = "/workers/pull",
+    tag = "Workers",
+    summary = "Long-poll for task assignment",
+    security(("Bearer" = [])),
+    params(PullQuery),
+    responses(
+        (status = 200, description = "Task assigned"),
+        (status = 204, description = "Timeout, no task"),
+        (status = 403, description = "Forbidden"),
+    )
+)]
 pub async fn pull_task(
     State(manager): State<Arc<WorkerManager>>,
     Extension(auth): Extension<AuthContext>,
@@ -99,7 +121,19 @@ pub async fn pull_task(
     }
 }
 
-/// GET /:workerId — Get single worker (scope: WorkerManage)
+#[utoipa::path(
+    get,
+    path = "/workers/{worker_id}",
+    tag = "Workers",
+    summary = "Get worker by ID",
+    security(("Bearer" = [])),
+    params(("worker_id" = String, Path, description = "Worker ID")),
+    responses(
+        (status = 200, description = "Worker details", body = taskcast_core::Worker),
+        (status = 404, description = "Not found"),
+        (status = 403, description = "Forbidden"),
+    )
+)]
 pub async fn get_worker(
     State(manager): State<Arc<WorkerManager>>,
     Extension(auth): Extension<AuthContext>,
@@ -118,7 +152,19 @@ pub async fn get_worker(
     Ok(axum::Json(worker))
 }
 
-/// DELETE /:workerId — Force disconnect (scope: WorkerManage)
+#[utoipa::path(
+    delete,
+    path = "/workers/{worker_id}",
+    tag = "Workers",
+    summary = "Delete worker",
+    security(("Bearer" = [])),
+    params(("worker_id" = String, Path, description = "Worker ID")),
+    responses(
+        (status = 204, description = "Deleted"),
+        (status = 404, description = "Not found"),
+        (status = 403, description = "Forbidden"),
+    )
+)]
 pub async fn delete_worker(
     State(manager): State<Arc<WorkerManager>>,
     Extension(auth): Extension<AuthContext>,
@@ -144,7 +190,19 @@ pub async fn delete_worker(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// POST /tasks/:taskId/decline — Decline task (scope: WorkerConnect)
+#[utoipa::path(
+    post,
+    path = "/workers/tasks/{task_id}/decline",
+    tag = "Workers",
+    summary = "Worker declines a task",
+    security(("Bearer" = [])),
+    params(("task_id" = String, Path, description = "Task ID")),
+    request_body = DeclineBody,
+    responses(
+        (status = 200, description = "Declined"),
+        (status = 403, description = "Forbidden"),
+    )
+)]
 pub async fn decline_task(
     State(manager): State<Arc<WorkerManager>>,
     Extension(auth): Extension<AuthContext>,
