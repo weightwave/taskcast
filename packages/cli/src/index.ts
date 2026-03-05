@@ -178,6 +178,7 @@ program
       engine,
       shortTermStore,
       auth: { mode: authMode },
+      config: fileConfig,
     }
     if (workerManager !== undefined) serverOpts.workerManager = workerManager
     const { app, stop } = createTaskcastApp(serverOpts)
@@ -256,7 +257,7 @@ program
     const { Hono } = await import('hono')
     const { serve } = await import('@hono/node-server')
     const { existsSync, readFileSync, statSync } = await import('fs')
-    const { join: joinPath, extname } = await import('path')
+    const { join: joinPath, extname, resolve: resolvePath } = await import('path')
 
     if (!existsSync(dashboardDistPath)) {
       console.error(
@@ -295,9 +296,15 @@ program
 
     // Serve static dashboard files with SPA fallback
     app.get('*', (c) => {
-      const urlPath = new URL(c.req.url).pathname
-      const safePath = urlPath.replace(/\.\./g, '')
-      let filePath = joinPath(dashboardDistPath, safePath)
+      const urlPath = decodeURIComponent(new URL(c.req.url).pathname)
+      const resolved = resolvePath(joinPath(dashboardDistPath, urlPath))
+
+      // Path traversal protection: ensure resolved path stays within dashboard dist
+      if (!resolved.startsWith(dashboardDistPath)) {
+        return c.text('Not Found', 404)
+      }
+
+      let filePath = resolved
 
       // Try the exact file first, then fall back to index.html (SPA)
       const isFile = existsSync(filePath) && statSync(filePath).isFile()
