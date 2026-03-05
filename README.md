@@ -297,7 +297,7 @@ ws.addEventListener('message', async (event) => {
 import { TaskcastClient } from '@taskcast/client'
 
 const client = new TaskcastClient({
-  baseUrl: 'http://taskcast-service:3721',
+  baseUrl: 'http://taskcast-service:3721', // or behind an API gateway that handles auth
   token: 'user-jwt-token',
 })
 
