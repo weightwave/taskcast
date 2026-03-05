@@ -2982,3 +2982,456 @@ async fn ws_pong_before_register_is_ignored() {
 
     ws.close().await;
 }
+
+// ─── JWT Worker Server Helper ─────────────────────────────────────────────
+
+fn make_jwt_worker_server() -> (Arc<TaskEngine>, Arc<WorkerManager>, TestServer) {
+    let short_term_store = Arc::new(MemoryShortTermStore::new());
+    let broadcast = Arc::new(MemoryBroadcastProvider::new());
+    let engine = Arc::new(TaskEngine::new(TaskEngineOptions {
+        short_term_store: Arc::clone(&short_term_store) as Arc<dyn ShortTermStore>,
+        broadcast: Arc::clone(&broadcast) as Arc<dyn BroadcastProvider>,
+        long_term_store: None,
+        hooks: None,
+    }));
+    let manager = Arc::new(WorkerManager::new(WorkerManagerOptions {
+        engine: Arc::clone(&engine),
+        short_term_store: short_term_store as Arc<dyn ShortTermStore>,
+        broadcast: broadcast as Arc<dyn BroadcastProvider>,
+        long_term_store: None,
+        hooks: None,
+        defaults: None,
+    }));
+    let auth_mode = AuthMode::Jwt(JwtConfig {
+        algorithm: jsonwebtoken::Algorithm::HS256,
+        secret: Some(JWT_SECRET.to_string()),
+        public_key: None,
+        issuer: None,
+        audience: None,
+    });
+    let app = create_app(
+        Arc::clone(&engine),
+        auth_mode,
+        Some(Arc::clone(&manager)),
+    );
+    let server = TestServer::new(app);
+    (engine, manager, server)
+}
+
+// ─── Workers JWT Auth Rejection Tests ─────────────────────────────────────
+
+#[tokio::test]
+async fn list_workers_returns_403_without_worker_manage_scope() {
+    let (_engine, _manager, server) = make_jwt_worker_server();
+    let token = make_token(json!({
+        "sub": "user",
+        "scope": ["task:create"],
+        "taskIds": "*",
+        "exp": 9999999999u64
+    }));
+    let response = server
+        .get("/workers")
+        .add_header(axum_test::http::header::AUTHORIZATION, bearer_header(&token))
+        .await;
+    response.assert_status(axum_test::http::StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn get_worker_returns_403_without_worker_manage_scope() {
+    let (_engine, _manager, server) = make_jwt_worker_server();
+    let token = make_token(json!({
+        "sub": "user",
+        "scope": ["task:create"],
+        "taskIds": "*",
+        "exp": 9999999999u64
+    }));
+    let response = server
+        .get("/workers/w1")
+        .add_header(axum_test::http::header::AUTHORIZATION, bearer_header(&token))
+        .await;
+    response.assert_status(axum_test::http::StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn delete_worker_returns_403_without_worker_manage_scope() {
+    let (_engine, _manager, server) = make_jwt_worker_server();
+    let token = make_token(json!({
+        "sub": "user",
+        "scope": ["task:create"],
+        "taskIds": "*",
+        "exp": 9999999999u64
+    }));
+    let response = server
+        .delete("/workers/w1")
+        .add_header(axum_test::http::header::AUTHORIZATION, bearer_header(&token))
+        .await;
+    response.assert_status(axum_test::http::StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn pull_task_returns_403_without_worker_connect_scope() {
+    let (_engine, _manager, server) = make_jwt_worker_server();
+    let token = make_token(json!({
+        "sub": "user",
+        "scope": ["task:create"],
+        "taskIds": "*",
+        "exp": 9999999999u64
+    }));
+    let response = server
+        .get("/workers/pull?workerId=w1")
+        .add_header(axum_test::http::header::AUTHORIZATION, bearer_header(&token))
+        .await;
+    response.assert_status(axum_test::http::StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn decline_task_returns_403_without_worker_connect_scope() {
+    let (_engine, _manager, server) = make_jwt_worker_server();
+    let token = make_token(json!({
+        "sub": "user",
+        "scope": ["task:create"],
+        "taskIds": "*",
+        "exp": 9999999999u64
+    }));
+    let response = server
+        .post("/workers/tasks/t1/decline")
+        .add_header(axum_test::http::header::AUTHORIZATION, bearer_header(&token))
+        .json(&json!({"workerId": "w1"}))
+        .await;
+    response.assert_status(axum_test::http::StatusCode::FORBIDDEN);
+}
+
+// ─── Workers with valid JWT scope ─────────────────────────────────────────
+
+#[tokio::test]
+async fn list_workers_succeeds_with_worker_manage_scope() {
+    let (_engine, manager, server) = make_jwt_worker_server();
+    let token = make_token(json!({
+        "sub": "user",
+        "scope": ["worker:manage"],
+        "taskIds": "*",
+        "exp": 9999999999u64
+    }));
+    register_test_worker(&manager, "w1").await;
+    let response = server
+        .get("/workers")
+        .add_header(axum_test::http::header::AUTHORIZATION, bearer_header(&token))
+        .await;
+    response.assert_status(axum_test::http::StatusCode::OK);
+    let body: Vec<serde_json::Value> = response.json();
+    assert_eq!(body.len(), 1);
+}
+
+#[tokio::test]
+async fn pull_task_with_weight_update_succeeds() {
+    let (_engine, manager, server) = make_worker_server();
+    register_test_worker(&manager, "w1").await;
+
+    // Create a pull-mode task
+    _engine
+        .create_task(taskcast_core::engine::CreateTaskInput {
+            id: Some("t1".to_string()),
+            assign_mode: Some(taskcast_core::AssignMode::Pull),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    // Pull with weight update
+    let response = server
+        .get("/workers/pull?workerId=w1&weight=80")
+        .await;
+    response.assert_status(axum_test::http::StatusCode::OK);
+
+    // Verify weight was updated
+    let worker = manager.get_worker("w1").await.unwrap().unwrap();
+    assert_eq!(worker.weight, 80);
+}
+
+// ─── Additional WebSocket Error Path Tests ────────────────────────────────
+
+#[tokio::test]
+async fn ws_disconnect_after_register_unregisters_worker_v2() {
+    let (_engine, manager, server) = make_worker_ws_server();
+
+    {
+        let mut ws = server.get_websocket("/workers/ws").await.into_websocket().await;
+        ws.send_json(&json!({
+            "type": "register",
+            "matchRule": {},
+            "capacity": 5,
+            "workerId": "disconnect-test"
+        }))
+        .await;
+
+        let resp: serde_json::Value = ws.receive_json().await;
+        assert_eq!(resp["type"], "registered");
+
+        // Verify worker exists
+        let worker = manager.get_worker("disconnect-test").await.unwrap();
+        assert!(worker.is_some());
+
+        // Drop ws to trigger close
+    }
+
+    // Give time for disconnect handler
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    // Worker should be unregistered
+    let worker = manager.get_worker("disconnect-test").await.unwrap();
+    assert!(worker.is_none());
+}
+
+#[tokio::test]
+async fn ws_binary_message_is_ignored() {
+    let (_engine, _manager, server) = make_worker_ws_server();
+
+    let mut ws = server.get_websocket("/workers/ws").await.into_websocket().await;
+
+    // Send binary message (should be silently ignored: Some(Ok(_)) => continue)
+    ws.send_message(axum_test::WsMessage::Binary(vec![0x01, 0x02, 0x03].into())).await;
+
+    // Send a valid register to prove the connection is still alive
+    ws.send_json(&json!({
+        "type": "register",
+        "matchRule": {},
+        "capacity": 5
+    }))
+    .await;
+
+    let resp: serde_json::Value = ws.receive_json().await;
+    assert_eq!(resp["type"], "registered");
+
+    ws.close().await;
+}
+
+#[tokio::test]
+async fn ws_accept_nonexistent_task_returns_claim_failed_v2() {
+    let (_engine, _manager, server) = make_worker_ws_server();
+
+    let mut ws = server.get_websocket("/workers/ws").await.into_websocket().await;
+    ws.send_json(&json!({
+        "type": "register",
+        "matchRule": {},
+        "capacity": 5,
+        "workerId": "w1"
+    }))
+    .await;
+    let _: serde_json::Value = ws.receive_json().await;
+
+    // Accept a task that doesn't exist — should get CLAIM_FAILED error
+    ws.send_json(&json!({
+        "type": "accept",
+        "taskId": "nonexistent-task"
+    }))
+    .await;
+
+    let resp: serde_json::Value = ws.receive_json().await;
+    assert_eq!(resp["type"], "error");
+    assert_eq!(resp["code"], "CLAIM_FAILED");
+
+    ws.close().await;
+}
+
+#[tokio::test]
+async fn ws_decline_after_register_succeeds() {
+    let (_engine, _manager, server) = make_worker_ws_server();
+
+    let mut ws = server.get_websocket("/workers/ws").await.into_websocket().await;
+    ws.send_json(&json!({
+        "type": "register",
+        "matchRule": {},
+        "capacity": 5,
+        "workerId": "w1"
+    }))
+    .await;
+    let _: serde_json::Value = ws.receive_json().await;
+
+    // Decline a task (even if no assignment exists, should return declined)
+    ws.send_json(&json!({
+        "type": "decline",
+        "taskId": "t1"
+    }))
+    .await;
+
+    let resp: serde_json::Value = ws.receive_json().await;
+    assert_eq!(resp["type"], "declined");
+    assert_eq!(resp["taskId"], "t1");
+
+    ws.close().await;
+}
+
+#[tokio::test]
+async fn ws_decline_with_blacklist_after_register() {
+    let (engine, _manager, server) = make_worker_ws_server();
+
+    // Create a task and claim it
+    engine
+        .create_task(taskcast_core::engine::CreateTaskInput {
+            id: Some("t1".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let mut ws = server.get_websocket("/workers/ws").await.into_websocket().await;
+    ws.send_json(&json!({
+        "type": "register",
+        "matchRule": {},
+        "capacity": 5,
+        "workerId": "w1"
+    }))
+    .await;
+    let _: serde_json::Value = ws.receive_json().await;
+
+    // Claim the task first
+    ws.send_json(&json!({
+        "type": "claim",
+        "taskId": "t1"
+    }))
+    .await;
+    let _: serde_json::Value = ws.receive_json().await;
+
+    // Decline with blacklist
+    ws.send_json(&json!({
+        "type": "decline",
+        "taskId": "t1",
+        "blacklist": true
+    }))
+    .await;
+
+    let resp: serde_json::Value = ws.receive_json().await;
+    assert_eq!(resp["type"], "declined");
+
+    ws.close().await;
+}
+
+#[tokio::test]
+async fn ws_drain_after_register_sets_status() {
+    let (_engine, manager, server) = make_worker_ws_server();
+
+    let mut ws = server.get_websocket("/workers/ws").await.into_websocket().await;
+    ws.send_json(&json!({
+        "type": "register",
+        "matchRule": {},
+        "capacity": 5,
+        "workerId": "w1"
+    }))
+    .await;
+    let _: serde_json::Value = ws.receive_json().await;
+
+    // Drain
+    ws.send_json(&json!({"type": "drain"})).await;
+
+    // Give time for processing
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    // Verify worker status changed to draining
+    let worker = manager.get_worker("w1").await.unwrap().unwrap();
+    assert_eq!(worker.status, taskcast_core::WorkerStatus::Draining);
+
+    ws.close().await;
+}
+
+#[tokio::test]
+async fn ws_update_after_register_changes_worker() {
+    let (_engine, manager, server) = make_worker_ws_server();
+
+    let mut ws = server.get_websocket("/workers/ws").await.into_websocket().await;
+    ws.send_json(&json!({
+        "type": "register",
+        "matchRule": {},
+        "capacity": 5,
+        "workerId": "w1"
+    }))
+    .await;
+    let _: serde_json::Value = ws.receive_json().await;
+
+    // Update weight and capacity
+    ws.send_json(&json!({
+        "type": "update",
+        "weight": 90,
+        "capacity": 10
+    }))
+    .await;
+
+    // Give time for processing
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    let worker = manager.get_worker("w1").await.unwrap().unwrap();
+    assert_eq!(worker.weight, 90);
+    assert_eq!(worker.capacity, 10);
+
+    ws.close().await;
+}
+
+#[tokio::test]
+async fn ws_claim_pending_task_returns_claimed_success() {
+    let (engine, _manager, server) = make_worker_ws_server();
+
+    engine
+        .create_task(taskcast_core::engine::CreateTaskInput {
+            id: Some("t1".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let mut ws = server.get_websocket("/workers/ws").await.into_websocket().await;
+    ws.send_json(&json!({
+        "type": "register",
+        "matchRule": {},
+        "capacity": 5,
+        "workerId": "w1"
+    }))
+    .await;
+    let _: serde_json::Value = ws.receive_json().await;
+
+    ws.send_json(&json!({
+        "type": "claim",
+        "taskId": "t1"
+    }))
+    .await;
+
+    let resp: serde_json::Value = ws.receive_json().await;
+    assert_eq!(resp["type"], "claimed");
+    assert_eq!(resp["taskId"], "t1");
+    assert_eq!(resp["success"], true);
+
+    ws.close().await;
+}
+
+#[tokio::test]
+async fn ws_accept_pending_task_returns_assigned_v2() {
+    let (engine, _manager, server) = make_worker_ws_server();
+
+    engine
+        .create_task(taskcast_core::engine::CreateTaskInput {
+            id: Some("t1".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let mut ws = server.get_websocket("/workers/ws").await.into_websocket().await;
+    ws.send_json(&json!({
+        "type": "register",
+        "matchRule": {},
+        "capacity": 5,
+        "workerId": "w1"
+    }))
+    .await;
+    let _: serde_json::Value = ws.receive_json().await;
+
+    ws.send_json(&json!({
+        "type": "accept",
+        "taskId": "t1"
+    }))
+    .await;
+
+    let resp: serde_json::Value = ws.receive_json().await;
+    assert_eq!(resp["type"], "assigned");
+    assert_eq!(resp["taskId"], "t1");
+
+    ws.close().await;
+}

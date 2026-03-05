@@ -1,0 +1,8 @@
+coverage:
+  status:
+    patch:
+      default:
+        target: auto
+
+ignore:
+  - "rust/taskcast-cli/src/main.rs"
