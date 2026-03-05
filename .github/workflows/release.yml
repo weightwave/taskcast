@@ -98,7 +98,7 @@ jobs:
   # ── Rust binary builds (5 platforms, native runners) ──────────────────────
   rust-build:
     needs: get-version
-    if: needs.get-version.outputs.version != ''
+    if: always() && needs.get-version.result == 'success' && needs.get-version.outputs.version != ''
     strategy:
       fail-fast: false
       matrix:
@@ -169,7 +169,7 @@ jobs:
   # ── Docker builds (2 platforms, native runners) ───────────────────────────
   docker-build:
     needs: get-version
-    if: needs.get-version.outputs.version != ''
+    if: always() && needs.get-version.result == 'success' && needs.get-version.outputs.version != ''
     strategy:
       fail-fast: false
       matrix:
@@ -233,6 +233,7 @@ jobs:
   # ── Docker manifest merge ─────────────────────────────────────────────────
   docker-merge:
     needs: [get-version, docker-build]
+    if: always() && needs.docker-build.result == 'success'
     runs-on: ubuntu-latest
     env:
       VERSION: ${{ needs.get-version.outputs.version }}
@@ -269,6 +270,7 @@ jobs:
   # ── Attach binaries to GitHub Release ─────────────────────────────────────
   attach-binaries:
     needs: [get-version, rust-build]
+    if: always() && needs.rust-build.result == 'success'
     runs-on: ubuntu-latest
     env:
       VERSION: ${{ needs.get-version.outputs.version }}
@@ -290,6 +292,7 @@ jobs:
   # ── Update Homebrew tap ────────────────────────────────────────────────────
   update-homebrew:
     needs: [get-version, rust-build]
+    if: always() && needs.rust-build.result == 'success'
     runs-on: ubuntu-latest
     env:
       VERSION: ${{ needs.get-version.outputs.version }}
