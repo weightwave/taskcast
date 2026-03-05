@@ -33,6 +33,8 @@
     "test:watch": "vitest"
   },
   "dependencies": {
+    "@hono/zod-openapi": "^0.19.10",
+    "@scalar/hono-api-reference": "^0.10.0",
     "@taskcast/core": "workspace:*",
     "hono": "^4.6.0",
     "jose": "^5.9.0",

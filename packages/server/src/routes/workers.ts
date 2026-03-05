@@ -1,15 +1,10 @@
 import { Hono } from 'hono'
-import { z } from 'zod'
 import { checkScope } from '../auth.js'
+import { DeclineSchema } from '../schemas.js'
 import type { WorkerManager, TaskEngine } from '@taskcast/core'
 
 export { WorkerWSHandler } from './worker-ws.js'
 export type { WSLike, TaskSummary } from './worker-ws.js'
-
-const DeclineSchema = z.object({
-  workerId: z.string(),
-  blacklist: z.boolean().optional(),
-})
 
 export function createWorkersRouter(manager: WorkerManager, engine: TaskEngine) {
   const router = new Hono()

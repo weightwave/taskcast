@@ -1,30 +1,7 @@
 import { Hono } from 'hono'
-import { z } from 'zod'
 import { checkScope } from '../auth.js'
+import { CreateTaskSchema, PublishEventSchema, TransitionSchema } from '../schemas.js'
 import type { TaskEngine, CreateTaskInput, PublishEventInput, SinceCursor, TaskError } from '@taskcast/core'
-
-const CreateTaskSchema = z.object({
-  id: z.string().optional(),
-  type: z.string().optional(),
-  params: z.record(z.unknown()).optional(),
-  metadata: z.record(z.unknown()).optional(),
-  ttl: z.number().int().positive().optional(),
-  webhooks: z.array(z.unknown()).optional(),
-  cleanup: z.object({ rules: z.array(z.unknown()) }).optional(),
-  tags: z.array(z.string()).optional(),
-  assignMode: z.enum(['external', 'pull', 'ws-offer', 'ws-race']).optional(),
-  cost: z.number().int().positive().optional(),
-  disconnectPolicy: z.enum(['reassign', 'mark', 'fail']).optional(),
-})
-
-const PublishEventSchema = z.object({
-  type: z.string(),
-  level: z.enum(['debug', 'info', 'warn', 'error']),
-  data: z.unknown(),
-  seriesId: z.string().optional(),
-  seriesMode: z.enum(['keep-all', 'accumulate', 'latest']).optional(),
-  seriesAccField: z.string().optional(),
-})
 
 export function createTasksRouter(engine: TaskEngine) {
   const router = new Hono()
@@ -69,19 +46,7 @@ export function createTasksRouter(engine: TaskEngine) {
     if (!checkScope(auth, 'task:manage', taskId)) return c.json({ error: 'Forbidden' }, 403)
 
     const body = await c.req.json()
-    const schema = z.object({
-      status: z.enum(['pending', 'assigned', 'running', 'paused', 'blocked', 'completed', 'failed', 'timeout', 'cancelled']),
-      result: z.record(z.unknown()).optional(),
-      error: z.object({
-        code: z.string().optional(),
-        message: z.string(),
-        details: z.record(z.unknown()).optional(),
-      }).optional(),
-      reason: z.string().optional(),
-      ttl: z.number().int().positive().optional(),
-      resumeAfterMs: z.number().int().positive().optional(),
-    })
-    const parsed = schema.safeParse(body)
+    const parsed = TransitionSchema.safeParse(body)
     if (!parsed.success) return c.json({ error: parsed.error.flatten() }, 400)
 
     try {
