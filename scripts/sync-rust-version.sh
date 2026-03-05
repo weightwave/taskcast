@@ -7,7 +7,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-VERSION=$(node -p "require('$ROOT/packages/cli/package.json').version")
+VERSION=$(cd "$ROOT" && node -p "require('./packages/cli/package.json').version")
 
 if [ -z "$VERSION" ]; then
   echo "ERROR: Could not read version from packages/cli/package.json" >&2
