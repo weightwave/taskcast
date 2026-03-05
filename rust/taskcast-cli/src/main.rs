@@ -249,7 +249,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("[taskcast] Worker assignment system enabled");
 
                 let mut wm_defaults = taskcast_core::worker_manager::WorkerManagerDefaults::default();
-                if let Some(ref cfg_defaults) = file_config.workers.as_ref().and_then(|w| w.defaults.as_ref()) {
+                if let Some(cfg_defaults) = file_config.workers.as_ref().and_then(|w| w.defaults.as_ref()) {
                     if let Some(v) = cfg_defaults.heartbeat_interval_ms {
                         wm_defaults.heartbeat_interval_ms = Some(v);
                     }
