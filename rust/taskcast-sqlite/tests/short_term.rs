@@ -1,7 +1,11 @@
 mod helpers;
 
 use helpers::{make_event, make_task, setup};
-use taskcast_core::types::{EventQueryOptions, SeriesMode, ShortTermStore, SinceCursor, TaskStatus};
+use taskcast_core::types::{
+    AssignMode, ConnectionMode, EventQueryOptions, SeriesMode, ShortTermStore, SinceCursor,
+    TaskFilter, TaskStatus, Worker, WorkerAssignment, WorkerAssignmentStatus, WorkerFilter,
+    WorkerMatchRule, WorkerStatus,
+};
 
 // ─── save_task / get_task ─────────────────────────────────────────────────
 
@@ -522,4 +526,679 @@ async fn event_data_with_null_value() {
         .unwrap();
     let events = ctx.short.get_events("task-1", None).await.unwrap();
     assert_eq!(events[0].data, serde_json::Value::Null);
+}
+
+// ─── helpers ─────────────────────────────────────────────────────────────
+
+fn make_worker(id: &str) -> Worker {
+    Worker {
+        id: id.to_string(),
+        status: WorkerStatus::Idle,
+        match_rule: WorkerMatchRule::default(),
+        capacity: 5,
+        used_slots: 0,
+        weight: 1,
+        connection_mode: ConnectionMode::Pull,
+        connected_at: 1000.0,
+        last_heartbeat_at: 1000.0,
+        metadata: None,
+    }
+}
+
+fn make_assignment(task_id: &str, worker_id: &str) -> WorkerAssignment {
+    WorkerAssignment {
+        task_id: task_id.to_string(),
+        worker_id: worker_id.to_string(),
+        cost: 1,
+        assigned_at: 2000.0,
+        status: WorkerAssignmentStatus::Assigned,
+    }
+}
+
+// ─── list_tasks ──────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn list_tasks_returns_empty_when_no_tasks() {
+    let ctx = setup().await;
+    let tasks = ctx
+        .short
+        .list_tasks(TaskFilter::default())
+        .await
+        .unwrap();
+    assert!(tasks.is_empty());
+}
+
+#[tokio::test]
+async fn list_tasks_returns_all_saved_tasks() {
+    let ctx = setup().await;
+    ctx.short.save_task(make_task("task-1")).await.unwrap();
+    ctx.short.save_task(make_task("task-2")).await.unwrap();
+    ctx.short.save_task(make_task("task-3")).await.unwrap();
+
+    let tasks = ctx
+        .short
+        .list_tasks(TaskFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(tasks.len(), 3);
+}
+
+#[tokio::test]
+async fn list_tasks_filters_by_status() {
+    let ctx = setup().await;
+    ctx.short.save_task(make_task("task-1")).await.unwrap(); // pending
+
+    let mut running_task = make_task("task-2");
+    running_task.status = TaskStatus::Running;
+    ctx.short.save_task(running_task).await.unwrap();
+
+    let mut completed_task = make_task("task-3");
+    completed_task.status = TaskStatus::Completed;
+    ctx.short.save_task(completed_task).await.unwrap();
+
+    let filter = TaskFilter {
+        status: Some(vec![TaskStatus::Pending]),
+        ..Default::default()
+    };
+    let tasks = ctx.short.list_tasks(filter).await.unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].id, "task-1");
+
+    let filter = TaskFilter {
+        status: Some(vec![TaskStatus::Running, TaskStatus::Completed]),
+        ..Default::default()
+    };
+    let tasks = ctx.short.list_tasks(filter).await.unwrap();
+    assert_eq!(tasks.len(), 2);
+}
+
+#[tokio::test]
+async fn list_tasks_filters_by_type() {
+    let ctx = setup().await;
+    let mut t1 = make_task("task-1");
+    t1.r#type = Some("llm".to_string());
+    ctx.short.save_task(t1).await.unwrap();
+
+    let mut t2 = make_task("task-2");
+    t2.r#type = Some("image".to_string());
+    ctx.short.save_task(t2).await.unwrap();
+
+    ctx.short.save_task(make_task("task-3")).await.unwrap(); // no type
+
+    let filter = TaskFilter {
+        types: Some(vec!["llm".to_string()]),
+        ..Default::default()
+    };
+    let tasks = ctx.short.list_tasks(filter).await.unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].id, "task-1");
+}
+
+#[tokio::test]
+async fn list_tasks_filters_by_assign_mode() {
+    let ctx = setup().await;
+    let mut t1 = make_task("task-1");
+    t1.assign_mode = Some(AssignMode::Pull);
+    ctx.short.save_task(t1).await.unwrap();
+
+    let mut t2 = make_task("task-2");
+    t2.assign_mode = Some(AssignMode::External);
+    ctx.short.save_task(t2).await.unwrap();
+
+    ctx.short.save_task(make_task("task-3")).await.unwrap(); // no assign_mode
+
+    let filter = TaskFilter {
+        assign_mode: Some(vec![AssignMode::Pull]),
+        ..Default::default()
+    };
+    let tasks = ctx.short.list_tasks(filter).await.unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].id, "task-1");
+}
+
+#[tokio::test]
+async fn list_tasks_excludes_task_ids() {
+    let ctx = setup().await;
+    ctx.short.save_task(make_task("task-1")).await.unwrap();
+    ctx.short.save_task(make_task("task-2")).await.unwrap();
+    ctx.short.save_task(make_task("task-3")).await.unwrap();
+
+    let filter = TaskFilter {
+        exclude_task_ids: Some(vec!["task-1".to_string(), "task-3".to_string()]),
+        ..Default::default()
+    };
+    let tasks = ctx.short.list_tasks(filter).await.unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].id, "task-2");
+}
+
+#[tokio::test]
+async fn list_tasks_respects_limit() {
+    let ctx = setup().await;
+    for i in 0..10 {
+        ctx.short
+            .save_task(make_task(&format!("task-{}", i)))
+            .await
+            .unwrap();
+    }
+
+    let filter = TaskFilter {
+        limit: Some(3),
+        ..Default::default()
+    };
+    let tasks = ctx.short.list_tasks(filter).await.unwrap();
+    assert_eq!(tasks.len(), 3);
+}
+
+#[tokio::test]
+async fn list_tasks_combines_multiple_filters() {
+    let ctx = setup().await;
+
+    let mut t1 = make_task("task-1");
+    t1.status = TaskStatus::Running;
+    t1.r#type = Some("llm".to_string());
+    ctx.short.save_task(t1).await.unwrap();
+
+    let mut t2 = make_task("task-2");
+    t2.status = TaskStatus::Running;
+    t2.r#type = Some("image".to_string());
+    ctx.short.save_task(t2).await.unwrap();
+
+    let mut t3 = make_task("task-3");
+    t3.status = TaskStatus::Pending;
+    t3.r#type = Some("llm".to_string());
+    ctx.short.save_task(t3).await.unwrap();
+
+    let filter = TaskFilter {
+        status: Some(vec![TaskStatus::Running]),
+        types: Some(vec!["llm".to_string()]),
+        ..Default::default()
+    };
+    let tasks = ctx.short.list_tasks(filter).await.unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].id, "task-1");
+}
+
+// ─── save_worker / get_worker ────────────────────────────────────────────
+
+#[tokio::test]
+async fn save_and_retrieve_a_worker() {
+    let ctx = setup().await;
+    let worker = make_worker("worker-1");
+    ctx.short.save_worker(worker.clone()).await.unwrap();
+    let retrieved = ctx.short.get_worker("worker-1").await.unwrap();
+    assert_eq!(retrieved, Some(worker));
+}
+
+#[tokio::test]
+async fn return_none_for_missing_worker() {
+    let ctx = setup().await;
+    let result = ctx.short.get_worker("nonexistent").await.unwrap();
+    assert_eq!(result, None);
+}
+
+#[tokio::test]
+async fn upsert_worker_on_conflict() {
+    let ctx = setup().await;
+    let worker = make_worker("worker-1");
+    ctx.short.save_worker(worker.clone()).await.unwrap();
+
+    let mut updated = worker.clone();
+    updated.status = WorkerStatus::Busy;
+    updated.used_slots = 3;
+    updated.last_heartbeat_at = 2000.0;
+    ctx.short.save_worker(updated.clone()).await.unwrap();
+
+    let retrieved = ctx.short.get_worker("worker-1").await.unwrap().unwrap();
+    assert_eq!(retrieved.status, WorkerStatus::Busy);
+    assert_eq!(retrieved.used_slots, 3);
+    assert_eq!(retrieved.last_heartbeat_at, 2000.0);
+}
+
+#[tokio::test]
+async fn worker_preserves_all_fields_on_round_trip() {
+    let ctx = setup().await;
+    let worker = Worker {
+        id: "worker-full".to_string(),
+        status: WorkerStatus::Busy,
+        match_rule: WorkerMatchRule {
+            task_types: Some(vec!["llm".to_string(), "image".to_string()]),
+            tags: None,
+        },
+        capacity: 10,
+        used_slots: 3,
+        weight: 5,
+        connection_mode: ConnectionMode::Websocket,
+        connected_at: 1500.0,
+        last_heartbeat_at: 1600.0,
+        metadata: Some(
+            [("region".to_string(), serde_json::json!("us-east"))]
+                .into_iter()
+                .collect(),
+        ),
+    };
+    ctx.short.save_worker(worker.clone()).await.unwrap();
+    let retrieved = ctx.short.get_worker("worker-full").await.unwrap().unwrap();
+    assert_eq!(retrieved, worker);
+}
+
+#[tokio::test]
+async fn worker_with_no_metadata_round_trips() {
+    let ctx = setup().await;
+    let worker = make_worker("worker-minimal");
+    ctx.short.save_worker(worker.clone()).await.unwrap();
+    let retrieved = ctx.short.get_worker("worker-minimal").await.unwrap().unwrap();
+    assert!(retrieved.metadata.is_none());
+    assert_eq!(retrieved, worker);
+}
+
+// ─── list_workers ────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn list_workers_returns_empty_when_none() {
+    let ctx = setup().await;
+    let workers = ctx.short.list_workers(None).await.unwrap();
+    assert!(workers.is_empty());
+}
+
+#[tokio::test]
+async fn list_workers_returns_all_workers() {
+    let ctx = setup().await;
+    ctx.short.save_worker(make_worker("w-1")).await.unwrap();
+    ctx.short.save_worker(make_worker("w-2")).await.unwrap();
+    ctx.short.save_worker(make_worker("w-3")).await.unwrap();
+
+    let workers = ctx.short.list_workers(None).await.unwrap();
+    assert_eq!(workers.len(), 3);
+}
+
+#[tokio::test]
+async fn list_workers_filters_by_status() {
+    let ctx = setup().await;
+    ctx.short.save_worker(make_worker("w-idle")).await.unwrap(); // idle
+
+    let mut busy = make_worker("w-busy");
+    busy.status = WorkerStatus::Busy;
+    ctx.short.save_worker(busy).await.unwrap();
+
+    let mut draining = make_worker("w-drain");
+    draining.status = WorkerStatus::Draining;
+    ctx.short.save_worker(draining).await.unwrap();
+
+    let filter = WorkerFilter {
+        status: Some(vec![WorkerStatus::Idle]),
+        connection_mode: None,
+    };
+    let workers = ctx.short.list_workers(Some(filter)).await.unwrap();
+    assert_eq!(workers.len(), 1);
+    assert_eq!(workers[0].id, "w-idle");
+
+    let filter = WorkerFilter {
+        status: Some(vec![WorkerStatus::Busy, WorkerStatus::Draining]),
+        connection_mode: None,
+    };
+    let workers = ctx.short.list_workers(Some(filter)).await.unwrap();
+    assert_eq!(workers.len(), 2);
+}
+
+#[tokio::test]
+async fn list_workers_filters_by_connection_mode() {
+    let ctx = setup().await;
+    ctx.short.save_worker(make_worker("w-pull")).await.unwrap(); // ConnectionMode::Pull
+
+    let mut ws_worker = make_worker("w-ws");
+    ws_worker.connection_mode = ConnectionMode::Websocket;
+    ctx.short.save_worker(ws_worker).await.unwrap();
+
+    let filter = WorkerFilter {
+        status: None,
+        connection_mode: Some(vec![ConnectionMode::Websocket]),
+    };
+    let workers = ctx.short.list_workers(Some(filter)).await.unwrap();
+    assert_eq!(workers.len(), 1);
+    assert_eq!(workers[0].id, "w-ws");
+}
+
+#[tokio::test]
+async fn list_workers_combines_filters() {
+    let ctx = setup().await;
+
+    // idle + pull
+    ctx.short.save_worker(make_worker("w-1")).await.unwrap();
+
+    // busy + websocket
+    let mut w2 = make_worker("w-2");
+    w2.status = WorkerStatus::Busy;
+    w2.connection_mode = ConnectionMode::Websocket;
+    ctx.short.save_worker(w2).await.unwrap();
+
+    // idle + websocket
+    let mut w3 = make_worker("w-3");
+    w3.connection_mode = ConnectionMode::Websocket;
+    ctx.short.save_worker(w3).await.unwrap();
+
+    let filter = WorkerFilter {
+        status: Some(vec![WorkerStatus::Idle]),
+        connection_mode: Some(vec![ConnectionMode::Websocket]),
+    };
+    let workers = ctx.short.list_workers(Some(filter)).await.unwrap();
+    assert_eq!(workers.len(), 1);
+    assert_eq!(workers[0].id, "w-3");
+}
+
+// ─── delete_worker ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn delete_worker_removes_it() {
+    let ctx = setup().await;
+    ctx.short.save_worker(make_worker("w-1")).await.unwrap();
+    ctx.short.save_worker(make_worker("w-2")).await.unwrap();
+
+    ctx.short.delete_worker("w-1").await.unwrap();
+
+    let result = ctx.short.get_worker("w-1").await.unwrap();
+    assert_eq!(result, None);
+
+    // Other worker still exists
+    let result = ctx.short.get_worker("w-2").await.unwrap();
+    assert!(result.is_some());
+}
+
+#[tokio::test]
+async fn delete_nonexistent_worker_does_not_error() {
+    let ctx = setup().await;
+    let result = ctx.short.delete_worker("nonexistent").await;
+    assert!(result.is_ok());
+}
+
+// ─── claim_task ──────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn claim_task_succeeds_for_pending_task_with_capacity() {
+    let ctx = setup().await;
+    ctx.short.save_task(make_task("task-1")).await.unwrap(); // pending
+    ctx.short.save_worker(make_worker("w-1")).await.unwrap(); // capacity=5, used=0
+
+    let claimed = ctx.short.claim_task("task-1", "w-1", 1).await.unwrap();
+    assert!(claimed);
+
+    // Verify task is now assigned
+    let task = ctx.short.get_task("task-1").await.unwrap().unwrap();
+    assert_eq!(task.status, TaskStatus::Assigned);
+    assert_eq!(task.assigned_worker, Some("w-1".to_string()));
+    assert_eq!(task.cost, Some(1));
+
+    // Verify worker used_slots incremented
+    let worker = ctx.short.get_worker("w-1").await.unwrap().unwrap();
+    assert_eq!(worker.used_slots, 1);
+}
+
+#[tokio::test]
+async fn claim_task_fails_when_worker_at_capacity() {
+    let ctx = setup().await;
+    ctx.short.save_task(make_task("task-1")).await.unwrap();
+
+    let mut worker = make_worker("w-1");
+    worker.capacity = 2;
+    worker.used_slots = 2;
+    ctx.short.save_worker(worker).await.unwrap();
+
+    let claimed = ctx.short.claim_task("task-1", "w-1", 1).await.unwrap();
+    assert!(!claimed);
+
+    // Task should remain pending
+    let task = ctx.short.get_task("task-1").await.unwrap().unwrap();
+    assert_eq!(task.status, TaskStatus::Pending);
+}
+
+#[tokio::test]
+async fn claim_task_fails_when_cost_exceeds_remaining_capacity() {
+    let ctx = setup().await;
+    ctx.short.save_task(make_task("task-1")).await.unwrap();
+
+    let mut worker = make_worker("w-1");
+    worker.capacity = 5;
+    worker.used_slots = 3;
+    ctx.short.save_worker(worker).await.unwrap();
+
+    // cost=3, but only 2 slots remaining
+    let claimed = ctx.short.claim_task("task-1", "w-1", 3).await.unwrap();
+    assert!(!claimed);
+}
+
+#[tokio::test]
+async fn claim_task_fails_for_nonexistent_worker() {
+    let ctx = setup().await;
+    ctx.short.save_task(make_task("task-1")).await.unwrap();
+
+    let claimed = ctx.short.claim_task("task-1", "no-worker", 1).await.unwrap();
+    assert!(!claimed);
+}
+
+#[tokio::test]
+async fn claim_task_fails_for_nonexistent_task() {
+    let ctx = setup().await;
+    ctx.short.save_worker(make_worker("w-1")).await.unwrap();
+
+    let claimed = ctx.short.claim_task("no-task", "w-1", 1).await.unwrap();
+    assert!(!claimed);
+}
+
+#[tokio::test]
+async fn claim_task_fails_for_running_task() {
+    let ctx = setup().await;
+    let mut task = make_task("task-1");
+    task.status = TaskStatus::Running;
+    ctx.short.save_task(task).await.unwrap();
+    ctx.short.save_worker(make_worker("w-1")).await.unwrap();
+
+    let claimed = ctx.short.claim_task("task-1", "w-1", 1).await.unwrap();
+    assert!(!claimed);
+}
+
+#[tokio::test]
+async fn claim_task_fails_for_completed_task() {
+    let ctx = setup().await;
+    let mut task = make_task("task-1");
+    task.status = TaskStatus::Completed;
+    ctx.short.save_task(task).await.unwrap();
+    ctx.short.save_worker(make_worker("w-1")).await.unwrap();
+
+    let claimed = ctx.short.claim_task("task-1", "w-1", 1).await.unwrap();
+    assert!(!claimed);
+}
+
+#[tokio::test]
+async fn claim_task_succeeds_for_assigned_task() {
+    let ctx = setup().await;
+    let mut task = make_task("task-1");
+    task.status = TaskStatus::Assigned;
+    ctx.short.save_task(task).await.unwrap();
+    ctx.short.save_worker(make_worker("w-1")).await.unwrap();
+
+    let claimed = ctx.short.claim_task("task-1", "w-1", 1).await.unwrap();
+    assert!(claimed);
+}
+
+#[tokio::test]
+async fn claim_task_increments_used_slots_by_cost() {
+    let ctx = setup().await;
+    ctx.short.save_task(make_task("task-1")).await.unwrap();
+
+    let mut worker = make_worker("w-1");
+    worker.capacity = 10;
+    worker.used_slots = 2;
+    ctx.short.save_worker(worker).await.unwrap();
+
+    let claimed = ctx.short.claim_task("task-1", "w-1", 3).await.unwrap();
+    assert!(claimed);
+
+    let worker = ctx.short.get_worker("w-1").await.unwrap().unwrap();
+    assert_eq!(worker.used_slots, 5); // 2 + 3
+}
+
+// ─── add_assignment / get_task_assignment / get_worker_assignments ───────
+
+#[tokio::test]
+async fn add_and_retrieve_assignment_by_task() {
+    let ctx = setup().await;
+    let assignment = make_assignment("task-1", "w-1");
+    ctx.short.add_assignment(assignment.clone()).await.unwrap();
+
+    let retrieved = ctx.short.get_task_assignment("task-1").await.unwrap();
+    assert_eq!(retrieved, Some(assignment));
+}
+
+#[tokio::test]
+async fn get_task_assignment_returns_none_when_missing() {
+    let ctx = setup().await;
+    let result = ctx.short.get_task_assignment("nonexistent").await.unwrap();
+    assert_eq!(result, None);
+}
+
+#[tokio::test]
+async fn get_worker_assignments_returns_all_for_worker() {
+    let ctx = setup().await;
+    let a1 = make_assignment("task-1", "w-1");
+    let a2 = WorkerAssignment {
+        task_id: "task-2".to_string(),
+        worker_id: "w-1".to_string(),
+        cost: 2,
+        assigned_at: 3000.0,
+        status: WorkerAssignmentStatus::Running,
+    };
+    let a3 = make_assignment("task-3", "w-2"); // different worker
+
+    ctx.short.add_assignment(a1.clone()).await.unwrap();
+    ctx.short.add_assignment(a2.clone()).await.unwrap();
+    ctx.short.add_assignment(a3.clone()).await.unwrap();
+
+    let assignments = ctx.short.get_worker_assignments("w-1").await.unwrap();
+    assert_eq!(assignments.len(), 2);
+    let task_ids: Vec<&str> = assignments.iter().map(|a| a.task_id.as_str()).collect();
+    assert!(task_ids.contains(&"task-1"));
+    assert!(task_ids.contains(&"task-2"));
+}
+
+#[tokio::test]
+async fn get_worker_assignments_returns_empty_when_none() {
+    let ctx = setup().await;
+    let assignments = ctx.short.get_worker_assignments("w-1").await.unwrap();
+    assert!(assignments.is_empty());
+}
+
+#[tokio::test]
+async fn add_assignment_upserts_on_same_task_id() {
+    let ctx = setup().await;
+    let a1 = make_assignment("task-1", "w-1");
+    ctx.short.add_assignment(a1).await.unwrap();
+
+    // Reassign task-1 to w-2
+    let a2 = WorkerAssignment {
+        task_id: "task-1".to_string(),
+        worker_id: "w-2".to_string(),
+        cost: 3,
+        assigned_at: 4000.0,
+        status: WorkerAssignmentStatus::Offered,
+    };
+    ctx.short.add_assignment(a2.clone()).await.unwrap();
+
+    let retrieved = ctx.short.get_task_assignment("task-1").await.unwrap().unwrap();
+    assert_eq!(retrieved.worker_id, "w-2");
+    assert_eq!(retrieved.cost, 3);
+    assert_eq!(retrieved.status, WorkerAssignmentStatus::Offered);
+}
+
+// ─── remove_assignment ───────────────────────────────────────────────────
+
+#[tokio::test]
+async fn remove_assignment_deletes_by_task_id() {
+    let ctx = setup().await;
+    ctx.short
+        .add_assignment(make_assignment("task-1", "w-1"))
+        .await
+        .unwrap();
+    ctx.short
+        .add_assignment(make_assignment("task-2", "w-1"))
+        .await
+        .unwrap();
+
+    ctx.short.remove_assignment("task-1").await.unwrap();
+
+    let removed = ctx.short.get_task_assignment("task-1").await.unwrap();
+    assert_eq!(removed, None);
+
+    // Other assignment still exists
+    let still_there = ctx.short.get_task_assignment("task-2").await.unwrap();
+    assert!(still_there.is_some());
+}
+
+#[tokio::test]
+async fn remove_nonexistent_assignment_does_not_error() {
+    let ctx = setup().await;
+    let result = ctx.short.remove_assignment("nonexistent").await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn remove_assignment_reflected_in_worker_assignments() {
+    let ctx = setup().await;
+    ctx.short
+        .add_assignment(make_assignment("task-1", "w-1"))
+        .await
+        .unwrap();
+    ctx.short
+        .add_assignment(make_assignment("task-2", "w-1"))
+        .await
+        .unwrap();
+
+    ctx.short.remove_assignment("task-1").await.unwrap();
+
+    let assignments = ctx.short.get_worker_assignments("w-1").await.unwrap();
+    assert_eq!(assignments.len(), 1);
+    assert_eq!(assignments[0].task_id, "task-2");
+}
+
+// ─── assignment round-trip preserves all fields ──────────────────────────
+
+#[tokio::test]
+async fn assignment_preserves_all_fields_on_round_trip() {
+    let ctx = setup().await;
+    let assignment = WorkerAssignment {
+        task_id: "task-99".to_string(),
+        worker_id: "w-42".to_string(),
+        cost: 7,
+        assigned_at: 9999.0,
+        status: WorkerAssignmentStatus::Offered,
+    };
+    ctx.short.add_assignment(assignment.clone()).await.unwrap();
+
+    let retrieved = ctx
+        .short
+        .get_task_assignment("task-99")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(retrieved, assignment);
+}
+
+#[tokio::test]
+async fn assignment_running_status_round_trips() {
+    let ctx = setup().await;
+    let assignment = WorkerAssignment {
+        task_id: "task-1".to_string(),
+        worker_id: "w-1".to_string(),
+        cost: 1,
+        assigned_at: 1000.0,
+        status: WorkerAssignmentStatus::Running,
+    };
+    ctx.short.add_assignment(assignment.clone()).await.unwrap();
+
+    let retrieved = ctx
+        .short
+        .get_task_assignment("task-1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(retrieved.status, WorkerAssignmentStatus::Running);
 }
