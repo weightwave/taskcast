@@ -328,9 +328,11 @@ cleanup:
 
 ```mermaid
 stateDiagram-v2
+    classDef optional stroke-dasharray: 5 5,stroke:#999,color:#666
+
     [*] --> pending
     pending --> assigned : worker claimed
-    pending --> running
+    pending --> running : externally managed
     pending --> cancelled
     assigned --> running
     assigned --> cancelled
@@ -341,6 +343,9 @@ stateDiagram-v2
     running --> cancelled
     paused --> running
     paused --> cancelled
+
+    assigned:::optional
+    note right of assigned : Optional — only when<br/>worker assignment is enabled
 ```
 
 ### Permission Scopes

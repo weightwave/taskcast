@@ -328,9 +328,11 @@ cleanup:
 
 ```mermaid
 stateDiagram-v2
+    classDef optional stroke-dasharray: 5 5,stroke:#999,color:#666
+
     [*] --> pending : 创建
     pending --> assigned : Worker 认领
-    pending --> running : 开始执行
+    pending --> running : 外部管理
     pending --> cancelled : 取消
     assigned --> running : 开始执行
     assigned --> cancelled : 取消
@@ -341,6 +343,9 @@ stateDiagram-v2
     running --> cancelled : 取消
     paused --> running : 恢复
     paused --> cancelled : 取消
+
+    assigned:::optional
+    note right of assigned : 可选 — 仅在启用<br/>Worker 分配时生效
 ```
 
 ### 权限范围
