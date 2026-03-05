@@ -556,8 +556,8 @@ export function WorkerWsPanel({ panel }: { panel: Panel }) {
     if (connectionMode === 'embedded' || baseUrl === '/taskcast') {
       return `ws://${window.location.host}/workers/ws`
     }
-    const httpUrl = baseUrl.replace('/taskcast', '')
-    return httpUrl.replace(/^http/, 'ws') + '/workers/ws'
+    // External mode: baseUrl already includes /taskcast (e.g. http://localhost:3721/taskcast)
+    return baseUrl.replace(/^http/, 'ws') + '/workers/ws'
   }, [connectionMode, baseUrl])
 
   /* ---------------------------------------------------------------- */

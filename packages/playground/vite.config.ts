@@ -20,6 +20,7 @@ export default defineConfig({
         target: 'http://localhost:3721',
         changeOrigin: true,
         ws: true,
+        rewrite: (path) => `/taskcast${path}`,
       },
     },
   },

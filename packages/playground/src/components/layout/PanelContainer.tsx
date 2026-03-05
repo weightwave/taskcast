@@ -48,7 +48,7 @@ export function PanelContainer() {
   })
 
   return (
-    <ResizablePanelGroup direction="horizontal" className="flex-1">
+    <ResizablePanelGroup orientation="horizontal" className="flex-1">
       {elements}
     </ResizablePanelGroup>
   )

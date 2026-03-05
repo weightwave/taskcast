@@ -1,8 +1,9 @@
 import { serve } from '@hono/node-server'
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
+import { WebSocketServer } from 'ws'
 import { TaskEngine, MemoryBroadcastProvider, MemoryShortTermStore, WorkerManager } from '@taskcast/core'
-import { createTaskcastApp } from '@taskcast/server'
+import { createTaskcastApp, WorkerWSHandler } from '@taskcast/server'
 import { createServer } from 'vite'
 
 async function main() {
@@ -27,8 +28,33 @@ async function main() {
   app.route('/taskcast', taskcastApp)
 
   const taskcastPort = 3721
-  serve({ fetch: app.fetch, port: taskcastPort }, (info) => {
+  const httpServer = serve({ fetch: app.fetch, port: taskcastPort }, (info) => {
     console.log(`Taskcast server running at http://localhost:${info.port}`)
+  })
+
+  // WebSocket upgrade handling for worker connections
+  const wss = new WebSocketServer({ noServer: true })
+
+  httpServer.on('upgrade', (req, socket, head) => {
+    if (req.url?.startsWith('/taskcast/workers/ws')) {
+      wss.handleUpgrade(req, socket, head, (ws) => {
+        const handler = new WorkerWSHandler(workerManager, {
+          send: (data: string) => ws.send(data),
+          close: () => ws.close(),
+        })
+
+        ws.on('message', (data) => {
+          handler.handleMessage(data.toString())
+        })
+
+        ws.on('close', () => {
+          handler.stopPingTimer()
+          handler.handleDisconnect()
+        })
+      })
+    } else {
+      socket.destroy()
+    }
   })
 
   const vite = await createServer({

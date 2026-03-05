@@ -464,10 +464,8 @@ export function WorkerPullPanel({ panel }: { panel: Panel }) {
     if (connectionMode === 'embedded' || baseUrl === '/taskcast') {
       return `ws://${window.location.host}/workers/ws`
     }
-    // External mode: derive from baseUrl
-    // baseUrl might be like http://localhost:3721/taskcast
-    const httpUrl = baseUrl.replace('/taskcast', '')
-    return httpUrl.replace(/^http/, 'ws') + '/workers/ws'
+    // External mode: derive from baseUrl (e.g. http://localhost:3721/taskcast)
+    return baseUrl.replace(/^http/, 'ws') + '/workers/ws'
   }, [connectionMode, baseUrl])
 
   /* ---------------------------------------------------------------- */
@@ -480,8 +478,8 @@ export function WorkerPullPanel({ panel }: { panel: Panel }) {
       if (connectionMode === 'embedded' || baseUrl === '/taskcast') {
         return `/workers/pull?${qs}`
       }
-      const httpUrl = baseUrl.replace('/taskcast', '')
-      return `${httpUrl}/workers/pull?${qs}`
+      // External mode: baseUrl already includes /taskcast
+      return `${baseUrl}/workers/pull?${qs}`
     },
     [connectionMode, baseUrl],
   )

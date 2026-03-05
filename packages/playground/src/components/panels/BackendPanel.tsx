@@ -330,7 +330,7 @@ function PublishEventTab({ panel }: { panel: Panel }) {
     const body: Record<string, unknown> = { type, level }
     if (parsedData.value !== undefined) body.data = parsedData.value
     if (seriesId.trim()) body.seriesId = seriesId.trim()
-    if (seriesMode) body.seriesMode = seriesMode
+    if (seriesMode && seriesMode !== 'none') body.seriesMode = seriesMode
 
     setLoading(true)
     try {
