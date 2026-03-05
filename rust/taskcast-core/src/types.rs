@@ -46,6 +46,10 @@ pub enum PermissionScope {
     WorkerConnect,
     #[serde(rename = "worker:manage")]
     WorkerManage,
+    #[serde(rename = "task:resolve")]
+    TaskResolve,
+    #[serde(rename = "task:signal")]
+    TaskSignal,
     #[serde(rename = "*")]
     All,
 }
@@ -203,6 +207,14 @@ pub enum DisconnectPolicy {
     Reassign,
     Mark,
     Fail,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockedRequest {
+    #[serde(rename = "type")]
+    pub request_type: String,
+    pub data: serde_json::Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
@@ -363,6 +375,12 @@ pub struct Task {
     pub assigned_worker: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disconnect_policy: Option<DisconnectPolicy>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resume_at: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked_request: Option<BlockedRequest>,
 }
 
 // ─── Events ─────────────────────────────────────────────────────────────────
@@ -482,6 +500,16 @@ pub trait ShortTermStore: Send + Sync {
     async fn remove_assignment(&self, task_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
     async fn get_worker_assignments(&self, worker_id: &str) -> Result<Vec<WorkerAssignment>, Box<dyn std::error::Error + Send + Sync>>;
     async fn get_task_assignment(&self, task_id: &str) -> Result<Option<WorkerAssignment>, Box<dyn std::error::Error + Send + Sync>>;
+
+    // TTL management
+    async fn clear_ttl(&self, _task_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
+
+    // Status query
+    async fn list_by_status(&self, _statuses: &[TaskStatus]) -> Result<Vec<Task>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(vec![])
+    }
 }
 
 #[async_trait]
@@ -679,6 +707,9 @@ mod tests {
             cost: None,
             assigned_worker: None,
             disconnect_policy: None,
+            reason: None,
+            resume_at: None,
+            blocked_request: None,
         };
         let json = serde_json::to_value(&task).unwrap();
         // Check camelCase field names
@@ -765,6 +796,9 @@ mod tests {
             cost: None,
             assigned_worker: None,
             disconnect_policy: None,
+            reason: None,
+            resume_at: None,
+            blocked_request: None,
         };
 
         let json = serde_json::to_value(&task).unwrap();
@@ -825,6 +859,9 @@ mod tests {
             cost: None,
             assigned_worker: None,
             disconnect_policy: None,
+            reason: None,
+            resume_at: None,
+            blocked_request: None,
         };
         let json_str = serde_json::to_string(&task).unwrap();
         let back: Task = serde_json::from_str(&json_str).unwrap();
@@ -1227,6 +1264,9 @@ mod tests {
             cost: None,
             assigned_worker: None,
             disconnect_policy: None,
+            reason: None,
+            resume_at: None,
+            blocked_request: None,
         };
         let json_str = serde_json::to_string(&task).unwrap();
         // These keys must NOT appear at all
@@ -1245,6 +1285,9 @@ mod tests {
         assert!(!json_str.contains("\"cost\""));
         assert!(!json_str.contains("\"assignedWorker\""));
         assert!(!json_str.contains("\"disconnectPolicy\""));
+        assert!(!json_str.contains("\"reason\""));
+        assert!(!json_str.contains("\"resumeAt\""));
+        assert!(!json_str.contains("\"blockedRequest\""));
     }
 
     #[test]
@@ -1318,6 +1361,9 @@ mod tests {
             cost: None,
             assigned_worker: None,
             disconnect_policy: None,
+            reason: None,
+            resume_at: None,
+            blocked_request: None,
         };
         let json = serde_json::to_value(&task).unwrap();
         assert_eq!(json["cleanup"]["rules"][0]["trigger"]["afterMs"], 1000);
@@ -1362,6 +1408,7 @@ mod tests {
             auth_config: None, webhooks: None, cleanup: None,
             tags: None, assign_mode: None, cost: None,
             assigned_worker: None, disconnect_policy: None,
+            reason: None, resume_at: None, blocked_request: None,
         };
         let err = TaskError { code: None, message: "boom".to_string(), details: None };
         let event = TaskEvent {

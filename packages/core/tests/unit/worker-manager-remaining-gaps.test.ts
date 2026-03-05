@@ -525,7 +525,7 @@ describe('WorkerManager — Audit Event Completeness', () => {
     await vi.waitFor(() => {
       expect(longTermStore.saveWorkerEvent).toHaveBeenCalledWith(
         expect.objectContaining({
-          action: 'task_released',
+          action: 'task_reclaimed',
           workerId: 'w1',
           data: { taskId: task.id },
         }),

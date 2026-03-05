@@ -2,6 +2,7 @@ import type { Redis } from 'ioredis'
 import type {
   Task,
   TaskEvent,
+  TaskStatus,
   ShortTermStore,
   EventQueryOptions,
   TaskFilter,
@@ -305,5 +306,25 @@ export class RedisShortTermStore implements ShortTermStore {
   async getTaskAssignment(taskId: string): Promise<WorkerAssignment | null> {
     const raw = await this.redis.get(this.KEY.assignment(taskId))
     return raw ? (JSON.parse(raw) as WorkerAssignment) : null
+  }
+
+  // TTL management — remove expiry from task-related keys
+  async clearTTL(taskId: string): Promise<void> {
+    await this.redis.persist(this.KEY.task(taskId))
+    await this.redis.persist(this.KEY.events(taskId))
+    await this.redis.persist(this.KEY.idx(taskId))
+
+    const seriesIds = await this.redis.smembers(this.KEY.seriesIds(taskId))
+    const pipeline = this.redis.pipeline()
+    for (const sid of seriesIds) {
+      pipeline.persist(this.KEY.seriesLatest(taskId, sid))
+    }
+    pipeline.persist(this.KEY.seriesIds(taskId))
+    await pipeline.exec()
+  }
+
+  // Task query by status
+  async listByStatus(statuses: TaskStatus[]): Promise<Task[]> {
+    return this.listTasks({ status: statuses })
   }
 }

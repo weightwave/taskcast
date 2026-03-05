@@ -91,6 +91,9 @@ impl PostgresLongTermStore {
             cost: cost_i32.map(|v| v as u32),
             assigned_worker,
             disconnect_policy,
+            reason: None,
+            resume_at: None,
+            blocked_request: None,
         }
     }
 

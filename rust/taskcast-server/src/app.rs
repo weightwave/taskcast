@@ -4,13 +4,20 @@ use axum::middleware;
 use axum::response::IntoResponse;
 use axum::routing::{get, patch, post};
 use axum::Router;
-use taskcast_core::worker_manager::WorkerManager;
-use taskcast_core::TaskEngine;
+use taskcast_core::heartbeat_monitor::{HeartbeatMonitor, HeartbeatMonitorOptions};
+use taskcast_core::scheduler::{TaskScheduler, TaskSchedulerOptions};
+use taskcast_core::worker_manager::{DispatchResult, WorkerManager};
+use taskcast_core::state_machine::is_terminal;
+use taskcast_core::{
+    AssignMode, ConnectionMode, DisconnectPolicy, ShortTermStore, TaskEngine, TaskStatus,
+    WorkerStatus,
+};
 use utoipa::OpenApi;
 use utoipa_scalar::{Scalar, Servable};
 
 use crate::auth::{auth_middleware, AuthMode};
 use crate::openapi::ApiDoc;
+use crate::routes::worker_ws::{WsRegistry, WorkerCommand, task_to_summary};
 use crate::routes::{sse, tasks};
 
 /// Shared application state available to all handlers.
@@ -21,17 +28,22 @@ pub struct AppState {
 }
 
 /// Create the Axum router with all taskcast routes mounted.
+///
+/// Returns the router and an optional `WsRegistry` (present when a `WorkerManager`
+/// is provided) that can be used to send commands to connected WebSocket workers.
 pub fn create_app(
     engine: Arc<TaskEngine>,
     auth_mode: AuthMode,
     worker_manager: Option<Arc<WorkerManager>>,
-) -> Router {
+) -> (Router, Option<WsRegistry>) {
     let auth_mode = Arc::new(auth_mode);
 
     let task_routes = Router::new()
         .route("/", post(tasks::create_task))
         .route("/{task_id}", get(tasks::get_task))
         .route("/{task_id}/status", patch(tasks::transition_task))
+        .route("/{task_id}/resolve", post(tasks::resolve_task))
+        .route("/{task_id}/request", get(tasks::get_blocked_request))
         .route(
             "/{task_id}/events",
             post(tasks::publish_events).get(sse::sse_events),
@@ -44,17 +56,102 @@ pub fn create_app(
         .nest("/tasks", task_routes);
 
     // Conditionally mount worker routes if a WorkerManager is provided
+    let mut ws_registry_out: Option<WsRegistry> = None;
+
     if let Some(manager) = worker_manager {
+        let ws_registry = WsRegistry::new();
+
+        // Auto-release worker capacity on terminal transitions
+        {
+            let wm_clone = Arc::clone(&manager);
+            engine.add_transition_listener(Box::new(move |task, _from, to| {
+                if is_terminal(to) {
+                    let wm = Arc::clone(&wm_clone);
+                    let task_id = task.id.clone();
+                    tokio::spawn(async move {
+                        let _ = wm.release_task(&task_id).await;
+                    });
+                }
+            }));
+        }
+
+        // Wire ws-offer/ws-race dispatch via transition listener
+        {
+            let wm_clone = Arc::clone(&manager);
+            let registry_clone = ws_registry.clone();
+            engine.add_transition_listener(Box::new(move |task, _from, to| {
+                if *to != TaskStatus::Pending {
+                    return;
+                }
+                let assign_mode = match &task.assign_mode {
+                    Some(m) => m.clone(),
+                    None => return,
+                };
+                match assign_mode {
+                    AssignMode::WsOffer => {
+                        let wm = Arc::clone(&wm_clone);
+                        let registry = registry_clone.clone();
+                        let task_id = task.id.clone();
+                        let task_summary = task_to_summary(task);
+                        tokio::spawn(async move {
+                            if let Ok(DispatchResult::Dispatched { worker_id }) =
+                                wm.dispatch_task(&task_id).await
+                            {
+                                registry.send(
+                                    &worker_id,
+                                    WorkerCommand::Offer {
+                                        task_id,
+                                        task: task_summary,
+                                    },
+                                );
+                            }
+                        });
+                    }
+                    AssignMode::WsRace => {
+                        let wm = Arc::clone(&wm_clone);
+                        let registry = registry_clone.clone();
+                        let task_id = task.id.clone();
+                        let task_summary = task_to_summary(task);
+                        tokio::spawn(async move {
+                            if let Ok(workers) = wm.list_workers(None).await {
+                                for worker in workers {
+                                    if worker.connection_mode != ConnectionMode::Websocket {
+                                        continue;
+                                    }
+                                    if worker.status != WorkerStatus::Idle
+                                        && worker.status != WorkerStatus::Busy
+                                    {
+                                        continue;
+                                    }
+                                    registry.send(
+                                        &worker.id,
+                                        WorkerCommand::Available {
+                                            task_id: task_id.clone(),
+                                            task: task_summary.clone(),
+                                        },
+                                    );
+                                }
+                            }
+                        });
+                    }
+                    _ => {}
+                }
+            }));
+        }
+
         let worker_routes = crate::routes::workers::workers_router()
             .with_state(Arc::clone(&manager));
 
-        // Mount WS route at top level for /workers/ws
+        // Mount WS route at top level for /workers/ws (with registry)
         app = app
             .route(
                 "/workers/ws",
-                get(crate::routes::worker_ws::ws_handler).with_state(Arc::clone(&manager)),
+                get(crate::routes::worker_ws::ws_handler)
+                    .with_state((Arc::clone(&manager), ws_registry.clone())),
             )
             .nest("/workers", worker_routes);
+
+        ws_registry_out = Some(ws_registry);
     }
 
     // OpenAPI spec and Scalar UI
@@ -70,12 +167,72 @@ pub fn create_app(
         .merge(Scalar::with_url("/docs", openapi_spec));
 
     // Auth middleware must be applied AFTER routes are mounted
-    app.layer(middleware::from_fn_with_state(
+    let router = app.layer(middleware::from_fn_with_state(
         Arc::clone(&auth_mode),
         auth_middleware,
-    ))
+    ));
+
+    (router, ws_registry_out)
 }
 
 async fn health() -> impl IntoResponse {
     axum::Json(serde_json::json!({ "ok": true }))
+}
+
+// ─── Background Services ────────────────────────────────────────────────────
+
+/// Holds optional background services that run alongside the HTTP server.
+pub struct BackgroundServices {
+    pub scheduler: Option<TaskScheduler>,
+    pub heartbeat_monitor: Option<HeartbeatMonitor>,
+}
+
+impl BackgroundServices {
+    /// Stop all running background services.
+    pub fn stop(&mut self) {
+        if let Some(ref mut s) = self.scheduler {
+            s.stop();
+        }
+        if let Some(ref mut h) = self.heartbeat_monitor {
+            h.stop();
+        }
+    }
+}
+
+/// Create and start background services (scheduler + heartbeat monitor).
+///
+/// The caller owns the returned `BackgroundServices` and should call `.stop()`
+/// on shutdown.
+pub fn start_background_services(
+    engine: Arc<TaskEngine>,
+    store: Arc<dyn ShortTermStore>,
+    worker_manager: Option<Arc<WorkerManager>>,
+) -> BackgroundServices {
+    let mut scheduler = TaskScheduler::new(TaskSchedulerOptions {
+        engine: Arc::clone(&engine),
+        short_term_store: Arc::clone(&store),
+        check_interval_ms: 60_000,
+        paused_cold_after_ms: None,
+        blocked_cold_after_ms: None,
+    });
+    scheduler.start();
+
+    let heartbeat_monitor = worker_manager.map(|wm| {
+        let mut monitor = HeartbeatMonitor::new(HeartbeatMonitorOptions {
+            worker_manager: wm,
+            engine,
+            short_term_store: store,
+            check_interval_ms: 30_000,
+            heartbeat_timeout_ms: 90_000,
+            default_disconnect_policy: DisconnectPolicy::Reassign,
+            disconnect_grace_ms: 30_000,
+        });
+        monitor.start();
+        monitor
+    });
+
+    BackgroundServices {
+        scheduler: Some(scheduler),
+        heartbeat_monitor,
+    }
 }

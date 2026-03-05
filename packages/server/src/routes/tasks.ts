@@ -10,7 +10,7 @@ import {
   TaskEventSchema,
   ErrorSchema,
 } from '../schemas.js'
-import type { TaskEngine, CreateTaskInput, PublishEventInput, SinceCursor, TaskError } from '@taskcast/core'
+import type { TaskEngine, CreateTaskInput, PublishEventInput, SinceCursor, TaskError, BlockedRequest } from '@taskcast/core'
 
 // ─── Route Definitions ─────────────────────────────────────────────────────
 
@@ -139,6 +139,9 @@ export function createTasksRouter(engine: TaskEngine): Hono {
     if (d.assignMode !== undefined) input.assignMode = d.assignMode
     if (d.cost !== undefined) input.cost = d.cost
     if (d.disconnectPolicy !== undefined) input.disconnectPolicy = d.disconnectPolicy
+    if (d.webhooks !== undefined) input.webhooks = d.webhooks as CreateTaskInput['webhooks']
+    if (d.cleanup !== undefined) input.cleanup = d.cleanup as CreateTaskInput['cleanup']
+    if (d.authConfig !== undefined) input.authConfig = d.authConfig as unknown as CreateTaskInput['authConfig']
 
     const task = await engine.createTask(input)
     return c.json(task, 201)
@@ -170,6 +173,7 @@ export function createTasksRouter(engine: TaskEngine): Hono {
         reason?: string
         ttl?: number
         resumeAfterMs?: number
+        blockedRequest?: BlockedRequest
       } = {}
       if (parsed.data.result !== undefined) payload.result = parsed.data.result
       if (parsed.data.error !== undefined) {
@@ -182,6 +186,12 @@ export function createTasksRouter(engine: TaskEngine): Hono {
       if (parsed.data.reason !== undefined) payload.reason = parsed.data.reason
       if (parsed.data.ttl !== undefined) payload.ttl = parsed.data.ttl
       if (parsed.data.resumeAfterMs !== undefined) payload.resumeAfterMs = parsed.data.resumeAfterMs
+      if (parsed.data.blockedRequest !== undefined) {
+        payload.blockedRequest = {
+          type: parsed.data.blockedRequest.type,
+          data: parsed.data.blockedRequest.data,
+        }
+      }
       const task = await engine.transitionTask(taskId, parsed.data.status, payload)
       return c.json(task)
     } catch (err) {
@@ -244,6 +254,49 @@ export function createTasksRouter(engine: TaskEngine): Hono {
 
     const events = await engine.getEvents(taskId, since !== undefined ? { since } : undefined)
     return c.json(events)
+  })
+
+  // ─── POST /tasks/:taskId/resolve — Resolve a blocked task ─────────────────
+  router.post('/:taskId/resolve', async (c: Context) => {
+    const taskId = c.req.param('taskId') as string
+    const auth = c.get('auth')
+    if (!checkScope(auth, 'task:resolve', taskId)) return c.json({ error: 'Forbidden' }, 403)
+
+    const task = await engine.getTask(taskId)
+    if (!task) return c.json({ error: 'Task not found' }, 404)
+    if (task.status !== 'blocked') return c.json({ error: 'Task is not blocked' }, 400)
+
+    const body = await c.req.json()
+    const schema = z.object({ data: z.unknown() })
+    const parsed = schema.safeParse(body)
+    if (!parsed.success) return c.json({ error: parsed.error.flatten() }, 400)
+
+    try {
+      const updated = await engine.transitionTask(taskId, 'running', {
+        result: typeof parsed.data.data === 'object' && parsed.data.data !== null
+          ? parsed.data.data as Record<string, unknown>
+          : { resolution: parsed.data.data },
+      })
+      return c.json(updated)
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      return c.json({ error: msg }, 400)
+    }
+  })
+
+  // ─── GET /tasks/:taskId/request — Get blocked request ────────────────────
+  router.get('/:taskId/request', async (c: Context) => {
+    const taskId = c.req.param('taskId') as string
+    const auth = c.get('auth')
+    if (!checkScope(auth, 'task:resolve', taskId)) return c.json({ error: 'Forbidden' }, 403)
+
+    const task = await engine.getTask(taskId)
+    if (!task) return c.json({ error: 'Task not found' }, 404)
+    if (task.status !== 'blocked' || !task.blockedRequest) {
+      return c.json({ error: 'No blocked request' }, 404)
+    }
+
+    return c.json(task.blockedRequest)
   })
 
   return router as unknown as Hono
