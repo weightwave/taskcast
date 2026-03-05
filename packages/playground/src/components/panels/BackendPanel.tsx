@@ -340,13 +340,13 @@ function PublishEventTab({ panel }: { panel: Panel }) {
       })
       const json = await res.json()
       setResponse({ status: res.status, body: json })
-      if (res.status === 201) addEvent(json)
+      if (res.status === 201) addEvent(json, 'sent', panel.label)
     } catch (e) {
       setResponse({ status: 0, body: { error: (e as Error).message } })
     } finally {
       setLoading(false)
     }
-  }, [apiFetch, addEvent, taskId, type, level, data, seriesId, seriesMode])
+  }, [apiFetch, addEvent, panel.label, taskId, type, level, data, seriesId, seriesMode])
 
   return (
     <div className="space-y-3 p-3">

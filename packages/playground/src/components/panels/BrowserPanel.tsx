@@ -361,7 +361,7 @@ export function BrowserPanel({ panel }: { panel: Panel }) {
             seriesId: envelope.seriesId,
             seriesMode: envelope.seriesMode,
             seriesAccField: envelope.seriesAccField,
-          })
+          }, 'received', panel.label)
         },
         onDone: (reason) => {
           setStatus('done')

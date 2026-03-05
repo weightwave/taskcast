@@ -83,7 +83,7 @@ export function TopBar() {
           {roleOptions.map((opt) => (
             <DropdownMenuItem
               key={opt.type}
-              onClick={() => addPanel(opt.type)}
+              onSelect={() => addPanel(opt.type)}
             >
               {opt.label}
             </DropdownMenuItem>

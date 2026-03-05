@@ -53,11 +53,27 @@ export function EventHistory() {
         {globalEvents.map((event) => (
           <div
             key={event.id}
-            className="flex items-center gap-2 border-b px-2 py-1.5 text-xs last:border-b-0"
+            className={`flex items-center gap-2 border-b px-2 py-1.5 text-xs last:border-b-0 ${
+              event.direction === 'sent'
+                ? 'bg-blue-500/10'
+                : event.direction === 'received'
+                  ? 'bg-green-500/10'
+                  : ''
+            }`}
           >
             <span className="shrink-0 font-mono text-[10px] text-muted-foreground">
               {formatTime(event.timestamp)}
             </span>
+            {event.direction && (
+              <span
+                className={`shrink-0 font-bold text-[10px] ${
+                  event.direction === 'sent' ? 'text-blue-400' : 'text-green-400'
+                }`}
+              >
+                {event.sourceLabel ? `${event.sourceLabel} ` : ''}
+                {event.direction === 'sent' ? '→' : '←'}
+              </span>
+            )}
             <Badge
               variant={levelBadgeVariant(event.level)}
               className="shrink-0 text-[10px] px-1.5 py-0"
