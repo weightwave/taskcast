@@ -46,7 +46,7 @@ When you merge a PR that contains `.changeset/*.md` files, CI will:
 | `@taskcast/server-sdk` | `packages/server-sdk` | HTTP client for remote server mode |
 | `@taskcast/client` | `packages/client` | Browser SSE subscription client |
 | `@taskcast/react` | `packages/react` | React hook `useTaskEvents` |
-| `@taskcast/cli` | `packages/cli` | `npx taskcast` standalone server |
+| `@taskcast/cli` | `packages/cli` | `npx @taskcast/cli` standalone server |
 | `@taskcast/redis` | `packages/redis` | Redis broadcast + short-term store adapters |
 | `@taskcast/postgres` | `packages/postgres` | PostgreSQL long-term store adapter |
 | `@taskcast/sqlite` | `packages/sqlite` | SQLite local storage adapter (ShortTermStore + LongTermStore) |

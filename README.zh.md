@@ -31,7 +31,7 @@
 - **Worker 管理**（可选） — 内置任务分配，支持 Pull（长轮询）和 WebSocket（offer/race）模式。容量追踪、匹配规则、断连自动重分配。
 - **Rust 服务端** — 可直接替换的原生 Rust 二进制（`taskcast-rs`），极致性能与最低资源占用。相同 API，相同行为，零 Node.js 依赖。Docker 镜像开箱即用。
 - **灵活的认证** — 无认证、JWT 或自定义中间件，权限粒度细化到单个任务。
-- **SDK-First 架构** — 核心零 HTTP 依赖，可嵌入你现有的服务器，也可用 `npx taskcast` 独立运行。
+- **SDK-First 架构** — 核心零 HTTP 依赖，可嵌入你现有的服务器，也可用 `npx @taskcast/cli` 独立运行。
 
 ## 架构
 
@@ -88,13 +88,13 @@ graph TB
 ### 独立服务器
 
 ```bash
-npx taskcast
+npx @taskcast/cli
 ```
 
 默认在 `3721` 端口启动。通过配置文件或环境变量进行配置：
 
 ```bash
-npx taskcast -p 8080 -c taskcast.config.yaml
+npx @taskcast/cli -p 8080 -c taskcast.config.yaml
 ```
 
 ### 嵌入模式
@@ -203,7 +203,7 @@ function TaskStream({ taskId }: { taskId: string }) {
 | [`@taskcast/server-sdk`](./packages/server-sdk) | 远程模式 HTTP 客户端 SDK | `pnpm add @taskcast/server-sdk` |
 | [`@taskcast/client`](./packages/client) | 浏览器 SSE 订阅客户端 | `pnpm add @taskcast/client` |
 | [`@taskcast/react`](./packages/react) | React Hooks（`useTaskEvents`） | `pnpm add @taskcast/react` |
-| [`@taskcast/cli`](./packages/cli) | 独立服务器 CLI | `npx taskcast` |
+| [`@taskcast/cli`](./packages/cli) | 独立服务器 CLI | `npx @taskcast/cli` |
 | [`@taskcast/sqlite`](./packages/sqlite) | SQLite 适配器（短期 + 长期存储层） | `pnpm add @taskcast/sqlite` |
 | [`@taskcast/redis`](./packages/redis) | Redis 适配器（广播层 + 短期存储层） | `pnpm add @taskcast/redis` |
 | [`@taskcast/postgres`](./packages/postgres) | PostgreSQL 适配器（长期存储层） | `pnpm add @taskcast/postgres` |
@@ -213,7 +213,17 @@ function TaskStream({ taskId }: { taskId: string }) {
 
 原生 Rust 二进制（`taskcast-rs`）可直接替换 Node.js 服务端。基于 Axum + Tokio + sqlx 构建，HTTP 行为完全一致 —— 相同的路径、相同的 JSON 格式、相同的 SSE 事件、相同的状态码。适用于追求极致吞吐或最小资源占用的场景。
 
-预编译二进制覆盖 Linux（amd64/arm64）、macOS（amd64/arm64）和 Windows，随每个 [GitHub Release](https://github.com/weightwave/taskcast/releases) 发布。多架构 Docker 镜像同步可用：
+**通过 Homebrew 安装（macOS / Linux）：**
+
+```bash
+brew tap weightwave/tap
+brew install taskcast
+taskcast-rs
+```
+
+**或下载预编译二进制**，从 [GitHub Releases](https://github.com/weightwave/taskcast/releases) 获取（Linux amd64/arm64、macOS amd64/arm64、Windows）。
+
+**或通过 Docker 运行：**
 
 ```bash
 docker run -p 3721:3721 mwr1998/taskcast-rs
@@ -318,9 +328,11 @@ cleanup:
 
 ```mermaid
 stateDiagram-v2
+    classDef optional stroke-dasharray: 5 5,stroke:#999,color:#666
+
     [*] --> pending : 创建
     pending --> assigned : Worker 认领
-    pending --> running : 开始执行
+    pending --> running : 外部管理
     pending --> cancelled : 取消
     assigned --> running : 开始执行
     assigned --> cancelled : 取消
@@ -331,6 +343,9 @@ stateDiagram-v2
     running --> cancelled : 取消
     paused --> running : 恢复
     paused --> cancelled : 取消
+
+    assigned:::optional
+    note right of assigned : 可选 — 仅在启用<br/>Worker 分配时生效
 ```
 
 ### 权限范围

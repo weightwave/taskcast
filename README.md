@@ -31,7 +31,7 @@ Create a task, publish events, subscribe — that's the whole mental model. Yet 
 - **Worker Management** *(optional)* — Built-in task assignment with pull (long-poll) and WebSocket (offer/race) modes. Capacity tracking, matching rules, and automatic reassignment on disconnect.
 - **Rust Server** — Drop-in native binary (`taskcast-rs`) for optimal performance and minimal resource usage. Same API, same behavior, zero Node.js dependency.
 - **Flexible Authentication** — No auth, JWT, or custom middleware. Fine-grained permission scopes down to individual tasks.
-- **SDK-First Architecture** — Zero HTTP dependencies in core. Embed into your existing server or run standalone with `npx taskcast`.
+- **SDK-First Architecture** — Zero HTTP dependencies in core. Embed into your existing server or run standalone with `npx @taskcast/cli`.
 
 ## Architecture
 
@@ -88,13 +88,13 @@ Your Server → @taskcast/server-sdk (REST) → taskcast service ← @taskcast/c
 ### Standalone Server
 
 ```bash
-npx taskcast
+npx @taskcast/cli
 ```
 
 The server starts on port `3721` by default. Configure with a config file or environment variables:
 
 ```bash
-npx taskcast -p 8080 -c taskcast.config.yaml
+npx @taskcast/cli -p 8080 -c taskcast.config.yaml
 ```
 
 ### Embedded Mode
@@ -203,7 +203,7 @@ function TaskStream({ taskId }: { taskId: string }) {
 | [`@taskcast/server-sdk`](./packages/server-sdk) | HTTP client SDK for remote server mode | `pnpm add @taskcast/server-sdk` |
 | [`@taskcast/client`](./packages/client) | Browser SSE subscription client | `pnpm add @taskcast/client` |
 | [`@taskcast/react`](./packages/react) | React hooks (`useTaskEvents`) | `pnpm add @taskcast/react` |
-| [`@taskcast/cli`](./packages/cli) | Standalone server CLI | `npx taskcast` |
+| [`@taskcast/cli`](./packages/cli) | Standalone server CLI | `npx @taskcast/cli` |
 | [`@taskcast/sqlite`](./packages/sqlite) | SQLite adapter (short-term + long-term store) | `pnpm add @taskcast/sqlite` |
 | [`@taskcast/redis`](./packages/redis) | Redis adapters (broadcast + short-term store) | `pnpm add @taskcast/redis` |
 | [`@taskcast/postgres`](./packages/postgres) | PostgreSQL adapter (long-term store) | `pnpm add @taskcast/postgres` |
@@ -213,7 +213,17 @@ function TaskStream({ taskId }: { taskId: string }) {
 
 A native Rust binary (`taskcast-rs`) is available as a drop-in replacement for the Node.js server. Built with Axum + Tokio + sqlx, it produces identical HTTP behavior — same paths, same JSON format, same SSE events, same status codes. Use it when you need optimal throughput or minimal resource footprint.
 
-Pre-built binaries for Linux (amd64/arm64), macOS (amd64/arm64), and Windows are attached to each [GitHub Release](https://github.com/weightwave/taskcast/releases). A multi-arch Docker image is also available:
+**Install via Homebrew (macOS / Linux):**
+
+```bash
+brew tap weightwave/tap
+brew install taskcast
+taskcast-rs
+```
+
+**Or download a pre-built binary** from [GitHub Releases](https://github.com/weightwave/taskcast/releases) (Linux amd64/arm64, macOS amd64/arm64, Windows).
+
+**Or run via Docker:**
 
 ```bash
 docker run -p 3721:3721 mwr1998/taskcast-rs
@@ -318,9 +328,11 @@ cleanup:
 
 ```mermaid
 stateDiagram-v2
+    classDef optional stroke-dasharray: 5 5,stroke:#999,color:#666
+
     [*] --> pending
     pending --> assigned : worker claimed
-    pending --> running
+    pending --> running : externally managed
     pending --> cancelled
     assigned --> running
     assigned --> cancelled
@@ -331,6 +343,9 @@ stateDiagram-v2
     running --> cancelled
     paused --> running
     paused --> cancelled
+
+    assigned:::optional
+    note right of assigned : Optional — only when<br/>worker assignment is enabled
 ```
 
 ### Permission Scopes

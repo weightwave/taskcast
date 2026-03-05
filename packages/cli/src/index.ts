@@ -50,9 +50,9 @@ async function promptCreateGlobalConfig(): Promise<boolean> {
     rl.question(
       `[taskcast] No config file found.\n? Create a default config at ${globalConfigPath}? (Y/n) `,
       (answer) => {
-        rl.close()
         const trimmed = answer.trim().toLowerCase()
         resolve(trimmed === '' || trimmed === 'y' || trimmed === 'yes')
+        rl.close()
       },
     )
   })

@@ -5,7 +5,7 @@ Standalone [Taskcast](https://github.com/weightwave/taskcast) server. Run a full
 ## Quick Start
 
 ```bash
-npx taskcast
+npx @taskcast/cli
 ```
 
 The server starts on port `3721` by default.
@@ -43,7 +43,7 @@ Options:
 ### Config File
 
 ```bash
-npx taskcast start -p 8080 -c taskcast.config.yaml
+npx @taskcast/cli start -p 8080 -c taskcast.config.yaml
 ```
 
 Taskcast searches for config files in the current directory:
@@ -68,13 +68,13 @@ Taskcast searches for config files in the current directory:
 For zero-dependency local development with persistent storage:
 
 ```bash
-npx taskcast start --storage sqlite
+npx @taskcast/cli start --storage sqlite
 ```
 
 Data is stored in `./taskcast.db` by default. Customize with `--db-path`:
 
 ```bash
-npx taskcast start --storage sqlite --db-path /tmp/my-taskcast.db
+npx @taskcast/cli start --storage sqlite --db-path /tmp/my-taskcast.db
 ```
 
 ## Part of Taskcast
