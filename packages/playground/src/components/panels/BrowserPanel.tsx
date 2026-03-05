@@ -16,6 +16,7 @@ import {
 import { usePanelStore, useDataStore } from '@/stores'
 import type { Panel } from '@/stores'
 import { useApi } from '@/hooks/useApi'
+import { PanelAuthConfig } from '@/components/panels/PanelAuthConfig'
 
 /* ------------------------------------------------------------------ */
 /*  Shared: task ID selector (same pattern as BackendPanel)           */
@@ -406,16 +407,19 @@ export function BrowserPanel({ panel }: { panel: Panel }) {
       {/* Panel header */}
       <div className="flex items-center justify-between border-b px-3 py-2">
         <span className="text-sm font-medium">{panel.label}</span>
-        <Button
-          variant="ghost"
-          size="icon-xs"
-          onClick={() => {
-            handleUnsubscribe()
-            removePanel(panel.id)
-          }}
-        >
-          &times;
-        </Button>
+        <div className="flex items-center gap-1">
+          <PanelAuthConfig panel={panel} />
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            onClick={() => {
+              handleUnsubscribe()
+              removePanel(panel.id)
+            }}
+          >
+            &times;
+          </Button>
+        </div>
       </div>
 
       {/* Config area */}

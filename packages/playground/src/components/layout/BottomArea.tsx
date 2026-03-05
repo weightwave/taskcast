@@ -4,6 +4,9 @@ import {
   TabsList,
   TabsTrigger,
 } from '@/components/ui/tabs'
+import { TaskList } from '@/components/bottom/TaskList'
+import { EventHistory } from '@/components/bottom/EventHistory'
+import { WebhookLogs } from '@/components/bottom/WebhookLogs'
 
 export function BottomArea() {
   return (
@@ -15,22 +18,16 @@ export function BottomArea() {
           <TabsTrigger value="webhooks">Webhook Logs</TabsTrigger>
         </TabsList>
 
-        <TabsContent value="tasks" className="px-4 py-2">
-          <p className="text-sm text-muted-foreground">
-            Task list will appear here.
-          </p>
+        <TabsContent value="tasks" className="px-4 py-2 h-[calc(100%-44px)]">
+          <TaskList />
         </TabsContent>
 
-        <TabsContent value="events" className="px-4 py-2">
-          <p className="text-sm text-muted-foreground">
-            Event history will appear here.
-          </p>
+        <TabsContent value="events" className="px-4 py-2 h-[calc(100%-44px)]">
+          <EventHistory />
         </TabsContent>
 
-        <TabsContent value="webhooks" className="px-4 py-2">
-          <p className="text-sm text-muted-foreground">
-            Webhook logs will appear here.
-          </p>
+        <TabsContent value="webhooks" className="px-4 py-2 h-[calc(100%-44px)]">
+          <WebhookLogs />
         </TabsContent>
       </Tabs>
     </div>
