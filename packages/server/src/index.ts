@@ -5,6 +5,10 @@ export { createSSERouter } from './routes/sse.js'
 export { createWorkersRouter, WorkerWSHandler } from './routes/workers.js'
 export type { WSLike, TaskSummary } from './routes/workers.js'
 export { WebhookDelivery } from './webhook.js'
+export {
+  TaskSchema, TaskEventSchema, WorkerSchema, ErrorSchema,
+  CreateTaskSchema, TransitionSchema, PublishEventSchema,
+} from './schemas.js'
 
 import { OpenAPIHono } from '@hono/zod-openapi'
 import { apiReference } from '@scalar/hono-api-reference'
