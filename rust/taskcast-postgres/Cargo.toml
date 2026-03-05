@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 taskcast-core = { path = "../taskcast-core" }
-sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "json"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "json", "migrate"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }

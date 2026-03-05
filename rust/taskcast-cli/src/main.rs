@@ -161,7 +161,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if let Some(ref pg_url) = postgres_url {
                             let pool = sqlx::PgPool::connect(pg_url).await?;
                             let store =
-                                taskcast_postgres::PostgresLongTermStore::new(pool, None);
+                                taskcast_postgres::PostgresLongTermStore::new(pool);
                             Some(Arc::new(store))
                         } else {
                             None
@@ -182,7 +182,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if let Some(ref pg_url) = postgres_url {
                             let pool = sqlx::PgPool::connect(pg_url).await?;
                             let store =
-                                taskcast_postgres::PostgresLongTermStore::new(pool, None);
+                                taskcast_postgres::PostgresLongTermStore::new(pool);
                             Some(Arc::new(store))
                         } else {
                             None

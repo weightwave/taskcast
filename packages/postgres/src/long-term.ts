@@ -14,27 +14,15 @@ import type {
   DisconnectPolicy,
 } from '@taskcast/core'
 
-function makeTableNames(prefix: string) {
-  return {
-    tasks: `${prefix}_tasks`,
-    events: `${prefix}_events`,
-    workerEvents: `${prefix}_worker_events`,
-  }
-}
+const TASKS = 'taskcast_tasks'
+const EVENTS = 'taskcast_events'
+const WORKER_EVENTS = 'taskcast_worker_events'
 
 export class PostgresLongTermStore implements LongTermStore {
-  private tables: ReturnType<typeof makeTableNames>
-
-  constructor(
-    private sql: ReturnType<typeof postgres>,
-    { prefix }: { prefix?: string } = {},
-  ) {
-    const resolvedPrefix = prefix ?? process.env['TASKCAST_PG_PREFIX'] ?? 'taskcast'
-    this.tables = makeTableNames(resolvedPrefix)
-  }
+  constructor(private sql: ReturnType<typeof postgres>) {}
 
   async saveTask(task: Task): Promise<void> {
-    const t = this.tables.tasks
+    const t = TASKS
     await this.sql`
       INSERT INTO ${this.sql(t)} (
         id, type, status, params, result, error, metadata,
@@ -73,7 +61,7 @@ export class PostgresLongTermStore implements LongTermStore {
   }
 
   async getTask(taskId: string): Promise<Task | null> {
-    const t = this.tables.tasks
+    const t = TASKS
     const rows = await this.sql`
       SELECT * FROM ${this.sql(t)} WHERE id = ${taskId}
     `
@@ -83,7 +71,7 @@ export class PostgresLongTermStore implements LongTermStore {
   }
 
   async saveEvent(event: TaskEvent): Promise<void> {
-    const t = this.tables.events
+    const t = EVENTS
     await this.sql`
       INSERT INTO ${this.sql(t)} (
         id, task_id, idx, timestamp, type, level, data, series_id, series_mode
@@ -98,7 +86,7 @@ export class PostgresLongTermStore implements LongTermStore {
   }
 
   async getEvents(taskId: string, opts?: EventQueryOptions): Promise<TaskEvent[]> {
-    const t = this.tables.events
+    const t = EVENTS
     const since = opts?.since
 
     let rows: postgres.RowList<postgres.Row[]>
@@ -140,7 +128,7 @@ export class PostgresLongTermStore implements LongTermStore {
   }
 
   async saveWorkerEvent(event: WorkerAuditEvent): Promise<void> {
-    const t = this.tables.workerEvents
+    const t = WORKER_EVENTS
     await this.sql`
       INSERT INTO ${this.sql(t)} (
         id, worker_id, timestamp, action, data
@@ -154,7 +142,7 @@ export class PostgresLongTermStore implements LongTermStore {
   }
 
   async getWorkerEvents(workerId: string, opts?: EventQueryOptions): Promise<WorkerAuditEvent[]> {
-    const t = this.tables.workerEvents
+    const t = WORKER_EVENTS
     const since = opts?.since
 
     let rows: postgres.RowList<postgres.Row[]>

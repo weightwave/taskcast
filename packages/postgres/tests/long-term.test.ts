@@ -126,28 +126,6 @@ describe('PostgresLongTermStore - events', () => {
   })
 })
 
-describe('PostgresLongTermStore - custom prefix', () => {
-  it('uses custom table names when prefix provided', async () => {
-    // Create tables with custom prefix
-    await sql.unsafe(`
-      CREATE TABLE IF NOT EXISTS myapp_tasks (LIKE taskcast_tasks INCLUDING ALL);
-      CREATE TABLE IF NOT EXISTS myapp_events (
-        LIKE taskcast_events INCLUDING ALL,
-        CONSTRAINT myapp_events_task_id_fkey FOREIGN KEY (task_id) REFERENCES myapp_tasks(id) ON DELETE CASCADE
-      );
-    `)
-    const customStore = new PostgresLongTermStore(sql, { prefix: 'myapp' })
-    await customStore.saveTask(makeTask('custom-task'))
-    const task = await customStore.getTask('custom-task')
-    expect(task?.id).toBe('custom-task')
-    // Should not appear in default tables
-    const defaultTask = await store.getTask('custom-task')
-    expect(defaultTask).toBeNull()
-    // Cleanup
-    await sql.unsafe('DROP TABLE IF EXISTS myapp_events, myapp_tasks')
-  })
-})
-
 describe('PostgresLongTermStore - since.id cursor', () => {
   it('filters events by since.id', async () => {
     await store.saveTask(makeTask())

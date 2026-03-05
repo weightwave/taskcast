@@ -9,30 +9,9 @@ use taskcast_core::types::{
     WorkerAuditAction, WorkerAuditEvent,
 };
 
-/// Table names derived from a configurable prefix.
-#[derive(Debug, Clone)]
-struct TableNames {
-    prefix: String,
-    tasks: String,
-    events: String,
-    worker_events: String,
-}
-
-impl TableNames {
-    fn new(prefix: &str) -> Self {
-        // Validate prefix to prevent SQL injection — only allow alphanumeric + underscore
-        assert!(
-            !prefix.is_empty() && prefix.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
-            "Table prefix must be non-empty and contain only alphanumeric characters or underscores, got: {prefix:?}"
-        );
-        Self {
-            prefix: prefix.to_string(),
-            tasks: format!("{prefix}_tasks"),
-            events: format!("{prefix}_events"),
-            worker_events: format!("{prefix}_worker_events"),
-        }
-    }
-}
+const TASKS: &str = "taskcast_tasks";
+const EVENTS: &str = "taskcast_events";
+const WORKER_EVENTS: &str = "taskcast_worker_events";
 
 /// PostgreSQL-backed long-term store for tasks and events.
 ///
@@ -40,105 +19,23 @@ impl TableNames {
 /// `LongTermStore` trait from `taskcast-core`.
 pub struct PostgresLongTermStore {
     pool: PgPool,
-    tables: TableNames,
 }
 
 impl PostgresLongTermStore {
-    /// Create a new store with the given connection pool and optional table prefix.
-    ///
-    /// If `prefix` is `None`, falls back to the `TASKCAST_PG_PREFIX` env var,
-    /// then to `"taskcast"`.
-    pub fn new(pool: PgPool, prefix: Option<&str>) -> Self {
-        let resolved = prefix
-            .map(|s| s.to_string())
-            .or_else(|| std::env::var("TASKCAST_PG_PREFIX").ok())
-            .unwrap_or_else(|| "taskcast".to_string());
-        Self {
-            pool,
-            tables: TableNames::new(&resolved),
-        }
+    /// Create a new store with the given connection pool.
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
     }
 
-    /// Run the initial migration to create tables and indexes.
+    /// Run migrations to create/update tables and indexes.
     ///
-    /// Uses the configurable table prefix to generate the correct table names.
+    /// Uses sqlx's built-in migration runner which reads `.sql` files from
+    /// the `migrations/` directory and tracks applied migrations in a
+    /// `_sqlx_migrations` table.
     pub async fn migrate(
         &self,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let tasks = &self.tables.tasks;
-        let events = &self.tables.events;
-        let worker_events = &self.tables.worker_events;
-        let prefix = &self.tables.prefix;
-
-        // Execute each statement separately — PostgreSQL does not allow
-        // multiple commands in a single prepared statement.
-        let statements = vec![
-            format!(
-                r#"CREATE TABLE IF NOT EXISTS {tasks} (
-                  id TEXT PRIMARY KEY,
-                  type TEXT,
-                  status TEXT NOT NULL,
-                  params JSONB,
-                  result JSONB,
-                  error JSONB,
-                  metadata JSONB,
-                  auth_config JSONB,
-                  webhooks JSONB,
-                  cleanup JSONB,
-                  created_at BIGINT NOT NULL,
-                  updated_at BIGINT NOT NULL,
-                  completed_at BIGINT,
-                  ttl INTEGER
-                )"#
-            ),
-            format!(
-                r#"CREATE TABLE IF NOT EXISTS {events} (
-                  id TEXT PRIMARY KEY,
-                  task_id TEXT NOT NULL REFERENCES {tasks}(id) ON DELETE CASCADE,
-                  idx INTEGER NOT NULL,
-                  timestamp BIGINT NOT NULL,
-                  type TEXT NOT NULL,
-                  level TEXT NOT NULL,
-                  data JSONB,
-                  series_id TEXT,
-                  series_mode TEXT,
-                  UNIQUE(task_id, idx)
-                )"#
-            ),
-            format!("CREATE INDEX IF NOT EXISTS {events}_task_id_idx ON {events}(task_id, idx)"),
-            format!(
-                "CREATE INDEX IF NOT EXISTS {events}_task_id_timestamp ON {events}(task_id, timestamp)"
-            ),
-        ];
-
-        let statements = [
-            statements.as_slice(),
-            &[
-                format!(
-                    r#"CREATE TABLE IF NOT EXISTS {worker_events} (
-                      id TEXT PRIMARY KEY,
-                      worker_id TEXT NOT NULL,
-                      timestamp BIGINT NOT NULL,
-                      action TEXT NOT NULL,
-                      data JSONB,
-                      created_at TIMESTAMPTZ DEFAULT now()
-                    )"#
-                ),
-                format!(
-                    "CREATE INDEX IF NOT EXISTS idx_{prefix}_worker_events_worker_id ON {worker_events} (worker_id, timestamp DESC)"
-                ),
-                format!("ALTER TABLE {tasks} ADD COLUMN IF NOT EXISTS tags JSONB"),
-                format!("ALTER TABLE {tasks} ADD COLUMN IF NOT EXISTS assign_mode TEXT"),
-                format!("ALTER TABLE {tasks} ADD COLUMN IF NOT EXISTS cost INTEGER"),
-                format!("ALTER TABLE {tasks} ADD COLUMN IF NOT EXISTS assigned_worker TEXT"),
-                format!("ALTER TABLE {tasks} ADD COLUMN IF NOT EXISTS disconnect_policy TEXT"),
-            ],
-        ]
-        .concat();
-
-        for stmt in &statements {
-            sqlx::query(stmt).execute(&self.pool).await?;
-        }
+        sqlx::migrate!("./migrations").run(&self.pool).await?;
         Ok(())
     }
 
@@ -249,8 +146,6 @@ impl LongTermStore for PostgresLongTermStore {
         &self,
         task: Task,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let tasks_table = &self.tables.tasks;
-
         let params_json: Option<JsonValue> =
             task.params.as_ref().map(|p| serde_json::to_value(p).unwrap_or(JsonValue::Null));
         let result_json: Option<JsonValue> =
@@ -293,7 +188,7 @@ impl LongTermStore for PostgresLongTermStore {
 
         let sql = format!(
             r#"
-            INSERT INTO {tasks_table} (
+            INSERT INTO {TASKS} (
                 id, type, status, params, result, error, metadata,
                 auth_config, webhooks, cleanup, created_at, updated_at, completed_at, ttl,
                 tags, assign_mode, cost, assigned_worker, disconnect_policy
@@ -349,8 +244,7 @@ impl LongTermStore for PostgresLongTermStore {
         &self,
         task_id: &str,
     ) -> Result<Option<Task>, Box<dyn std::error::Error + Send + Sync>> {
-        let tasks_table = &self.tables.tasks;
-        let sql = format!("SELECT * FROM {tasks_table} WHERE id = $1");
+        let sql = format!("SELECT * FROM {TASKS} WHERE id = $1");
 
         let row = sqlx::query(&sql)
             .bind(task_id)
@@ -364,11 +258,9 @@ impl LongTermStore for PostgresLongTermStore {
         &self,
         event: TaskEvent,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let events_table = &self.tables.events;
-
         let sql = format!(
             r#"
-            INSERT INTO {events_table} (
+            INSERT INTO {EVENTS} (
                 id, task_id, idx, timestamp, type, level, data, series_id, series_mode
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9
@@ -414,7 +306,6 @@ impl LongTermStore for PostgresLongTermStore {
         task_id: &str,
         opts: Option<EventQueryOptions>,
     ) -> Result<Vec<TaskEvent>, Box<dyn std::error::Error + Send + Sync>> {
-        let events_table = &self.tables.events;
         let since = opts.as_ref().and_then(|o| o.since.as_ref());
         let limit = opts.as_ref().and_then(|o| o.limit);
 
@@ -425,7 +316,7 @@ impl LongTermStore for PostgresLongTermStore {
         let rows = if let Some(since) = since {
             if let Some(index) = since.index {
                 let sql = format!(
-                    "SELECT * FROM {events_table} WHERE task_id = $1 AND idx > $2 ORDER BY idx ASC LIMIT $3"
+                    "SELECT * FROM {EVENTS} WHERE task_id = $1 AND idx > $2 ORDER BY idx ASC LIMIT $3"
                 );
                 sqlx::query(&sql)
                     .bind(task_id)
@@ -435,7 +326,7 @@ impl LongTermStore for PostgresLongTermStore {
                     .await?
             } else if let Some(timestamp) = since.timestamp {
                 let sql = format!(
-                    "SELECT * FROM {events_table} WHERE task_id = $1 AND timestamp > $2 ORDER BY idx ASC LIMIT $3"
+                    "SELECT * FROM {EVENTS} WHERE task_id = $1 AND timestamp > $2 ORDER BY idx ASC LIMIT $3"
                 );
                 sqlx::query(&sql)
                     .bind(task_id)
@@ -446,7 +337,7 @@ impl LongTermStore for PostgresLongTermStore {
             } else if let Some(ref id) = since.id {
                 // Look up the anchor event's idx, then fetch events after it
                 let anchor_sql =
-                    format!("SELECT idx FROM {events_table} WHERE id = $1");
+                    format!("SELECT idx FROM {EVENTS} WHERE id = $1");
                 let anchor_row = sqlx::query(&anchor_sql)
                     .bind(id)
                     .fetch_optional(&self.pool)
@@ -457,7 +348,7 @@ impl LongTermStore for PostgresLongTermStore {
                     .unwrap_or(-1);
 
                 let sql = format!(
-                    "SELECT * FROM {events_table} WHERE task_id = $1 AND idx > $2 ORDER BY idx ASC LIMIT $3"
+                    "SELECT * FROM {EVENTS} WHERE task_id = $1 AND idx > $2 ORDER BY idx ASC LIMIT $3"
                 );
                 sqlx::query(&sql)
                     .bind(task_id)
@@ -468,7 +359,7 @@ impl LongTermStore for PostgresLongTermStore {
             } else {
                 // since exists but has no usable cursor fields
                 let sql = format!(
-                    "SELECT * FROM {events_table} WHERE task_id = $1 ORDER BY idx ASC LIMIT $2"
+                    "SELECT * FROM {EVENTS} WHERE task_id = $1 ORDER BY idx ASC LIMIT $2"
                 );
                 sqlx::query(&sql)
                     .bind(task_id)
@@ -478,7 +369,7 @@ impl LongTermStore for PostgresLongTermStore {
             }
         } else {
             let sql = format!(
-                "SELECT * FROM {events_table} WHERE task_id = $1 ORDER BY idx ASC LIMIT $2"
+                "SELECT * FROM {EVENTS} WHERE task_id = $1 ORDER BY idx ASC LIMIT $2"
             );
             sqlx::query(&sql)
                 .bind(task_id)
@@ -494,8 +385,6 @@ impl LongTermStore for PostgresLongTermStore {
         &self,
         event: WorkerAuditEvent,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let worker_events_table = &self.tables.worker_events;
-
         let action_str = serde_json::to_value(&event.action)
             .ok()
             .and_then(|v| v.as_str().map(|s| s.to_string()))
@@ -507,7 +396,7 @@ impl LongTermStore for PostgresLongTermStore {
 
         let sql = format!(
             r#"
-            INSERT INTO {worker_events_table} (id, worker_id, timestamp, action, data)
+            INSERT INTO {WORKER_EVENTS} (id, worker_id, timestamp, action, data)
             VALUES ($1, $2, $3, $4, $5)
             ON CONFLICT (id) DO NOTHING
             "#
@@ -530,7 +419,6 @@ impl LongTermStore for PostgresLongTermStore {
         worker_id: &str,
         opts: Option<EventQueryOptions>,
     ) -> Result<Vec<WorkerAuditEvent>, Box<dyn std::error::Error + Send + Sync>> {
-        let worker_events_table = &self.tables.worker_events;
         let since = opts.as_ref().and_then(|o| o.since.as_ref());
         let limit = opts.as_ref().and_then(|o| o.limit);
         let limit_val = limit.map(|l| l as i64).unwrap_or(i64::MAX);
@@ -538,7 +426,7 @@ impl LongTermStore for PostgresLongTermStore {
         let rows = if let Some(since) = since {
             if let Some(timestamp) = since.timestamp {
                 let sql = format!(
-                    "SELECT * FROM {worker_events_table} WHERE worker_id = $1 AND timestamp > $2 ORDER BY timestamp ASC LIMIT $3"
+                    "SELECT * FROM {WORKER_EVENTS} WHERE worker_id = $1 AND timestamp > $2 ORDER BY timestamp ASC LIMIT $3"
                 );
                 sqlx::query(&sql)
                     .bind(worker_id)
@@ -549,7 +437,7 @@ impl LongTermStore for PostgresLongTermStore {
             } else if let Some(ref id) = since.id {
                 // Look up the anchor event's timestamp, then fetch events after it
                 let anchor_sql = format!(
-                    "SELECT timestamp FROM {worker_events_table} WHERE id = $1"
+                    "SELECT timestamp FROM {WORKER_EVENTS} WHERE id = $1"
                 );
                 let anchor_row = sqlx::query(&anchor_sql)
                     .bind(id)
@@ -561,7 +449,7 @@ impl LongTermStore for PostgresLongTermStore {
                     .unwrap_or(-1);
 
                 let sql = format!(
-                    "SELECT * FROM {worker_events_table} WHERE worker_id = $1 AND (timestamp > $2 OR (timestamp = $2 AND id > $3)) ORDER BY timestamp ASC, id ASC LIMIT $4"
+                    "SELECT * FROM {WORKER_EVENTS} WHERE worker_id = $1 AND (timestamp > $2 OR (timestamp = $2 AND id > $3)) ORDER BY timestamp ASC, id ASC LIMIT $4"
                 );
                 sqlx::query(&sql)
                     .bind(worker_id)
@@ -573,7 +461,7 @@ impl LongTermStore for PostgresLongTermStore {
             } else {
                 // since exists but has no usable cursor fields
                 let sql = format!(
-                    "SELECT * FROM {worker_events_table} WHERE worker_id = $1 ORDER BY timestamp ASC LIMIT $2"
+                    "SELECT * FROM {WORKER_EVENTS} WHERE worker_id = $1 ORDER BY timestamp ASC LIMIT $2"
                 );
                 sqlx::query(&sql)
                     .bind(worker_id)
@@ -583,7 +471,7 @@ impl LongTermStore for PostgresLongTermStore {
             }
         } else {
             let sql = format!(
-                "SELECT * FROM {worker_events_table} WHERE worker_id = $1 ORDER BY timestamp ASC LIMIT $2"
+                "SELECT * FROM {WORKER_EVENTS} WHERE worker_id = $1 ORDER BY timestamp ASC LIMIT $2"
             );
             sqlx::query(&sql)
                 .bind(worker_id)
@@ -600,36 +488,6 @@ impl LongTermStore for PostgresLongTermStore {
 mod tests {
     use super::*;
     use std::collections::HashMap;
-
-    #[test]
-    fn table_names_with_default_prefix() {
-        let tables = TableNames::new("taskcast");
-        assert_eq!(tables.tasks, "taskcast_tasks");
-        assert_eq!(tables.events, "taskcast_events");
-        assert_eq!(tables.worker_events, "taskcast_worker_events");
-        assert_eq!(tables.prefix, "taskcast");
-    }
-
-    #[test]
-    fn table_names_with_custom_prefix() {
-        let tables = TableNames::new("myapp");
-        assert_eq!(tables.tasks, "myapp_tasks");
-        assert_eq!(tables.events, "myapp_events");
-        assert_eq!(tables.worker_events, "myapp_worker_events");
-        assert_eq!(tables.prefix, "myapp");
-    }
-
-    #[test]
-    #[should_panic(expected = "Table prefix must be non-empty")]
-    fn table_names_with_empty_prefix_panics() {
-        TableNames::new("");
-    }
-
-    #[test]
-    #[should_panic(expected = "Table prefix must be non-empty")]
-    fn table_names_with_sql_injection_panics() {
-        TableNames::new("foo; DROP TABLE");
-    }
 
     #[test]
     fn status_serializes_for_db() {

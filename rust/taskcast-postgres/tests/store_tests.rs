@@ -24,7 +24,7 @@ async fn setup() -> (
         .connect(&database_url)
         .await
         .unwrap();
-    let store = PostgresLongTermStore::new(pool, None);
+    let store = PostgresLongTermStore::new(pool);
     store.migrate().await.unwrap();
     (store, container)
 }
