@@ -1,4 +1,5 @@
 export { PostgresLongTermStore } from './long-term.js'
+export { runMigrations, loadMigrationFiles } from './migration-runner.js'
 
 import postgres from 'postgres'
 import { PostgresLongTermStore } from './long-term.js'
