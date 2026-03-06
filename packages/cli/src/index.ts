@@ -12,6 +12,7 @@ import {
   TaskEngine,
   WorkerManager,
   loadConfigFile,
+  resolveAdminToken,
   MemoryBroadcastProvider,
   MemoryShortTermStore,
 } from '@taskcast/core'
@@ -173,6 +174,9 @@ program
       if (fileConfig.workers?.defaults) wmOpts.defaults = fileConfig.workers.defaults
       workerManager = new WorkerManager(wmOpts)
     }
+
+    // Resolve admin token (auto-generate + print if adminApi is enabled)
+    resolveAdminToken(fileConfig)
 
     const serverOpts: Parameters<typeof createTaskcastApp>[0] = {
       engine,
