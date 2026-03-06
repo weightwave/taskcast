@@ -40,7 +40,7 @@ jobs:
         working-directory: .
         run: |
           pnpm install --frozen-lockfile
-          pnpm --filter @taskcast/playground build
+          pnpm --filter @taskcast/playground... build
       - name: Check
         run: cargo check --workspace
       - name: Clippy
@@ -66,7 +66,7 @@ jobs:
         working-directory: .
         run: |
           pnpm install --frozen-lockfile
-          pnpm --filter @taskcast/playground build
+          pnpm --filter @taskcast/playground... build
       - name: Run tests
         run: cargo test --workspace
 
@@ -93,7 +93,7 @@ jobs:
         working-directory: .
         run: |
           pnpm install --frozen-lockfile
-          pnpm --filter @taskcast/playground build
+          pnpm --filter @taskcast/playground... build
       - name: Generate coverage
         run: cargo llvm-cov --workspace --lcov --output-path lcov.info
       - name: Upload to Codecov
@@ -125,7 +125,7 @@ jobs:
         working-directory: .
         run: |
           pnpm install --frozen-lockfile
-          pnpm --filter @taskcast/playground build
+          pnpm --filter @taskcast/playground... build
       - name: Build release
         run: cargo build --release -p taskcast-cli
       - name: Upload binary
