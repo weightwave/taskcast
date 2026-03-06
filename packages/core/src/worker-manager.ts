@@ -52,7 +52,7 @@ export interface WorkerUpdate {
   weight?: number
   capacity?: number
   matchRule?: WorkerMatchRule
-  status?: 'draining'
+  status?: 'draining' | 'idle'
 }
 
 // ─── Dispatch / Claim / Decline ─────────────────────────────────────────────

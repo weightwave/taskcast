@@ -152,3 +152,9 @@ export const DeclineSchema = z
     blacklist: z.boolean().optional(),
   })
   .openapi('DeclineInput')
+
+export const WorkerStatusUpdateSchema = z
+  .object({
+    status: z.enum(['draining', 'idle']),
+  })
+  .openapi('WorkerStatusUpdateInput')

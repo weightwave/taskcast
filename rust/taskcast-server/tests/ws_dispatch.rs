@@ -213,7 +213,7 @@ fn make_worker_manager(
 fn create_app_with_worker_manager_compiles() {
     let (engine, store) = make_engine_and_store();
     let manager = make_worker_manager(&engine, &store);
-    let (_app, registry) = create_app(engine, AuthMode::None, Some(manager));
+    let (_app, registry) = create_app(engine, AuthMode::None, Some(manager), None);
     // If this compiles and runs, the routing/state wiring is correct.
     assert!(registry.is_some());
 }
@@ -221,7 +221,7 @@ fn create_app_with_worker_manager_compiles() {
 #[test]
 fn create_app_without_worker_manager_compiles() {
     let (engine, _store) = make_engine_and_store();
-    let (_app, registry) = create_app(engine, AuthMode::None, None);
+    let (_app, registry) = create_app(engine, AuthMode::None, None, None);
     assert!(registry.is_none());
 }
 
@@ -333,6 +333,7 @@ async fn ws_offer_dispatch_sends_offer_to_best_worker() {
         Arc::clone(&engine),
         AuthMode::None,
         Some(Arc::clone(&manager)),
+        None,
     );
     let ws_registry = ws_registry.unwrap();
 
@@ -427,6 +428,7 @@ async fn ws_race_dispatch_broadcasts_to_all_ws_workers() {
         Arc::clone(&engine),
         AuthMode::None,
         Some(Arc::clone(&manager)),
+        None,
     );
     let ws_registry = ws_registry.unwrap();
 
@@ -510,6 +512,7 @@ async fn external_assign_mode_does_not_trigger_ws_dispatch() {
         Arc::clone(&engine),
         AuthMode::None,
         Some(Arc::clone(&manager)),
+        None,
     );
     let ws_registry = ws_registry.unwrap();
 
@@ -571,6 +574,7 @@ async fn auto_release_fires_on_terminal_transition() {
         Arc::clone(&engine),
         AuthMode::None,
         Some(Arc::clone(&manager)),
+        None,
     );
 
     // Create a task and claim it (which creates an assignment)
@@ -665,6 +669,7 @@ async fn auto_release_fires_on_failed_transition() {
         Arc::clone(&engine),
         AuthMode::None,
         Some(Arc::clone(&manager)),
+        None,
     );
 
     engine
@@ -732,6 +737,7 @@ async fn auto_release_does_not_fire_on_non_terminal_transition() {
         Arc::clone(&engine),
         AuthMode::None,
         Some(Arc::clone(&manager)),
+        None,
     );
 
     engine
@@ -786,6 +792,7 @@ async fn ws_offer_no_available_worker_does_not_send() {
         Arc::clone(&engine),
         AuthMode::None,
         Some(Arc::clone(&manager)),
+        None,
     );
     let ws_registry = ws_registry.unwrap();
 
@@ -873,6 +880,7 @@ async fn ws_race_skips_draining_and_offline_workers() {
         Arc::clone(&engine),
         AuthMode::None,
         Some(Arc::clone(&manager)),
+        None,
     );
     let ws_registry = ws_registry.unwrap();
 
@@ -945,6 +953,7 @@ async fn task_without_assign_mode_does_not_trigger_dispatch() {
         Arc::clone(&engine),
         AuthMode::None,
         Some(Arc::clone(&manager)),
+        None,
     );
     let ws_registry = ws_registry.unwrap();
 
@@ -1006,6 +1015,7 @@ async fn non_pending_transition_does_not_trigger_ws_dispatch() {
         Arc::clone(&engine),
         AuthMode::None,
         Some(Arc::clone(&manager)),
+        None,
     );
     let ws_registry = ws_registry.unwrap();
 
@@ -1154,6 +1164,7 @@ async fn ws_offer_dispatch_includes_task_metadata_in_summary() {
         Arc::clone(&engine),
         AuthMode::None,
         Some(Arc::clone(&manager)),
+        None,
     );
     let ws_registry = ws_registry.unwrap();
 
@@ -1228,6 +1239,7 @@ async fn ws_race_dispatch_includes_task_metadata_in_summary() {
         Arc::clone(&engine),
         AuthMode::None,
         Some(Arc::clone(&manager)),
+        None,
     );
     let ws_registry = ws_registry.unwrap();
 
@@ -1298,6 +1310,7 @@ async fn auto_release_fires_on_cancelled_transition() {
         Arc::clone(&engine),
         AuthMode::None,
         Some(Arc::clone(&manager)),
+        None,
     );
 
     engine
@@ -1370,6 +1383,7 @@ async fn auto_release_fires_on_timeout_transition() {
         Arc::clone(&engine),
         AuthMode::None,
         Some(Arc::clone(&manager)),
+        None,
     );
 
     engine

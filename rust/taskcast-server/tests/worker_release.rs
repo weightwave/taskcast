@@ -40,6 +40,7 @@ fn make_worker_server() -> (Arc<TaskEngine>, Arc<WorkerManager>, TestServer) {
         Arc::clone(&engine),
         AuthMode::None,
         Some(Arc::clone(&manager)),
+        None,
     );
     let server = TestServer::new(router);
     (engine, manager, server)

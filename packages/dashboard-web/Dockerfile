@@ -1,0 +1,14 @@
+FROM node:20-alpine AS builder
+WORKDIR /app
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY packages/ packages/
+RUN npm install -g pnpm@10.30.3 && pnpm install --frozen-lockfile && pnpm --filter @taskcast/dashboard-web build
+
+FROM nginx:alpine
+RUN apk add --no-cache jq
+COPY --from=builder /app/packages/dashboard-web/dist /usr/share/nginx/html
+COPY packages/dashboard-web/nginx.conf /etc/nginx/conf.d/default.conf
+COPY packages/dashboard-web/docker-entrypoint.sh /docker-entrypoint.sh
+ENV TASKCAST_SERVER_URL=http://localhost:3721
+EXPOSE 80
+ENTRYPOINT ["/docker-entrypoint.sh"]

@@ -3,7 +3,8 @@ use std::sync::Arc;
 use axum::middleware;
 use axum::response::IntoResponse;
 use axum::routing::{get, patch, post};
-use axum::Router;
+use axum::{Extension, Router};
+use taskcast_core::config::TaskcastConfig;
 use taskcast_core::heartbeat_monitor::{HeartbeatMonitor, HeartbeatMonitorOptions};
 use taskcast_core::scheduler::{TaskScheduler, TaskSchedulerOptions};
 use taskcast_core::state_machine::is_terminal;
@@ -17,8 +18,9 @@ use utoipa_scalar::{Scalar, Servable};
 
 use crate::auth::{auth_middleware, AuthMode};
 use crate::openapi::ApiDoc;
+use crate::routes::sse::create_subscriber_counts;
 use crate::routes::worker_ws::{task_to_summary, WorkerCommand, WsRegistry};
-use crate::routes::{sse, tasks};
+use crate::routes::{admin, sse, tasks};
 
 /// Shared application state available to all handlers.
 #[derive(Clone)]
@@ -35,11 +37,13 @@ pub fn create_app(
     engine: Arc<TaskEngine>,
     auth_mode: AuthMode,
     worker_manager: Option<Arc<WorkerManager>>,
+    config: Option<TaskcastConfig>,
 ) -> (Router, Option<WsRegistry>) {
     let auth_mode = Arc::new(auth_mode);
+    let subscriber_counts = create_subscriber_counts();
 
     let task_routes = Router::new()
-        .route("/", post(tasks::create_task))
+        .route("/", get(tasks::list_tasks).post(tasks::create_task))
         .route("/{task_id}", get(tasks::get_task))
         .route("/{task_id}/status", patch(tasks::transition_task))
         .route("/{task_id}/resolve", post(tasks::resolve_task))
@@ -49,6 +53,7 @@ pub fn create_app(
             post(tasks::publish_events).get(sse::sse_events),
         )
         .route("/{task_id}/events/history", get(tasks::get_event_history))
+        .layer(Extension(subscriber_counts))
         .with_state(Arc::clone(&engine));
 
     let mut app = Router::new()
@@ -136,13 +141,29 @@ pub fn create_app(
         )
         .merge(Scalar::with_url("/docs", openapi_spec));
 
-    // Auth middleware must be applied AFTER routes are mounted
-    let router = app.layer(middleware::from_fn_with_state(
+    // Auth middleware must be applied AFTER routes are mounted but BEFORE
+    // admin routes are merged, so admin routes bypass auth.
+    let app_with_auth = app.layer(middleware::from_fn_with_state(
         Arc::clone(&auth_mode),
         auth_middleware,
     ));
 
-    (router, ws_registry_out)
+    // Admin route is merged AFTER the auth layer so it bypasses JWT/custom auth.
+    // It authenticates via admin token independently.
+    let final_app = if let Some(cfg) = config {
+        let admin_state = Arc::new(admin::AdminState {
+            config: Arc::new(cfg),
+            auth_mode: Arc::clone(&auth_mode),
+        });
+        let admin_routes = Router::new()
+            .route("/admin/token", post(admin::admin_token))
+            .with_state(admin_state);
+        app_with_auth.merge(admin_routes)
+    } else {
+        app_with_auth
+    };
+
+    (final_app, ws_registry_out)
 }
 
 async fn health() -> impl IntoResponse {

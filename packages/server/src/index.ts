@@ -1,9 +1,12 @@
 export { createAuthMiddleware, checkScope } from './auth.js'
 export type { AuthConfig, AuthContext, JWTConfig } from './auth.js'
 export { createTasksRouter } from './routes/tasks.js'
-export { createSSERouter } from './routes/sse.js'
+export { createSSERouter, createSubscriberCounts, getSubscriberCount } from './routes/sse.js'
+export type { SubscriberCounts } from './routes/sse.js'
 export { createWorkersRouter, WorkerWSHandler, WorkerWSRegistry } from './routes/workers.js'
 export type { WSLike, TaskSummary } from './routes/workers.js'
+export { createAdminRouter } from './routes/admin.js'
+export type { AdminRouteOptions } from './routes/admin.js'
 export { WebhookDelivery } from './webhook.js'
 export {
   TaskSchema, TaskEventSchema, WorkerSchema, ErrorSchema,
@@ -15,9 +18,10 @@ import { OpenAPIHono } from '@hono/zod-openapi'
 import { apiReference } from '@scalar/hono-api-reference'
 import { createAuthMiddleware } from './auth.js'
 import { createTasksRouter } from './routes/tasks.js'
-import { createSSERouter } from './routes/sse.js'
+import { createSSERouter, createSubscriberCounts } from './routes/sse.js'
 import { createWorkersRouter } from './routes/workers.js'
 import { WorkerWSRegistry } from './routes/worker-ws.js'
+import { createAdminRouter } from './routes/admin.js'
 import type { AuthConfig } from './auth.js'
 import { isTerminal, matchesWorkerRule } from '@taskcast/core'
 import type {
@@ -26,6 +30,7 @@ import type {
   WorkerManager,
   ShortTermStore,
   DisconnectPolicy,
+  TaskcastConfig,
 } from '@taskcast/core'
 import { TaskScheduler } from '@taskcast/core'
 import { HeartbeatMonitor } from '@taskcast/core'
@@ -35,6 +40,7 @@ export interface TaskcastServerOptions {
   workerManager?: WorkerManager
   shortTermStore?: ShortTermStore
   auth?: AuthConfig
+  config?: TaskcastConfig
   scheduler?: {
     enabled?: boolean
     checkIntervalMs?: number
@@ -66,9 +72,18 @@ export interface TaskcastApp {
 export function createTaskcastApp(opts: TaskcastServerOptions): TaskcastApp {
   const app = new OpenAPIHono()
   app.get('/health', (c) => c.json({ ok: true }))
+
+  // Admin route is mounted BEFORE auth middleware so it bypasses JWT/custom auth.
+  // It authenticates via admin token independently.
+  if (opts.config) {
+    app.route('/admin', createAdminRouter({ config: opts.config, auth: opts.auth }))
+  }
+
+  const subscriberCounts = createSubscriberCounts()
+
   app.use('*', createAuthMiddleware(opts.auth ?? { mode: 'none' }))
-  app.route('/tasks', createTasksRouter(opts.engine))
-  app.route('/tasks', createSSERouter(opts.engine))
+  app.route('/tasks', createTasksRouter(opts.engine, subscriberCounts))
+  app.route('/tasks', createSSERouter(opts.engine, subscriberCounts))
 
   const cleanups: Array<() => void> = []
 

@@ -6,6 +6,7 @@ import type {
   TaskStatus,
   TaskEvent,
   BlockedRequest,
+  TaskFilter,
   BroadcastProvider,
   ShortTermStore,
   LongTermStore,
@@ -254,6 +255,10 @@ export class TaskEngine {
     }
 
     return this._emit(taskId, input)
+  }
+
+  async listTasks(filter: TaskFilter): Promise<Task[]> {
+    return this.shortTermStore.listTasks(filter)
   }
 
   async getEvents(taskId: string, opts?: EventQueryOptions): Promise<TaskEvent[]> {

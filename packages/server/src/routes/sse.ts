@@ -7,6 +7,31 @@ import { checkScope } from '../auth.js'
 import { ErrorSchema } from '../schemas.js'
 import type { TaskEngine, TaskEvent, SubscribeFilter, SSEEnvelope, Level } from '@taskcast/core'
 
+// ─── Subscriber Tracking ─────────────────────────────────────────────────────
+
+export type SubscriberCounts = Map<string, number>
+
+export function createSubscriberCounts(): SubscriberCounts {
+  return new Map<string, number>()
+}
+
+export function getSubscriberCount(counts: SubscriberCounts, taskId: string): number {
+  return counts.get(taskId) ?? 0
+}
+
+function incrementSubscriberCount(counts: SubscriberCounts, taskId: string): void {
+  counts.set(taskId, (counts.get(taskId) ?? 0) + 1)
+}
+
+function decrementSubscriberCount(counts: SubscriberCounts, taskId: string): void {
+  const count = (counts.get(taskId) ?? 1) - 1
+  if (count <= 0) {
+    counts.delete(taskId)
+  } else {
+    counts.set(taskId, count)
+  }
+}
+
 // ─── Route Definition ──────────────────────────────────────────────────────
 
 const sseRoute = createRoute({
@@ -91,7 +116,7 @@ const TERMINAL: Set<string> = new Set(TERMINAL_STATUSES)
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type OpenAPIRegister = (route: any, handler: (c: Context) => Promise<Response>) => void
 
-export function createSSERouter(engine: TaskEngine): Hono {
+export function createSSERouter(engine: TaskEngine, subscriberCounts: SubscriberCounts): Hono {
   const router = new OpenAPIHono()
   const register = router.openapi.bind(router) as OpenAPIRegister
 
@@ -107,6 +132,12 @@ export function createSSERouter(engine: TaskEngine): Hono {
     const wrap = filter.wrap !== false // default true
 
     return streamSSE(c, async (stream) => {
+      incrementSubscriberCount(subscriberCounts, taskId)
+      let decremented = false
+      const cleanup = () => {
+        if (!decremented) { decremented = true; decrementSubscriberCount(subscriberCounts, taskId) }
+      }
+
       const sendEvent = async (event: TaskEvent, filteredIndex: number) => {
         const payload = wrap ? toEnvelope(event, filteredIndex) : event
         await stream.writeSSE({
@@ -124,7 +155,13 @@ export function createSSERouter(engine: TaskEngine): Hono {
       }
 
       // Replay history
-      const history = await engine.getEvents(taskId)
+      let history: TaskEvent[]
+      try {
+        history = await engine.getEvents(taskId)
+      } catch {
+        cleanup()
+        return
+      }
       const filtered = applyFilteredIndex(history, filter)
       for (const { event, filteredIndex } of filtered) {
         await sendEvent(event, filteredIndex)
@@ -133,6 +170,7 @@ export function createSSERouter(engine: TaskEngine): Hono {
       // If task is already terminal, send done and close
       if (TERMINAL.has(task.status)) {
         await sendDone(task.status)
+        cleanup()
         return
       }
 
@@ -150,6 +188,7 @@ export function createSSERouter(engine: TaskEngine): Hono {
             const status = (event.data as { status: string }).status
             if (TERMINAL.has(status)) {
               await sendDone(status)
+              cleanup()
               unsub()
               resolve()
             }
@@ -157,6 +196,7 @@ export function createSSERouter(engine: TaskEngine): Hono {
         })
 
         stream.onAbort(() => {
+          cleanup()
           unsub()
           resolve()
         })

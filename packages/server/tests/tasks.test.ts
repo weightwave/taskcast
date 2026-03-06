@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest'
 import { Hono } from 'hono'
 import { TaskEngine, MemoryBroadcastProvider, MemoryShortTermStore } from '@taskcast/core'
 import { createTasksRouter } from '../src/routes/tasks.js'
+import { createSubscriberCounts } from '../src/routes/sse.js'
 import type { AuthContext } from '../src/auth.js'
 
 function makeApp() {
@@ -14,7 +15,7 @@ function makeApp() {
     c.set('auth', auth)
     await next()
   })
-  app.route('/tasks', createTasksRouter(engine))
+  app.route('/tasks', createTasksRouter(engine, createSubscriberCounts()))
   return { app, engine }
 }
 

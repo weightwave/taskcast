@@ -10,11 +10,12 @@ use serde_json::json;
 use taskcast_core::{
     AssignMode, BlockedRequest, CleanupConfig, CreateTaskInput, DisconnectPolicy, EngineError,
     EventQueryOptions, Level, PublishEventInput, SeriesMode, SinceCursor, TaskAuthConfig,
-    TaskEngine, TaskError, TaskStatus, TransitionPayload, WebhookConfig,
+    TaskEngine, TaskError, TaskFilter, TaskStatus, TransitionPayload, WebhookConfig,
 };
 
 use crate::auth::{check_scope, AuthContext};
 use crate::error::AppError;
+use crate::routes::sse::{get_subscriber_count, SubscriberCounts};
 
 // ─── Request Bodies ──────────────────────────────────────────────────────────
 
@@ -83,7 +84,74 @@ pub struct HistoryQuery {
     pub since_id: Option<String>,
 }
 
+// ─── List Query ──────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub struct ListTasksQuery {
+    pub status: Option<String>,
+    pub r#type: Option<String>,
+}
+
 // ─── Handlers ────────────────────────────────────────────────────────────────
+
+#[utoipa::path(
+    get,
+    path = "/tasks",
+    tag = "Tasks",
+    summary = "List tasks",
+    description = "List tasks with optional status and type filters.",
+    security(("Bearer" = [])),
+    params(ListTasksQuery),
+    responses(
+        (status = 200, description = "Task list"),
+        (status = 403, description = "Forbidden"),
+    )
+)]
+pub async fn list_tasks(
+    State(engine): State<Arc<TaskEngine>>,
+    Extension(auth): Extension<AuthContext>,
+    Extension(subscriber_counts): Extension<SubscriberCounts>,
+    Query(query): Query<ListTasksQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    if !check_scope(
+        &auth,
+        taskcast_core::PermissionScope::EventSubscribe,
+        None,
+    ) {
+        return Err(AppError::Forbidden);
+    }
+
+    let mut filter = TaskFilter::default();
+
+    if let Some(ref status_str) = query.status {
+        let statuses: Vec<TaskStatus> = status_str
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| serde_json::from_value(serde_json::Value::String(s.to_string())).ok())
+            .collect();
+        if !statuses.is_empty() {
+            filter.status = Some(statuses);
+        }
+    }
+
+    if let Some(ref type_str) = query.r#type {
+        filter.types = Some(vec![type_str.clone()]);
+    }
+
+    let tasks = engine.list_tasks(filter).await?;
+    let mut enriched = Vec::with_capacity(tasks.len());
+    for task in &tasks {
+        let subscriber_count = get_subscriber_count(&subscriber_counts, &task.id).await;
+        let mut task_json = serde_json::to_value(task).unwrap();
+        if let Some(obj) = task_json.as_object_mut() {
+            obj.insert("hot".to_string(), json!(subscriber_count > 0));
+            obj.insert("subscriberCount".to_string(), json!(subscriber_count));
+        }
+        enriched.push(task_json);
+    }
+
+    Ok(axum::Json(json!({ "tasks": enriched })))
+}
 
 #[utoipa::path(
     post,
@@ -146,6 +214,7 @@ pub async fn create_task(
 pub async fn get_task(
     State(engine): State<Arc<TaskEngine>>,
     Extension(auth): Extension<AuthContext>,
+    Extension(subscriber_counts): Extension<SubscriberCounts>,
     Path(task_id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
     if !check_scope(
@@ -161,7 +230,14 @@ pub async fn get_task(
         .await?
         .ok_or_else(|| AppError::NotFound("Task not found".to_string()))?;
 
-    Ok(axum::Json(task))
+    let subscriber_count = get_subscriber_count(&subscriber_counts, &task_id).await;
+    let mut task_json = serde_json::to_value(&task).unwrap();
+    if let Some(obj) = task_json.as_object_mut() {
+        obj.insert("hot".to_string(), json!(subscriber_count > 0));
+        obj.insert("subscriberCount".to_string(), json!(subscriber_count));
+    }
+
+    Ok(axum::Json(task_json))
 }
 
 #[utoipa::path(

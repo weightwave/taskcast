@@ -41,6 +41,7 @@ fn make_sse_worker_app() -> (Arc<TaskEngine>, Arc<WorkerManager>, axum::Router) 
         Arc::clone(&engine),
         AuthMode::None,
         Some(Arc::clone(&manager)),
+        None,
     );
     (engine, manager, router)
 }
