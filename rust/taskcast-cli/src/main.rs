@@ -374,7 +374,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let app = nest_playground(app, &dist_dir);
                     // Redirect / to /_playground/
                     let app = app.route("/", axum::routing::get(|| async {
-                        axum::response::Redirect::permanent("/_playground/")
+                        axum::response::Redirect::temporary("/_playground/")
                     }));
                     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await?;
                     println!("[taskcast] Playground UI at http://localhost:{port}/_playground/");
