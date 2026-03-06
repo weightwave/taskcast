@@ -15,7 +15,7 @@ use taskcast_core::{
 
 use crate::auth::{check_scope, AuthContext};
 use crate::error::AppError;
-use crate::routes::sse::get_subscriber_count;
+use crate::routes::sse::{get_subscriber_count, SubscriberCounts};
 
 // ─── Request Bodies ──────────────────────────────────────────────────────────
 
@@ -110,6 +110,7 @@ pub struct ListTasksQuery {
 pub async fn list_tasks(
     State(engine): State<Arc<TaskEngine>>,
     Extension(auth): Extension<AuthContext>,
+    Extension(subscriber_counts): Extension<SubscriberCounts>,
     Query(query): Query<ListTasksQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     if !check_scope(
@@ -140,7 +141,7 @@ pub async fn list_tasks(
     let tasks = engine.list_tasks(filter).await?;
     let mut enriched = Vec::with_capacity(tasks.len());
     for task in &tasks {
-        let subscriber_count = get_subscriber_count(&task.id).await;
+        let subscriber_count = get_subscriber_count(&subscriber_counts, &task.id).await;
         let mut task_json = serde_json::to_value(task).unwrap();
         if let Some(obj) = task_json.as_object_mut() {
             obj.insert("hot".to_string(), json!(true));
@@ -213,6 +214,7 @@ pub async fn create_task(
 pub async fn get_task(
     State(engine): State<Arc<TaskEngine>>,
     Extension(auth): Extension<AuthContext>,
+    Extension(subscriber_counts): Extension<SubscriberCounts>,
     Path(task_id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
     if !check_scope(
@@ -228,7 +230,7 @@ pub async fn get_task(
         .await?
         .ok_or_else(|| AppError::NotFound("Task not found".to_string()))?;
 
-    let subscriber_count = get_subscriber_count(&task_id).await;
+    let subscriber_count = get_subscriber_count(&subscriber_counts, &task_id).await;
     let mut task_json = serde_json::to_value(&task).unwrap();
     if let Some(obj) = task_json.as_object_mut() {
         obj.insert("hot".to_string(), json!(true));

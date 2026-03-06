@@ -69,7 +69,7 @@ pub async fn list_workers(
     }
 
     let workers = manager.list_workers(None).await.map_err(manager_error)?;
-    Ok(axum::Json(workers))
+    Ok(axum::Json(json!({ "workers": workers })))
 }
 
 #[utoipa::path(

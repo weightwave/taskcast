@@ -2,20 +2,21 @@ import { describe, it, expect } from 'vitest'
 import { Hono } from 'hono'
 import { TaskEngine, MemoryBroadcastProvider, MemoryShortTermStore } from '@taskcast/core'
 import { createTasksRouter } from '../../src/routes/tasks.js'
-import { createSSERouter } from '../../src/routes/sse.js'
+import { createSSERouter, createSubscriberCounts } from '../../src/routes/sse.js'
 import type { AuthContext } from '../../src/auth.js'
 
 function makeApp(authOverride?: Partial<AuthContext>) {
   const store = new MemoryShortTermStore()
   const broadcast = new MemoryBroadcastProvider()
   const engine = new TaskEngine({ shortTermStore: store, broadcast })
+  const subscriberCounts = createSubscriberCounts()
   const app = new Hono()
   app.use('*', async (c, next) => {
     c.set('auth', { taskIds: '*', scope: ['*'], ...authOverride } as AuthContext)
     await next()
   })
-  app.route('/tasks', createTasksRouter(engine))
-  app.route('/tasks', createSSERouter(engine))
+  app.route('/tasks', createTasksRouter(engine, subscriberCounts))
+  app.route('/tasks', createSSERouter(engine, subscriberCounts))
   return { app, engine }
 }
 

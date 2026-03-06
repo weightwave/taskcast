@@ -1,20 +1,21 @@
 import { describe, it, expect } from 'vitest'
 import { Hono } from 'hono'
 import { TaskEngine, MemoryBroadcastProvider, MemoryShortTermStore } from '@taskcast/core'
-import { createSSERouter } from '../src/routes/sse.js'
+import { createSSERouter, createSubscriberCounts } from '../src/routes/sse.js'
 import type { AuthContext } from '../src/auth.js'
 
 function makeApp() {
   const store = new MemoryShortTermStore()
   const broadcast = new MemoryBroadcastProvider()
   const engine = new TaskEngine({ shortTermStore: store, broadcast })
+  const subscriberCounts = createSubscriberCounts()
   const app = new Hono()
   app.use('*', async (c, next) => {
     const auth: AuthContext = { taskIds: '*', scope: ['*'] }
     c.set('auth', auth)
     await next()
   })
-  app.route('/tasks', createSSERouter(engine))
+  app.route('/tasks', createSSERouter(engine, subscriberCounts))
   return { app, engine }
 }
 
@@ -189,7 +190,7 @@ describe('GET /tasks/:taskId/events (SSE)', () => {
       c.set('auth', auth)
       await next()
     })
-    app.route('/tasks', createSSERouter(engine))
+    app.route('/tasks', createSSERouter(engine, createSubscriberCounts()))
     const task = await engine.createTask({})
     const res = await app.request(`/tasks/${task.id}/events`)
     expect(res.status).toBe(403)

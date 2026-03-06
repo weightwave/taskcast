@@ -9,7 +9,7 @@ export function useWorkersQuery() {
       const res = await apiFetch('/workers')
       if (!res.ok) throw new Error(`Failed to fetch workers: ${res.status}`)
       const body = await res.json()
-      return (body.workers ?? body) as Worker[]  // Handle both { workers: [...] } and [...]
+      return body.workers as Worker[]
     },
     refetchInterval: 5000,
   })

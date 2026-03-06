@@ -20,21 +20,25 @@ use crate::error::AppError;
 
 // ─── Subscriber Tracking ─────────────────────────────────────────────────────
 
-static SUBSCRIBER_COUNTS: std::sync::LazyLock<Mutex<HashMap<String, usize>>> =
-    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Shared subscriber count state, passed via Axum Extension to avoid module-level globals.
+pub type SubscriberCounts = Arc<Mutex<HashMap<String, usize>>>;
 
-pub async fn get_subscriber_count(task_id: &str) -> usize {
-    let counts = SUBSCRIBER_COUNTS.lock().await;
+pub fn create_subscriber_counts() -> SubscriberCounts {
+    Arc::new(Mutex::new(HashMap::new()))
+}
+
+pub async fn get_subscriber_count(counts: &SubscriberCounts, task_id: &str) -> usize {
+    let counts = counts.lock().await;
     counts.get(task_id).copied().unwrap_or(0)
 }
 
-async fn increment_subscriber_count(task_id: &str) {
-    let mut counts = SUBSCRIBER_COUNTS.lock().await;
+async fn increment_subscriber_count(counts: &SubscriberCounts, task_id: &str) {
+    let mut counts = counts.lock().await;
     *counts.entry(task_id.to_string()).or_insert(0) += 1;
 }
 
-async fn decrement_subscriber_count(task_id: &str) {
-    let mut counts = SUBSCRIBER_COUNTS.lock().await;
+async fn decrement_subscriber_count(counts: &SubscriberCounts, task_id: &str) {
+    let mut counts = counts.lock().await;
     if let Some(count) = counts.get_mut(task_id) {
         *count = count.saturating_sub(1);
         if *count == 0 {
@@ -143,6 +147,7 @@ fn is_terminal_status(status: &TaskStatus) -> bool {
 pub async fn sse_events(
     State(engine): State<Arc<TaskEngine>>,
     Extension(auth): Extension<AuthContext>,
+    Extension(subscriber_counts): Extension<SubscriberCounts>,
     Path(task_id): Path<String>,
     Query(query): Query<SseQuery>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
@@ -166,9 +171,10 @@ pub async fn sse_events(
 
     let task_status = task.status.clone();
     let task_id_clone = task_id.clone();
+    let sub_counts = subscriber_counts.clone();
 
     tokio::spawn(async move {
-        increment_subscriber_count(&task_id_clone).await;
+        increment_subscriber_count(&sub_counts, &task_id_clone).await;
 
         // Helper closures
         let send_event = |tx: &tokio::sync::mpsc::Sender<Result<Event, Infallible>>,
@@ -212,7 +218,7 @@ pub async fn sse_events(
             let status_str =
                 serde_json::to_value(&task_status).unwrap_or(serde_json::Value::Null);
             send_done(&tx, status_str.as_str().unwrap_or("completed"));
-            decrement_subscriber_count(&task_id_clone).await;
+            decrement_subscriber_count(&sub_counts, &task_id_clone).await;
             return;
         }
 
@@ -265,7 +271,7 @@ pub async fn sse_events(
         // Wait for terminal event or channel close
         let _ = done_rx.await;
         unsub();
-        decrement_subscriber_count(&task_id_clone).await;
+        decrement_subscriber_count(&sub_counts, &task_id_clone).await;
     });
 
     let stream = ReceiverStream::new(rx);

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use axum::middleware;
 use axum::response::IntoResponse;
 use axum::routing::{get, patch, post};
-use axum::Router;
+use axum::{Extension, Router};
 use taskcast_core::config::TaskcastConfig;
 use taskcast_core::heartbeat_monitor::{HeartbeatMonitor, HeartbeatMonitorOptions};
 use taskcast_core::scheduler::{TaskScheduler, TaskSchedulerOptions};
@@ -18,6 +18,7 @@ use utoipa_scalar::{Scalar, Servable};
 
 use crate::auth::{auth_middleware, AuthMode};
 use crate::openapi::ApiDoc;
+use crate::routes::sse::create_subscriber_counts;
 use crate::routes::worker_ws::{task_to_summary, WorkerCommand, WsRegistry};
 use crate::routes::{admin, sse, tasks};
 
@@ -39,6 +40,7 @@ pub fn create_app(
     config: Option<TaskcastConfig>,
 ) -> (Router, Option<WsRegistry>) {
     let auth_mode = Arc::new(auth_mode);
+    let subscriber_counts = create_subscriber_counts();
 
     let task_routes = Router::new()
         .route("/", get(tasks::list_tasks).post(tasks::create_task))
@@ -51,6 +53,7 @@ pub fn create_app(
             post(tasks::publish_events).get(sse::sse_events),
         )
         .route("/{task_id}/events/history", get(tasks::get_event_history))
+        .layer(Extension(subscriber_counts))
         .with_state(Arc::clone(&engine));
 
     let mut app = Router::new()

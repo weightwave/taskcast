@@ -17,7 +17,7 @@ const listWorkersRoute = createRoute({
   summary: 'List all workers',
   security: [{ Bearer: [] }],
   responses: {
-    200: { description: 'Worker list', content: { 'application/json': { schema: z.array(WorkerSchema) } } },
+    200: { description: 'Worker list', content: { 'application/json': { schema: z.object({ workers: z.array(WorkerSchema) }) } } },
     403: { description: 'Forbidden', content: { 'application/json': { schema: ErrorSchema } } },
   },
 })
@@ -126,7 +126,7 @@ export function createWorkersRouter(manager: WorkerManager, engine: TaskEngine):
     const auth = c.get('auth')
     if (!checkScope(auth, 'worker:manage')) return c.json({ error: 'Forbidden' }, 403)
     const workers = await manager.listWorkers()
-    return c.json(workers)
+    return c.json({ workers })
   })
 
   // GET /pull — long-poll for task (worker:connect scope)

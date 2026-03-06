@@ -1903,7 +1903,7 @@ async fn get_workers_returns_empty_array_when_no_workers() {
     response.assert_status(axum_test::http::StatusCode::OK);
 
     let body: serde_json::Value = response.json();
-    assert_eq!(body, json!([]));
+    assert_eq!(body, json!({ "workers": [] }));
 }
 
 #[tokio::test]
@@ -1916,10 +1916,11 @@ async fn get_workers_returns_registered_workers() {
     let response = server.get("/workers").await;
     response.assert_status(axum_test::http::StatusCode::OK);
 
-    let body: Vec<serde_json::Value> = response.json();
-    assert_eq!(body.len(), 2);
+    let body: serde_json::Value = response.json();
+    let workers = body["workers"].as_array().expect("workers should be an array");
+    assert_eq!(workers.len(), 2);
 
-    let ids: Vec<&str> = body.iter().map(|w| w["id"].as_str().unwrap()).collect();
+    let ids: Vec<&str> = workers.iter().map(|w| w["id"].as_str().unwrap()).collect();
     assert!(ids.contains(&"w1"));
     assert!(ids.contains(&"w2"));
 }
@@ -3135,8 +3136,9 @@ async fn list_workers_succeeds_with_worker_manage_scope() {
         .add_header(axum_test::http::header::AUTHORIZATION, bearer_header(&token))
         .await;
     response.assert_status(axum_test::http::StatusCode::OK);
-    let body: Vec<serde_json::Value> = response.json();
-    assert_eq!(body.len(), 1);
+    let body: serde_json::Value = response.json();
+    let workers = body["workers"].as_array().expect("workers should be an array");
+    assert_eq!(workers.len(), 1);
 }
 
 #[tokio::test]

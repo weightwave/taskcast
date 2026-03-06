@@ -2,22 +2,23 @@ import { describe, it, expect } from 'vitest'
 import { Hono } from 'hono'
 import { TaskEngine, MemoryBroadcastProvider, MemoryShortTermStore } from '@taskcast/core'
 import { createTasksRouter } from '../../src/routes/tasks.js'
-import { createSSERouter, getSubscriberCount } from '../../src/routes/sse.js'
+import { createSSERouter, getSubscriberCount, createSubscriberCounts } from '../../src/routes/sse.js'
 import type { AuthContext } from '../../src/auth.js'
 
 function makeApp() {
   const store = new MemoryShortTermStore()
   const broadcast = new MemoryBroadcastProvider()
   const engine = new TaskEngine({ shortTermStore: store, broadcast })
+  const subscriberCounts = createSubscriberCounts()
   const app = new Hono()
   app.use('*', async (c, next) => {
     const auth: AuthContext = { taskIds: '*', scope: ['*'] }
     c.set('auth', auth)
     await next()
   })
-  app.route('/tasks', createTasksRouter(engine))
-  app.route('/tasks', createSSERouter(engine))
-  return { app, engine }
+  app.route('/tasks', createTasksRouter(engine, subscriberCounts))
+  app.route('/tasks', createSSERouter(engine, subscriberCounts))
+  return { app, engine, subscriberCounts }
 }
 
 describe('GET /tasks/:id — hot and subscriberCount enrichment', () => {
@@ -57,7 +58,8 @@ describe('GET /tasks/:id — hot and subscriberCount enrichment', () => {
 
 describe('getSubscriberCount — direct function', () => {
   it('returns 0 for an unknown taskId', () => {
-    expect(getSubscriberCount('unknown-task-id')).toBe(0)
+    const counts = createSubscriberCounts()
+    expect(getSubscriberCount(counts, 'unknown-task-id')).toBe(0)
   })
 })
 

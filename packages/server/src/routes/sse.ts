@@ -9,22 +9,26 @@ import type { TaskEngine, TaskEvent, SubscribeFilter, SSEEnvelope, Level } from 
 
 // ─── Subscriber Tracking ─────────────────────────────────────────────────────
 
-const subscriberCounts = new Map<string, number>()
+export type SubscriberCounts = Map<string, number>
 
-export function getSubscriberCount(taskId: string): number {
-  return subscriberCounts.get(taskId) ?? 0
+export function createSubscriberCounts(): SubscriberCounts {
+  return new Map<string, number>()
 }
 
-function incrementSubscriberCount(taskId: string): void {
-  subscriberCounts.set(taskId, (subscriberCounts.get(taskId) ?? 0) + 1)
+export function getSubscriberCount(counts: SubscriberCounts, taskId: string): number {
+  return counts.get(taskId) ?? 0
 }
 
-function decrementSubscriberCount(taskId: string): void {
-  const count = (subscriberCounts.get(taskId) ?? 1) - 1
+function incrementSubscriberCount(counts: SubscriberCounts, taskId: string): void {
+  counts.set(taskId, (counts.get(taskId) ?? 0) + 1)
+}
+
+function decrementSubscriberCount(counts: SubscriberCounts, taskId: string): void {
+  const count = (counts.get(taskId) ?? 1) - 1
   if (count <= 0) {
-    subscriberCounts.delete(taskId)
+    counts.delete(taskId)
   } else {
-    subscriberCounts.set(taskId, count)
+    counts.set(taskId, count)
   }
 }
 
@@ -112,7 +116,7 @@ const TERMINAL: Set<string> = new Set(TERMINAL_STATUSES)
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type OpenAPIRegister = (route: any, handler: (c: Context) => Promise<Response>) => void
 
-export function createSSERouter(engine: TaskEngine): Hono {
+export function createSSERouter(engine: TaskEngine, subscriberCounts: SubscriberCounts): Hono {
   const router = new OpenAPIHono()
   const register = router.openapi.bind(router) as OpenAPIRegister
 
@@ -128,7 +132,7 @@ export function createSSERouter(engine: TaskEngine): Hono {
     const wrap = filter.wrap !== false // default true
 
     return streamSSE(c, async (stream) => {
-      incrementSubscriberCount(taskId)
+      incrementSubscriberCount(subscriberCounts, taskId)
 
       const sendEvent = async (event: TaskEvent, filteredIndex: number) => {
         const payload = wrap ? toEnvelope(event, filteredIndex) : event
@@ -156,7 +160,7 @@ export function createSSERouter(engine: TaskEngine): Hono {
       // If task is already terminal, send done and close
       if (TERMINAL.has(task.status)) {
         await sendDone(task.status)
-        decrementSubscriberCount(taskId)
+        decrementSubscriberCount(subscriberCounts, taskId)
         return
       }
 
@@ -175,7 +179,7 @@ export function createSSERouter(engine: TaskEngine): Hono {
             const status = (event.data as { status: string }).status
             if (TERMINAL.has(status)) {
               await sendDone(status)
-              if (!decremented) { decremented = true; decrementSubscriberCount(taskId) }
+              if (!decremented) { decremented = true; decrementSubscriberCount(subscriberCounts, taskId) }
               unsub()
               resolve()
             }
@@ -183,7 +187,7 @@ export function createSSERouter(engine: TaskEngine): Hono {
         })
 
         stream.onAbort(() => {
-          if (!decremented) { decremented = true; decrementSubscriberCount(taskId) }
+          if (!decremented) { decremented = true; decrementSubscriberCount(subscriberCounts, taskId) }
           unsub()
           resolve()
         })

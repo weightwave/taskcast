@@ -3,6 +3,7 @@ import { OpenAPIHono, createRoute, z } from '@hono/zod-openapi'
 import type { Context } from 'hono'
 import { checkScope } from '../auth.js'
 import { getSubscriberCount } from './sse.js'
+import type { SubscriberCounts } from './sse.js'
 import {
   CreateTaskSchema,
   PublishEventSchema,
@@ -136,7 +137,7 @@ const eventHistoryRoute = createRoute({
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type OpenAPIRegister = (route: any, handler: (c: Context) => Promise<Response>) => void
 
-export function createTasksRouter(engine: TaskEngine): Hono {
+export function createTasksRouter(engine: TaskEngine, subscriberCounts: SubscriberCounts): Hono {
   const router = new OpenAPIHono()
   const register = router.openapi.bind(router) as OpenAPIRegister
 
@@ -182,7 +183,7 @@ export function createTasksRouter(engine: TaskEngine): Hono {
     const enriched = tasks.map(t => ({
       ...t,
       hot: true,
-      subscriberCount: getSubscriberCount(t.id),
+      subscriberCount: getSubscriberCount(subscriberCounts, t.id),
     }))
 
     return c.json({ tasks: enriched })
@@ -195,7 +196,7 @@ export function createTasksRouter(engine: TaskEngine): Hono {
 
     const task = await engine.getTask(taskId)
     if (!task) return c.json({ error: 'Task not found' }, 404)
-    return c.json({ ...task, hot: true, subscriberCount: getSubscriberCount(taskId) })
+    return c.json({ ...task, hot: true, subscriberCount: getSubscriberCount(subscriberCounts, taskId) })
   })
 
   register(transitionRoute, async (c) => {

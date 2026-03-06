@@ -1,7 +1,8 @@
 export { createAuthMiddleware, checkScope } from './auth.js'
 export type { AuthConfig, AuthContext, JWTConfig } from './auth.js'
 export { createTasksRouter } from './routes/tasks.js'
-export { createSSERouter } from './routes/sse.js'
+export { createSSERouter, createSubscriberCounts, getSubscriberCount } from './routes/sse.js'
+export type { SubscriberCounts } from './routes/sse.js'
 export { createWorkersRouter, WorkerWSHandler, WorkerWSRegistry } from './routes/workers.js'
 export type { WSLike, TaskSummary } from './routes/workers.js'
 export { createAdminRouter } from './routes/admin.js'
@@ -17,7 +18,7 @@ import { OpenAPIHono } from '@hono/zod-openapi'
 import { apiReference } from '@scalar/hono-api-reference'
 import { createAuthMiddleware } from './auth.js'
 import { createTasksRouter } from './routes/tasks.js'
-import { createSSERouter } from './routes/sse.js'
+import { createSSERouter, createSubscriberCounts } from './routes/sse.js'
 import { createWorkersRouter } from './routes/workers.js'
 import { WorkerWSRegistry } from './routes/worker-ws.js'
 import { createAdminRouter } from './routes/admin.js'
@@ -78,9 +79,11 @@ export function createTaskcastApp(opts: TaskcastServerOptions): TaskcastApp {
     app.route('/admin', createAdminRouter({ config: opts.config, auth: opts.auth }))
   }
 
+  const subscriberCounts = createSubscriberCounts()
+
   app.use('*', createAuthMiddleware(opts.auth ?? { mode: 'none' }))
-  app.route('/tasks', createTasksRouter(opts.engine))
-  app.route('/tasks', createSSERouter(opts.engine))
+  app.route('/tasks', createTasksRouter(opts.engine, subscriberCounts))
+  app.route('/tasks', createSSERouter(opts.engine, subscriberCounts))
 
   const cleanups: Array<() => void> = []
 
