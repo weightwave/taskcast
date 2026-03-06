@@ -29,9 +29,9 @@ impl PostgresLongTermStore {
 
     /// Run migrations to create/update tables and indexes.
     ///
-    /// Uses sqlx's built-in migration runner which reads `.sql` files from
-    /// the `migrations/` directory and tracks applied migrations in a
-    /// `_sqlx_migrations` table.
+    /// Uses sqlx's built-in migration runner with `.sql` files from the shared
+    /// `migrations/postgres/` directory at the repo root (embedded at compile time).
+    /// Tracks applied migrations in the `_sqlx_migrations` table.
     pub async fn migrate(
         &self,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

@@ -327,6 +327,10 @@ program
       }
 
       if (!options.yes) {
+        if (!process.stdin.isTTY) {
+          console.error('[taskcast] No TTY detected. Re-run with --yes (-y) to skip confirmation.')
+          process.exit(1)
+        }
         const confirmed = await promptConfirm(`Apply ${pending.length} migration(s) to ${target}? (Y/n) `)
         if (!confirmed) {
           console.log('[taskcast] Migration cancelled.')

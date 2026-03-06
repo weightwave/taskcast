@@ -405,8 +405,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Migrate { url, config, yes } => {
             // 1. Resolve postgres URL: --url > env var > config file
-            let file_config = taskcast_core::config::load_config_file(config.as_deref())
-                .unwrap_or_default();
+            let file_config = match taskcast_core::config::load_config_file(config.as_deref()) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    eprintln!("[taskcast] Failed to load config file: {e}");
+                    std::process::exit(1);
+                }
+            };
 
             let config_url = file_config
                 .adapters
@@ -457,11 +462,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await
             .map_err(|e| format!("Failed to check migration state: {e}"))?;
 
-            let applied: Vec<(i64,)> =
-                sqlx::query_as("SELECT version FROM _sqlx_migrations ORDER BY version")
-                    .fetch_all(&pool)
-                    .await
-                    .map_err(|e| format!("Failed to query applied migrations: {e}"))?;
+            // Fail fast on dirty (failed) migrations
+            let dirty: Vec<(i64,)> = sqlx::query_as(
+                "SELECT version FROM _sqlx_migrations WHERE success = false ORDER BY version",
+            )
+            .fetch_all(&pool)
+            .await
+            .map_err(|e| format!("Failed to query dirty migrations: {e}"))?;
+
+            if !dirty.is_empty() {
+                let versions: Vec<String> = dirty.iter().map(|r| r.0.to_string()).collect();
+                eprintln!(
+                    "[taskcast] Dirty (failed) migrations found: versions {}. Fix manually before running migrations.",
+                    versions.join(", ")
+                );
+                pool.close().await;
+                std::process::exit(1);
+            }
+
+            let applied: Vec<(i64,)> = sqlx::query_as(
+                "SELECT version FROM _sqlx_migrations WHERE success = true ORDER BY version",
+            )
+            .fetch_all(&pool)
+            .await
+            .map_err(|e| format!("Failed to query applied migrations: {e}"))?;
 
             let applied_set: HashSet<i64> = applied.iter().map(|r| r.0).collect();
             let pending: Vec<_> = migrator
@@ -491,7 +515,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // 7. Prompt for confirmation unless -y
             if !yes {
+                use std::io::IsTerminal;
                 use std::io::Write;
+                if !std::io::stdin().is_terminal() {
+                    eprintln!("[taskcast] No TTY detected. Re-run with --yes (-y) to skip confirmation.");
+                    pool.close().await;
+                    std::process::exit(1);
+                }
                 eprint!(
                     "Apply {} migration(s) to {}? (Y/n) ",
                     pending.len(),
