@@ -7,3 +7,4 @@ coverage/
 .worktrees/
 rust/target/
 .claude/
+.playwright-cli/
