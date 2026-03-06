@@ -29,6 +29,15 @@ enum Commands {
         /// SQLite database file path (default: ./taskcast.db)
         #[arg(long, default_value = "./taskcast.db")]
         db_path: String,
+        /// Serve the interactive playground UI at /_playground/
+        #[arg(long)]
+        playground: bool,
+    },
+    /// Serve only the playground UI (no engine)
+    Playground {
+        /// Port to listen on
+        #[arg(short, long, default_value = "5173")]
+        port: u16,
     },
     /// Start the server as a background service (not yet implemented)
     Daemon,
@@ -92,6 +101,46 @@ fn auth_mode_to_string(mode: &taskcast_core::config::AuthMode) -> String {
     }
 }
 
+/// Try to find the playground dist directory relative to the binary.
+fn resolve_playground_dir() -> Option<std::path::PathBuf> {
+    // Check TASKCAST_PLAYGROUND_DIR env var first
+    if let Ok(dir) = std::env::var("TASKCAST_PLAYGROUND_DIR") {
+        let p = std::path::PathBuf::from(dir);
+        if p.join("index.html").exists() {
+            return Some(p);
+        }
+    }
+    // Check relative to current exe (for installed binaries)
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            // ../share/taskcast/playground (standard install layout)
+            let share_dir = parent.join("../share/taskcast/playground");
+            if share_dir.join("index.html").exists() {
+                return Some(share_dir);
+            }
+        }
+    }
+    // Check relative to cwd (for development)
+    let dev_dir = std::path::PathBuf::from("packages/playground/dist");
+    if dev_dir.join("index.html").exists() {
+        return Some(dev_dir);
+    }
+    None
+}
+
+/// Nest the playground static file serving under /_playground/
+fn nest_playground<S>(app: axum::Router<S>, dist_dir: &std::path::Path) -> axum::Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    use tower_http::services::ServeDir;
+
+    let serve_dir = ServeDir::new(dist_dir)
+        .fallback(tower_http::services::ServeFile::new(dist_dir.join("index.html")));
+
+    app.nest_service("/_playground", serve_dir)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
@@ -100,6 +149,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         port: 3721,
         storage: "memory".to_string(),
         db_path: "./taskcast.db".to_string(),
+        playground: false,
     });
 
     match cmd {
@@ -108,6 +158,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             port,
             storage,
             db_path,
+            playground,
         } => {
             // 1. Load config file
             let file_config = taskcast_core::config::load_config_file(config.as_deref())
@@ -295,9 +346,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // 9. Create and serve app
             let (app, _ws_registry) = taskcast_server::create_app(engine, auth_mode, worker_manager);
+
+            // Serve playground static files if --playground
+            let app = if playground {
+                match resolve_playground_dir() {
+                    Some(dist_dir) => {
+                        println!("[taskcast] Playground UI at http://localhost:{port}/_playground/");
+                        nest_playground(app, &dist_dir)
+                    }
+                    None => {
+                        eprintln!("[taskcast] Playground dist not found. Build the playground first.");
+                        app
+                    }
+                }
+            } else {
+                app
+            };
+
             let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await?;
             println!("[taskcast] Server started on http://localhost:{port}");
             axum::serve(listener, app).await?;
+        }
+        Commands::Playground { port } => {
+            match resolve_playground_dir() {
+                Some(dist_dir) => {
+                    let app = axum::Router::new();
+                    let app = nest_playground(app, &dist_dir);
+                    // Redirect / to /_playground/
+                    let app = app.route("/", axum::routing::get(|| async {
+                        axum::response::Redirect::permanent("/_playground/")
+                    }));
+                    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await?;
+                    println!("[taskcast] Playground UI at http://localhost:{port}/_playground/");
+                    println!("[taskcast] Use \"External\" mode in the UI to connect to a remote server.");
+                    axum::serve(listener, app).await?;
+                }
+                None => {
+                    eprintln!("[taskcast] Playground dist not found. Build the playground first.");
+                    std::process::exit(1);
+                }
+            }
         }
         Commands::Daemon => {
             eprintln!("[taskcast] daemon mode is not yet implemented, use `taskcast start` for foreground mode");
@@ -456,13 +544,48 @@ mod tests {
                 port,
                 storage,
                 db_path,
+                playground,
             } => {
                 assert!(config.is_none());
                 assert_eq!(port, 3721);
                 assert_eq!(storage, "memory");
                 assert_eq!(db_path, "./taskcast.db");
+                assert!(!playground);
             }
             _ => panic!("expected Start command"),
+        }
+    }
+
+    #[test]
+    fn cli_start_with_playground_flag() {
+        let cli = Cli::parse_from(["taskcast", "start", "--playground"]);
+        match cli.command.unwrap() {
+            Commands::Start { playground, .. } => {
+                assert!(playground);
+            }
+            _ => panic!("expected Start command"),
+        }
+    }
+
+    #[test]
+    fn cli_playground_subcommand_parses() {
+        let cli = Cli::parse_from(["taskcast", "playground"]);
+        match cli.command.unwrap() {
+            Commands::Playground { port } => {
+                assert_eq!(port, 5173);
+            }
+            _ => panic!("expected Playground command"),
+        }
+    }
+
+    #[test]
+    fn cli_playground_with_port() {
+        let cli = Cli::parse_from(["taskcast", "playground", "--port", "8080"]);
+        match cli.command.unwrap() {
+            Commands::Playground { port } => {
+                assert_eq!(port, 8080);
+            }
+            _ => panic!("expected Playground command"),
         }
     }
 
