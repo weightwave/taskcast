@@ -1,13 +1,15 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::series::process_series;
-use crate::state_machine::{can_transition, is_terminal};
+use serde::{Deserialize, Serialize};
+
+use crate::state_machine::{can_transition, is_suspended, is_terminal};
 use crate::types::{
-    AssignMode, BroadcastProvider, CleanupConfig, DisconnectPolicy, EventQueryOptions, Level,
-    LongTermStore, ShortTermStore, Task, TaskAuthConfig, TaskFilter, TaskcastHooks, TaskError,
-    TaskEvent, TaskStatus, WebhookConfig,
+    AssignMode, BlockedRequest, BroadcastProvider, CleanupConfig, DisconnectPolicy,
+    EventQueryOptions, Level, LongTermStore, ShortTermStore, Task, TaskAuthConfig, TaskFilter,
+    TaskcastHooks, TaskError, TaskEvent, TaskStatus, WebhookConfig,
 };
 
 // ─── Error ───────────────────────────────────────────────────────────────────
@@ -54,9 +56,15 @@ pub struct PublishEventInput {
     pub series_acc_field: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TransitionPayload {
     pub result: Option<HashMap<String, serde_json::Value>>,
     pub error: Option<TaskError>,
+    pub reason: Option<String>,
+    pub resume_after_ms: Option<f64>,
+    pub blocked_request: Option<BlockedRequest>,
+    pub ttl: Option<u64>,
 }
 
 // ─── TaskEngineOptions ───────────────────────────────────────────────────────
@@ -70,11 +78,16 @@ pub struct TaskEngineOptions {
 
 // ─── TaskEngine ──────────────────────────────────────────────────────────────
 
+/// Callback signature for transition listeners.
+/// Receives the task, the old status, and the new status.
+pub type TransitionListener = Box<dyn Fn(&Task, &TaskStatus, &TaskStatus) + Send + Sync>;
+
 pub struct TaskEngine {
     short_term_store: Arc<dyn ShortTermStore>,
     broadcast: Arc<dyn BroadcastProvider>,
     long_term_store: Option<Arc<dyn LongTermStore>>,
     hooks: Option<Arc<dyn TaskcastHooks>>,
+    transition_listeners: Mutex<Vec<TransitionListener>>,
 }
 
 impl TaskEngine {
@@ -84,7 +97,14 @@ impl TaskEngine {
             broadcast: opts.broadcast,
             long_term_store: opts.long_term_store,
             hooks: opts.hooks,
+            transition_listeners: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Register a callback that fires whenever a task transitions status.
+    /// Also fires when a task is created (with from = to = Pending).
+    pub fn add_transition_listener(&self, listener: TransitionListener) {
+        self.transition_listeners.lock().unwrap().push(listener);
     }
 
     pub async fn create_task(&self, input: CreateTaskInput) -> Result<Task, EngineError> {
@@ -109,6 +129,9 @@ impl TaskEngine {
             cost: input.cost,
             assigned_worker: None,
             disconnect_policy: input.disconnect_policy,
+            reason: None,
+            resume_at: None,
+            blocked_request: None,
         };
 
         self.short_term_store.save_task(task.clone()).await?;
@@ -123,6 +146,14 @@ impl TaskEngine {
 
         if let Some(ref hooks) = self.hooks {
             hooks.on_task_created(&task);
+        }
+
+        // Fire transition listeners for task creation (pending → pending)
+        {
+            let listeners = self.transition_listeners.lock().unwrap();
+            for listener in listeners.iter() {
+                listener(&task, &TaskStatus::Pending, &TaskStatus::Pending);
+            }
         }
 
         Ok(task)
@@ -150,11 +181,11 @@ impl TaskEngine {
             .await?
             .ok_or_else(|| EngineError::TaskNotFound(task_id.to_string()))?;
 
-        let current_status = task.status.clone();
+        let from = task.status.clone();
 
-        if !can_transition(&current_status, &to) {
+        if !can_transition(&from, &to) {
             return Err(EngineError::InvalidTransition {
-                from: current_status,
+                from,
                 to,
             });
         }
@@ -163,22 +194,84 @@ impl TaskEngine {
         let new_result = payload
             .as_ref()
             .and_then(|p| p.result.clone())
-            .or(task.result);
-        let new_error = payload.as_ref().and_then(|p| p.error.clone()).or(task.error);
+            .or_else(|| task.result.clone());
+        let new_error = payload
+            .as_ref()
+            .and_then(|p| p.error.clone())
+            .or_else(|| task.error.clone());
         let new_completed_at = if is_terminal(&to) {
             Some(now)
         } else {
             task.completed_at
         };
 
-        let updated = Task {
+        let mut updated = Task {
             status: to.clone(),
             updated_at: now,
             completed_at: new_completed_at,
             result: new_result,
             error: new_error,
-            ..task
+            ..task.clone()
         };
+
+        // ─── Suspended-state field management ────────────────────────────────
+        // Set reason when entering suspended state
+        if is_suspended(&to) {
+            if let Some(ref payload) = payload {
+                if payload.reason.is_some() {
+                    updated.reason = payload.reason.clone();
+                }
+            }
+        } else {
+            // Clear suspended fields when leaving suspended state
+            updated.reason = None;
+            updated.blocked_request = None;
+            updated.resume_at = None;
+        }
+
+        // Blocked-specific: set blockedRequest and resumeAt
+        if to == TaskStatus::Blocked {
+            if let Some(ref payload) = payload {
+                if payload.blocked_request.is_some() {
+                    updated.blocked_request = payload.blocked_request.clone();
+                }
+                if let Some(resume_after_ms) = payload.resume_after_ms {
+                    updated.resume_at = Some(now + resume_after_ms);
+                }
+            }
+        }
+
+        // ─── TTL manipulation for suspended states ───────────────────────────
+        // → paused: stop TTL clock
+        if to == TaskStatus::Paused {
+            self.short_term_store.clear_ttl(task_id).await?;
+        }
+        // paused → blocked: restart TTL
+        if from == TaskStatus::Paused && to == TaskStatus::Blocked {
+            if let Some(ttl) = updated.ttl {
+                self.short_term_store.set_ttl(task_id, ttl).await?;
+            }
+        }
+        // paused → running: reset full TTL
+        if from == TaskStatus::Paused && to == TaskStatus::Running {
+            if let Some(ttl) = updated.ttl {
+                self.short_term_store.set_ttl(task_id, ttl).await?;
+            }
+        }
+        // blocked → paused: stop TTL clock
+        if from == TaskStatus::Blocked && to == TaskStatus::Paused {
+            self.short_term_store.clear_ttl(task_id).await?;
+        }
+
+        // TTL override from payload
+        if let Some(ref payload) = payload {
+            if let Some(ttl) = payload.ttl {
+                updated.ttl = Some(ttl);
+                if to != TaskStatus::Paused {
+                    self.short_term_store.set_ttl(task_id, ttl).await?;
+                }
+            }
+        }
 
         self.short_term_store.save_task(updated.clone()).await?;
 
@@ -198,14 +291,68 @@ impl TaskEngine {
                 }),
                 series_id: None,
                 series_mode: None,
-
                 series_acc_field: None,
             },
         )
         .await?;
 
+        // Emit taskcast:blocked event when entering blocked with blockedRequest
+        if to == TaskStatus::Blocked {
+            if let Some(ref blocked_request) = updated.blocked_request {
+                let mut data = serde_json::Map::new();
+                if let Some(ref reason) = updated.reason {
+                    data.insert(
+                        "reason".to_string(),
+                        serde_json::Value::String(reason.clone()),
+                    );
+                }
+                data.insert(
+                    "request".to_string(),
+                    serde_json::to_value(blocked_request).unwrap(),
+                );
+                self.emit(
+                    task_id,
+                    PublishEventInput {
+                        r#type: "taskcast:blocked".to_string(),
+                        level: Level::Info,
+                        data: serde_json::Value::Object(data),
+                        series_id: None,
+                        series_mode: None,
+                        series_acc_field: None,
+                    },
+                )
+                .await?;
+            }
+        }
+
+        // Emit taskcast:resolved event when going from blocked → running
+        if from == TaskStatus::Blocked && to == TaskStatus::Running && task.blocked_request.is_some()
+        {
+            let resolution = payload.as_ref().and_then(|p| p.result.clone());
+            self.emit(
+                task_id,
+                PublishEventInput {
+                    r#type: "taskcast:resolved".to_string(),
+                    level: Level::Info,
+                    data: serde_json::json!({ "resolution": resolution }),
+                    series_id: None,
+                    series_mode: None,
+                    series_acc_field: None,
+                },
+            )
+            .await?;
+        }
+
         if let Some(ref hooks) = self.hooks {
-            hooks.on_task_transitioned(&updated, &current_status, &updated.status);
+            hooks.on_task_transitioned(&updated, &from, &updated.status);
+        }
+
+        // Fire transition listeners
+        {
+            let listeners = self.transition_listeners.lock().unwrap();
+            for listener in listeners.iter() {
+                listener(&updated, &from, &updated.status);
+            }
         }
 
         Ok(updated)
@@ -642,6 +789,7 @@ mod tests {
                 Some(TransitionPayload {
                     result: Some(result_map.clone()),
                     error: None,
+                    ..Default::default()
                 }),
             )
             .await
@@ -678,6 +826,7 @@ mod tests {
                 Some(TransitionPayload {
                     result: None,
                     error: Some(err.clone()),
+                    ..Default::default()
                 }),
             )
             .await
@@ -1274,6 +1423,7 @@ mod tests {
             auth_config: None, webhooks: None, cleanup: None,
             tags: None, assign_mode: None, cost: None,
             assigned_worker: None, disconnect_policy: None,
+            reason: None, resume_at: None, blocked_request: None,
         };
         long_term_store.save_task(task).await.unwrap();
 

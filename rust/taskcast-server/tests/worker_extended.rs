@@ -36,12 +36,12 @@ fn make_worker_server() -> (Arc<TaskEngine>, Arc<WorkerManager>, TestServer) {
         hooks: None,
         defaults: None,
     }));
-    let app = create_app(
+    let (router, _ws_registry) = create_app(
         Arc::clone(&engine),
         AuthMode::None,
         Some(Arc::clone(&manager)),
     );
-    let server = TestServer::new(app);
+    let server = TestServer::new(router);
     (engine, manager, server)
 }
 
@@ -64,12 +64,12 @@ fn make_worker_ws_server() -> (Arc<TaskEngine>, Arc<WorkerManager>, TestServer) 
         hooks: None,
         defaults: None,
     }));
-    let app = create_app(
+    let (router, _ws_registry) = create_app(
         Arc::clone(&engine),
         AuthMode::None,
         Some(Arc::clone(&manager)),
     );
-    let server = TestServer::builder().http_transport().build(app);
+    let server = TestServer::builder().http_transport().build(router);
     (engine, manager, server)
 }
 
@@ -99,8 +99,8 @@ fn make_jwt_worker_server() -> (Arc<TaskEngine>, Arc<WorkerManager>, TestServer)
         issuer: None,
         audience: None,
     });
-    let app = create_app(Arc::clone(&engine), auth_mode, Some(Arc::clone(&manager)));
-    let server = TestServer::new(app);
+    let (router, _ws_registry) = create_app(Arc::clone(&engine), auth_mode, Some(Arc::clone(&manager)));
+    let server = TestServer::new(router);
     (engine, manager, server)
 }
 
@@ -189,6 +189,7 @@ async fn ws_offer_complete_flow_register_dispatch_accept_assigned() {
     assert_eq!(wid, "ext-offer-w1");
 
     // Step 2: Create a task with ws-offer assign mode
+    // The transition listener in create_app will automatically dispatch
     create_task(
         &engine,
         "ext-offer-t1",
@@ -196,14 +197,12 @@ async fn ws_offer_complete_flow_register_dispatch_accept_assigned() {
     )
     .await;
 
-    // Step 3: Dispatch the task — the manager picks the best worker
-    let dispatch = manager.dispatch_task("ext-offer-t1").await.unwrap();
-    assert_eq!(
-        dispatch,
-        taskcast_core::worker_manager::DispatchResult::Dispatched {
-            worker_id: "ext-offer-w1".to_string()
-        }
-    );
+    // Step 3: Worker should automatically receive an offer via the dispatch wiring
+    // Give the async dispatch a moment to propagate
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    let offer: serde_json::Value = ws.receive_json().await;
+    assert_eq!(offer["type"], "offer");
+    assert_eq!(offer["taskId"], "ext-offer-t1");
 
     // Step 4: Worker accepts the task (internally calls claim_task)
     ws.send_json(&json!({

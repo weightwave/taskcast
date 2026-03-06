@@ -56,6 +56,8 @@ export type PermissionScope =
   | 'webhook:create'
   | 'worker:connect'
   | 'worker:manage'
+  | 'task:resolve'
+  | 'task:signal'
   | '*'
 
 export interface CleanupRule {
@@ -74,6 +76,11 @@ export interface CleanupRule {
     olderThanMs?: number
     seriesMode?: SeriesMode[]
   }
+}
+
+export interface BlockedRequest {
+  type: string
+  data: unknown
 }
 
 // ─── Worker Assignment ──────────────────────────────────────────────────────
@@ -154,6 +161,9 @@ export interface Task {
   assignMode?: AssignMode
   cost?: number
   assignedWorker?: string
+  reason?: string
+  resumeAt?: number
+  blockedRequest?: BlockedRequest
   disconnectPolicy?: DisconnectPolicy
 }
 
@@ -243,6 +253,12 @@ export interface ShortTermStore {
   removeAssignment(taskId: string): Promise<void>
   getWorkerAssignments(workerId: string): Promise<WorkerAssignment[]>
   getTaskAssignment(taskId: string): Promise<WorkerAssignment | null>
+
+  // TTL management
+  clearTTL(taskId: string): Promise<void>
+
+  // Task query by status
+  listByStatus(statuses: TaskStatus[]): Promise<Task[]>
 }
 
 export interface LongTermStore {

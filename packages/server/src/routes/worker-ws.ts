@@ -27,6 +27,28 @@ function toSummary(task: Task): TaskSummary {
   return summary
 }
 
+// ─── WorkerWSRegistry ──────────────────────────────────────────────────────
+
+export class WorkerWSRegistry {
+  private handlers = new Map<string, WorkerWSHandler>()
+
+  register(workerId: string, handler: WorkerWSHandler): void {
+    this.handlers.set(workerId, handler)
+  }
+
+  unregister(workerId: string): void {
+    this.handlers.delete(workerId)
+  }
+
+  get(workerId: string): WorkerWSHandler | undefined {
+    return this.handlers.get(workerId)
+  }
+
+  getAll(): Map<string, WorkerWSHandler> {
+    return this.handlers
+  }
+}
+
 // ─── WorkerWSHandler ────────────────────────────────────────────────────────
 
 export class WorkerWSHandler {
@@ -38,6 +60,7 @@ export class WorkerWSHandler {
     private manager: WorkerManager,
     private ws: WSLike,
     private auth?: AuthContext,
+    private registry?: WorkerWSRegistry,
   ) {}
 
   // ─── Public API ─────────────────────────────────────────────────────────
@@ -96,6 +119,7 @@ export class WorkerWSHandler {
   async handleDisconnect(): Promise<void> {
     this.stopPingTimer()
     if (this.workerId) {
+      this.registry?.unregister(this.workerId)
       await this.manager.unregisterWorker(this.workerId)
     }
   }
@@ -123,6 +147,7 @@ export class WorkerWSHandler {
     if (typeof msg.weight === 'number') reg.weight = msg.weight
     const worker = await this.manager.registerWorker(reg)
     this.workerId = worker.id
+    this.registry?.register(worker.id, this)
     this.send({ type: 'registered', workerId: worker.id })
     this.startPingTimer()
   }

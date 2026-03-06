@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
@@ -11,9 +11,56 @@ use taskcast_core::worker_manager::{
     WorkerUpdateStatus,
 };
 use taskcast_core::{ConnectionMode, PermissionScope, Task, WorkerMatchRule};
+use tokio::sync::mpsc;
 
 use crate::auth::{check_scope, AuthContext};
 use crate::error::AppError;
+
+// ─── WS Registry ────────────────────────────────────────────────────────────
+
+/// Message that can be sent TO a connected WebSocket worker.
+#[derive(Debug, Clone)]
+pub enum WorkerCommand {
+    Offer { task: TaskSummary, task_id: String },
+    Available { task: TaskSummary, task_id: String },
+}
+
+/// Registry tracking all active WebSocket worker connections.
+#[derive(Clone, Default)]
+pub struct WsRegistry {
+    senders: Arc<RwLock<HashMap<String, mpsc::UnboundedSender<WorkerCommand>>>>,
+}
+
+impl WsRegistry {
+    pub fn new() -> Self {
+        Self {
+            senders: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    pub fn register(&self, worker_id: &str, sender: mpsc::UnboundedSender<WorkerCommand>) {
+        self.senders
+            .write()
+            .unwrap()
+            .insert(worker_id.to_string(), sender);
+    }
+
+    pub fn unregister(&self, worker_id: &str) {
+        self.senders.write().unwrap().remove(worker_id);
+    }
+
+    pub fn send(&self, worker_id: &str, cmd: WorkerCommand) -> bool {
+        if let Some(sender) = self.senders.read().unwrap().get(worker_id) {
+            sender.send(cmd).is_ok()
+        } else {
+            false
+        }
+    }
+
+    pub fn worker_ids(&self) -> Vec<String> {
+        self.senders.read().unwrap().keys().cloned().collect()
+    }
+}
 
 // ─── Client → Server Messages ───────────────────────────────────────────────
 
@@ -113,19 +160,24 @@ pub struct TaskSummary {
 
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
-    State(manager): State<Arc<WorkerManager>>,
+    State((manager, registry)): State<(Arc<WorkerManager>, WsRegistry)>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<impl IntoResponse, AppError> {
     if !check_scope(&auth, PermissionScope::WorkerConnect, None) {
         return Err(AppError::Forbidden);
     }
 
-    Ok(ws.on_upgrade(move |socket| handle_socket(socket, manager, auth)))
+    Ok(ws.on_upgrade(move |socket| handle_socket(socket, manager, registry, auth)))
 }
 
 // ─── Socket Loop ────────────────────────────────────────────────────────────
 
-async fn handle_socket(mut socket: WebSocket, manager: Arc<WorkerManager>, auth: AuthContext) {
+async fn handle_socket(
+    mut socket: WebSocket,
+    manager: Arc<WorkerManager>,
+    registry: WsRegistry,
+    auth: AuthContext,
+) {
     let mut worker_id: Option<String> = None;
     let interval_ms = manager.heartbeat_interval_ms();
     let mut ping_interval = tokio::time::interval(tokio::time::Duration::from_millis(interval_ms));
@@ -133,12 +185,27 @@ async fn handle_socket(mut socket: WebSocket, manager: Arc<WorkerManager>, auth:
     ping_interval.tick().await;
     let mut registered = false;
 
+    // Channel for receiving commands from the WsRegistry
+    let (cmd_sender, mut cmd_receiver) = mpsc::unbounded_channel::<WorkerCommand>();
+
     loop {
         let msg = if registered {
             tokio::select! {
                 msg = socket.recv() => msg,
                 _ = ping_interval.tick() => {
                     let _ = send_message(&mut socket, &ServerMessage::Ping).await;
+                    continue;
+                }
+                cmd = cmd_receiver.recv() => {
+                    match cmd {
+                        Some(WorkerCommand::Offer { task, task_id }) => {
+                            let _ = send_message(&mut socket, &ServerMessage::Offer { task_id, task }).await;
+                        }
+                        Some(WorkerCommand::Available { task, task_id }) => {
+                            let _ = send_message(&mut socket, &ServerMessage::Available { task_id, task }).await;
+                        }
+                        None => break, // Channel closed
+                    }
                     continue;
                 }
             }
@@ -205,6 +272,7 @@ async fn handle_socket(mut socket: WebSocket, manager: Arc<WorkerManager>, auth:
                     Ok(worker) => {
                         worker_id = Some(worker.id.clone());
                         registered = true;
+                        registry.register(&worker.id, cmd_sender.clone());
                         let _ = send_message(
                             &mut socket,
                             &ServerMessage::Registered {
@@ -423,8 +491,9 @@ async fn handle_socket(mut socket: WebSocket, manager: Arc<WorkerManager>, auth:
         }
     }
 
-    // On disconnect: unregister worker
+    // On disconnect: unregister worker from registry and manager
     if let Some(ref wid) = worker_id {
+        registry.unregister(wid);
         let _ = manager.unregister_worker(wid).await;
     }
 }
@@ -440,7 +509,6 @@ async fn send_message(
 }
 
 /// Convert a Task to a TaskSummary for WebSocket messages.
-#[allow(dead_code)]
 pub fn task_to_summary(task: &Task) -> TaskSummary {
     TaskSummary {
         id: task.id.clone(),

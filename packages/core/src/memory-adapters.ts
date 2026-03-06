@@ -1,6 +1,7 @@
 import type {
   Task,
   TaskEvent,
+  TaskStatus,
   BroadcastProvider,
   ShortTermStore,
   EventQueryOptions,
@@ -204,5 +205,15 @@ export class MemoryShortTermStore implements ShortTermStore {
 
   async getTaskAssignment(taskId: string): Promise<WorkerAssignment | null> {
     return this.assignments.get(taskId) ?? null
+  }
+
+  // TTL management — no-op in memory adapter (setTTL is also a no-op)
+  async clearTTL(_taskId: string): Promise<void> {
+    // no-op in memory adapter
+  }
+
+  // Task query by status
+  async listByStatus(statuses: TaskStatus[]): Promise<Task[]> {
+    return Array.from(this.tasks.values()).filter((t) => statuses.includes(t.status))
   }
 }
