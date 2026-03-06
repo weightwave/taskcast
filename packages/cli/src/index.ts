@@ -19,6 +19,7 @@ import { createTaskcastApp } from '@taskcast/server'
 import { createRedisAdapters } from '@taskcast/redis'
 import { PostgresLongTermStore, loadMigrationFiles, runMigrations } from '@taskcast/postgres'
 import { createSqliteAdapters } from '@taskcast/sqlite'
+import { resolvePostgresUrl, formatDisplayUrl } from './migrate-helpers.js'
 
 const DEFAULT_CONFIG_YAML = `# Taskcast configuration
 # Docs: https://github.com/weightwave/taskcast
@@ -215,31 +216,20 @@ program
   .option('-c, --config <path>', 'config file path')
   .option('-y, --yes', 'skip confirmation prompt')
   .action(async (options: { url?: string; config?: string; yes?: boolean }) => {
-    let pgUrl: string | undefined = options.url
-
     // URL resolution priority: --url flag > env var > config file
-    if (!pgUrl) {
-      pgUrl = process.env['TASKCAST_POSTGRES_URL']
-    }
-    if (!pgUrl) {
-      const { config: fileConfig } = await loadConfigFile(options.config)
-      pgUrl = fileConfig.adapters?.longTermStore?.url
-    }
+    const { config: fileConfig } = await loadConfigFile(options.config)
+    const pgUrl = resolvePostgresUrl({
+      url: options.url,
+      envUrl: process.env['TASKCAST_POSTGRES_URL'],
+      configUrl: fileConfig.adapters?.longTermStore?.url,
+    })
 
     if (!pgUrl) {
       console.error('[taskcast] No Postgres URL found. Provide --url, set TASKCAST_POSTGRES_URL, or configure adapters.longTermStore.url in config.')
       process.exit(1)
     }
 
-    // Parse and display target info
-    let target: string
-    try {
-      const parsed = new URL(pgUrl)
-      const dbname = parsed.pathname.replace(/^\//, '') || 'postgres'
-      target = `${parsed.hostname}:${parsed.port || '5432'}/${dbname}`
-    } catch {
-      target = pgUrl
-    }
+    const target = formatDisplayUrl(pgUrl)
 
     // TODO: This path works in the monorepo only. For npm publishing,
     // migrations would need to be bundled with the package.
