@@ -6,8 +6,11 @@ use axum::routing::{get, patch, post};
 use axum::Router;
 use taskcast_core::worker_manager::WorkerManager;
 use taskcast_core::TaskEngine;
+use utoipa::OpenApi;
+use utoipa_scalar::{Scalar, Servable};
 
 use crate::auth::{auth_middleware, AuthMode};
+use crate::openapi::ApiDoc;
 use crate::routes::{sse, tasks};
 
 /// Shared application state available to all handlers.
@@ -53,6 +56,18 @@ pub fn create_app(
             )
             .nest("/workers", worker_routes);
     }
+
+    // OpenAPI spec and Scalar UI
+    let openapi_spec = ApiDoc::openapi();
+    app = app
+        .route(
+            "/openapi.json",
+            get({
+                let spec = openapi_spec.clone();
+                move || async move { axum::Json(spec) }
+            }),
+        )
+        .merge(Scalar::with_url("/docs", openapi_spec));
 
     // Auth middleware must be applied AFTER routes are mounted
     app.layer(middleware::from_fn_with_state(

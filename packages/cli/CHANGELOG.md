@@ -1,5 +1,16 @@
 # @taskcast/cli
 
+## 0.3.1
+
+### Patch Changes
+
+- db97000: Fix `npx @taskcast/cli` command (previously documented as `npx taskcast` which doesn't resolve) and fix global config creation race condition where `rl.close()` synchronously resolved the Promise to `false` before the user's answer was processed.
+  - @taskcast/core@0.3.1
+  - @taskcast/server@0.3.1
+  - @taskcast/redis@0.3.1
+  - @taskcast/postgres@0.3.1
+  - @taskcast/sqlite@0.3.1
+
 ## 0.3.0
 
 ### Minor Changes

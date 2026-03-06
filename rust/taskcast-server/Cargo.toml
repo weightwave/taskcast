@@ -20,6 +20,9 @@ reqwest = { version = "0.12", features = ["json"] }
 hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
+utoipa = { version = "5", features = ["axum_extras", "preserve_order"] }
+utoipa-axum = "0.2"
+utoipa-scalar = { version = "0.3", features = ["axum"] }
 
 [dev-dependencies]
 axum-test = { version = "19", features = ["ws"] }

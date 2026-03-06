@@ -18,7 +18,7 @@ use crate::error::AppError;
 
 // ─── Request Bodies ──────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateTaskBody {
     pub id: Option<String>,
@@ -35,7 +35,7 @@ pub struct CreateTaskBody {
     pub disconnect_policy: Option<DisconnectPolicy>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TransitionBody {
     pub status: TaskStatus,
@@ -43,7 +43,7 @@ pub struct TransitionBody {
     pub error: Option<TaskErrorBody>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskErrorBody {
     pub code: Option<String>,
@@ -51,7 +51,7 @@ pub struct TaskErrorBody {
     pub details: Option<HashMap<String, serde_json::Value>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PublishEventBody {
     pub r#type: String,
@@ -69,7 +69,7 @@ pub enum EventsBody {
     Single(PublishEventBody),
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
 pub struct HistoryQuery {
     #[serde(rename = "since.index")]
     pub since_index: Option<u64>,
@@ -81,6 +81,19 @@ pub struct HistoryQuery {
 
 // ─── Handlers ────────────────────────────────────────────────────────────────
 
+#[utoipa::path(
+    post,
+    path = "/tasks",
+    tag = "Tasks",
+    summary = "Create a new task",
+    security(("Bearer" = [])),
+    request_body = CreateTaskBody,
+    responses(
+        (status = 201, description = "Task created", body = taskcast_core::Task),
+        (status = 400, description = "Validation error"),
+        (status = 403, description = "Forbidden"),
+    )
+)]
 pub async fn create_task(
     State(engine): State<Arc<TaskEngine>>,
     Extension(auth): Extension<AuthContext>,
@@ -113,6 +126,19 @@ pub async fn create_task(
     Ok((StatusCode::CREATED, axum::Json(task)))
 }
 
+#[utoipa::path(
+    get,
+    path = "/tasks/{task_id}",
+    tag = "Tasks",
+    summary = "Get task by ID",
+    security(("Bearer" = [])),
+    params(("task_id" = String, Path, description = "Task ID")),
+    responses(
+        (status = 200, description = "Task details", body = taskcast_core::Task),
+        (status = 404, description = "Task not found"),
+        (status = 403, description = "Forbidden"),
+    )
+)]
 pub async fn get_task(
     State(engine): State<Arc<TaskEngine>>,
     Extension(auth): Extension<AuthContext>,
@@ -134,6 +160,21 @@ pub async fn get_task(
     Ok(axum::Json(task))
 }
 
+#[utoipa::path(
+    patch,
+    path = "/tasks/{task_id}/status",
+    tag = "Tasks",
+    summary = "Transition task status",
+    security(("Bearer" = [])),
+    params(("task_id" = String, Path, description = "Task ID")),
+    request_body = TransitionBody,
+    responses(
+        (status = 200, description = "Updated task", body = taskcast_core::Task),
+        (status = 400, description = "Invalid transition"),
+        (status = 404, description = "Task not found"),
+        (status = 403, description = "Forbidden"),
+    )
+)]
 pub async fn transition_task(
     State(engine): State<Arc<TaskEngine>>,
     Extension(auth): Extension<AuthContext>,
@@ -175,6 +216,21 @@ pub async fn transition_task(
     Ok(axum::Json(task))
 }
 
+#[utoipa::path(
+    post,
+    path = "/tasks/{task_id}/events",
+    tag = "Events",
+    summary = "Publish events to a task",
+    description = "Supports single event or batch (array) publishing.",
+    security(("Bearer" = [])),
+    params(("task_id" = String, Path, description = "Task ID")),
+    responses(
+        (status = 201, description = "Events published"),
+        (status = 400, description = "Validation error"),
+        (status = 404, description = "Task not found"),
+        (status = 403, description = "Forbidden"),
+    )
+)]
 pub async fn publish_events(
     State(engine): State<Arc<TaskEngine>>,
     Extension(auth): Extension<AuthContext>,
@@ -230,6 +286,19 @@ pub async fn publish_events(
     Ok((StatusCode::CREATED, axum::Json(body)))
 }
 
+#[utoipa::path(
+    get,
+    path = "/tasks/{task_id}/events/history",
+    tag = "Events",
+    summary = "Query event history",
+    security(("Bearer" = [])),
+    params(("task_id" = String, Path, description = "Task ID"), HistoryQuery),
+    responses(
+        (status = 200, description = "Event list", body = Vec<taskcast_core::TaskEvent>),
+        (status = 404, description = "Task not found"),
+        (status = 403, description = "Forbidden"),
+    )
+)]
 pub async fn get_event_history(
     State(engine): State<Arc<TaskEngine>>,
     Extension(auth): Extension<AuthContext>,

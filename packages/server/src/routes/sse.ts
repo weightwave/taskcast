@@ -1,8 +1,41 @@
-import { Hono } from 'hono'
+import type { Hono } from 'hono'
+import { OpenAPIHono, createRoute, z } from '@hono/zod-openapi'
+import type { Context } from 'hono'
 import { streamSSE } from 'hono/streaming'
 import { applyFilteredIndex, matchesFilter, TERMINAL_STATUSES } from '@taskcast/core'
 import { checkScope } from '../auth.js'
+import { ErrorSchema } from '../schemas.js'
 import type { TaskEngine, TaskEvent, SubscribeFilter, SSEEnvelope, Level } from '@taskcast/core'
+
+// ─── Route Definition ──────────────────────────────────────────────────────
+
+const sseRoute = createRoute({
+  method: 'get',
+  path: '/{taskId}/events',
+  tags: ['Events'],
+  summary: 'Subscribe to task events via SSE',
+  description: 'Server-Sent Events stream. Replays history then streams live. Closes on terminal status.',
+  security: [{ Bearer: [] }],
+  request: {
+    params: z.object({ taskId: z.string() }),
+    query: z.object({
+      types: z.string().optional().openapi({ description: 'Comma-separated type filter with wildcard support' }),
+      levels: z.string().optional().openapi({ description: 'Comma-separated level filter' }),
+      includeStatus: z.string().optional().openapi({ description: 'Include taskcast:status events (default: true)' }),
+      wrap: z.string().optional().openapi({ description: 'Wrap in SSEEnvelope (default: true)' }),
+      'since.id': z.string().optional(),
+      'since.index': z.string().optional(),
+      'since.timestamp': z.string().optional(),
+    }),
+  },
+  responses: {
+    200: { description: 'SSE event stream (text/event-stream)' },
+    403: { description: 'Forbidden', content: { 'application/json': { schema: ErrorSchema } } },
+    404: { description: 'Task not found', content: { 'application/json': { schema: ErrorSchema } } },
+  },
+})
+
+// ─── Helpers ───────────────────────────────────────────────────────────────
 
 function parseFilter(query: Record<string, string | undefined>): SubscribeFilter {
   const get = (k: string) => query[k]
@@ -53,11 +86,17 @@ function toEnvelope(event: TaskEvent, filteredIndex: number): SSEEnvelope {
 
 const TERMINAL: Set<string> = new Set(TERMINAL_STATUSES)
 
-export function createSSERouter(engine: TaskEngine) {
-  const router = new Hono()
+// ─── Router Factory ────────────────────────────────────────────────────────
 
-  router.get('/:taskId/events', async (c) => {
-    const { taskId } = c.req.param()
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type OpenAPIRegister = (route: any, handler: (c: Context) => Promise<Response>) => void
+
+export function createSSERouter(engine: TaskEngine): Hono {
+  const router = new OpenAPIHono()
+  const register = router.openapi.bind(router) as OpenAPIRegister
+
+  register(sseRoute, async (c) => {
+    const taskId = c.req.param('taskId') as string
     const auth = c.get('auth')
     if (!checkScope(auth, 'event:subscribe', taskId)) return c.json({ error: 'Forbidden' }, 403)
 
@@ -125,5 +164,5 @@ export function createSSERouter(engine: TaskEngine) {
     })
   })
 
-  return router
+  return router as unknown as Hono
 }

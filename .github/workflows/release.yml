@@ -29,8 +29,8 @@ jobs:
     runs-on: ubuntu-latest
     environment: npm
     outputs:
-      published: ${{ steps.changesets.outputs.published }}
-      publishedPackages: ${{ steps.changesets.outputs.publishedPackages }}
+      published: ${{ steps.detect-publish.outputs.published }}
+      version: ${{ steps.detect-publish.outputs.version }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -68,7 +68,54 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  # ── Extract version from changesets output or dispatch input ──────────────
+      # changesets/action@v1 has a known bug with pnpm where it does not
+      # set the `published` output even after a successful npm publish.
+      # This step independently detects whether packages were published
+      # by checking the npm registry for the current version.
+      - name: Detect if packages were published
+        id: detect-publish
+        run: |
+          # If changesets/action set its output, trust it
+          if [ "${{ steps.changesets.outputs.published }}" = "true" ]; then
+            VERSION=$(echo '${{ steps.changesets.outputs.publishedPackages }}' \
+              | jq -r '.[] | select(.name == "@taskcast/cli") | .version')
+            echo "published=true" >> "$GITHUB_OUTPUT"
+            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+            echo "changesets/action reported published=true (v$VERSION)"
+            exit 0
+          fi
+
+          # Check if changeset files remain — if yes, a versioning PR was
+          # created and no publish happened (correct to skip downstream)
+          CHANGESET_COUNT=$(find .changeset -name '*.md' ! -name 'README.md' 2>/dev/null | wc -l | tr -d ' ')
+          if [ "$CHANGESET_COUNT" -gt 0 ]; then
+            echo "published=false" >> "$GITHUB_OUTPUT"
+            echo "Changesets found ($CHANGESET_COUNT) — versioning PR created, not published"
+            exit 0
+          fi
+
+          # No changesets remain — the action should have published.
+          # Verify against the npm registry.
+          LOCAL_VERSION=$(node -p "require('./packages/cli/package.json').version")
+          echo "Local version: $LOCAL_VERSION"
+
+          # Retry up to 3 times (npm registry eventual consistency)
+          for i in 1 2 3; do
+            NPM_VERSION=$(npm view @taskcast/cli version 2>/dev/null || echo "")
+            if [ "$LOCAL_VERSION" = "$NPM_VERSION" ]; then
+              echo "published=true" >> "$GITHUB_OUTPUT"
+              echo "version=$LOCAL_VERSION" >> "$GITHUB_OUTPUT"
+              echo "Detected publish: v$LOCAL_VERSION confirmed on npm"
+              exit 0
+            fi
+            echo "Attempt $i: npm has '$NPM_VERSION', expected '$LOCAL_VERSION'. Retrying in 10s..."
+            sleep 10
+          done
+
+          echo "published=false" >> "$GITHUB_OUTPUT"
+          echo "Version $LOCAL_VERSION not found on npm after retries — publish may have failed"
+
+  # ── Extract version from release output or dispatch input ────────────────
   get-version:
     needs: release
     if: >-
@@ -88,8 +135,7 @@ jobs:
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             VERSION="${{ inputs.version }}"
           else
-            VERSION=$(echo '${{ needs.release.outputs.publishedPackages }}' \
-              | jq -r '.[] | select(.name == "@taskcast/cli") | .version')
+            VERSION="${{ needs.release.outputs.version }}"
           fi
           if [ -z "$VERSION" ]; then
             echo "ERROR: version not found" >&2

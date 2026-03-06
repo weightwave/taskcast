@@ -3477,3 +3477,45 @@ async fn pull_task_returns_400_when_worker_not_registered() {
     .expect("pull request timed out");
     response.assert_status(axum_test::http::StatusCode::BAD_REQUEST);
 }
+
+// ─── OpenAPI / Scalar UI ────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn openapi_json_returns_valid_spec() {
+    let (_engine, server) = make_no_auth_server();
+
+    let response = server.get("/openapi.json").await;
+    response.assert_status(axum_test::http::StatusCode::OK);
+
+    let body: serde_json::Value = response.json();
+
+    // Must be OpenAPI 3.1.x
+    assert_eq!(body["openapi"], "3.1.0");
+
+    // Must have correct title
+    assert_eq!(body["info"]["title"], "Taskcast API");
+
+    // Must contain a paths object with /tasks
+    assert!(body["paths"].is_object(), "paths should be an object");
+    assert!(
+        body["paths"]["/tasks"].is_object(),
+        "paths should contain /tasks"
+    );
+}
+
+#[tokio::test]
+async fn docs_returns_html() {
+    let (_engine, server) = make_no_auth_server();
+
+    let response = server.get("/docs").await;
+    response.assert_status(axum_test::http::StatusCode::OK);
+
+    let header_value = response.header("content-type");
+    let content_type = header_value
+        .to_str()
+        .expect("content-type header should be valid UTF-8");
+    assert!(
+        content_type.contains("text/html"),
+        "expected text/html content type, got: {content_type}"
+    );
+}
