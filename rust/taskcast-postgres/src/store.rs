@@ -35,7 +35,7 @@ impl PostgresLongTermStore {
     pub async fn migrate(
         &self,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        sqlx::migrate!("./migrations").run(&self.pool).await?;
+        sqlx::migrate!("../../migrations/postgres").run(&self.pool).await?;
         Ok(())
     }
 
