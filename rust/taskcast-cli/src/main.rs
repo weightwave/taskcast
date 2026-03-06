@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
@@ -29,6 +30,18 @@ enum Commands {
         /// SQLite database file path (default: ./taskcast.db)
         #[arg(long, default_value = "./taskcast.db")]
         db_path: String,
+    },
+    /// Run Postgres database migrations
+    Migrate {
+        /// Postgres connection URL (highest priority)
+        #[arg(long)]
+        url: Option<String>,
+        /// Config file path
+        #[arg(short, long)]
+        config: Option<String>,
+        /// Skip confirmation prompt
+        #[arg(short, long)]
+        yes: bool,
     },
     /// Start the server as a background service (not yet implemented)
     Daemon,
@@ -299,6 +312,133 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("[taskcast] Server started on http://localhost:{port}");
             axum::serve(listener, app).await?;
         }
+        Commands::Migrate { url, config, yes } => {
+            // 1. Resolve postgres URL: --url > env var > config file
+            let file_config = taskcast_core::config::load_config_file(config.as_deref())
+                .unwrap_or_default();
+
+            let postgres_url = url
+                .or_else(|| std::env::var("TASKCAST_POSTGRES_URL").ok())
+                .or_else(|| {
+                    file_config
+                        .adapters
+                        .as_ref()?
+                        .long_term_store
+                        .as_ref()?
+                        .url
+                        .clone()
+                });
+
+            let postgres_url = match postgres_url {
+                Some(u) => u,
+                None => {
+                    eprintln!(
+                        "[taskcast] No Postgres URL found. Provide one via --url, TASKCAST_POSTGRES_URL, or config file."
+                    );
+                    std::process::exit(1);
+                }
+            };
+
+            // 2. Display target info
+            let display_url = match url::Url::parse(&postgres_url) {
+                Ok(parsed) => {
+                    let host = parsed.host_str().unwrap_or("unknown");
+                    let port = parsed.port().unwrap_or(5432);
+                    let path = parsed.path().trim_start_matches('/');
+                    format!("{host}:{port}/{path}")
+                }
+                Err(_) => postgres_url.clone(),
+            };
+            eprintln!("[taskcast] Target database: {display_url}");
+
+            // 3. Connect to database
+            let pool = sqlx::PgPool::connect(&postgres_url)
+                .await
+                .map_err(|e| format!("Failed to connect to database: {e}"))?;
+
+            // 4. Check pending migrations
+            let migrator = sqlx::migrate!("../../migrations/postgres");
+
+            // Ensure _sqlx_migrations table exists so the query doesn't fail on fresh databases
+            sqlx::query(
+                "CREATE TABLE IF NOT EXISTS _sqlx_migrations (
+                    version BIGINT PRIMARY KEY,
+                    description TEXT NOT NULL,
+                    installed_on TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    success BOOLEAN NOT NULL,
+                    checksum BYTEA NOT NULL,
+                    execution_time BIGINT NOT NULL
+                )",
+            )
+            .execute(&pool)
+            .await
+            .map_err(|e| format!("Failed to check migration state: {e}"))?;
+
+            let applied: Vec<(i64,)> =
+                sqlx::query_as("SELECT version FROM _sqlx_migrations ORDER BY version")
+                    .fetch_all(&pool)
+                    .await
+                    .map_err(|e| format!("Failed to query applied migrations: {e}"))?;
+
+            let applied_set: HashSet<i64> = applied.iter().map(|r| r.0).collect();
+            let pending: Vec<_> = migrator
+                .iter()
+                .filter(|m| !applied_set.contains(&m.version))
+                .collect();
+
+            // 5. If nothing pending, exit early
+            if pending.is_empty() {
+                eprintln!("[taskcast] Database is up to date.");
+                pool.close().await;
+                return Ok(());
+            }
+
+            // 6. List pending migrations
+            eprintln!(
+                "[taskcast] {} pending migration(s):",
+                pending.len()
+            );
+            for m in &pending {
+                eprintln!(
+                    "  - {:03}_{}.sql",
+                    m.version,
+                    m.description.replace(' ', "_")
+                );
+            }
+
+            // 7. Prompt for confirmation unless -y
+            if !yes {
+                use std::io::Write;
+                eprint!(
+                    "Apply {} migration(s) to {}? (Y/n) ",
+                    pending.len(),
+                    display_url
+                );
+                std::io::stderr().flush()?;
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input)?;
+                let trimmed = input.trim().to_lowercase();
+                if !(trimmed.is_empty() || trimmed == "y" || trimmed == "yes") {
+                    eprintln!("[taskcast] Migration cancelled.");
+                    pool.close().await;
+                    return Ok(());
+                }
+            }
+
+            // 8. Run migrations
+            let store = taskcast_postgres::PostgresLongTermStore::new(pool.clone());
+            store
+                .migrate()
+                .await
+                .map_err(|e| format!("Migration failed: {e}"))?;
+
+            // 9. Print summary
+            eprintln!(
+                "[taskcast] Successfully applied {} migration(s).",
+                pending.len()
+            );
+            pool.close().await;
+        }
         Commands::Daemon => {
             eprintln!("[taskcast] daemon mode is not yet implemented, use `taskcast start` for foreground mode");
             std::process::exit(1);
@@ -485,6 +625,43 @@ mod tests {
                 assert_eq!(db_path, "/data/tasks.db");
             }
             _ => panic!("expected Start command"),
+        }
+    }
+
+    // ─── Migrate subcommand parsing ────────────────────────────────────────
+
+    #[test]
+    fn cli_migrate_subcommand_parses() {
+        let cli = Cli::parse_from(["taskcast", "migrate", "--url", "postgres://localhost/db"]);
+        match cli.command.unwrap() {
+            Commands::Migrate { url, config, yes } => {
+                assert_eq!(url, Some("postgres://localhost/db".to_string()));
+                assert!(config.is_none());
+                assert!(!yes);
+            }
+            _ => panic!("expected Migrate command"),
+        }
+    }
+
+    #[test]
+    fn cli_migrate_with_yes_flag() {
+        let cli =
+            Cli::parse_from(["taskcast", "migrate", "-y", "--url", "postgres://localhost/db"]);
+        match cli.command.unwrap() {
+            Commands::Migrate { yes, .. } => assert!(yes),
+            _ => panic!("expected Migrate command"),
+        }
+    }
+
+    #[test]
+    fn cli_migrate_with_config_flag() {
+        let cli = Cli::parse_from(["taskcast", "migrate", "-c", "/etc/taskcast.yaml"]);
+        match cli.command.unwrap() {
+            Commands::Migrate { config, url, .. } => {
+                assert_eq!(config, Some("/etc/taskcast.yaml".to_string()));
+                assert!(url.is_none());
+            }
+            _ => panic!("expected Migrate command"),
         }
     }
 
