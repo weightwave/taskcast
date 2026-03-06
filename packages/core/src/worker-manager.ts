@@ -312,6 +312,35 @@ export class WorkerManager {
     return this.shortTermStore.getWorkerAssignments(workerId)
   }
 
+  // ─── Task Release ───────────────────────────────────────────────────────
+
+  async releaseTask(taskId: string): Promise<void> {
+    const assignment = await this.shortTermStore.getTaskAssignment(taskId)
+    if (!assignment) return
+
+    // Remove the assignment record
+    await this.shortTermStore.removeAssignment(taskId)
+
+    // Restore worker capacity (but don't change status if offline/draining)
+    const worker = await this.shortTermStore.getWorker(assignment.workerId)
+    if (worker) {
+      worker.usedSlots = Math.max(0, worker.usedSlots - assignment.cost)
+      if (worker.status !== 'offline' && worker.status !== 'draining') {
+        worker.status = worker.usedSlots >= worker.capacity ? 'busy' : 'idle'
+      }
+      await this.shortTermStore.saveWorker(worker)
+    }
+
+    // Clear assignedWorker on the task
+    const task = await this.engine.getTask(taskId)
+    if (task) {
+      delete task.assignedWorker
+      await this.shortTermStore.saveTask(task)
+    }
+
+    this.emitWorkerAudit('task_reclaimed', assignment.workerId, { taskId })
+  }
+
   // ─── Pull Mode (Long-Poll) ─────────────────────────────────────────────
 
   async waitForTask(workerId: string, signal?: AbortSignal): Promise<Task> {

@@ -31,6 +31,9 @@ async fn returns_working_adapters() {
         cost: None,
         assigned_worker: None,
         disconnect_policy: None,
+        reason: None,
+        resume_at: None,
+        blocked_request: None,
     };
 
     adapters.short_term_store.save_task(task.clone()).await.unwrap();

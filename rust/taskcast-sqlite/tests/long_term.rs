@@ -90,6 +90,9 @@ async fn handle_task_with_no_optional_fields() {
         cost: None,
         assigned_worker: None,
         disconnect_policy: None,
+        reason: None,
+        resume_at: None,
+        blocked_request: None,
     };
     ctx.long.save_task(task.clone()).await.unwrap();
     let retrieved = ctx.long.get_task("minimal").await.unwrap().unwrap();

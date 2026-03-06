@@ -432,6 +432,26 @@ impl ShortTermStore for MemoryShortTermStore {
         let assignments = self.assignments.read().unwrap();
         Ok(assignments.iter().find(|a| a.task_id == task_id).cloned())
     }
+
+    async fn clear_ttl(
+        &self,
+        _task_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // no-op in memory adapter (no TTL tracking)
+        Ok(())
+    }
+
+    async fn list_by_status(
+        &self,
+        statuses: &[TaskStatus],
+    ) -> Result<Vec<Task>, Box<dyn std::error::Error + Send + Sync>> {
+        let tasks = self.tasks.read().unwrap();
+        Ok(tasks
+            .values()
+            .filter(|t| statuses.contains(&t.status))
+            .cloned()
+            .collect())
+    }
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -467,6 +487,9 @@ mod tests {
             cost: None,
             assigned_worker: None,
             disconnect_policy: None,
+            reason: None,
+            resume_at: None,
+            blocked_request: None,
         }
     }
 

@@ -5,7 +5,7 @@ import { checkScope } from '../auth.js'
 import { DeclineSchema, WorkerSchema, TaskSchema, ErrorSchema } from '../schemas.js'
 import type { WorkerManager, TaskEngine } from '@taskcast/core'
 
-export { WorkerWSHandler } from './worker-ws.js'
+export { WorkerWSHandler, WorkerWSRegistry } from './worker-ws.js'
 export type { WSLike, TaskSummary } from './worker-ws.js'
 
 // ─── Route Definitions ─────────────────────────────────────────────────────

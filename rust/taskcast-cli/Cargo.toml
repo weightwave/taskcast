@@ -21,3 +21,5 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres",
 url = "2"
 redis = { version = "0.27", features = ["tokio-comp", "aio"] }
 jsonwebtoken = "9"
+tower-http = { version = "0.6", features = ["fs"] }
+tower = "0.5"

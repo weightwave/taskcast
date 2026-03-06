@@ -1,0 +1,74 @@
+import { serve } from '@hono/node-server'
+import { Hono } from 'hono'
+import { cors } from 'hono/cors'
+import { WebSocketServer } from 'ws'
+import { TaskEngine, MemoryBroadcastProvider, MemoryShortTermStore, WorkerManager } from '@taskcast/core'
+import { createTaskcastApp, WorkerWSHandler } from '@taskcast/server'
+import { createServer } from 'vite'
+
+async function main() {
+  const broadcast = new MemoryBroadcastProvider()
+  const shortTermStore = new MemoryShortTermStore()
+
+  const engine = new TaskEngine({
+    broadcast,
+    shortTermStore,
+  })
+
+  const workerManager = new WorkerManager({
+    engine,
+    shortTermStore,
+    broadcast,
+  })
+
+  const taskcastApp = createTaskcastApp({ engine, workerManager })
+
+  const app = new Hono()
+  app.use('*', cors())
+  app.route('/taskcast', taskcastApp)
+
+  const taskcastPort = 3721
+  const httpServer = serve({ fetch: app.fetch, port: taskcastPort }, (info) => {
+    console.log(`Taskcast server running at http://localhost:${info.port}`)
+  })
+
+  // WebSocket upgrade handling for worker connections
+  const wss = new WebSocketServer({ noServer: true })
+
+  httpServer.on('upgrade', (req, socket, head) => {
+    if (req.url?.startsWith('/taskcast/workers/ws')) {
+      wss.handleUpgrade(req, socket, head, (ws) => {
+        const handler = new WorkerWSHandler(workerManager, {
+          send: (data: string) => ws.send(data),
+          close: () => ws.close(),
+        })
+
+        ws.on('message', (data) => {
+          handler.handleMessage(data.toString())
+        })
+
+        ws.on('close', () => {
+          handler.stopPingTimer()
+          handler.handleDisconnect()
+        })
+      })
+    } else {
+      socket.destroy()
+    }
+  })
+
+  const vite = await createServer({
+    configFile: new URL('../vite.config.ts', import.meta.url).pathname,
+    root: new URL('..', import.meta.url).pathname,
+    server: { port: 5173 },
+  })
+  await vite.listen()
+  console.log(`Playground UI at http://localhost:5173`)
+
+  process.on('SIGINT', async () => {
+    await vite.close()
+    process.exit(0)
+  })
+}
+
+main().catch(console.error)

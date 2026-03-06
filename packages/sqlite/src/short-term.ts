@@ -2,6 +2,7 @@ import type Database from 'better-sqlite3'
 import type {
   Task,
   TaskEvent,
+  TaskStatus,
   ShortTermStore,
   EventQueryOptions,
   TaskFilter,
@@ -400,5 +401,22 @@ export class SqliteShortTermStore implements ShortTermStore {
       .get(taskId) as Record<string, unknown> | undefined
 
     return row ? rowToWorkerAssignment(row) : null
+  }
+
+  // TTL management — no-op: SQLite does not support key-level TTL.
+  async clearTTL(_taskId: string): Promise<void> {
+    // No-op: SQLite does not support key-level TTL.
+  }
+
+  // Task query by status
+  async listByStatus(statuses: TaskStatus[]): Promise<Task[]> {
+    if (statuses.length === 0) return []
+
+    const placeholders = statuses.map(() => '?').join(', ')
+    const rows = this.db
+      .prepare(`SELECT * FROM taskcast_tasks WHERE status IN (${placeholders})`)
+      .all(...statuses) as Record<string, unknown>[]
+
+    return rows.map(rowToTask)
   }
 }
