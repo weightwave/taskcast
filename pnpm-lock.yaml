@@ -61,16 +61,22 @@ importers:
       typescript:
         specifier: ^5.7.0
         version: 5.9.3
+      vitest:
+        specifier: ^2.1.9
+        version: 2.1.9(@types/node@25.3.2)(jsdom@25.0.1)(lightningcss@1.31.1)(msw@2.12.10(@types/node@25.3.2)(typescript@5.9.3))
 
   packages/client:
     dependencies:
-      '@taskcast/core':
-        specifier: workspace:*
-        version: link:../core
       eventsource-parser:
         specifier: ^2.0.1
         version: 2.0.1
     devDependencies:
+      '@taskcast/core':
+        specifier: workspace:*
+        version: link:../core
+      '@taskcast/server':
+        specifier: workspace:*
+        version: link:../server
       '@vitest/coverage-v8':
         specifier: ^2.1.0
         version: 2.1.9(vitest@2.1.9(@types/node@25.3.2)(jsdom@25.0.1)(lightningcss@1.31.1)(msw@2.12.10(@types/node@25.3.2)(typescript@5.9.3)))
@@ -262,11 +268,13 @@ importers:
         version: 2.1.9(@types/node@25.3.2)(jsdom@25.0.1)(lightningcss@1.31.1)(msw@2.12.10(@types/node@25.3.2)(typescript@5.9.3))
 
   packages/server-sdk:
-    dependencies:
+    devDependencies:
       '@taskcast/core':
         specifier: workspace:*
         version: link:../core
-    devDependencies:
+      '@taskcast/server':
+        specifier: workspace:*
+        version: link:../server
       '@vitest/coverage-v8':
         specifier: ^2.1.0
         version: 2.1.9(vitest@2.1.9(@types/node@25.3.2)(jsdom@25.0.1)(lightningcss@1.31.1)(msw@2.12.10(@types/node@25.3.2)(typescript@5.9.3)))
