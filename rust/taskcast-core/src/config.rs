@@ -278,6 +278,7 @@ fn coerce_port(mut value: serde_json::Value) -> serde_json::Value {
 /// - If `admin_api` is false/unset, returns None (admin API disabled, no token needed).
 /// - If `admin_api` is true and `admin_token` is set, returns it.
 /// - If `admin_api` is true and `admin_token` is not set, auto-generates a ULID and logs it.
+///
 /// Mutates the config in place.
 pub fn resolve_admin_token(config: &mut TaskcastConfig) -> Option<String> {
     if config.admin_api != Some(true) {
