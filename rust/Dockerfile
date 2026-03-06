@@ -15,6 +15,9 @@ FROM chef AS builder
 COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json
 COPY . .
+# Place playground dist where rust-embed expects it (../../packages/playground/dist from taskcast-cli/)
+RUN mkdir -p /packages/playground && \
+    if [ -d /app/playground-dist ]; then cp -r /app/playground-dist /packages/playground/dist; fi
 RUN cargo build --release -p taskcast-cli
 
 # ── Stage 4: runtime ─────────────────────────────────────────
