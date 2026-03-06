@@ -23,6 +23,17 @@ import type { ApiResponse } from '@/components/shared/utils'
 /*  Tab 1: Create Task                                                */
 /* ------------------------------------------------------------------ */
 
+interface WebhookEntry {
+  url: string
+  secret: string
+  filterTypes: string
+  filterLevels: string
+}
+
+function emptyWebhook(): WebhookEntry {
+  return { url: '', secret: '', filterTypes: '', filterLevels: '' }
+}
+
 function CreateTaskTab({ panel }: { panel: Panel }) {
   const { apiFetch } = useApi(panel)
   const { addTask } = useDataStore()
@@ -33,10 +44,19 @@ function CreateTaskTab({ panel }: { panel: Panel }) {
   const [tags, setTags] = useState('')
   const [assignMode, setAssignMode] = useState('external')
   const [cost, setCost] = useState('')
+  const [webhooks, setWebhooks] = useState<WebhookEntry[]>([])
 
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [response, setResponse] = useState<ApiResponse | null>(null)
+
+  const updateWebhook = useCallback((idx: number, patch: Partial<WebhookEntry>) => {
+    setWebhooks((prev) => prev.map((w, i) => (i === idx ? { ...w, ...patch } : w)))
+  }, [])
+
+  const removeWebhook = useCallback((idx: number) => {
+    setWebhooks((prev) => prev.filter((_, i) => i !== idx))
+  }, [])
 
   const handleSubmit = useCallback(async () => {
     setError('')
@@ -53,6 +73,23 @@ function CreateTaskTab({ panel }: { panel: Panel }) {
     if (assignMode) body.assignMode = assignMode
     if (cost) body.cost = Number(cost)
 
+    const validWebhooks = webhooks
+      .filter((w) => w.url.trim())
+      .map((w) => {
+        const wh: Record<string, unknown> = { url: w.url.trim() }
+        if (w.secret.trim()) wh.secret = w.secret.trim()
+        const types = w.filterTypes.split(',').map((t) => t.trim()).filter(Boolean)
+        const levels = w.filterLevels.split(',').map((l) => l.trim()).filter(Boolean)
+        if (types.length > 0 || levels.length > 0) {
+          const filter: Record<string, unknown> = {}
+          if (types.length > 0) filter.types = types
+          if (levels.length > 0) filter.levels = levels
+          wh.filter = filter
+        }
+        return wh
+      })
+    if (validWebhooks.length > 0) body.webhooks = validWebhooks
+
     setLoading(true)
     try {
       const res = await apiFetch('/tasks', {
@@ -67,7 +104,7 @@ function CreateTaskTab({ panel }: { panel: Panel }) {
     } finally {
       setLoading(false)
     }
-  }, [apiFetch, addTask, type, params, ttl, tags, assignMode, cost])
+  }, [apiFetch, addTask, type, params, ttl, tags, assignMode, cost, webhooks])
 
   return (
     <div className="space-y-3 p-3">
@@ -111,6 +148,60 @@ function CreateTaskTab({ panel }: { panel: Panel }) {
             <SelectItem value="ws-race">ws-race</SelectItem>
           </SelectContent>
         </Select>
+      </div>
+
+      {/* Webhooks */}
+      <div className="space-y-1.5">
+        <div className="flex items-center justify-between">
+          <Label>Webhooks</Label>
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-6 text-[10px] px-2"
+            onClick={() => setWebhooks((prev) => [...prev, emptyWebhook()])}
+          >
+            + Add
+          </Button>
+        </div>
+        {webhooks.map((wh, idx) => (
+          <div key={idx} className="space-y-1.5 rounded border p-2">
+            <div className="flex items-center gap-1.5">
+              <Input
+                value={wh.url}
+                onChange={(e) => updateWebhook(idx, { url: e.target.value })}
+                placeholder="https://example.com/webhook"
+                className="text-xs"
+              />
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                onClick={() => removeWebhook(idx)}
+              >
+                &times;
+              </Button>
+            </div>
+            <Input
+              value={wh.secret}
+              onChange={(e) => updateWebhook(idx, { secret: e.target.value })}
+              placeholder="HMAC secret (optional)"
+              className="text-xs"
+            />
+            <div className="grid grid-cols-2 gap-1.5">
+              <Input
+                value={wh.filterTypes}
+                onChange={(e) => updateWebhook(idx, { filterTypes: e.target.value })}
+                placeholder="Filter types (e.g. llm.*)"
+                className="text-xs"
+              />
+              <Input
+                value={wh.filterLevels}
+                onChange={(e) => updateWebhook(idx, { filterLevels: e.target.value })}
+                placeholder="Filter levels (e.g. info,error)"
+                className="text-xs"
+              />
+            </div>
+          </div>
+        ))}
       </div>
 
       {error && <p className="text-xs text-destructive">{error}</p>}
