@@ -105,6 +105,29 @@ fn auth_mode_to_string(mode: &taskcast_core::config::AuthMode) -> String {
     }
 }
 
+/// Resolve the Postgres URL: explicit URL > env var > config file.
+fn resolve_postgres_url(
+    cli_url: Option<String>,
+    env_url: Option<String>,
+    config_url: Option<String>,
+) -> Option<String> {
+    cli_url.or(env_url).or(config_url)
+}
+
+/// Format a Postgres URL for human-readable display (host:port/dbname).
+fn format_display_url(postgres_url: &str) -> String {
+    match url::Url::parse(postgres_url) {
+        Ok(parsed) => {
+            let host = parsed.host_str().unwrap_or("unknown");
+            let port = parsed.port().unwrap_or(5432);
+            let path = parsed.path().trim_start_matches('/');
+            let db = if path.is_empty() { "postgres" } else { path };
+            format!("{host}:{port}/{db}")
+        }
+        Err(_) => postgres_url.to_string(),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
@@ -317,17 +340,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let file_config = taskcast_core::config::load_config_file(config.as_deref())
                 .unwrap_or_default();
 
-            let postgres_url = url
-                .or_else(|| std::env::var("TASKCAST_POSTGRES_URL").ok())
-                .or_else(|| {
-                    file_config
-                        .adapters
-                        .as_ref()?
-                        .long_term_store
-                        .as_ref()?
-                        .url
-                        .clone()
-                });
+            let config_url = file_config
+                .adapters
+                .as_ref()
+                .and_then(|a| a.long_term_store.as_ref())
+                .and_then(|lt| lt.url.clone());
+
+            let postgres_url = resolve_postgres_url(
+                url,
+                std::env::var("TASKCAST_POSTGRES_URL").ok(),
+                config_url,
+            );
 
             let postgres_url = match postgres_url {
                 Some(u) => u,
@@ -340,15 +363,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             // 2. Display target info
-            let display_url = match url::Url::parse(&postgres_url) {
-                Ok(parsed) => {
-                    let host = parsed.host_str().unwrap_or("unknown");
-                    let port = parsed.port().unwrap_or(5432);
-                    let path = parsed.path().trim_start_matches('/');
-                    format!("{host}:{port}/{path}")
-                }
-                Err(_) => postgres_url.clone(),
-            };
+            let display_url = format_display_url(&postgres_url);
             eprintln!("[taskcast] Target database: {display_url}");
 
             // 3. Connect to database
@@ -681,5 +696,86 @@ mod tests {
     fn cli_status_subcommand_parses() {
         let cli = Cli::parse_from(["taskcast", "status"]);
         assert!(matches!(cli.command.unwrap(), Commands::Status));
+    }
+
+    // ─── resolve_postgres_url ────────────────────────────────────────────
+
+    #[test]
+    fn postgres_url_prefers_cli_flag() {
+        assert_eq!(
+            resolve_postgres_url(
+                Some("postgres://flag".to_string()),
+                Some("postgres://env".to_string()),
+                Some("postgres://config".to_string()),
+            ),
+            Some("postgres://flag".to_string())
+        );
+    }
+
+    #[test]
+    fn postgres_url_falls_back_to_env() {
+        assert_eq!(
+            resolve_postgres_url(
+                None,
+                Some("postgres://env".to_string()),
+                Some("postgres://config".to_string()),
+            ),
+            Some("postgres://env".to_string())
+        );
+    }
+
+    #[test]
+    fn postgres_url_falls_back_to_config() {
+        assert_eq!(
+            resolve_postgres_url(
+                None,
+                None,
+                Some("postgres://config".to_string()),
+            ),
+            Some("postgres://config".to_string())
+        );
+    }
+
+    #[test]
+    fn postgres_url_returns_none_when_all_missing() {
+        assert_eq!(resolve_postgres_url(None, None, None), None);
+    }
+
+    // ─── format_display_url ──────────────────────────────────────────────
+
+    #[test]
+    fn display_url_formats_standard() {
+        assert_eq!(
+            format_display_url("postgres://user:pass@myhost:5433/mydb"),
+            "myhost:5433/mydb"
+        );
+    }
+
+    #[test]
+    fn display_url_uses_default_port() {
+        assert_eq!(
+            format_display_url("postgres://user@myhost/mydb"),
+            "myhost:5432/mydb"
+        );
+    }
+
+    #[test]
+    fn display_url_defaults_db_name() {
+        assert_eq!(
+            format_display_url("postgres://user@myhost:5432"),
+            "myhost:5432/postgres"
+        );
+        assert_eq!(
+            format_display_url("postgres://user@myhost:5432/"),
+            "myhost:5432/postgres"
+        );
+    }
+
+    #[test]
+    fn display_url_returns_raw_for_invalid() {
+        assert_eq!(
+            format_display_url("not-a-url"),
+            "not-a-url"
+        );
     }
 }
