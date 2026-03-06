@@ -66,3 +66,22 @@ export function createTaskcastApp(opts: TaskcastServerOptions): Hono {
 
   return app as unknown as Hono
 }
+
+/**
+ * Starts a real HTTP server for integration testing.
+ * Returns baseUrl and a close function.
+ */
+export async function startTestServer(
+  opts: TaskcastServerOptions & { port?: number },
+): Promise<{ baseUrl: string; close: () => void }> {
+  const { serve } = await import('@hono/node-server')
+  const app = createTaskcastApp(opts)
+  return new Promise((resolve) => {
+    const server = serve({ fetch: app.fetch, port: opts.port ?? 0 }, (info) => {
+      resolve({
+        baseUrl: `http://localhost:${(info as { port: number }).port}`,
+        close: () => server.close(),
+      })
+    })
+  })
+}
