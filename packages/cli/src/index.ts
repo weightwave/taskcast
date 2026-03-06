@@ -252,6 +252,7 @@ program
 
 program
   .command('ui')
+  .alias('dashboard')
   .description('Start the Taskcast Dashboard web UI')
   .option('-p, --port <port>', 'Dashboard port', '3722')
   .option('-s, --server <url>', 'Taskcast server URL', 'http://localhost:3721')
