@@ -36,6 +36,9 @@ importers:
       '@taskcast/core':
         specifier: workspace:*
         version: link:../core
+      '@taskcast/playground':
+        specifier: workspace:*
+        version: link:../playground
       '@taskcast/postgres':
         specifier: workspace:*
         version: link:../postgres

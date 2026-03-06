@@ -11,12 +11,15 @@ export interface ConnectionState {
   setConnected: (connected: boolean) => void
 }
 
+const isCliMode = typeof window !== 'undefined' && window.location.pathname.startsWith('/_playground')
+const defaultBaseUrl = isCliMode ? '' : '/taskcast'
+
 export const useConnectionStore = create<ConnectionState>((set) => ({
   mode: 'embedded',
-  baseUrl: '/taskcast',
+  baseUrl: defaultBaseUrl,
   token: '',
   connected: false,
-  setMode: (mode) => set({ mode, baseUrl: mode === 'embedded' ? '/taskcast' : '' }),
+  setMode: (mode) => set({ mode, baseUrl: mode === 'embedded' ? defaultBaseUrl : '' }),
   setBaseUrl: (baseUrl) => set({ baseUrl }),
   setToken: (token) => set({ token }),
   setConnected: (connected) => set({ connected }),

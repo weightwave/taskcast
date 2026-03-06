@@ -3,9 +3,10 @@ import { Command } from 'commander'
 import { Redis } from 'ioredis'
 import postgres from 'postgres'
 import { createInterface } from 'readline'
-import { mkdirSync, writeFileSync } from 'fs'
-import { join } from 'path'
+import { mkdirSync, writeFileSync, existsSync } from 'fs'
+import { join, dirname } from 'path'
 import { homedir } from 'os'
+import { createRequire } from 'module'
 import {
   TaskEngine,
   WorkerManager,
@@ -86,7 +87,8 @@ program
   .option('-p, --port <port>', 'port to listen on', '3721')
   .option('-s, --storage <type>', 'storage backend: memory | redis | sqlite', 'memory')
   .option('--db-path <path>', 'SQLite database file path (default: ./taskcast.db)')
-  .action(async (options: { config?: string; port: string; storage?: string; dbPath?: string }) => {
+  .option('--playground', 'serve the interactive playground UI at /_playground/')
+  .action(async (options: { config?: string; port: string; storage?: string; dbPath?: string; playground?: boolean }) => {
     let { config: fileConfig, source } = await loadConfigFile(options.config)
 
     if (source === 'none') {
@@ -164,14 +166,67 @@ program
     if (workerManager !== undefined) serverOpts.workerManager = workerManager
     const { app, stop } = createTaskcastApp(serverOpts)
 
+    // Serve playground static files if --playground and dist exists
+    if (options.playground) {
+      try {
+        const require = createRequire(import.meta.url)
+        const pkgPath = require.resolve('@taskcast/playground/package.json')
+        const distDir = join(dirname(pkgPath), 'dist')
+        if (existsSync(distDir)) {
+          const { serveStatic } = await import('@hono/node-server/serve-static')
+          app.use('/_playground/*', serveStatic({ root: distDir, rewriteRequestPath: (p) => p.replace(/^\/_playground/, '') }))
+          // SPA fallback: serve index.html for non-asset paths
+          app.get('/_playground/*', serveStatic({ root: distDir, rewriteRequestPath: () => '/index.html' }))
+        } else {
+          console.warn('[taskcast] Playground dist not found. Run `pnpm --filter @taskcast/playground build` first.')
+        }
+      } catch {
+        console.warn('[taskcast] @taskcast/playground not available, skipping playground UI.')
+      }
+    }
+
     const { serve } = await import('@hono/node-server')
     const server = serve({ fetch: app.fetch, port }, () => {
       console.log(`[taskcast] Server started on http://localhost:${port}`)
+      if (options.playground) {
+        console.log(`[taskcast] Playground UI at http://localhost:${port}/_playground/`)
+      }
     })
 
     // Clean up scheduler/heartbeat on shutdown
     process.on('SIGTERM', () => { stop(); (server as { close?: () => void }).close?.() })
     process.on('SIGINT', () => { stop(); (server as { close?: () => void }).close?.() })
+  })
+
+program
+  .command('playground')
+  .description('Serve only the playground UI (no engine)')
+  .option('-p, --port <port>', 'port to listen on', '5173')
+  .action(async (options: { port: string }) => {
+    const port = Number(options.port)
+    try {
+      const require = createRequire(import.meta.url)
+      const pkgPath = require.resolve('@taskcast/playground/package.json')
+      const distDir = join(dirname(pkgPath), 'dist')
+      if (!existsSync(distDir)) {
+        console.error('[taskcast] Playground dist not found. Run `pnpm --filter @taskcast/playground build` first.')
+        process.exit(1)
+      }
+      const { OpenAPIHono } = await import('@hono/zod-openapi')
+      const app = new OpenAPIHono()
+      const { serveStatic } = await import('@hono/node-server/serve-static')
+      app.use('/_playground/*', serveStatic({ root: distDir, rewriteRequestPath: (p: string) => p.replace(/^\/_playground/, '') }))
+      app.get('/_playground/*', serveStatic({ root: distDir, rewriteRequestPath: () => '/index.html' }))
+      app.get('/', (c: { redirect: (url: string) => Response }) => c.redirect('/_playground/'))
+      const { serve } = await import('@hono/node-server')
+      serve({ fetch: app.fetch, port }, () => {
+        console.log(`[taskcast] Playground UI at http://localhost:${port}/_playground/`)
+        console.log('[taskcast] Use "External" mode in the UI to connect to a remote server.')
+      })
+    } catch {
+      console.error('[taskcast] @taskcast/playground not available.')
+      process.exit(1)
+    }
   })
 
 program
