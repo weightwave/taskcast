@@ -18,7 +18,7 @@ fn make_engine() -> Arc<TaskEngine> {
 }
 
 fn make_server(engine: Arc<TaskEngine>) -> TestServer {
-    let (app, _) = create_app(engine, AuthMode::None, None);
+    let (app, _) = create_app(engine, AuthMode::None, None, None);
     TestServer::new(app)
 }
 

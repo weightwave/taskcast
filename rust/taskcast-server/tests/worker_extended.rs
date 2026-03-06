@@ -40,6 +40,7 @@ fn make_worker_server() -> (Arc<TaskEngine>, Arc<WorkerManager>, TestServer) {
         Arc::clone(&engine),
         AuthMode::None,
         Some(Arc::clone(&manager)),
+        None,
     );
     let server = TestServer::new(router);
     (engine, manager, server)
@@ -68,6 +69,7 @@ fn make_worker_ws_server() -> (Arc<TaskEngine>, Arc<WorkerManager>, TestServer) 
         Arc::clone(&engine),
         AuthMode::None,
         Some(Arc::clone(&manager)),
+        None,
     );
     let server = TestServer::builder().http_transport().build(router);
     (engine, manager, server)
@@ -99,7 +101,7 @@ fn make_jwt_worker_server() -> (Arc<TaskEngine>, Arc<WorkerManager>, TestServer)
         issuer: None,
         audience: None,
     });
-    let (router, _ws_registry) = create_app(Arc::clone(&engine), auth_mode, Some(Arc::clone(&manager)));
+    let (router, _ws_registry) = create_app(Arc::clone(&engine), auth_mode, Some(Arc::clone(&manager)), None);
     let server = TestServer::new(router);
     (engine, manager, server)
 }
