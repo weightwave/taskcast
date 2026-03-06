@@ -624,6 +624,8 @@ mod tests {
         assert_eq!(serde_json::to_string(&PermissionScope::WebhookCreate).unwrap(), "\"webhook:create\"");
         assert_eq!(serde_json::to_string(&PermissionScope::WorkerConnect).unwrap(), "\"worker:connect\"");
         assert_eq!(serde_json::to_string(&PermissionScope::WorkerManage).unwrap(), "\"worker:manage\"");
+        assert_eq!(serde_json::to_string(&PermissionScope::TaskResolve).unwrap(), "\"task:resolve\"");
+        assert_eq!(serde_json::to_string(&PermissionScope::TaskSignal).unwrap(), "\"task:signal\"");
         assert_eq!(serde_json::to_string(&PermissionScope::All).unwrap(), "\"*\"");
     }
 
@@ -1431,5 +1433,47 @@ mod tests {
         hooks.on_webhook_failed(&webhook, io_err.as_ref());
         hooks.on_sse_connect("t", "client-1");
         hooks.on_sse_disconnect("t", "client-1", 1000.0);
+    }
+
+    // ─── ShortTermStore default trait method tests ──────────────────────
+
+    /// Stub that does NOT override clear_ttl / list_by_status so we test defaults.
+    struct StubStore;
+
+    #[async_trait::async_trait]
+    impl ShortTermStore for StubStore {
+        async fn save_task(&self, _: Task) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
+        async fn get_task(&self, _: &str) -> Result<Option<Task>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
+        async fn append_event(&self, _: &str, _: TaskEvent) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
+        async fn get_events(&self, _: &str, _: Option<EventQueryOptions>) -> Result<Vec<TaskEvent>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
+        async fn set_ttl(&self, _: &str, _: u64) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
+        async fn get_series_latest(&self, _: &str, _: &str) -> Result<Option<TaskEvent>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
+        async fn set_series_latest(&self, _: &str, _: &str, _: TaskEvent) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
+        async fn replace_last_series_event(&self, _: &str, _: &str, _: TaskEvent) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
+        async fn next_index(&self, _: &str) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> { Ok(0) }
+        async fn list_tasks(&self, _: TaskFilter) -> Result<Vec<Task>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
+        async fn save_worker(&self, _: Worker) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
+        async fn get_worker(&self, _: &str) -> Result<Option<Worker>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
+        async fn list_workers(&self, _: Option<WorkerFilter>) -> Result<Vec<Worker>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
+        async fn delete_worker(&self, _: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
+        async fn claim_task(&self, _: &str, _: &str, _: u32) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> { Ok(false) }
+        async fn add_assignment(&self, _: WorkerAssignment) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
+        async fn remove_assignment(&self, _: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
+        async fn get_worker_assignments(&self, _: &str) -> Result<Vec<WorkerAssignment>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
+        async fn get_task_assignment(&self, _: &str) -> Result<Option<WorkerAssignment>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
+        // clear_ttl and list_by_status: use defaults
+    }
+
+    #[tokio::test]
+    async fn default_clear_ttl_returns_ok() {
+        let store = StubStore;
+        assert!(store.clear_ttl("any").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn default_list_by_status_returns_empty() {
+        let store = StubStore;
+        let result = store.list_by_status(&[TaskStatus::Pending]).await.unwrap();
+        assert!(result.is_empty());
     }
 }

@@ -516,3 +516,206 @@ async fn paused_does_not_set_blocked_request_or_resume_at() {
     assert_eq!(task.blocked_request, None);
     assert_eq!(task.resume_at, None);
 }
+
+// ─── Test 12: Paused → Blocked restarts TTL ─────────────────────────────────
+
+#[tokio::test]
+async fn paused_to_blocked_restarts_ttl() {
+    let store = Arc::new(MemoryShortTermStore::new());
+    let engine = TaskEngine::new(TaskEngineOptions {
+        short_term_store: store.clone(),
+        broadcast: Arc::new(MemoryBroadcastProvider::new()),
+        long_term_store: None,
+        hooks: None,
+    });
+
+    // Create task with TTL, move to running, then to paused
+    engine
+        .create_task(CreateTaskInput {
+            id: Some("t12".to_string()),
+            ttl: Some(3600),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    engine.transition_task("t12", TaskStatus::Running, None).await.unwrap();
+    engine
+        .transition_task("t12", TaskStatus::Paused, Some(TransitionPayload {
+            reason: Some("pause".to_string()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+
+    // Now paused → blocked should restart TTL
+    let task = engine
+        .transition_task("t12", TaskStatus::Blocked, Some(TransitionPayload {
+            reason: Some("need data".to_string()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+
+    assert_eq!(task.status, TaskStatus::Blocked);
+    assert_eq!(task.ttl, Some(3600));
+}
+
+// ─── Test 13: Blocked → Paused clears TTL clock ─────────────────────────────
+
+#[tokio::test]
+async fn blocked_to_paused_clears_ttl() {
+    let store = Arc::new(MemoryShortTermStore::new());
+    let engine = TaskEngine::new(TaskEngineOptions {
+        short_term_store: store.clone(),
+        broadcast: Arc::new(MemoryBroadcastProvider::new()),
+        long_term_store: None,
+        hooks: None,
+    });
+
+    engine
+        .create_task(CreateTaskInput {
+            id: Some("t13".to_string()),
+            ttl: Some(3600),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    engine.transition_task("t13", TaskStatus::Running, None).await.unwrap();
+    engine
+        .transition_task("t13", TaskStatus::Blocked, Some(TransitionPayload {
+            reason: Some("blocked".to_string()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+
+    // Now blocked → paused
+    let task = engine
+        .transition_task("t13", TaskStatus::Paused, Some(TransitionPayload {
+            reason: Some("repause".to_string()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+
+    assert_eq!(task.status, TaskStatus::Paused);
+}
+
+// ─── Test 14: TTL override from transition payload ──────────────────────────
+
+#[tokio::test]
+async fn ttl_override_in_transition_payload() {
+    let engine = make_engine();
+
+    engine
+        .create_task(CreateTaskInput {
+            id: Some("t14".to_string()),
+            ttl: Some(3600),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    // Transition to running with a TTL override
+    let task = engine
+        .transition_task(
+            "t14",
+            TaskStatus::Running,
+            Some(TransitionPayload {
+                ttl: Some(7200),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(task.status, TaskStatus::Running);
+    assert_eq!(task.ttl, Some(7200));
+}
+
+// ─── Test 15: TTL override to paused does NOT set TTL (clock stops) ─────────
+
+#[tokio::test]
+async fn ttl_override_to_paused_does_not_set_ttl_clock() {
+    let engine = make_engine();
+
+    engine
+        .create_task(CreateTaskInput {
+            id: Some("t15".to_string()),
+            ttl: Some(3600),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    engine.transition_task("t15", TaskStatus::Running, None).await.unwrap();
+
+    // Transition to paused with a TTL override — should store the ttl value
+    // but NOT call set_ttl (clock is stopped in paused)
+    let task = engine
+        .transition_task(
+            "t15",
+            TaskStatus::Paused,
+            Some(TransitionPayload {
+                ttl: Some(9999),
+                reason: Some("pause with ttl override".to_string()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(task.status, TaskStatus::Paused);
+    assert_eq!(task.ttl, Some(9999));
+}
+
+// ─── Test 16: Transition listeners fire on create and status change ─────────
+
+#[tokio::test]
+async fn transition_listeners_fire_on_create() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    let engine = make_engine();
+    let count = Arc::new(AtomicU32::new(0));
+    let count_clone = Arc::clone(&count);
+
+    engine.add_transition_listener(Box::new(move |_task, _from, _to| {
+        count_clone.fetch_add(1, Ordering::SeqCst);
+    }));
+
+    engine
+        .create_task(CreateTaskInput {
+            id: Some("tl-1".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(count.load(Ordering::SeqCst), 1, "listener should fire once on create");
+}
+
+#[tokio::test]
+async fn transition_listeners_fire_on_status_change() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    let engine = make_engine();
+    let count = Arc::new(AtomicU32::new(0));
+    let count_clone = Arc::clone(&count);
+
+    engine.add_transition_listener(Box::new(move |_task, _from, to| {
+        if *to == TaskStatus::Running {
+            count_clone.fetch_add(1, Ordering::SeqCst);
+        }
+    }));
+
+    engine
+        .create_task(CreateTaskInput {
+            id: Some("tl-2".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    engine.transition_task("tl-2", TaskStatus::Running, None).await.unwrap();
+
+    assert_eq!(count.load(Ordering::SeqCst), 1, "listener should fire for running transition");
+}

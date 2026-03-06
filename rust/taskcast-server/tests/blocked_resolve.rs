@@ -314,3 +314,31 @@ async fn transition_with_resume_after_ms_sets_resume_at() {
     // resume_at should be set (some positive value)
     assert!(body["resumeAt"].as_f64().unwrap() > 0.0);
 }
+
+#[tokio::test]
+async fn transition_with_ttl_override() {
+    let engine = make_engine();
+    let server = make_server(Arc::clone(&engine));
+
+    engine
+        .create_task(taskcast_core::CreateTaskInput {
+            id: Some("ttl-override-1".to_string()),
+            ttl: Some(60),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    // Transition to running with a TTL override
+    let response = server
+        .patch("/tasks/ttl-override-1/status")
+        .json(&json!({
+            "status": "running",
+            "ttl": 120000
+        }))
+        .await;
+
+    response.assert_status(axum_test::http::StatusCode::OK);
+    let body: serde_json::Value = response.json();
+    assert_eq!(body["status"], "running");
+}
