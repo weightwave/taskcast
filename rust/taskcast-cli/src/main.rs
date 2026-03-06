@@ -137,44 +137,54 @@ fn format_display_url(postgres_url: &str) -> String {
     }
 }
 
-/// Try to find the playground dist directory relative to the binary.
-fn resolve_playground_dir() -> Option<std::path::PathBuf> {
-    // Check TASKCAST_PLAYGROUND_DIR env var first
-    if let Ok(dir) = std::env::var("TASKCAST_PLAYGROUND_DIR") {
-        let p = std::path::PathBuf::from(dir);
-        if p.join("index.html").exists() {
-            return Some(p);
+#[derive(rust_embed::RustEmbed)]
+#[folder = "../../packages/playground/dist"]
+struct PlaygroundAssets;
+
+/// Serve embedded playground files under /_playground/
+fn playground_routes() -> axum::Router {
+    axum::Router::new()
+        .route("/{*path}", axum::routing::get(serve_playground_asset))
+        .route("/", axum::routing::get(serve_playground_index))
+}
+
+async fn serve_playground_index() -> axum::response::Response {
+    serve_playground_file("index.html")
+}
+
+async fn serve_playground_asset(
+    axum::extract::Path(path): axum::extract::Path<String>,
+) -> axum::response::Response {
+    serve_playground_file(&path)
+}
+
+fn serve_playground_file(path: &str) -> axum::response::Response {
+    use axum::http::{header, StatusCode};
+    use axum::response::IntoResponse;
+
+    match PlaygroundAssets::get(path) {
+        Some(asset) => {
+            let mime = mime_guess::from_path(path).first_or_octet_stream();
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, mime.as_ref())],
+                asset.data,
+            )
+                .into_response()
         }
-    }
-    // Check relative to current exe (for installed binaries)
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            // ../share/taskcast/playground (standard install layout)
-            let share_dir = parent.join("../share/taskcast/playground");
-            if share_dir.join("index.html").exists() {
-                return Some(share_dir);
+        None => {
+            // SPA fallback: serve index.html for unknown paths
+            match PlaygroundAssets::get("index.html") {
+                Some(index) => (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "text/html")],
+                    index.data,
+                )
+                    .into_response(),
+                None => StatusCode::NOT_FOUND.into_response(),
             }
         }
     }
-    // Check relative to cwd (for development)
-    let dev_dir = std::path::PathBuf::from("packages/playground/dist");
-    if dev_dir.join("index.html").exists() {
-        return Some(dev_dir);
-    }
-    None
-}
-
-/// Nest the playground static file serving under /_playground/
-fn nest_playground<S>(app: axum::Router<S>, dist_dir: &std::path::Path) -> axum::Router<S>
-where
-    S: Clone + Send + Sync + 'static,
-{
-    use tower_http::services::ServeDir;
-
-    let serve_dir = ServeDir::new(dist_dir)
-        .fallback(tower_http::services::ServeFile::new(dist_dir.join("index.html")));
-
-    app.nest_service("/_playground", serve_dir)
 }
 
 #[tokio::main]
@@ -385,16 +395,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Serve playground static files if --playground
             let app = if playground {
-                match resolve_playground_dir() {
-                    Some(dist_dir) => {
-                        println!("[taskcast] Playground UI at http://localhost:{port}/_playground/");
-                        nest_playground(app, &dist_dir)
-                    }
-                    None => {
-                        eprintln!("[taskcast] Playground dist not found. Build the playground first.");
-                        app
-                    }
-                }
+                println!("[taskcast] Playground UI at http://localhost:{port}/_playground/");
+                app.nest("/_playground", playground_routes())
             } else {
                 app
             };
@@ -553,24 +555,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             pool.close().await;
         }
         Commands::Playground { port } => {
-            match resolve_playground_dir() {
-                Some(dist_dir) => {
-                    let app = axum::Router::new();
-                    let app = nest_playground(app, &dist_dir);
-                    // Redirect / to /_playground/
-                    let app = app.route("/", axum::routing::get(|| async {
-                        axum::response::Redirect::temporary("/_playground/")
-                    }));
-                    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await?;
-                    println!("[taskcast] Playground UI at http://localhost:{port}/_playground/");
-                    println!("[taskcast] Use \"External\" mode in the UI to connect to a remote server.");
-                    axum::serve(listener, app).await?;
-                }
-                None => {
-                    eprintln!("[taskcast] Playground dist not found. Build the playground first.");
-                    std::process::exit(1);
-                }
-            }
+            let app = axum::Router::new()
+                .nest("/_playground", playground_routes())
+                .route("/", axum::routing::get(|| async {
+                    axum::response::Redirect::temporary("/_playground/")
+                }));
+            let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await?;
+            println!("[taskcast] Playground UI at http://localhost:{port}/_playground/");
+            println!("[taskcast] Use \"External\" mode in the UI to connect to a remote server.");
+            axum::serve(listener, app).await?;
         }
         Commands::Daemon => {
             eprintln!("[taskcast] daemon mode is not yet implemented, use `taskcast start` for foreground mode");
@@ -930,5 +923,53 @@ mod tests {
             format_display_url("not-a-url"),
             "not-a-url"
         );
+    }
+
+    // ─── Embedded playground assets ─────────────────────────────────────
+
+    #[test]
+    fn playground_assets_contains_index_html() {
+        assert!(
+            PlaygroundAssets::get("index.html").is_some(),
+            "index.html must be embedded"
+        );
+    }
+
+    #[test]
+    fn playground_assets_index_html_has_content() {
+        let asset = PlaygroundAssets::get("index.html").unwrap();
+        let content = std::str::from_utf8(&asset.data).unwrap();
+        assert!(content.contains("<!DOCTYPE html>") || content.contains("<html"),
+            "index.html should contain HTML");
+    }
+
+    #[test]
+    fn serve_playground_file_returns_html_for_index() {
+        let response = serve_playground_file("index.html");
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+    }
+
+    #[test]
+    fn serve_playground_file_spa_fallback_for_unknown_path() {
+        let response = serve_playground_file("nonexistent/route");
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+    }
+
+    #[test]
+    fn serve_playground_file_returns_css_with_correct_mime() {
+        let css_file = PlaygroundAssets::iter()
+            .find(|f| f.ends_with(".css"))
+            .expect("should have a CSS file");
+        let response = serve_playground_file(&css_file);
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+    }
+
+    #[test]
+    fn serve_playground_file_returns_js_with_correct_mime() {
+        let js_file = PlaygroundAssets::iter()
+            .find(|f| f.ends_with(".js"))
+            .expect("should have a JS file");
+        let response = serve_playground_file(&js_file);
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
     }
 }
