@@ -7,12 +7,18 @@ on:
       - 'rust/**'
       - 'packages/playground/**'
       - '.github/workflows/rust.yml'
+      - 'pnpm-lock.yaml'
+      - 'package.json'
+      - 'pnpm-workspace.yaml'
   pull_request:
     branches: [main]
     paths:
       - 'rust/**'
       - 'packages/playground/**'
       - '.github/workflows/rust.yml'
+      - 'pnpm-lock.yaml'
+      - 'package.json'
+      - 'pnpm-workspace.yaml'
 
 env:
   CARGO_TERM_COLOR: always

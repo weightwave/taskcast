@@ -962,6 +962,8 @@ mod tests {
             .expect("should have a CSS file");
         let response = serve_playground_file(&css_file);
         assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let content_type = response.headers().get("content-type").expect("should have content-type");
+        assert!(content_type.to_str().unwrap().starts_with("text/css"), "expected text/css, got {content_type:?}");
     }
 
     #[test]
@@ -971,5 +973,7 @@ mod tests {
             .expect("should have a JS file");
         let response = serve_playground_file(&js_file);
         assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let content_type = response.headers().get("content-type").expect("should have content-type");
+        assert!(content_type.to_str().unwrap().contains("javascript"), "expected javascript mime, got {content_type:?}");
     }
 }
