@@ -5,7 +5,10 @@ pub mod openapi;
 pub mod routes;
 pub mod webhook;
 
-pub use app::{create_app, start_background_services, AppState, BackgroundServices};
+pub use app::{
+    auto_release_worker, create_app, dispatch_ws_offer, dispatch_ws_race,
+    start_background_services, AppState, BackgroundServices,
+};
 pub use auth::{AuthContext, AuthMode, JwtConfig, TaskIdAccess, check_scope};
 pub use error::AppError;
 pub use routes::worker_ws::{ClientMessage, ServerMessage, TaskSummary, WorkerCommand, WsRegistry};

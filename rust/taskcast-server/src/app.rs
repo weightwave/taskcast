@@ -6,10 +6,10 @@ use axum::routing::{get, patch, post};
 use axum::Router;
 use taskcast_core::heartbeat_monitor::{HeartbeatMonitor, HeartbeatMonitorOptions};
 use taskcast_core::scheduler::{TaskScheduler, TaskSchedulerOptions};
-use taskcast_core::worker_manager::{DispatchResult, WorkerManager};
 use taskcast_core::state_machine::is_terminal;
+use taskcast_core::worker_manager::{DispatchResult, WorkerManager};
 use taskcast_core::{
-    AssignMode, ConnectionMode, DisconnectPolicy, ShortTermStore, TaskEngine, TaskStatus,
+    AssignMode, ConnectionMode, DisconnectPolicy, ShortTermStore, Task, TaskEngine, TaskStatus,
     WorkerStatus,
 };
 use utoipa::OpenApi;
@@ -17,7 +17,7 @@ use utoipa_scalar::{Scalar, Servable};
 
 use crate::auth::{auth_middleware, AuthMode};
 use crate::openapi::ApiDoc;
-use crate::routes::worker_ws::{WsRegistry, WorkerCommand, task_to_summary};
+use crate::routes::worker_ws::{task_to_summary, WorkerCommand, WsRegistry};
 use crate::routes::{sse, tasks};
 
 /// Shared application state available to all handlers.
@@ -69,7 +69,7 @@ pub fn create_app(
                     let wm = Arc::clone(&wm_clone);
                     let task_id = task.id.clone();
                     tokio::spawn(async move {
-                        let _ = wm.release_task(&task_id).await;
+                        auto_release_worker(&wm, &task_id).await;
                     });
                 }
             }));
@@ -91,47 +91,17 @@ pub fn create_app(
                     AssignMode::WsOffer => {
                         let wm = Arc::clone(&wm_clone);
                         let registry = registry_clone.clone();
-                        let task_id = task.id.clone();
-                        let task_summary = task_to_summary(task);
+                        let task_clone = task.clone();
                         tokio::spawn(async move {
-                            if let Ok(DispatchResult::Dispatched { worker_id }) =
-                                wm.dispatch_task(&task_id).await
-                            {
-                                registry.send(
-                                    &worker_id,
-                                    WorkerCommand::Offer {
-                                        task_id,
-                                        task: task_summary,
-                                    },
-                                );
-                            }
+                            dispatch_ws_offer(&wm, &registry, &task_clone).await;
                         });
                     }
                     AssignMode::WsRace => {
                         let wm = Arc::clone(&wm_clone);
                         let registry = registry_clone.clone();
-                        let task_id = task.id.clone();
-                        let task_summary = task_to_summary(task);
+                        let task_clone = task.clone();
                         tokio::spawn(async move {
-                            if let Ok(workers) = wm.list_workers(None).await {
-                                for worker in workers {
-                                    if worker.connection_mode != ConnectionMode::Websocket {
-                                        continue;
-                                    }
-                                    if worker.status != WorkerStatus::Idle
-                                        && worker.status != WorkerStatus::Busy
-                                    {
-                                        continue;
-                                    }
-                                    registry.send(
-                                        &worker.id,
-                                        WorkerCommand::Available {
-                                            task_id: task_id.clone(),
-                                            task: task_summary.clone(),
-                                        },
-                                    );
-                                }
-                            }
+                            dispatch_ws_race(&wm, &registry, &task_clone).await;
                         });
                     }
                     _ => {}
@@ -177,6 +147,66 @@ pub fn create_app(
 
 async fn health() -> impl IntoResponse {
     axum::Json(serde_json::json!({ "ok": true }))
+}
+
+// ─── Extracted dispatch helpers (testable without closures) ─────────────────
+
+/// Release worker capacity when a task reaches a terminal status.
+///
+/// Called from the auto-release transition listener. Ignoring errors is
+/// intentional — a missing assignment is not a problem.
+pub async fn auto_release_worker(wm: &WorkerManager, task_id: &str) {
+    let _ = wm.release_task(task_id).await;
+}
+
+/// Dispatch a ws-offer task to the best matching worker.
+///
+/// Uses `WorkerManager::dispatch_task` to find and assign a worker, then
+/// sends an `Offer` command via the `WsRegistry`.
+pub async fn dispatch_ws_offer(
+    wm: &WorkerManager,
+    registry: &WsRegistry,
+    task: &Task,
+) {
+    if let Ok(DispatchResult::Dispatched { worker_id }) = wm.dispatch_task(&task.id).await {
+        let summary = task_to_summary(task);
+        registry.send(
+            &worker_id,
+            WorkerCommand::Offer {
+                task_id: task.id.clone(),
+                task: summary,
+            },
+        );
+    }
+}
+
+/// Broadcast a ws-race task to all eligible WebSocket workers.
+///
+/// Sends an `Available` command to every connected WebSocket worker that is
+/// in `Idle` or `Busy` status (skips `Draining`/`Offline`).
+pub async fn dispatch_ws_race(
+    wm: &WorkerManager,
+    registry: &WsRegistry,
+    task: &Task,
+) {
+    if let Ok(workers) = wm.list_workers(None).await {
+        let summary = task_to_summary(task);
+        for worker in workers {
+            if worker.connection_mode != ConnectionMode::Websocket {
+                continue;
+            }
+            if worker.status != WorkerStatus::Idle && worker.status != WorkerStatus::Busy {
+                continue;
+            }
+            registry.send(
+                &worker.id,
+                WorkerCommand::Available {
+                    task_id: task.id.clone(),
+                    task: summary.clone(),
+                },
+            );
+        }
+    }
 }
 
 // ─── Background Services ────────────────────────────────────────────────────
