@@ -1476,4 +1476,71 @@ mod tests {
         let result = store.list_by_status(&[TaskStatus::Pending]).await.unwrap();
         assert!(result.is_empty());
     }
+
+    #[tokio::test]
+    async fn stub_store_all_methods_return_ok() {
+        let store = StubStore;
+        let task = Task {
+            id: "x".to_string(), r#type: None, status: TaskStatus::Pending,
+            params: None, result: None, error: None, metadata: None,
+            created_at: 0.0, updated_at: 0.0, completed_at: None, ttl: None,
+            auth_config: None, webhooks: None, cleanup: None, tags: None,
+            assign_mode: None, cost: None, assigned_worker: None,
+            disconnect_policy: None, reason: None, resume_at: None,
+            blocked_request: None,
+        };
+        let event = TaskEvent {
+            id: "e".to_string(),
+            task_id: "x".to_string(),
+            r#type: "t".to_string(),
+            level: Level::Info,
+            data: json!(null),
+            index: 0,
+            timestamp: 0.0,
+            series_id: None,
+            series_mode: None,
+            series_acc_field: None,
+        };
+
+        assert!(store.save_task(task).await.is_ok());
+        assert!(store.get_task("x").await.unwrap().is_none());
+        assert!(store.append_event("x", event.clone()).await.is_ok());
+        assert!(store.get_events("x", None).await.unwrap().is_empty());
+        assert!(store.set_ttl("x", 60).await.is_ok());
+        assert!(store.get_series_latest("x", "s").await.unwrap().is_none());
+        assert!(store.set_series_latest("x", "s", event.clone()).await.is_ok());
+        assert!(store.replace_last_series_event("x", "s", event).await.is_ok());
+        assert_eq!(store.next_index("x").await.unwrap(), 0);
+        assert!(store.list_tasks(TaskFilter::default()).await.unwrap().is_empty());
+
+        let worker = Worker {
+            id: "w".to_string(),
+            status: WorkerStatus::Idle,
+            match_rule: WorkerMatchRule::default(),
+            capacity: 1,
+            used_slots: 0,
+            weight: 50,
+            connection_mode: ConnectionMode::Websocket,
+            connected_at: 0.0,
+            last_heartbeat_at: 0.0,
+            metadata: None,
+        };
+        assert!(store.save_worker(worker).await.is_ok());
+        assert!(store.get_worker("w").await.unwrap().is_none());
+        assert!(store.list_workers(None).await.unwrap().is_empty());
+        assert!(store.delete_worker("w").await.is_ok());
+        assert!(!store.claim_task("x", "w", 1).await.unwrap());
+
+        let assignment = WorkerAssignment {
+            task_id: "x".to_string(),
+            worker_id: "w".to_string(),
+            cost: 1,
+            assigned_at: 0.0,
+            status: WorkerAssignmentStatus::Assigned,
+        };
+        assert!(store.add_assignment(assignment).await.is_ok());
+        assert!(store.remove_assignment("x").await.is_ok());
+        assert!(store.get_worker_assignments("w").await.unwrap().is_empty());
+        assert!(store.get_task_assignment("x").await.unwrap().is_none());
+    }
 }
