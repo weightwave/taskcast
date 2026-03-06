@@ -1,0 +1,18 @@
+{
+  "name": "@taskcast/e2e",
+  "version": "0.3.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest run tests/",
+    "test:browser": "playwright test"
+  },
+  "devDependencies": {
+    "@hono/node-server": "^1.13.0",
+    "@playwright/test": "^1.50.0",
+    "@taskcast/core": "workspace:*",
+    "@taskcast/server": "workspace:*",
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.0"
+  }
+}
