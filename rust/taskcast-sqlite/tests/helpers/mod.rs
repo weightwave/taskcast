@@ -47,6 +47,9 @@ pub fn make_task(id: &str) -> Task {
         cost: None,
         assigned_worker: None,
         disconnect_policy: None,
+        reason: None,
+        resume_at: None,
+        blocked_request: None,
     }
 }
 

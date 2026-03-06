@@ -23,7 +23,7 @@ fn make_engine() -> Arc<TaskEngine> {
 }
 
 fn make_server(engine: Arc<TaskEngine>, auth_mode: AuthMode) -> TestServer {
-    let app = create_app(engine, auth_mode, None);
+    let (app, _) = create_app(engine, auth_mode, None);
     TestServer::new(app)
 }
 
@@ -1710,7 +1710,7 @@ async fn sse_level_filter_only_returns_matching_levels() {
 #[tokio::test]
 async fn sse_live_streaming_receives_events_and_done() {
     let engine = make_engine();
-    let app = create_app(Arc::clone(&engine), AuthMode::None, None);
+    let (app, _) = create_app(Arc::clone(&engine), AuthMode::None, None);
 
     // Bind to a random port
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1838,7 +1838,7 @@ fn make_worker_server() -> (Arc<TaskEngine>, Arc<WorkerManager>, TestServer) {
         hooks: None,
         defaults: None,
     }));
-    let app = create_app(
+    let (app, _) = create_app(
         Arc::clone(&engine),
         AuthMode::None,
         Some(Arc::clone(&manager)),
@@ -1864,7 +1864,7 @@ fn make_worker_ws_server() -> (Arc<TaskEngine>, Arc<WorkerManager>, TestServer) 
         hooks: None,
         defaults: None,
     }));
-    let app = create_app(
+    let (app, _) = create_app(
         Arc::clone(&engine),
         AuthMode::None,
         Some(Arc::clone(&manager)),
@@ -3023,7 +3023,7 @@ fn make_jwt_worker_server() -> (Arc<TaskEngine>, Arc<WorkerManager>, TestServer)
         issuer: None,
         audience: None,
     });
-    let app = create_app(
+    let (app, _) = create_app(
         Arc::clone(&engine),
         auth_mode,
         Some(Arc::clone(&manager)),

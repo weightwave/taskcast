@@ -61,6 +61,9 @@ pub fn row_to_task(row: &SqliteRow) -> Task {
         assigned_worker,
         disconnect_policy: disconnect_policy_str
             .and_then(|s| serde_json::from_value(JsonValue::String(s)).ok()),
+        reason: None,
+        resume_at: None,
+        blocked_request: None,
     }
 }
 

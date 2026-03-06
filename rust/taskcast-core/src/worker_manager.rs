@@ -538,6 +538,29 @@ impl WorkerManager {
         self.short_term_store.get_worker_assignments(worker_id).await
     }
 
+    /// Release a task assignment: remove the assignment record and restore
+    /// the worker's used_slots. Does nothing if no assignment exists.
+    pub async fn release_task(&self, task_id: &str) -> ManagerResult<()> {
+        let assignment = self.short_term_store.get_task_assignment(task_id).await?;
+        let Some(assignment) = assignment else {
+            return Ok(());
+        };
+
+        self.short_term_store.remove_assignment(task_id).await?;
+
+        // Restore worker capacity
+        let worker = self.short_term_store.get_worker(&assignment.worker_id).await?;
+        if let Some(mut w) = worker {
+            w.used_slots = w.used_slots.saturating_sub(assignment.cost);
+            if w.status == WorkerStatus::Busy && w.used_slots < w.capacity {
+                w.status = WorkerStatus::Idle;
+            }
+            self.short_term_store.save_worker(w).await?;
+        }
+
+        Ok(())
+    }
+
     // ─── Pull Mode (Long-Poll) ─────────────────────────────────────────
 
     pub async fn wait_for_task(

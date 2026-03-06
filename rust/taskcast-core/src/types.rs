@@ -46,6 +46,10 @@ pub enum PermissionScope {
     WorkerConnect,
     #[serde(rename = "worker:manage")]
     WorkerManage,
+    #[serde(rename = "task:resolve")]
+    TaskResolve,
+    #[serde(rename = "task:signal")]
+    TaskSignal,
     #[serde(rename = "*")]
     All,
 }
@@ -203,6 +207,14 @@ pub enum DisconnectPolicy {
     Reassign,
     Mark,
     Fail,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockedRequest {
+    #[serde(rename = "type")]
+    pub request_type: String,
+    pub data: serde_json::Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
@@ -363,6 +375,12 @@ pub struct Task {
     pub assigned_worker: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disconnect_policy: Option<DisconnectPolicy>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resume_at: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked_request: Option<BlockedRequest>,
 }
 
 // ─── Events ─────────────────────────────────────────────────────────────────
@@ -482,6 +500,16 @@ pub trait ShortTermStore: Send + Sync {
     async fn remove_assignment(&self, task_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
     async fn get_worker_assignments(&self, worker_id: &str) -> Result<Vec<WorkerAssignment>, Box<dyn std::error::Error + Send + Sync>>;
     async fn get_task_assignment(&self, task_id: &str) -> Result<Option<WorkerAssignment>, Box<dyn std::error::Error + Send + Sync>>;
+
+    // TTL management
+    async fn clear_ttl(&self, _task_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
+
+    // Status query
+    async fn list_by_status(&self, _statuses: &[TaskStatus]) -> Result<Vec<Task>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(vec![])
+    }
 }
 
 #[async_trait]
@@ -596,6 +624,8 @@ mod tests {
         assert_eq!(serde_json::to_string(&PermissionScope::WebhookCreate).unwrap(), "\"webhook:create\"");
         assert_eq!(serde_json::to_string(&PermissionScope::WorkerConnect).unwrap(), "\"worker:connect\"");
         assert_eq!(serde_json::to_string(&PermissionScope::WorkerManage).unwrap(), "\"worker:manage\"");
+        assert_eq!(serde_json::to_string(&PermissionScope::TaskResolve).unwrap(), "\"task:resolve\"");
+        assert_eq!(serde_json::to_string(&PermissionScope::TaskSignal).unwrap(), "\"task:signal\"");
         assert_eq!(serde_json::to_string(&PermissionScope::All).unwrap(), "\"*\"");
     }
 
@@ -679,6 +709,9 @@ mod tests {
             cost: None,
             assigned_worker: None,
             disconnect_policy: None,
+            reason: None,
+            resume_at: None,
+            blocked_request: None,
         };
         let json = serde_json::to_value(&task).unwrap();
         // Check camelCase field names
@@ -765,6 +798,9 @@ mod tests {
             cost: None,
             assigned_worker: None,
             disconnect_policy: None,
+            reason: None,
+            resume_at: None,
+            blocked_request: None,
         };
 
         let json = serde_json::to_value(&task).unwrap();
@@ -825,6 +861,9 @@ mod tests {
             cost: None,
             assigned_worker: None,
             disconnect_policy: None,
+            reason: None,
+            resume_at: None,
+            blocked_request: None,
         };
         let json_str = serde_json::to_string(&task).unwrap();
         let back: Task = serde_json::from_str(&json_str).unwrap();
@@ -1227,6 +1266,9 @@ mod tests {
             cost: None,
             assigned_worker: None,
             disconnect_policy: None,
+            reason: None,
+            resume_at: None,
+            blocked_request: None,
         };
         let json_str = serde_json::to_string(&task).unwrap();
         // These keys must NOT appear at all
@@ -1245,6 +1287,9 @@ mod tests {
         assert!(!json_str.contains("\"cost\""));
         assert!(!json_str.contains("\"assignedWorker\""));
         assert!(!json_str.contains("\"disconnectPolicy\""));
+        assert!(!json_str.contains("\"reason\""));
+        assert!(!json_str.contains("\"resumeAt\""));
+        assert!(!json_str.contains("\"blockedRequest\""));
     }
 
     #[test]
@@ -1318,6 +1363,9 @@ mod tests {
             cost: None,
             assigned_worker: None,
             disconnect_policy: None,
+            reason: None,
+            resume_at: None,
+            blocked_request: None,
         };
         let json = serde_json::to_value(&task).unwrap();
         assert_eq!(json["cleanup"]["rules"][0]["trigger"]["afterMs"], 1000);
@@ -1362,6 +1410,7 @@ mod tests {
             auth_config: None, webhooks: None, cleanup: None,
             tags: None, assign_mode: None, cost: None,
             assigned_worker: None, disconnect_policy: None,
+            reason: None, resume_at: None, blocked_request: None,
         };
         let err = TaskError { code: None, message: "boom".to_string(), details: None };
         let event = TaskEvent {
@@ -1384,5 +1433,114 @@ mod tests {
         hooks.on_webhook_failed(&webhook, io_err.as_ref());
         hooks.on_sse_connect("t", "client-1");
         hooks.on_sse_disconnect("t", "client-1", 1000.0);
+    }
+
+    // ─── ShortTermStore default trait method tests ──────────────────────
+
+    /// Stub that does NOT override clear_ttl / list_by_status so we test defaults.
+    struct StubStore;
+
+    #[async_trait::async_trait]
+    impl ShortTermStore for StubStore {
+        async fn save_task(&self, _: Task) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
+        async fn get_task(&self, _: &str) -> Result<Option<Task>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
+        async fn append_event(&self, _: &str, _: TaskEvent) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
+        async fn get_events(&self, _: &str, _: Option<EventQueryOptions>) -> Result<Vec<TaskEvent>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
+        async fn set_ttl(&self, _: &str, _: u64) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
+        async fn get_series_latest(&self, _: &str, _: &str) -> Result<Option<TaskEvent>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
+        async fn set_series_latest(&self, _: &str, _: &str, _: TaskEvent) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
+        async fn replace_last_series_event(&self, _: &str, _: &str, _: TaskEvent) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
+        async fn next_index(&self, _: &str) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> { Ok(0) }
+        async fn list_tasks(&self, _: TaskFilter) -> Result<Vec<Task>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
+        async fn save_worker(&self, _: Worker) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
+        async fn get_worker(&self, _: &str) -> Result<Option<Worker>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
+        async fn list_workers(&self, _: Option<WorkerFilter>) -> Result<Vec<Worker>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
+        async fn delete_worker(&self, _: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
+        async fn claim_task(&self, _: &str, _: &str, _: u32) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> { Ok(false) }
+        async fn add_assignment(&self, _: WorkerAssignment) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
+        async fn remove_assignment(&self, _: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
+        async fn get_worker_assignments(&self, _: &str) -> Result<Vec<WorkerAssignment>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
+        async fn get_task_assignment(&self, _: &str) -> Result<Option<WorkerAssignment>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
+        // clear_ttl and list_by_status: use defaults
+    }
+
+    #[tokio::test]
+    async fn default_clear_ttl_returns_ok() {
+        let store = StubStore;
+        assert!(store.clear_ttl("any").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn default_list_by_status_returns_empty() {
+        let store = StubStore;
+        let result = store.list_by_status(&[TaskStatus::Pending]).await.unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stub_store_all_methods_return_ok() {
+        let store = StubStore;
+        let task = Task {
+            id: "x".to_string(), r#type: None, status: TaskStatus::Pending,
+            params: None, result: None, error: None, metadata: None,
+            created_at: 0.0, updated_at: 0.0, completed_at: None, ttl: None,
+            auth_config: None, webhooks: None, cleanup: None, tags: None,
+            assign_mode: None, cost: None, assigned_worker: None,
+            disconnect_policy: None, reason: None, resume_at: None,
+            blocked_request: None,
+        };
+        let event = TaskEvent {
+            id: "e".to_string(),
+            task_id: "x".to_string(),
+            r#type: "t".to_string(),
+            level: Level::Info,
+            data: json!(null),
+            index: 0,
+            timestamp: 0.0,
+            series_id: None,
+            series_mode: None,
+            series_acc_field: None,
+        };
+
+        assert!(store.save_task(task).await.is_ok());
+        assert!(store.get_task("x").await.unwrap().is_none());
+        assert!(store.append_event("x", event.clone()).await.is_ok());
+        assert!(store.get_events("x", None).await.unwrap().is_empty());
+        assert!(store.set_ttl("x", 60).await.is_ok());
+        assert!(store.get_series_latest("x", "s").await.unwrap().is_none());
+        assert!(store.set_series_latest("x", "s", event.clone()).await.is_ok());
+        assert!(store.replace_last_series_event("x", "s", event).await.is_ok());
+        assert_eq!(store.next_index("x").await.unwrap(), 0);
+        assert!(store.list_tasks(TaskFilter::default()).await.unwrap().is_empty());
+
+        let worker = Worker {
+            id: "w".to_string(),
+            status: WorkerStatus::Idle,
+            match_rule: WorkerMatchRule::default(),
+            capacity: 1,
+            used_slots: 0,
+            weight: 50,
+            connection_mode: ConnectionMode::Websocket,
+            connected_at: 0.0,
+            last_heartbeat_at: 0.0,
+            metadata: None,
+        };
+        assert!(store.save_worker(worker).await.is_ok());
+        assert!(store.get_worker("w").await.unwrap().is_none());
+        assert!(store.list_workers(None).await.unwrap().is_empty());
+        assert!(store.delete_worker("w").await.is_ok());
+        assert!(!store.claim_task("x", "w", 1).await.unwrap());
+
+        let assignment = WorkerAssignment {
+            task_id: "x".to_string(),
+            worker_id: "w".to_string(),
+            cost: 1,
+            assigned_at: 0.0,
+            status: WorkerAssignmentStatus::Assigned,
+        };
+        assert!(store.add_assignment(assignment).await.is_ok());
+        assert!(store.remove_assignment("x").await.is_ok());
+        assert!(store.get_worker_assignments("w").await.unwrap().is_empty());
+        assert!(store.get_task_assignment("x").await.unwrap().is_none());
     }
 }

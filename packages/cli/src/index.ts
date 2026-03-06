@@ -158,15 +158,20 @@ program
 
     const serverOpts: Parameters<typeof createTaskcastApp>[0] = {
       engine,
+      shortTermStore,
       auth: { mode: authMode },
     }
     if (workerManager !== undefined) serverOpts.workerManager = workerManager
-    const app = createTaskcastApp(serverOpts)
+    const { app, stop } = createTaskcastApp(serverOpts)
 
     const { serve } = await import('@hono/node-server')
-    serve({ fetch: app.fetch, port }, () => {
+    const server = serve({ fetch: app.fetch, port }, () => {
       console.log(`[taskcast] Server started on http://localhost:${port}`)
     })
+
+    // Clean up scheduler/heartbeat on shutdown
+    process.on('SIGTERM', () => { stop(); (server as { close?: () => void }).close?.() })
+    process.on('SIGINT', () => { stop(); (server as { close?: () => void }).close?.() })
   })
 
 program

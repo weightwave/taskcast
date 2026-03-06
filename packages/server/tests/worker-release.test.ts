@@ -16,7 +16,7 @@ function makeApp(opts?: { withWorkerManager?: boolean }) {
   const manager = withWM
     ? new WorkerManager({ engine, shortTermStore: store, broadcast })
     : undefined
-  const app = createTaskcastApp({ engine, workerManager: manager, auth: { mode: 'none' } })
+  const { app } = createTaskcastApp({ engine, workerManager: manager, auth: { mode: 'none' } })
   return { app, engine, manager, store }
 }
 

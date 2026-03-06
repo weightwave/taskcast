@@ -1,10 +1,11 @@
 import { ulid } from 'ulidx'
-import { canTransition, isTerminal } from './state-machine.js'
+import { canTransition, isTerminal, isSuspended } from './state-machine.js'
 import { processSeries } from './series.js'
 import type {
   Task,
   TaskStatus,
   TaskEvent,
+  BlockedRequest,
   BroadcastProvider,
   ShortTermStore,
   LongTermStore,
@@ -54,11 +55,16 @@ export interface CreateTaskInput {
   disconnectPolicy?: Task['disconnectPolicy']
 }
 
+export type TransitionListener = (task: Task, from: TaskStatus, to: TaskStatus) => void
+export type CreationListener = (task: Task) => void
+
 export class TaskEngine {
   private shortTermStore: ShortTermStore
   private longTermStore: LongTermStore | undefined
   private broadcast: BroadcastProvider
   private hooks: TaskcastHooks | undefined
+  private transitionListeners: TransitionListener[] = []
+  private creationListeners: CreationListener[] = []
 
   constructor(opts: TaskEngineOptions) {
     if ('shortTerm' in opts && 'shortTermStore' in opts) {
@@ -100,7 +106,18 @@ export class TaskEngine {
     if (this.longTermStore) await this.longTermStore.saveTask(task)
     if (task.ttl) await this.shortTermStore.setTTL(task.id, task.ttl)
     this.hooks?.onTaskCreated?.(task)
+    for (const listener of this.creationListeners) {
+      try { listener(task) } catch { /* best-effort */ }
+    }
     return task
+  }
+
+  addTransitionListener(listener: TransitionListener): void {
+    this.transitionListeners.push(listener)
+  }
+
+  addCreationListener(listener: CreationListener): void {
+    this.creationListeners.push(listener)
   }
 
   async getTask(taskId: string): Promise<Task | null> {
@@ -112,7 +129,14 @@ export class TaskEngine {
   async transitionTask(
     taskId: string,
     to: TaskStatus,
-    payload?: { result?: Task['result']; error?: Task['error'] },
+    payload?: {
+      result?: Task['result']
+      error?: Task['error']
+      reason?: string
+      resumeAfterMs?: number
+      blockedRequest?: BlockedRequest
+      ttl?: number
+    },
   ): Promise<Task> {
     const task = await this.getTask(taskId)
     if (!task) throw new Error(`Task not found: ${taskId}`)
@@ -121,6 +145,7 @@ export class TaskEngine {
     }
 
     const now = Date.now()
+    const from = task.status
     const newResult = payload?.result ?? task.result
     const newError = payload?.error ?? task.error
     const newCompletedAt = isTerminal(to) ? now : task.completedAt
@@ -133,6 +158,51 @@ export class TaskEngine {
       ...(newError !== undefined && { error: newError }),
     }
 
+    // ─── Suspended-state field management ────────────────────────────────
+    // Set reason when entering suspended state
+    if (isSuspended(to)) {
+      if (payload?.reason !== undefined) updated.reason = payload.reason
+    } else {
+      // Clear suspended fields when leaving suspended state
+      delete updated.reason
+      delete updated.blockedRequest
+      delete updated.resumeAt
+    }
+
+    // Blocked-specific: set blockedRequest and resumeAt
+    if (to === 'blocked') {
+      if (payload?.blockedRequest !== undefined) updated.blockedRequest = payload.blockedRequest
+      if (payload?.resumeAfterMs !== undefined) {
+        updated.resumeAt = now + payload.resumeAfterMs
+      }
+    }
+
+    // ─── TTL manipulation for suspended states ───────────────────────────
+    // → paused: stop TTL clock
+    if (to === 'paused') {
+      await this.shortTermStore.clearTTL(taskId)
+    }
+    // → blocked from paused: restart TTL (clock resumes)
+    if (from === 'paused' && to === 'blocked' && updated.ttl) {
+      await this.shortTermStore.setTTL(taskId, updated.ttl)
+    }
+    // paused → running: reset full TTL
+    if (from === 'paused' && to === 'running' && updated.ttl) {
+      await this.shortTermStore.setTTL(taskId, updated.ttl)
+    }
+    // blocked → paused: stop TTL clock
+    if (from === 'blocked' && to === 'paused') {
+      await this.shortTermStore.clearTTL(taskId)
+    }
+
+    // TTL override from payload
+    if (payload?.ttl !== undefined) {
+      updated.ttl = payload.ttl
+      if (to !== 'paused') {
+        await this.shortTermStore.setTTL(taskId, payload.ttl)
+      }
+    }
+
     await this.shortTermStore.saveTask(updated)
     if (this.longTermStore) await this.longTermStore.saveTask(updated)
 
@@ -142,6 +212,24 @@ export class TaskEngine {
       data: { status: to, result: updated.result, error: updated.error },
     })
 
+    // Emit taskcast:blocked when entering blocked with a blockedRequest
+    if (to === 'blocked' && updated.blockedRequest) {
+      await this._emit(taskId, {
+        type: 'taskcast:blocked',
+        level: 'info',
+        data: { reason: updated.reason, request: updated.blockedRequest },
+      })
+    }
+
+    // Emit taskcast:resolved when leaving blocked to running (if had a blockedRequest)
+    if (from === 'blocked' && to === 'running' && task.blockedRequest) {
+      await this._emit(taskId, {
+        type: 'taskcast:resolved',
+        level: 'info',
+        data: { resolution: payload?.result },
+      })
+    }
+
     if (to === 'failed' && updated.error) {
       this.hooks?.onTaskFailed?.(updated, updated.error)
     }
@@ -149,7 +237,11 @@ export class TaskEngine {
       this.hooks?.onTaskTimeout?.(updated)
     }
 
-    this.hooks?.onTaskTransitioned?.(updated, task.status, to)
+    this.hooks?.onTaskTransitioned?.(updated, from, to)
+
+    for (const listener of this.transitionListeners) {
+      try { listener(updated, from, to) } catch { /* best-effort */ }
+    }
 
     return updated
   }
