@@ -11,6 +11,7 @@ use crate::routes::{sse, tasks, workers};
         description = "Unified long-lifecycle task tracking service for LLM streaming, agents, and async workloads."
     ),
     paths(
+        tasks::list_tasks,
         tasks::create_task,
         tasks::get_task,
         tasks::transition_task,
@@ -21,6 +22,7 @@ use crate::routes::{sse, tasks, workers};
         workers::pull_task,
         workers::get_worker,
         workers::delete_worker,
+        workers::update_worker_status,
         workers::decline_task,
     ),
     components(schemas(
@@ -40,6 +42,8 @@ use crate::routes::{sse, tasks, workers};
         tasks::TaskErrorBody,
         tasks::PublishEventBody,
         workers::DeclineBody,
+        workers::WorkerStatusUpdateBody,
+        workers::WorkerStatusUpdateValue,
     )),
     modifiers(&SecurityAddon),
     tags(

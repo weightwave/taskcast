@@ -36,12 +36,13 @@ fn make_worker_server() -> (Arc<TaskEngine>, Arc<WorkerManager>, TestServer) {
         hooks: None,
         defaults: None,
     }));
-    let app = create_app(
+    let (router, _ws_registry) = create_app(
         Arc::clone(&engine),
         AuthMode::None,
         Some(Arc::clone(&manager)),
+        None,
     );
-    let server = TestServer::new(app);
+    let server = TestServer::new(router);
     (engine, manager, server)
 }
 

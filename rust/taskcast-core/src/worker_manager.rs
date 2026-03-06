@@ -81,11 +81,12 @@ pub struct WorkerUpdate {
     pub status: Option<WorkerUpdateStatus>,
 }
 
-/// Only "draining" is a valid status update via WorkerUpdate.
+/// Valid status values that can be set via WorkerUpdate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum WorkerUpdateStatus {
     Draining,
+    Idle,
 }
 
 // ─── Dispatch / Claim / Decline ─────────────────────────────────────────────
@@ -258,14 +259,24 @@ impl WorkerManager {
                 WorkerUpdateStatus::Draining => {
                     worker.status = WorkerStatus::Draining;
                 }
+                WorkerUpdateStatus::Idle => {
+                    worker.status = WorkerStatus::Idle;
+                }
             }
         }
 
         self.short_term_store.save_worker(worker.clone()).await?;
 
         self.emit_worker_audit(WorkerAuditAction::Updated, worker_id, None);
-        if update.status.is_some() {
-            self.emit_worker_audit(WorkerAuditAction::Draining, worker_id, None);
+        if let Some(ref status) = update.status {
+            match status {
+                WorkerUpdateStatus::Draining => {
+                    self.emit_worker_audit(WorkerAuditAction::Draining, worker_id, None);
+                }
+                WorkerUpdateStatus::Idle => {
+                    // No specific audit action for resuming to idle
+                }
+            }
         }
 
         Ok(Some(worker))
@@ -536,6 +547,29 @@ impl WorkerManager {
         worker_id: &str,
     ) -> ManagerResult<Vec<WorkerAssignment>> {
         self.short_term_store.get_worker_assignments(worker_id).await
+    }
+
+    /// Release a task assignment: remove the assignment record and restore
+    /// the worker's used_slots. Does nothing if no assignment exists.
+    pub async fn release_task(&self, task_id: &str) -> ManagerResult<()> {
+        let assignment = self.short_term_store.get_task_assignment(task_id).await?;
+        let Some(assignment) = assignment else {
+            return Ok(());
+        };
+
+        self.short_term_store.remove_assignment(task_id).await?;
+
+        // Restore worker capacity
+        let worker = self.short_term_store.get_worker(&assignment.worker_id).await?;
+        if let Some(mut w) = worker {
+            w.used_slots = w.used_slots.saturating_sub(assignment.cost);
+            if w.status == WorkerStatus::Busy && w.used_slots < w.capacity {
+                w.status = WorkerStatus::Idle;
+            }
+            self.short_term_store.save_worker(w).await?;
+        }
+
+        Ok(())
     }
 
     // ─── Pull Mode (Long-Poll) ─────────────────────────────────────────

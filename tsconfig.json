@@ -10,6 +10,7 @@
     { "path": "packages/redis" },
     { "path": "packages/postgres" },
     { "path": "packages/sqlite" },
-    { "path": "packages/sentry" }
+    { "path": "packages/sentry" },
+    { "path": "packages/playground" }
   ]
 }

@@ -1,16 +1,17 @@
 import { describe, it, expect, beforeAll } from 'vitest'
 import { createTaskcastApp } from '../src/index.js'
+import type { Hono } from 'hono'
 import { TaskEngine, MemoryBroadcastProvider, MemoryShortTermStore } from '@taskcast/core'
 
 describe('OpenAPI', () => {
-  let app: ReturnType<typeof createTaskcastApp>
+  let app: Hono
 
   beforeAll(async () => {
     const engine = new TaskEngine({
       broadcast: new MemoryBroadcastProvider(),
       shortTermStore: new MemoryShortTermStore(),
     })
-    app = createTaskcastApp({ engine, auth: { mode: 'none' } })
+    ;({ app } = createTaskcastApp({ engine, auth: { mode: 'none' } }))
   })
 
   it('GET /openapi.json returns valid OpenAPI spec', async () => {

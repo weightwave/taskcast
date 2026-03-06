@@ -15,11 +15,12 @@ export interface TestServerOptions {
 }
 
 export interface TestServer {
-  app: ReturnType<typeof createTaskcastApp>
+  app: import('hono').Hono
   engine: TaskEngine
   store: MemoryShortTermStore
   broadcast: MemoryBroadcastProvider
   workerManager?: WorkerManager
+  stop: () => void
 }
 
 export function createTestServer(opts?: TestServerOptions): TestServer {
@@ -37,11 +38,11 @@ export function createTestServer(opts?: TestServerOptions): TestServer {
     workerManager = new WorkerManager({ engine, shortTermStore: store, broadcast })
   }
 
-  const app = createTaskcastApp({
+  const taskcast = createTaskcastApp({
     engine,
     workerManager,
     auth: opts?.auth ?? { mode: 'none' },
   })
 
-  return { app, engine, store, broadcast, workerManager }
+  return { app: taskcast.app, engine, store, broadcast, workerManager, stop: taskcast.stop }
 }

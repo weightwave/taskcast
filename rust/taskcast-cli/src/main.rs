@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
@@ -29,6 +30,27 @@ enum Commands {
         /// SQLite database file path (default: ./taskcast.db)
         #[arg(long, default_value = "./taskcast.db")]
         db_path: String,
+        /// Serve the interactive playground UI at /_playground/
+        #[arg(long)]
+        playground: bool,
+    },
+    /// Serve only the playground UI (no engine)
+    Playground {
+        /// Port to listen on
+        #[arg(short, long, default_value = "5173")]
+        port: u16,
+    },
+    /// Run Postgres database migrations
+    Migrate {
+        /// Postgres connection URL (highest priority)
+        #[arg(long)]
+        url: Option<String>,
+        /// Config file path
+        #[arg(short, long)]
+        config: Option<String>,
+        /// Skip confirmation prompt
+        #[arg(short, long)]
+        yes: bool,
     },
     /// Start the server as a background service (not yet implemented)
     Daemon,
@@ -92,6 +114,69 @@ fn auth_mode_to_string(mode: &taskcast_core::config::AuthMode) -> String {
     }
 }
 
+/// Resolve the Postgres URL: explicit URL > env var > config file.
+fn resolve_postgres_url(
+    cli_url: Option<String>,
+    env_url: Option<String>,
+    config_url: Option<String>,
+) -> Option<String> {
+    cli_url.or(env_url).or(config_url)
+}
+
+/// Format a Postgres URL for human-readable display (host:port/dbname).
+fn format_display_url(postgres_url: &str) -> String {
+    match url::Url::parse(postgres_url) {
+        Ok(parsed) => {
+            let host = parsed.host_str().unwrap_or("unknown");
+            let port = parsed.port().unwrap_or(5432);
+            let path = parsed.path().trim_start_matches('/');
+            let db = if path.is_empty() { "postgres" } else { path };
+            format!("{host}:{port}/{db}")
+        }
+        Err(_) => postgres_url.to_string(),
+    }
+}
+
+/// Try to find the playground dist directory relative to the binary.
+fn resolve_playground_dir() -> Option<std::path::PathBuf> {
+    // Check TASKCAST_PLAYGROUND_DIR env var first
+    if let Ok(dir) = std::env::var("TASKCAST_PLAYGROUND_DIR") {
+        let p = std::path::PathBuf::from(dir);
+        if p.join("index.html").exists() {
+            return Some(p);
+        }
+    }
+    // Check relative to current exe (for installed binaries)
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            // ../share/taskcast/playground (standard install layout)
+            let share_dir = parent.join("../share/taskcast/playground");
+            if share_dir.join("index.html").exists() {
+                return Some(share_dir);
+            }
+        }
+    }
+    // Check relative to cwd (for development)
+    let dev_dir = std::path::PathBuf::from("packages/playground/dist");
+    if dev_dir.join("index.html").exists() {
+        return Some(dev_dir);
+    }
+    None
+}
+
+/// Nest the playground static file serving under /_playground/
+fn nest_playground<S>(app: axum::Router<S>, dist_dir: &std::path::Path) -> axum::Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    use tower_http::services::ServeDir;
+
+    let serve_dir = ServeDir::new(dist_dir)
+        .fallback(tower_http::services::ServeFile::new(dist_dir.join("index.html")));
+
+    app.nest_service("/_playground", serve_dir)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
@@ -100,6 +185,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         port: 3721,
         storage: "memory".to_string(),
         db_path: "./taskcast.db".to_string(),
+        playground: false,
     });
 
     match cmd {
@@ -108,6 +194,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             port,
             storage,
             db_path,
+            playground,
         } => {
             // 1. Load config file
             let file_config = taskcast_core::config::load_config_file(config.as_deref())
@@ -294,10 +381,196 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             // 9. Create and serve app
-            let app = taskcast_server::create_app(engine, auth_mode, worker_manager);
+            let (app, _ws_registry) = taskcast_server::create_app(engine, auth_mode, worker_manager, None);
+
+            // Serve playground static files if --playground
+            let app = if playground {
+                match resolve_playground_dir() {
+                    Some(dist_dir) => {
+                        println!("[taskcast] Playground UI at http://localhost:{port}/_playground/");
+                        nest_playground(app, &dist_dir)
+                    }
+                    None => {
+                        eprintln!("[taskcast] Playground dist not found. Build the playground first.");
+                        app
+                    }
+                }
+            } else {
+                app
+            };
+
             let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await?;
             println!("[taskcast] Server started on http://localhost:{port}");
             axum::serve(listener, app).await?;
+        }
+        Commands::Migrate { url, config, yes } => {
+            // 1. Resolve postgres URL: --url > env var > config file
+            let file_config = match taskcast_core::config::load_config_file(config.as_deref()) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    eprintln!("[taskcast] Failed to load config file: {e}");
+                    std::process::exit(1);
+                }
+            };
+
+            let config_url = file_config
+                .adapters
+                .as_ref()
+                .and_then(|a| a.long_term_store.as_ref())
+                .and_then(|lt| lt.url.clone());
+
+            let postgres_url = resolve_postgres_url(
+                url,
+                std::env::var("TASKCAST_POSTGRES_URL").ok(),
+                config_url,
+            );
+
+            let postgres_url = match postgres_url {
+                Some(u) => u,
+                None => {
+                    eprintln!(
+                        "[taskcast] No Postgres URL found. Provide one via --url, TASKCAST_POSTGRES_URL, or config file."
+                    );
+                    std::process::exit(1);
+                }
+            };
+
+            // 2. Display target info
+            let display_url = format_display_url(&postgres_url);
+            eprintln!("[taskcast] Target database: {display_url}");
+
+            // 3. Connect to database
+            let pool = sqlx::PgPool::connect(&postgres_url)
+                .await
+                .map_err(|e| format!("Failed to connect to database: {e}"))?;
+
+            // 4. Check pending migrations
+            let migrator = sqlx::migrate!("../../migrations/postgres");
+
+            // Ensure _sqlx_migrations table exists so the query doesn't fail on fresh databases
+            sqlx::query(
+                "CREATE TABLE IF NOT EXISTS _sqlx_migrations (
+                    version BIGINT PRIMARY KEY,
+                    description TEXT NOT NULL,
+                    installed_on TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    success BOOLEAN NOT NULL,
+                    checksum BYTEA NOT NULL,
+                    execution_time BIGINT NOT NULL
+                )",
+            )
+            .execute(&pool)
+            .await
+            .map_err(|e| format!("Failed to check migration state: {e}"))?;
+
+            // Fail fast on dirty (failed) migrations
+            let dirty: Vec<(i64,)> = sqlx::query_as(
+                "SELECT version FROM _sqlx_migrations WHERE success = false ORDER BY version",
+            )
+            .fetch_all(&pool)
+            .await
+            .map_err(|e| format!("Failed to query dirty migrations: {e}"))?;
+
+            if !dirty.is_empty() {
+                let versions: Vec<String> = dirty.iter().map(|r| r.0.to_string()).collect();
+                eprintln!(
+                    "[taskcast] Dirty (failed) migrations found: versions {}. Fix manually before running migrations.",
+                    versions.join(", ")
+                );
+                pool.close().await;
+                std::process::exit(1);
+            }
+
+            let applied: Vec<(i64,)> = sqlx::query_as(
+                "SELECT version FROM _sqlx_migrations WHERE success = true ORDER BY version",
+            )
+            .fetch_all(&pool)
+            .await
+            .map_err(|e| format!("Failed to query applied migrations: {e}"))?;
+
+            let applied_set: HashSet<i64> = applied.iter().map(|r| r.0).collect();
+            let pending: Vec<_> = migrator
+                .iter()
+                .filter(|m| !applied_set.contains(&m.version))
+                .collect();
+
+            // 5. If nothing pending, exit early
+            if pending.is_empty() {
+                eprintln!("[taskcast] Database is up to date.");
+                pool.close().await;
+                return Ok(());
+            }
+
+            // 6. List pending migrations
+            eprintln!(
+                "[taskcast] {} pending migration(s):",
+                pending.len()
+            );
+            for m in &pending {
+                eprintln!(
+                    "  - {:03}_{}.sql",
+                    m.version,
+                    m.description.replace(' ', "_")
+                );
+            }
+
+            // 7. Prompt for confirmation unless -y
+            if !yes {
+                use std::io::IsTerminal;
+                use std::io::Write;
+                if !std::io::stdin().is_terminal() {
+                    eprintln!("[taskcast] No TTY detected. Re-run with --yes (-y) to skip confirmation.");
+                    pool.close().await;
+                    std::process::exit(1);
+                }
+                eprint!(
+                    "Apply {} migration(s) to {}? (Y/n) ",
+                    pending.len(),
+                    display_url
+                );
+                std::io::stderr().flush()?;
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input)?;
+                let trimmed = input.trim().to_lowercase();
+                if !(trimmed.is_empty() || trimmed == "y" || trimmed == "yes") {
+                    eprintln!("[taskcast] Migration cancelled.");
+                    pool.close().await;
+                    return Ok(());
+                }
+            }
+
+            // 8. Run migrations
+            let store = taskcast_postgres::PostgresLongTermStore::new(pool.clone());
+            store
+                .migrate()
+                .await
+                .map_err(|e| format!("Migration failed: {e}"))?;
+
+            // 9. Print summary
+            eprintln!(
+                "[taskcast] Successfully applied {} migration(s).",
+                pending.len()
+            );
+            pool.close().await;
+        }
+        Commands::Playground { port } => {
+            match resolve_playground_dir() {
+                Some(dist_dir) => {
+                    let app = axum::Router::new();
+                    let app = nest_playground(app, &dist_dir);
+                    // Redirect / to /_playground/
+                    let app = app.route("/", axum::routing::get(|| async {
+                        axum::response::Redirect::temporary("/_playground/")
+                    }));
+                    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await?;
+                    println!("[taskcast] Playground UI at http://localhost:{port}/_playground/");
+                    println!("[taskcast] Use \"External\" mode in the UI to connect to a remote server.");
+                    axum::serve(listener, app).await?;
+                }
+                None => {
+                    eprintln!("[taskcast] Playground dist not found. Build the playground first.");
+                    std::process::exit(1);
+                }
+            }
         }
         Commands::Daemon => {
             eprintln!("[taskcast] daemon mode is not yet implemented, use `taskcast start` for foreground mode");
@@ -456,13 +729,48 @@ mod tests {
                 port,
                 storage,
                 db_path,
+                playground,
             } => {
                 assert!(config.is_none());
                 assert_eq!(port, 3721);
                 assert_eq!(storage, "memory");
                 assert_eq!(db_path, "./taskcast.db");
+                assert!(!playground);
             }
             _ => panic!("expected Start command"),
+        }
+    }
+
+    #[test]
+    fn cli_start_with_playground_flag() {
+        let cli = Cli::parse_from(["taskcast", "start", "--playground"]);
+        match cli.command.unwrap() {
+            Commands::Start { playground, .. } => {
+                assert!(playground);
+            }
+            _ => panic!("expected Start command"),
+        }
+    }
+
+    #[test]
+    fn cli_playground_subcommand_parses() {
+        let cli = Cli::parse_from(["taskcast", "playground"]);
+        match cli.command.unwrap() {
+            Commands::Playground { port } => {
+                assert_eq!(port, 5173);
+            }
+            _ => panic!("expected Playground command"),
+        }
+    }
+
+    #[test]
+    fn cli_playground_with_port() {
+        let cli = Cli::parse_from(["taskcast", "playground", "--port", "8080"]);
+        match cli.command.unwrap() {
+            Commands::Playground { port } => {
+                assert_eq!(port, 8080);
+            }
+            _ => panic!("expected Playground command"),
         }
     }
 
@@ -488,6 +796,43 @@ mod tests {
         }
     }
 
+    // ─── Migrate subcommand parsing ────────────────────────────────────────
+
+    #[test]
+    fn cli_migrate_subcommand_parses() {
+        let cli = Cli::parse_from(["taskcast", "migrate", "--url", "postgres://localhost/db"]);
+        match cli.command.unwrap() {
+            Commands::Migrate { url, config, yes } => {
+                assert_eq!(url, Some("postgres://localhost/db".to_string()));
+                assert!(config.is_none());
+                assert!(!yes);
+            }
+            _ => panic!("expected Migrate command"),
+        }
+    }
+
+    #[test]
+    fn cli_migrate_with_yes_flag() {
+        let cli =
+            Cli::parse_from(["taskcast", "migrate", "-y", "--url", "postgres://localhost/db"]);
+        match cli.command.unwrap() {
+            Commands::Migrate { yes, .. } => assert!(yes),
+            _ => panic!("expected Migrate command"),
+        }
+    }
+
+    #[test]
+    fn cli_migrate_with_config_flag() {
+        let cli = Cli::parse_from(["taskcast", "migrate", "-c", "/etc/taskcast.yaml"]);
+        match cli.command.unwrap() {
+            Commands::Migrate { config, url, .. } => {
+                assert_eq!(config, Some("/etc/taskcast.yaml".to_string()));
+                assert!(url.is_none());
+            }
+            _ => panic!("expected Migrate command"),
+        }
+    }
+
     #[test]
     fn cli_daemon_subcommand_parses() {
         let cli = Cli::parse_from(["taskcast", "daemon"]);
@@ -504,5 +849,86 @@ mod tests {
     fn cli_status_subcommand_parses() {
         let cli = Cli::parse_from(["taskcast", "status"]);
         assert!(matches!(cli.command.unwrap(), Commands::Status));
+    }
+
+    // ─── resolve_postgres_url ────────────────────────────────────────────
+
+    #[test]
+    fn postgres_url_prefers_cli_flag() {
+        assert_eq!(
+            resolve_postgres_url(
+                Some("postgres://flag".to_string()),
+                Some("postgres://env".to_string()),
+                Some("postgres://config".to_string()),
+            ),
+            Some("postgres://flag".to_string())
+        );
+    }
+
+    #[test]
+    fn postgres_url_falls_back_to_env() {
+        assert_eq!(
+            resolve_postgres_url(
+                None,
+                Some("postgres://env".to_string()),
+                Some("postgres://config".to_string()),
+            ),
+            Some("postgres://env".to_string())
+        );
+    }
+
+    #[test]
+    fn postgres_url_falls_back_to_config() {
+        assert_eq!(
+            resolve_postgres_url(
+                None,
+                None,
+                Some("postgres://config".to_string()),
+            ),
+            Some("postgres://config".to_string())
+        );
+    }
+
+    #[test]
+    fn postgres_url_returns_none_when_all_missing() {
+        assert_eq!(resolve_postgres_url(None, None, None), None);
+    }
+
+    // ─── format_display_url ──────────────────────────────────────────────
+
+    #[test]
+    fn display_url_formats_standard() {
+        assert_eq!(
+            format_display_url("postgres://user:pass@myhost:5433/mydb"),
+            "myhost:5433/mydb"
+        );
+    }
+
+    #[test]
+    fn display_url_uses_default_port() {
+        assert_eq!(
+            format_display_url("postgres://user@myhost/mydb"),
+            "myhost:5432/mydb"
+        );
+    }
+
+    #[test]
+    fn display_url_defaults_db_name() {
+        assert_eq!(
+            format_display_url("postgres://user@myhost:5432"),
+            "myhost:5432/postgres"
+        );
+        assert_eq!(
+            format_display_url("postgres://user@myhost:5432/"),
+            "myhost:5432/postgres"
+        );
+    }
+
+    #[test]
+    fn display_url_returns_raw_for_invalid() {
+        assert_eq!(
+            format_display_url("not-a-url"),
+            "not-a-url"
+        );
     }
 }

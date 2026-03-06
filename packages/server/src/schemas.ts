@@ -113,6 +113,7 @@ export const CreateTaskSchema = z
     assignMode: AssignModeSchema.optional(),
     cost: z.number().int().positive().optional(),
     disconnectPolicy: DisconnectPolicySchema.optional(),
+    authConfig: z.record(z.unknown()).optional(),
   })
   .openapi('CreateTaskInput')
 
@@ -130,6 +131,7 @@ export const TransitionSchema = z
     reason: z.string().optional(),
     ttl: z.number().int().positive().optional(),
     resumeAfterMs: z.number().int().positive().optional(),
+    blockedRequest: z.object({ type: z.string(), data: z.unknown() }).optional(),
   })
   .openapi('TransitionInput')
 
@@ -150,3 +152,9 @@ export const DeclineSchema = z
     blacklist: z.boolean().optional(),
   })
   .openapi('DeclineInput')
+
+export const WorkerStatusUpdateSchema = z
+  .object({
+    status: z.enum(['draining', 'idle']),
+  })
+  .openapi('WorkerStatusUpdateInput')

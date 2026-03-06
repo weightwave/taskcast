@@ -37,12 +37,13 @@ fn make_sse_worker_app() -> (Arc<TaskEngine>, Arc<WorkerManager>, axum::Router) 
         hooks: None,
         defaults: None,
     }));
-    let app = create_app(
+    let (router, _ws_registry) = create_app(
         Arc::clone(&engine),
         AuthMode::None,
         Some(Arc::clone(&manager)),
+        None,
     );
-    (engine, manager, app)
+    (engine, manager, router)
 }
 
 /// Spin up a real TCP listener so we can use reqwest for SSE streaming.

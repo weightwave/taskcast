@@ -41,12 +41,12 @@ beforeAll(async () => {
 
   // Run migrations
   const migration001 = readFileSync(
-    join(import.meta.dirname, '../../../postgres/migrations/001_initial.sql'),
+    join(import.meta.dirname, '../../../../migrations/postgres/001_initial.sql'),
     'utf8',
   )
   await sql.unsafe(migration001)
   const migration002 = readFileSync(
-    join(import.meta.dirname, '../../../postgres/migrations/002_workers.sql'),
+    join(import.meta.dirname, '../../../../migrations/postgres/002_workers.sql'),
     'utf8',
   )
   await sql.unsafe(migration002)

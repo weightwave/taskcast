@@ -11,7 +11,7 @@ describe('CLI — startup scenarios', () => {
     const store = new MemoryShortTermStore()
     const broadcast = new MemoryBroadcastProvider()
     const engine = new TaskEngine({ shortTermStore: store, broadcast })
-    const app = createTaskcastApp({ engine, auth: { mode: 'none' } })
+    const { app } = createTaskcastApp({ engine, auth: { mode: 'none' } })
 
     const res = await app.request('/health')
     expect(res.status).toBe(200)
@@ -23,7 +23,7 @@ describe('CLI — startup scenarios', () => {
     const store = new MemoryShortTermStore()
     const broadcast = new MemoryBroadcastProvider()
     const engine = new TaskEngine({ shortTermStore: store, broadcast })
-    const app = createTaskcastApp({
+    const { app } = createTaskcastApp({
       engine,
       auth: { mode: 'jwt', jwt: { algorithm: 'HS256', secret: 'test-secret-key-for-hmac-256' } },
     })

@@ -2,8 +2,8 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest'
 import postgres from 'postgres'
 import { GenericContainer, type StartedTestContainer } from 'testcontainers'
 import { PostgresLongTermStore } from '../src/long-term.js'
-import { readFileSync } from 'fs'
-import { join } from 'path'
+import { join } from 'node:path'
+import { runMigrations } from '../src/migration-runner.js'
 import type { Task, TaskEvent, WorkerAuditEvent } from '@taskcast/core'
 
 let container: StartedTestContainer
@@ -24,20 +24,12 @@ beforeAll(async () => {
   store = new PostgresLongTermStore(sql)
 
   // Run migrations
-  const migration001 = readFileSync(
-    join(import.meta.dirname, '../migrations/001_initial.sql'),
-    'utf8',
-  )
-  await sql.unsafe(migration001)
-  const migration002 = readFileSync(
-    join(import.meta.dirname, '../migrations/002_workers.sql'),
-    'utf8',
-  )
-  await sql.unsafe(migration002)
+  const migrationsDir = join(import.meta.dirname, '../../../migrations/postgres')
+  await runMigrations(sql, migrationsDir)
 }, 120000)
 
 afterAll(async () => {
-  await sql.end()
+  await sql?.end()
   await container?.stop()
 })
 

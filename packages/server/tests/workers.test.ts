@@ -29,7 +29,7 @@ describe('GET /workers', () => {
     const res = await app.request('/workers')
     expect(res.status).toBe(200)
     const body = await res.json()
-    expect(body).toEqual([])
+    expect(body).toEqual({ workers: [] })
   })
 
   it('returns registered workers', async () => {
@@ -47,7 +47,7 @@ describe('GET /workers', () => {
     const res = await app.request('/workers')
     expect(res.status).toBe(200)
     const body = await res.json()
-    expect(body).toHaveLength(2)
+    expect(body.workers).toHaveLength(2)
   })
 })
 

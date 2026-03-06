@@ -1,8 +1,12 @@
 import { load as yamlLoad } from 'js-yaml'
+import { ulid } from 'ulidx'
 
 export interface TaskcastConfig {
   port?: number
   logLevel?: 'debug' | 'info' | 'warn' | 'error'
+  adminToken?: string
+  /** Enable the admin API endpoint (POST /admin/token). Defaults to false. */
+  adminApi?: boolean
   auth?: {
     mode: 'none' | 'jwt' | 'custom'
     jwt?: {
@@ -166,4 +170,24 @@ export async function loadConfigFile(
   }
 
   return { config: {}, source: 'none' }
+}
+
+/**
+ * Resolves the admin token based on config.
+ * - If `adminApi` is false/unset, returns null (admin API disabled, no token needed).
+ * - If `adminApi` is true and `adminToken` is set, returns it.
+ * - If `adminApi` is true and `adminToken` is not set, auto-generates a ULID and logs it.
+ * Mutates the config in place.
+ */
+export function resolveAdminToken(config: TaskcastConfig): string | null {
+  if (!config.adminApi) {
+    return null
+  }
+  if (!config.adminToken) {
+    const token = ulid()
+    config.adminToken = token
+    console.log(`[taskcast] Admin token (auto-generated): ${token}`)
+    return token
+  }
+  return config.adminToken
 }

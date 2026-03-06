@@ -59,7 +59,8 @@ graph TB
         LongTerm["Long-Term — PostgreSQL | SQLite (optional)"]
     end
 
-    Browser -->|SSE| SSE
+    Browser ~~~ SSE
+    SSE -->|SSE| Browser
     Backend -->|HTTP| REST
     Workers -.->|pull / ws| REST
     REST --> Engine

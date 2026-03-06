@@ -36,7 +36,7 @@ beforeAll(async () => {
 
   const adapters = createRedisAdapters(pub, sub, store)
   const engine = new TaskEngine(adapters)
-  const app = createTaskcastApp({ engine })
+  const { app } = createTaskcastApp({ engine })
 
   // Start real HTTP server on OS-assigned port (port: 0)
   await new Promise<void>((resolve) => {

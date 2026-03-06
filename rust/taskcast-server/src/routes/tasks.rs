@@ -8,13 +8,14 @@ use axum::Extension;
 use serde::Deserialize;
 use serde_json::json;
 use taskcast_core::{
-    AssignMode, CleanupConfig, CreateTaskInput, DisconnectPolicy, EngineError, EventQueryOptions,
-    Level, PublishEventInput, SeriesMode, SinceCursor, TaskAuthConfig, TaskEngine, TaskError,
-    TaskStatus, WebhookConfig,
+    AssignMode, BlockedRequest, CleanupConfig, CreateTaskInput, DisconnectPolicy, EngineError,
+    EventQueryOptions, Level, PublishEventInput, SeriesMode, SinceCursor, TaskAuthConfig,
+    TaskEngine, TaskError, TaskFilter, TaskStatus, TransitionPayload, WebhookConfig,
 };
 
 use crate::auth::{check_scope, AuthContext};
 use crate::error::AppError;
+use crate::routes::sse::{get_subscriber_count, SubscriberCounts};
 
 // ─── Request Bodies ──────────────────────────────────────────────────────────
 
@@ -41,6 +42,10 @@ pub struct TransitionBody {
     pub status: TaskStatus,
     pub result: Option<HashMap<String, serde_json::Value>>,
     pub error: Option<TaskErrorBody>,
+    pub reason: Option<String>,
+    pub ttl: Option<u64>,
+    pub resume_after_ms: Option<f64>,
+    pub blocked_request: Option<BlockedRequest>,
 }
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
@@ -79,7 +84,74 @@ pub struct HistoryQuery {
     pub since_id: Option<String>,
 }
 
+// ─── List Query ──────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub struct ListTasksQuery {
+    pub status: Option<String>,
+    pub r#type: Option<String>,
+}
+
 // ─── Handlers ────────────────────────────────────────────────────────────────
+
+#[utoipa::path(
+    get,
+    path = "/tasks",
+    tag = "Tasks",
+    summary = "List tasks",
+    description = "List tasks with optional status and type filters.",
+    security(("Bearer" = [])),
+    params(ListTasksQuery),
+    responses(
+        (status = 200, description = "Task list"),
+        (status = 403, description = "Forbidden"),
+    )
+)]
+pub async fn list_tasks(
+    State(engine): State<Arc<TaskEngine>>,
+    Extension(auth): Extension<AuthContext>,
+    Extension(subscriber_counts): Extension<SubscriberCounts>,
+    Query(query): Query<ListTasksQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    if !check_scope(
+        &auth,
+        taskcast_core::PermissionScope::EventSubscribe,
+        None,
+    ) {
+        return Err(AppError::Forbidden);
+    }
+
+    let mut filter = TaskFilter::default();
+
+    if let Some(ref status_str) = query.status {
+        let statuses: Vec<TaskStatus> = status_str
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| serde_json::from_value(serde_json::Value::String(s.to_string())).ok())
+            .collect();
+        if !statuses.is_empty() {
+            filter.status = Some(statuses);
+        }
+    }
+
+    if let Some(ref type_str) = query.r#type {
+        filter.types = Some(vec![type_str.clone()]);
+    }
+
+    let tasks = engine.list_tasks(filter).await?;
+    let mut enriched = Vec::with_capacity(tasks.len());
+    for task in &tasks {
+        let subscriber_count = get_subscriber_count(&subscriber_counts, &task.id).await;
+        let mut task_json = serde_json::to_value(task).unwrap();
+        if let Some(obj) = task_json.as_object_mut() {
+            obj.insert("hot".to_string(), json!(subscriber_count > 0));
+            obj.insert("subscriberCount".to_string(), json!(subscriber_count));
+        }
+        enriched.push(task_json);
+    }
+
+    Ok(axum::Json(json!({ "tasks": enriched })))
+}
 
 #[utoipa::path(
     post,
@@ -142,6 +214,7 @@ pub async fn create_task(
 pub async fn get_task(
     State(engine): State<Arc<TaskEngine>>,
     Extension(auth): Extension<AuthContext>,
+    Extension(subscriber_counts): Extension<SubscriberCounts>,
     Path(task_id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
     if !check_scope(
@@ -157,7 +230,14 @@ pub async fn get_task(
         .await?
         .ok_or_else(|| AppError::NotFound("Task not found".to_string()))?;
 
-    Ok(axum::Json(task))
+    let subscriber_count = get_subscriber_count(&subscriber_counts, &task_id).await;
+    let mut task_json = serde_json::to_value(&task).unwrap();
+    if let Some(obj) = task_json.as_object_mut() {
+        obj.insert("hot".to_string(), json!(subscriber_count > 0));
+        obj.insert("subscriberCount".to_string(), json!(subscriber_count));
+    }
+
+    Ok(axum::Json(task_json))
 }
 
 #[utoipa::path(
@@ -189,15 +269,25 @@ pub async fn transition_task(
         return Err(AppError::Forbidden);
     }
 
-    let payload = if body.result.is_some() || body.error.is_some() {
+    let payload = if body.result.is_some()
+        || body.error.is_some()
+        || body.reason.is_some()
+        || body.ttl.is_some()
+        || body.resume_after_ms.is_some()
+        || body.blocked_request.is_some()
+    {
         let error = body.error.map(|e| TaskError {
             code: e.code,
             message: e.message,
             details: e.details,
         });
-        Some(taskcast_core::TransitionPayload {
+        Some(TransitionPayload {
             result: body.result,
             error,
+            reason: body.reason,
+            ttl: body.ttl,
+            resume_after_ms: body.resume_after_ms,
+            blocked_request: body.blocked_request,
         })
     } else {
         None
@@ -337,4 +427,88 @@ pub async fn get_event_history(
 
     let events = engine.get_events(&task_id, opts).await?;
     Ok(axum::Json(events))
+}
+
+// ─── Resolve / Request Handlers ─────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolveBody {
+    pub data: serde_json::Value,
+}
+
+pub async fn resolve_task(
+    State(engine): State<Arc<TaskEngine>>,
+    Extension(auth): Extension<AuthContext>,
+    Path(task_id): Path<String>,
+    axum::Json(body): axum::Json<ResolveBody>,
+) -> Result<impl IntoResponse, AppError> {
+    if !check_scope(
+        &auth,
+        taskcast_core::PermissionScope::TaskResolve,
+        Some(&task_id),
+    ) {
+        return Err(AppError::Forbidden);
+    }
+
+    let task = engine
+        .get_task(&task_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Task not found".to_string()))?;
+
+    if task.status != TaskStatus::Blocked {
+        return Err(AppError::BadRequest("Task is not blocked".to_string()));
+    }
+
+    let result = if body.data.is_object() {
+        let map: HashMap<String, serde_json::Value> =
+            serde_json::from_value(body.data).unwrap_or_default();
+        Some(map)
+    } else {
+        let mut map = HashMap::new();
+        map.insert("resolution".to_string(), body.data);
+        Some(map)
+    };
+
+    let updated = engine
+        .transition_task(
+            &task_id,
+            TaskStatus::Running,
+            Some(TransitionPayload {
+                result,
+                ..Default::default()
+            }),
+        )
+        .await
+        .map_err(|e| AppError::BadRequest(e.to_string()))?;
+
+    Ok(axum::Json(updated))
+}
+
+pub async fn get_blocked_request(
+    State(engine): State<Arc<TaskEngine>>,
+    Extension(auth): Extension<AuthContext>,
+    Path(task_id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    if !check_scope(
+        &auth,
+        taskcast_core::PermissionScope::TaskResolve,
+        Some(&task_id),
+    ) {
+        return Err(AppError::Forbidden);
+    }
+
+    let task = engine
+        .get_task(&task_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Task not found".to_string()))?;
+
+    if task.status != TaskStatus::Blocked {
+        return Err(AppError::NotFound("No blocked request".to_string()));
+    }
+
+    match task.blocked_request {
+        Some(request) => Ok(axum::Json(serde_json::to_value(request).unwrap())),
+        None => Err(AppError::NotFound("No blocked request".to_string())),
+    }
 }

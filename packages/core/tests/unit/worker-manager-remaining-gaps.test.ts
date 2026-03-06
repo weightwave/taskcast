@@ -477,6 +477,28 @@ describe('WorkerManager — Audit Event Completeness', () => {
     expect((declinedAudit!.data as Record<string, unknown>).blacklisted).toBe(false)
   })
 
+  it('releaseTask emits "task_released" worker audit', async () => {
+    const { manager, engine, longTermStore } = makeSetupWithLongTerm()
+    const worker = await manager.registerWorker({ ...defaultRegistration, id: 'w1' })
+    const task = await engine.createTask({ type: 'test', cost: 1 })
+    await manager.claimTask(task.id, worker.id)
+
+    vi.mocked(longTermStore.saveWorkerEvent).mockClear()
+
+    await engine.transitionTask(task.id, 'running')
+    await engine.transitionTask(task.id, 'completed')
+    await manager.releaseTask(task.id)
+
+    await vi.waitFor(() => {
+      expect(longTermStore.saveWorkerEvent).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'task_reclaimed',
+          workerId: 'w1',
+          data: { taskId: task.id },
+        }),
+      )
+    })
+  })
 
   it('waitForTask emits "pull_request" audit with matched=true when task is found immediately', async () => {
     const { manager, engine, longTermStore } = makeSetupWithLongTerm()

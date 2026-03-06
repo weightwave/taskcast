@@ -23,7 +23,7 @@ fn make_engine() -> Arc<TaskEngine> {
 }
 
 fn make_server(engine: Arc<TaskEngine>, auth_mode: AuthMode) -> TestServer {
-    let app = create_app(engine, auth_mode, None);
+    let (app, _) = create_app(engine, auth_mode, None, None);
     TestServer::new(app)
 }
 
@@ -1710,7 +1710,7 @@ async fn sse_level_filter_only_returns_matching_levels() {
 #[tokio::test]
 async fn sse_live_streaming_receives_events_and_done() {
     let engine = make_engine();
-    let app = create_app(Arc::clone(&engine), AuthMode::None, None);
+    let (app, _) = create_app(Arc::clone(&engine), AuthMode::None, None, None);
 
     // Bind to a random port
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1838,10 +1838,11 @@ fn make_worker_server() -> (Arc<TaskEngine>, Arc<WorkerManager>, TestServer) {
         hooks: None,
         defaults: None,
     }));
-    let app = create_app(
+    let (app, _) = create_app(
         Arc::clone(&engine),
         AuthMode::None,
         Some(Arc::clone(&manager)),
+        None,
     );
     let server = TestServer::new(app);
     (engine, manager, server)
@@ -1864,10 +1865,11 @@ fn make_worker_ws_server() -> (Arc<TaskEngine>, Arc<WorkerManager>, TestServer) 
         hooks: None,
         defaults: None,
     }));
-    let app = create_app(
+    let (app, _) = create_app(
         Arc::clone(&engine),
         AuthMode::None,
         Some(Arc::clone(&manager)),
+        None,
     );
     let server = TestServer::builder().http_transport().build(app);
     (engine, manager, server)
@@ -1901,7 +1903,7 @@ async fn get_workers_returns_empty_array_when_no_workers() {
     response.assert_status(axum_test::http::StatusCode::OK);
 
     let body: serde_json::Value = response.json();
-    assert_eq!(body, json!([]));
+    assert_eq!(body, json!({ "workers": [] }));
 }
 
 #[tokio::test]
@@ -1914,10 +1916,11 @@ async fn get_workers_returns_registered_workers() {
     let response = server.get("/workers").await;
     response.assert_status(axum_test::http::StatusCode::OK);
 
-    let body: Vec<serde_json::Value> = response.json();
-    assert_eq!(body.len(), 2);
+    let body: serde_json::Value = response.json();
+    let workers = body["workers"].as_array().expect("workers should be an array");
+    assert_eq!(workers.len(), 2);
 
-    let ids: Vec<&str> = body.iter().map(|w| w["id"].as_str().unwrap()).collect();
+    let ids: Vec<&str> = workers.iter().map(|w| w["id"].as_str().unwrap()).collect();
     assert!(ids.contains(&"w1"));
     assert!(ids.contains(&"w2"));
 }
@@ -3023,10 +3026,11 @@ fn make_jwt_worker_server() -> (Arc<TaskEngine>, Arc<WorkerManager>, TestServer)
         issuer: None,
         audience: None,
     });
-    let app = create_app(
+    let (app, _) = create_app(
         Arc::clone(&engine),
         auth_mode,
         Some(Arc::clone(&manager)),
+        None,
     );
     let server = TestServer::new(app);
     (engine, manager, server)
@@ -3132,8 +3136,9 @@ async fn list_workers_succeeds_with_worker_manage_scope() {
         .add_header(axum_test::http::header::AUTHORIZATION, bearer_header(&token))
         .await;
     response.assert_status(axum_test::http::StatusCode::OK);
-    let body: Vec<serde_json::Value> = response.json();
-    assert_eq!(body.len(), 1);
+    let body: serde_json::Value = response.json();
+    let workers = body["workers"].as_array().expect("workers should be an array");
+    assert_eq!(workers.len(), 1);
 }
 
 #[tokio::test]
