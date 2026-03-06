@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest'
-import { parseMigrationFilename, computeChecksum } from '../../src/migration-runner.js'
+import { mkdtempSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { tmpdir } from 'node:os'
+import { parseMigrationFilename, computeChecksum, loadMigrationFiles } from '../../src/migration-runner.js'
 
 describe('parseMigrationFilename', () => {
   it('parses a standard filename', () => {
@@ -71,5 +74,40 @@ describe('computeChecksum', () => {
     const sql = 'CREATE TABLE foo (\n  id INT PRIMARY KEY,\n  name TEXT\n);'
     const checksum = computeChecksum(sql)
     expect(checksum.length).toBe(48)
+  })
+})
+
+describe('loadMigrationFiles', () => {
+  it('loads and sorts SQL files from directory', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'migrations-'))
+    writeFileSync(join(dir, '002_second.sql'), 'SELECT 2;')
+    writeFileSync(join(dir, '001_first.sql'), 'SELECT 1;')
+    writeFileSync(join(dir, 'README.md'), 'not a migration')
+
+    const files = loadMigrationFiles(dir)
+    expect(files).toHaveLength(2)
+    expect(files[0]!.version).toBe(1)
+    expect(files[0]!.filename).toBe('001_first.sql')
+    expect(files[0]!.sql).toBe('SELECT 1;')
+    expect(files[0]!.description).toBe('first')
+    expect(files[0]!.checksum).toBeInstanceOf(Buffer)
+    expect(files[1]!.version).toBe(2)
+    expect(files[1]!.filename).toBe('002_second.sql')
+  })
+
+  it('returns empty array for empty directory', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'migrations-'))
+    expect(loadMigrationFiles(dir)).toEqual([])
+  })
+
+  it('skips files with invalid names', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'migrations-'))
+    writeFileSync(join(dir, 'not_versioned.sql'), 'SELECT 1;')
+    writeFileSync(join(dir, '001_valid.sql'), 'SELECT 1;')
+    writeFileSync(join(dir, 'readme.md'), 'not sql')
+
+    const files = loadMigrationFiles(dir)
+    expect(files).toHaveLength(1)
+    expect(files[0]!.filename).toBe('001_valid.sql')
   })
 })
