@@ -6,7 +6,7 @@ import {
   MemoryShortTermStore,
   WorkerManager,
 } from '@taskcast/core'
-import { createSSERouter } from '../src/routes/sse.js'
+import { createSSERouter, createSubscriberCounts } from '../src/routes/sse.js'
 import type { AuthContext } from '../src/auth.js'
 
 function makeApp() {
@@ -20,7 +20,7 @@ function makeApp() {
     c.set('auth', auth)
     await next()
   })
-  app.route('/tasks', createSSERouter(engine))
+  app.route('/tasks', createSSERouter(engine, createSubscriberCounts()))
   return { app, engine, manager, store }
 }
 
