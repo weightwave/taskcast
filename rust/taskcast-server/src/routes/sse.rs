@@ -205,7 +205,10 @@ pub async fn sse_events(
         // Replay history
         let history = match engine.get_events(&task_id_clone, None).await {
             Ok(events) => events,
-            Err(_) => return,
+            Err(_) => {
+                decrement_subscriber_count(&sub_counts, &task_id_clone).await;
+                return;
+            }
         };
 
         let filtered = apply_filtered_index(&history, &filter);
@@ -268,8 +271,11 @@ pub async fn sse_events(
             )
             .await;
 
-        // Wait for terminal event or channel close
-        let _ = done_rx.await;
+        // Wait for terminal event OR client disconnect (tx.closed() resolves when rx is dropped)
+        tokio::select! {
+            _ = done_rx => {}
+            _ = tx.closed() => {}
+        }
         unsub();
         decrement_subscriber_count(&sub_counts, &task_id_clone).await;
     });

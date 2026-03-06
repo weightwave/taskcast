@@ -133,6 +133,10 @@ export function createSSERouter(engine: TaskEngine, subscriberCounts: Subscriber
 
     return streamSSE(c, async (stream) => {
       incrementSubscriberCount(subscriberCounts, taskId)
+      let decremented = false
+      const cleanup = () => {
+        if (!decremented) { decremented = true; decrementSubscriberCount(subscriberCounts, taskId) }
+      }
 
       const sendEvent = async (event: TaskEvent, filteredIndex: number) => {
         const payload = wrap ? toEnvelope(event, filteredIndex) : event
@@ -151,7 +155,13 @@ export function createSSERouter(engine: TaskEngine, subscriberCounts: Subscriber
       }
 
       // Replay history
-      const history = await engine.getEvents(taskId)
+      let history: TaskEvent[]
+      try {
+        history = await engine.getEvents(taskId)
+      } catch {
+        cleanup()
+        return
+      }
       const filtered = applyFilteredIndex(history, filter)
       for (const { event, filteredIndex } of filtered) {
         await sendEvent(event, filteredIndex)
@@ -160,7 +170,7 @@ export function createSSERouter(engine: TaskEngine, subscriberCounts: Subscriber
       // If task is already terminal, send done and close
       if (TERMINAL.has(task.status)) {
         await sendDone(task.status)
-        decrementSubscriberCount(subscriberCounts, taskId)
+        cleanup()
         return
       }
 
@@ -169,7 +179,6 @@ export function createSSERouter(engine: TaskEngine, subscriberCounts: Subscriber
         ? (filtered[filtered.length - 1]!.filteredIndex + 1)
         : 0
 
-      let decremented = false
       await new Promise<void>((resolve) => {
         const unsub = engine.subscribe(taskId, async (event) => {
           if (!matchesFilter(event, filter)) return
@@ -179,7 +188,7 @@ export function createSSERouter(engine: TaskEngine, subscriberCounts: Subscriber
             const status = (event.data as { status: string }).status
             if (TERMINAL.has(status)) {
               await sendDone(status)
-              if (!decremented) { decremented = true; decrementSubscriberCount(subscriberCounts, taskId) }
+              cleanup()
               unsub()
               resolve()
             }
@@ -187,7 +196,7 @@ export function createSSERouter(engine: TaskEngine, subscriberCounts: Subscriber
         })
 
         stream.onAbort(() => {
-          if (!decremented) { decremented = true; decrementSubscriberCount(subscriberCounts, taskId) }
+          cleanup()
           unsub()
           resolve()
         })

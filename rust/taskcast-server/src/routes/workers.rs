@@ -47,6 +47,11 @@ pub enum WorkerStatusUpdateValue {
     Idle,
 }
 
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct WorkerListResponse {
+    pub workers: Vec<taskcast_core::Worker>,
+}
+
 // ─── Handlers ───────────────────────────────────────────────────────────────
 
 #[utoipa::path(
@@ -56,7 +61,7 @@ pub enum WorkerStatusUpdateValue {
     summary = "List all workers",
     security(("Bearer" = [])),
     responses(
-        (status = 200, description = "Worker list", body = Vec<taskcast_core::Worker>),
+        (status = 200, description = "Worker list", body = WorkerListResponse),
         (status = 403, description = "Forbidden"),
     )
 )]

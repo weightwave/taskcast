@@ -144,7 +144,7 @@ pub async fn list_tasks(
         let subscriber_count = get_subscriber_count(&subscriber_counts, &task.id).await;
         let mut task_json = serde_json::to_value(task).unwrap();
         if let Some(obj) = task_json.as_object_mut() {
-            obj.insert("hot".to_string(), json!(true));
+            obj.insert("hot".to_string(), json!(subscriber_count > 0));
             obj.insert("subscriberCount".to_string(), json!(subscriber_count));
         }
         enriched.push(task_json);
@@ -233,7 +233,7 @@ pub async fn get_task(
     let subscriber_count = get_subscriber_count(&subscriber_counts, &task_id).await;
     let mut task_json = serde_json::to_value(&task).unwrap();
     if let Some(obj) = task_json.as_object_mut() {
-        obj.insert("hot".to_string(), json!(true));
+        obj.insert("hot".to_string(), json!(subscriber_count > 0));
         obj.insert("subscriberCount".to_string(), json!(subscriber_count));
     }
 

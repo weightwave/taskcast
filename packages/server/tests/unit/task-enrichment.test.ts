@@ -28,7 +28,7 @@ describe('GET /tasks/:id — hot and subscriberCount enrichment', () => {
     const res = await app.request(`/tasks/${task.id}`)
     expect(res.status).toBe(200)
     const body = await res.json()
-    expect(body.hot).toBe(true)
+    expect(body.hot).toBe(false)
     expect(body.subscriberCount).toBe(0)
   })
 
@@ -42,7 +42,7 @@ describe('GET /tasks/:id — hot and subscriberCount enrichment', () => {
     expect(body.status).toBe('pending')
     expect(body.type).toBe('enrichment-test')
     expect(body.params).toEqual({ x: 1 })
-    expect(body.hot).toBe(true)
+    expect(body.hot).toBe(false)
     expect(body.subscriberCount).toBe(0)
   })
 

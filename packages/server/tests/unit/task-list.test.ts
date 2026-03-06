@@ -92,7 +92,7 @@ describe('GET /tasks', () => {
     expect(res.status).toBe(200)
     const body = await res.json()
     expect(body.tasks).toHaveLength(1)
-    expect(body.tasks[0].hot).toBe(true)
+    expect(body.tasks[0].hot).toBe(false)
     expect(body.tasks[0].subscriberCount).toBe(0)
   })
 

@@ -271,6 +271,31 @@ program
       process.exit(1)
     }
 
+    // Exchange admin token for JWT at startup (never expose raw token to browser)
+    let dashboardJwt: string | undefined
+    if (opts.adminToken) {
+      try {
+        const tokenRes = await fetch(`${opts.server}/admin/token`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ adminToken: opts.adminToken }),
+        })
+        if (tokenRes.ok) {
+          const { token } = await tokenRes.json()
+          dashboardJwt = token
+        } else if (tokenRes.status === 404) {
+          // Admin API not enabled — server may be in auth: none mode
+          console.log('[taskcast] Admin API not enabled, connecting without JWT')
+        } else {
+          console.error(`[taskcast] Failed to exchange admin token: ${tokenRes.status}`)
+          process.exit(1)
+        }
+      } catch (err) {
+        console.error(`[taskcast] Cannot reach server at ${opts.server}: ${err instanceof Error ? err.message : err}`)
+        process.exit(1)
+      }
+    }
+
     const MIME_TYPES: Record<string, string> = {
       '.html': 'text/html',
       '.js': 'application/javascript',
@@ -291,11 +316,11 @@ program
 
     const app = new Hono()
 
-    // Auto-connect config endpoint
+    // Auto-connect config endpoint (never exposes admin token — only pre-exchanged JWT)
     app.get('/api/config', (c) => {
       return c.json({
         baseUrl: opts.server,
-        adminToken: opts.adminToken,
+        token: dashboardJwt,
       })
     })
 

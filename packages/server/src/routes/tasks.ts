@@ -180,11 +180,10 @@ export function createTasksRouter(engine: TaskEngine, subscriberCounts: Subscrib
     if (type) filter.types = [type]
 
     const tasks = await engine.listTasks(filter)
-    const enriched = tasks.map(t => ({
-      ...t,
-      hot: true,
-      subscriberCount: getSubscriberCount(subscriberCounts, t.id),
-    }))
+    const enriched = tasks.map(t => {
+      const subscriberCount = getSubscriberCount(subscriberCounts, t.id)
+      return { ...t, hot: subscriberCount > 0, subscriberCount }
+    })
 
     return c.json({ tasks: enriched })
   })
@@ -196,7 +195,8 @@ export function createTasksRouter(engine: TaskEngine, subscriberCounts: Subscrib
 
     const task = await engine.getTask(taskId)
     if (!task) return c.json({ error: 'Task not found' }, 404)
-    return c.json({ ...task, hot: true, subscriberCount: getSubscriberCount(subscriberCounts, taskId) })
+    const subscriberCount = getSubscriberCount(subscriberCounts, taskId)
+    return c.json({ ...task, hot: subscriberCount > 0, subscriberCount })
   })
 
   register(transitionRoute, async (c) => {

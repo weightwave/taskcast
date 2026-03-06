@@ -2,7 +2,7 @@ FROM node:20-alpine AS builder
 WORKDIR /app
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY packages/ packages/
-RUN npm install -g pnpm && pnpm install --frozen-lockfile && pnpm --filter @taskcast/dashboard-web build
+RUN npm install -g pnpm@10.30.3 && pnpm install --frozen-lockfile && pnpm --filter @taskcast/dashboard-web build
 
 FROM nginx:alpine
 RUN apk add --no-cache jq
