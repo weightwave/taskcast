@@ -27,7 +27,8 @@ adapters:
   })
 
   it('returns empty config for nonexistent file', async () => {
-    const { config, source } = await loadConfigFile('/tmp/nonexistent-taskcast-config.yaml')
+    const nonexistentPath = join(tmpdir(), `taskcast-nonexistent-${Date.now()}`, 'config.yaml')
+    const { config, source } = await loadConfigFile(nonexistentPath)
     expect(source).toBe('explicit')
     expect(config).toBeTruthy()
   })

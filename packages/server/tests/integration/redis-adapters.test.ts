@@ -18,7 +18,7 @@ describe.skipIf(!canDocker)('Redis adapter integration — testcontainer', () =>
     container = await new GenericContainer('redis:7-alpine')
       .withExposedPorts(6379)
       .start()
-    redisUrl = `redis://localhost:${container.getMappedPort(6379)}`
+    redisUrl = `redis://${container.getHost()}:${container.getMappedPort(6379)}`
     pub = new Redis(redisUrl)
     sub = new Redis(redisUrl)
     store = new Redis(redisUrl)

@@ -4,7 +4,7 @@ import {
   MemoryBroadcastProvider,
   MemoryShortTermStore,
 } from '@taskcast/core'
-import { startTestServer } from '@taskcast/server'
+import { startTestServer } from '@taskcast/server/testing'
 import { TaskcastServerClient } from '../../src/client.js'
 
 async function startRealServer() {

@@ -4,7 +4,7 @@ import {
   MemoryBroadcastProvider,
   MemoryShortTermStore,
 } from '@taskcast/core'
-import { startTestServer } from '@taskcast/server'
+import { startTestServer } from '@taskcast/server/testing'
 import { TaskcastClient } from '../../src/client.js'
 import type { SSEEnvelope } from '@taskcast/core'
 

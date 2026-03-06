@@ -35,6 +35,9 @@
   "dependencies": {
     "eventsource-parser": "^2.0.1"
   },
+  "peerDependencies": {
+    "@taskcast/core": "workspace:*"
+  },
   "devDependencies": {
     "@taskcast/core": "workspace:*",
     "@taskcast/server": "workspace:*",
