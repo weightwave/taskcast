@@ -183,6 +183,14 @@ jobs:
         with:
           node-version: 22
 
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Build playground dist
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm --filter @taskcast/playground build
+
       - name: Sync Rust version
         shell: bash
         run: bash scripts/sync-rust-version.sh
@@ -235,6 +243,17 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Build playground dist
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm --filter @taskcast/playground build
+
+      - name: Copy playground dist for Docker
+        run: cp -r packages/playground/dist rust/playground-dist
 
       - name: Sync Rust version
         run: bash scripts/sync-rust-version.sh
