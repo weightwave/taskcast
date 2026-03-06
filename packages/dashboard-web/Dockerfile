@@ -1,8 +1,10 @@
-FROM node:20-alpine AS builder
+FROM node:22-alpine AS builder
+RUN corepack enable && corepack prepare pnpm@10 --activate
 WORKDIR /app
-COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
 COPY packages/ packages/
-RUN npm install -g pnpm@10.30.3 && pnpm install --frozen-lockfile && pnpm --filter @taskcast/dashboard-web build
+COPY tsconfig.base.json ./
+RUN pnpm install --frozen-lockfile && pnpm --filter @taskcast/dashboard-web build
 
 FROM nginx:alpine
 RUN apk add --no-cache jq

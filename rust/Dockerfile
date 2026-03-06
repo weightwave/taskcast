@@ -7,14 +7,16 @@ WORKDIR /app
 
 # ── Stage 2: planner ─────────────────────────────────────────
 FROM chef AS planner
-COPY . .
+COPY rust/ .
+COPY migrations/ /migrations/
 RUN cargo chef prepare --recipe-path recipe.json
 
 # ── Stage 3: builder ─────────────────────────────────────────
 FROM chef AS builder
 COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json
-COPY . .
+COPY rust/ .
+COPY migrations/ /migrations/
 RUN cargo build --release -p taskcast-cli
 
 # ── Stage 4: runtime ─────────────────────────────────────────
