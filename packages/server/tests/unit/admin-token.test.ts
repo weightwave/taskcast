@@ -391,7 +391,7 @@ describe('POST /admin/token — via createTaskcastApp', () => {
     const broadcast = new MemoryBroadcastProvider()
     const engine = new TaskEngine({ shortTermStore: store, broadcast })
 
-    const app = createTaskcastApp({
+    const { app } = createTaskcastApp({
       engine,
       auth: {
         mode: 'jwt',
@@ -423,7 +423,7 @@ describe('POST /admin/token — via createTaskcastApp', () => {
     const broadcast = new MemoryBroadcastProvider()
     const engine = new TaskEngine({ shortTermStore: store, broadcast })
 
-    const app = createTaskcastApp({
+    const { app } = createTaskcastApp({
       engine,
       auth: {
         mode: 'jwt',
@@ -452,7 +452,7 @@ describe('POST /admin/token — via createTaskcastApp', () => {
     const broadcast = new MemoryBroadcastProvider()
     const engine = new TaskEngine({ shortTermStore: store, broadcast })
 
-    const app = createTaskcastApp({ engine })
+    const { app } = createTaskcastApp({ engine })
 
     const res = await app.request('/admin/token', {
       method: 'POST',
