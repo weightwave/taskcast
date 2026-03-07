@@ -20,7 +20,7 @@ pub enum EngineError {
     TaskNotFound(String),
 
     #[error("Task already exists: {0}")]
-    TaskAlreadyExists(String),
+    TaskConflict(String),
 
     #[error("{0}")]
     InvalidInput(String),
@@ -131,11 +131,21 @@ impl TaskEngine {
         if input.id.is_some() {
             let existing = self.short_term_store.get_task(&id).await?;
             if existing.is_some() {
-                return Err(EngineError::TaskAlreadyExists(id));
+                return Err(EngineError::TaskConflict(id));
             }
         }
 
         let now = now_millis();
+        let id = input
+            .id
+            .clone()
+            .unwrap_or_else(|| ulid::Ulid::new().to_string());
+
+        // Check for duplicate explicit ID
+        if input.id.is_some() && self.short_term_store.get_task(&id).await?.is_some() {
+            return Err(EngineError::TaskConflict(id));
+        }
+
         let task = Task {
             id,
             status: TaskStatus::Pending,
@@ -699,8 +709,8 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
-            matches!(err, EngineError::TaskAlreadyExists(_)),
-            "Expected TaskAlreadyExists error, got: {err}"
+            matches!(err, EngineError::TaskConflict(_)),
+            "Expected TaskConflict error, got: {err}"
         );
     }
 

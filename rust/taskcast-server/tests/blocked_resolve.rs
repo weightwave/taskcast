@@ -6,7 +6,7 @@ use taskcast_core::{
     BlockedRequest, MemoryBroadcastProvider, MemoryShortTermStore, TaskEngine, TaskEngineOptions,
     TaskStatus, TransitionPayload,
 };
-use taskcast_server::{create_app, AuthMode};
+use taskcast_server::{create_app, AuthMode, CorsConfig};
 
 fn make_engine() -> Arc<TaskEngine> {
     Arc::new(TaskEngine::new(TaskEngineOptions {
@@ -18,7 +18,7 @@ fn make_engine() -> Arc<TaskEngine> {
 }
 
 fn make_server(engine: Arc<TaskEngine>) -> TestServer {
-    let (app, _) = create_app(engine, AuthMode::None, None, None);
+    let (app, _) = create_app(engine, AuthMode::None, None, None, CorsConfig::default());
     TestServer::new(app)
 }
 

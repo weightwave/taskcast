@@ -40,7 +40,7 @@ describe('Concurrency API', () => {
     )
 
     const successes = results.filter((s) => s === 200)
-    const failures = results.filter((s) => s === 400)
+    const failures = results.filter((s) => s === 409)
 
     // At least 1 succeeds; memory adapter lacks CAS so multiple may succeed
     expect(successes.length).toBeGreaterThanOrEqual(1)

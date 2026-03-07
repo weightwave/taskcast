@@ -391,7 +391,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             // 9. Create and serve app
-            let (app, _ws_registry) = taskcast_server::create_app(engine, auth_mode, worker_manager, None);
+            let (app, _ws_registry) = taskcast_server::create_app(engine, auth_mode, worker_manager, None, taskcast_server::CorsConfig::default());
 
             // Serve playground static files if --playground
             let app = if playground {

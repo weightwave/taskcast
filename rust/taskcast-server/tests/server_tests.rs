@@ -11,7 +11,7 @@ use taskcast_core::{
     MemoryShortTermStore, ShortTermStore, TaskEngine, TaskEngineOptions, TaskStatus,
     WorkerMatchRule,
 };
-use taskcast_server::{create_app, AppError, AuthMode, JwtConfig, WebhookDelivery};
+use taskcast_server::{create_app, AppError, AuthMode, CorsConfig, JwtConfig, WebhookDelivery};
 
 fn make_engine() -> Arc<TaskEngine> {
     Arc::new(TaskEngine::new(TaskEngineOptions {
@@ -23,7 +23,7 @@ fn make_engine() -> Arc<TaskEngine> {
 }
 
 fn make_server(engine: Arc<TaskEngine>, auth_mode: AuthMode) -> TestServer {
-    let (app, _) = create_app(engine, auth_mode, None, None);
+    let (app, _) = create_app(engine, auth_mode, None, None, CorsConfig::default());
     TestServer::new(app)
 }
 
@@ -931,20 +931,20 @@ fn app_error_engine_task_not_found_returns_404() {
 }
 
 #[test]
-fn app_error_engine_invalid_transition_returns_400() {
+fn app_error_engine_invalid_transition_returns_409() {
     let error = AppError::Engine(EngineError::InvalidTransition {
         from: TaskStatus::Pending,
         to: TaskStatus::Completed,
     });
     let response = error.into_response();
-    assert_eq!(response.status(), axum_test::http::StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), axum_test::http::StatusCode::CONFLICT);
 }
 
 #[test]
-fn app_error_engine_task_terminal_returns_400() {
+fn app_error_engine_task_terminal_returns_409() {
     let error = AppError::Engine(EngineError::TaskTerminal(TaskStatus::Completed));
     let response = error.into_response();
-    assert_eq!(response.status(), axum_test::http::StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), axum_test::http::StatusCode::CONFLICT);
 }
 
 #[test]
@@ -1710,7 +1710,7 @@ async fn sse_level_filter_only_returns_matching_levels() {
 #[tokio::test]
 async fn sse_live_streaming_receives_events_and_done() {
     let engine = make_engine();
-    let (app, _) = create_app(Arc::clone(&engine), AuthMode::None, None, None);
+    let (app, _) = create_app(Arc::clone(&engine), AuthMode::None, None, None, CorsConfig::default());
 
     // Bind to a random port
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1843,6 +1843,7 @@ fn make_worker_server() -> (Arc<TaskEngine>, Arc<WorkerManager>, TestServer) {
         AuthMode::None,
         Some(Arc::clone(&manager)),
         None,
+        CorsConfig::default(),
     );
     let server = TestServer::new(app);
     (engine, manager, server)
@@ -1870,6 +1871,7 @@ fn make_worker_ws_server() -> (Arc<TaskEngine>, Arc<WorkerManager>, TestServer) 
         AuthMode::None,
         Some(Arc::clone(&manager)),
         None,
+        CorsConfig::default(),
     );
     let server = TestServer::builder().http_transport().build(app);
     (engine, manager, server)
@@ -3031,6 +3033,7 @@ fn make_jwt_worker_server() -> (Arc<TaskEngine>, Arc<WorkerManager>, TestServer)
         auth_mode,
         Some(Arc::clone(&manager)),
         None,
+        CorsConfig::default(),
     );
     let server = TestServer::new(app);
     (engine, manager, server)

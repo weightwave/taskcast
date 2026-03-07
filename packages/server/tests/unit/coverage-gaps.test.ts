@@ -10,6 +10,9 @@
  *   6. src/auth.ts lines 65-66 — JWT payload missing taskIds/scope fallback
  *   7. src/routes/admin.ts line 55 — algorithm ?? 'HS256' fallback
  *   8. src/routes/workers.ts lines 190, 204 — Zod parse failure branches
+ *   9. src/index.ts lines 78-80 — CORS middleware branches
+ *  10. src/routes/tasks.ts — TaskConflictError catch (duplicate ID → 409)
+ *  11. src/routes/tasks.ts — Invalid TTL/cost catch (→ 400)
  */
 
 import { describe, it, expect, vi } from 'vitest'
@@ -550,5 +553,86 @@ describe('SSE — level filter parsing', () => {
 
     // Should only include error level events (not debug)
     expect(text).toContain('taskcast.done')
+  })
+})
+
+// ─── 9. CORS middleware branches (index.ts lines 78-80) ────────────────────
+
+describe('createTaskcastApp — CORS option', () => {
+  it('sets Access-Control-Allow-Origin: * when cors: true', async () => {
+    const store = new MemoryShortTermStore()
+    const broadcast = new MemoryBroadcastProvider()
+    const engine = new TaskEngine({ shortTermStore: store, broadcast })
+
+    const { app, stop } = createTaskcastApp({ engine, cors: true })
+
+    const res = await app.request('/health', {
+      headers: { Origin: 'http://example.com' },
+    })
+    expect(res.status).toBe(200)
+    expect(res.headers.get('access-control-allow-origin')).toBe('*')
+    stop()
+  })
+
+  it('sets Access-Control-Allow-Origin to specific origin', async () => {
+    const store = new MemoryShortTermStore()
+    const broadcast = new MemoryBroadcastProvider()
+    const engine = new TaskEngine({ shortTermStore: store, broadcast })
+
+    const { app, stop } = createTaskcastApp({ engine, cors: { origin: 'http://myapp.com' } })
+
+    const res = await app.request('/health', {
+      headers: { Origin: 'http://myapp.com' },
+    })
+    expect(res.status).toBe(200)
+    expect(res.headers.get('access-control-allow-origin')).toBe('http://myapp.com')
+    stop()
+  })
+
+  it('does not set CORS headers when cors option is omitted', async () => {
+    const store = new MemoryShortTermStore()
+    const broadcast = new MemoryBroadcastProvider()
+    const engine = new TaskEngine({ shortTermStore: store, broadcast })
+
+    const { app, stop } = createTaskcastApp({ engine })
+
+    const res = await app.request('/health', {
+      headers: { Origin: 'http://example.com' },
+    })
+    expect(res.status).toBe(200)
+    expect(res.headers.get('access-control-allow-origin')).toBeNull()
+    stop()
+  })
+})
+
+// ─── 10. TaskConflictError catch (tasks.ts create → 409) ───────────────────
+
+describe('POST /tasks — duplicate explicit ID returns 409', () => {
+  it('returns 409 when creating a task with an existing ID', async () => {
+    const store = new MemoryShortTermStore()
+    const broadcast = new MemoryBroadcastProvider()
+    const engine = new TaskEngine({ shortTermStore: store, broadcast })
+
+    const app = new Hono()
+    app.use('*', authMiddleware())
+    app.route('/tasks', createTasksRouter(engine, createSubscriberCounts()))
+
+    // Create first task with explicit ID
+    const res1 = await app.request('/tasks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: 'dup-test', type: 'first' }),
+    })
+    expect(res1.status).toBe(201)
+
+    // Attempt to create second task with same ID
+    const res2 = await app.request('/tasks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: 'dup-test', type: 'second' }),
+    })
+    expect(res2.status).toBe(409)
+    const body = await res2.json()
+    expect(body.error).toContain('already exists')
   })
 })
