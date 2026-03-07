@@ -129,4 +129,111 @@ describe('verbose logger middleware', () => {
     await app.request('/health')
     expect(logs).toHaveLength(3)
   })
+
+  it('logs GET /tasks/:id/events as SSE subscriber connected', async () => {
+    const { app, engine, logs } = makeVerboseApp()
+    const task = await engine.createTask({ type: 'test' })
+    await engine.transitionTask(task.id, 'running')
+    await engine.transitionTask(task.id, 'completed')
+    logs.length = 0
+
+    const res = await app.request(`/tasks/${task.id}/events`)
+    expect(res.status).toBe(200)
+    // Drain the SSE stream so the response completes
+    const reader = res.body!.getReader()
+    while (true) {
+      const { done } = await reader.read()
+      if (done) break
+    }
+    expect(logs).toHaveLength(1)
+    expect(logs[0]).toContain('SSE')
+    expect(logs[0]).toContain('subscriber connected')
+  })
+
+  it('logs GET /events as global subscriber connected', async () => {
+    const { app, logs } = makeVerboseApp()
+    logs.length = 0
+
+    const res = await app.request('/events')
+    expect(res.status).toBe(200)
+    // Cancel the stream to let the response finish
+    res.body!.getReader().cancel()
+    // Wait a tick for the log to be flushed
+    await new Promise((r) => setTimeout(r, 50))
+    expect(logs).toHaveLength(1)
+    expect(logs[0]).toContain('SSE')
+    expect(logs[0]).toContain('global subscriber connected')
+  })
+
+  it('logs PATCH status transition without target status in body', async () => {
+    const { app, engine, logs } = makeVerboseApp()
+    const task = await engine.createTask({ type: 'test' })
+    logs.length = 0
+
+    // Send PATCH with non-JSON body to trigger the catch block (line 29)
+    // and the 'status transition' fallback (lines 71-72)
+    await app.request(`/tasks/${task.id}/status`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'text/plain' },
+      body: 'not json',
+    })
+    expect(logs).toHaveLength(1)
+    expect(logs[0]).toContain('PATCH')
+    expect(logs[0]).toContain('status transition')
+  })
+
+  it('logs POST /tasks/:id/events with batch events context', async () => {
+    const { app, engine, logs } = makeVerboseApp()
+    const task = await engine.createTask({ type: 'test' })
+    await engine.transitionTask(task.id, 'running')
+    logs.length = 0
+
+    const res = await app.request(`/tasks/${task.id}/events`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify([
+        { type: 'a', level: 'info', data: null },
+        { type: 'b', level: 'info', data: null },
+      ]),
+    })
+    expect(res.status).toBe(201)
+    expect(logs).toHaveLength(1)
+    expect(logs[0]).toContain('2 events')
+  })
+
+  it('logs POST /tasks/:id/events without type as event published', async () => {
+    const { app, engine, logs } = makeVerboseApp()
+    const task = await engine.createTask({ type: 'test' })
+    await engine.transitionTask(task.id, 'running')
+    logs.length = 0
+
+    // Send a non-JSON body to POST /tasks/:id/events so requestBody is undefined
+    // This triggers the 'event published' fallback (line 84)
+    await app.request(`/tasks/${task.id}/events`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain' },
+      body: 'not json',
+    })
+    expect(logs).toHaveLength(1)
+    expect(logs[0]).toContain('event published')
+  })
+
+  it('logs POST /tasks/:id/resolve as resolve', async () => {
+    const { app, engine, logs } = makeVerboseApp()
+    const task = await engine.createTask({ type: 'test' })
+    await engine.transitionTask(task.id, 'running')
+    await engine.transitionTask(task.id, 'blocked')
+    logs.length = 0
+
+    const res = await app.request(`/tasks/${task.id}/resolve`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ data: { approved: true } }),
+    })
+    expect(res.status).toBe(200)
+    expect(logs).toHaveLength(1)
+    expect(logs[0]).toContain('POST')
+    expect(logs[0]).toContain('/resolve')
+    expect(logs[0]).toContain('resolve')
+  })
 })

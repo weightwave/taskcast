@@ -57,6 +57,20 @@ describe('createClientFromNodeAsync', () => {
     ).rejects.toThrow('Invalid admin token')
   })
 
+  it('falls back to HTTP status when error JSON parsing fails', async () => {
+    const node: NodeEntry = { url: 'https://tc.example.com', token: 'bad_admin', tokenType: 'admin' }
+
+    const mockFetch = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 500,
+      json: async () => { throw new Error('not json') },
+    })
+
+    await expect(
+      createClientFromNodeAsync(node, mockFetch as unknown as typeof fetch),
+    ).rejects.toThrow('HTTP 500')
+  })
+
   it('returns client directly for JWT tokens without exchange', async () => {
     const node: NodeEntry = { url: 'https://tc.example.com', token: 'ey.jwt.tok', tokenType: 'jwt' }
 

@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import { Hono } from 'hono'
 import { TaskEngine, MemoryBroadcastProvider, MemoryShortTermStore } from '@taskcast/core'
 import { createGlobalSSERoute, createSubscriberCounts } from '../src/routes/sse.js'
@@ -271,5 +271,29 @@ describe('GET /events (global SSE)', () => {
     const parsed = JSON.parse(chunkEvent!.data)
     expect(parsed.seriesId).toBe('s1')
     expect(parsed.seriesMode).toBe('accumulate')
+  }, 10000)
+
+  it('exits keepalive loop when stream is aborted', async () => {
+    vi.useFakeTimers()
+    try {
+      const { app } = makeApp()
+
+      const resPromise = app.request('/events')
+
+      // Advance past the first keepalive write + sleep
+      await vi.advanceTimersByTimeAsync(30000)
+
+      const res = await resPromise
+      expect(res.status).toBe(200)
+
+      // Cancel the reader to trigger stream abort (sets closed = true)
+      const reader = res.body!.getReader()
+      reader.cancel()
+
+      // Advance timer so the pending setTimeout resolves and while(!closed) exits
+      await vi.advanceTimersByTimeAsync(30000)
+    } finally {
+      vi.useRealTimers()
+    }
   }, 10000)
 })
