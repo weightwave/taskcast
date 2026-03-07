@@ -30,8 +30,9 @@ export class NodeConfigManager {
 
   getCurrent(): NodeEntry {
     const data = this.load()
-    if (data.current && data.nodes[data.current]) {
-      return data.nodes[data.current]
+    if (data.current) {
+      const node = data.nodes[data.current]
+      if (node) return node
     }
     return { url: DEFAULT_URL }
   }

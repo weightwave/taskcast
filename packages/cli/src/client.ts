@@ -7,11 +7,10 @@ import type { NodeEntry } from './node-config.js'
  * createClientFromNodeAsync instead.
  */
 export function createClientFromNode(node: NodeEntry, fetchFn?: typeof fetch): TaskcastServerClient {
-  return new TaskcastServerClient({
-    baseUrl: node.url,
-    token: node.tokenType === 'jwt' ? node.token : undefined,
-    fetch: fetchFn,
-  })
+  const opts: { baseUrl: string; token?: string; fetch?: typeof fetch } = { baseUrl: node.url }
+  if (node.tokenType === 'jwt' && node.token) opts.token = node.token
+  if (fetchFn) opts.fetch = fetchFn
+  return new TaskcastServerClient(opts)
 }
 
 /**
@@ -40,11 +39,9 @@ export async function createClientFromNodeAsync(node: NodeEntry, fetchFn?: typeo
     }
 
     const { token: jwt } = (await res.json()) as { token: string }
-    return new TaskcastServerClient({
-      baseUrl: node.url,
-      token: jwt,
-      fetch: fetchFn,
-    })
+    const opts: { baseUrl: string; token?: string; fetch?: typeof fetch } = { baseUrl: node.url, token: jwt }
+    if (fetchFn) opts.fetch = fetchFn
+    return new TaskcastServerClient(opts)
   }
 
   return createClientFromNode(node, fetchFn)

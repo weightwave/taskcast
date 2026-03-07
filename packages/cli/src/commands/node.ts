@@ -1,6 +1,6 @@
 import { Command } from 'commander'
 import { NodeConfigManager } from '../node-config.js'
-import type { NodeListEntry } from '../node-config.js'
+import type { NodeEntry, NodeListEntry } from '../node-config.js'
 
 export function formatNodeList(nodes: NodeListEntry[]): string {
   if (nodes.length === 0) {
@@ -27,11 +27,12 @@ export function registerNodeCommand(program: Command): void {
     .option('--token-type <type>', 'Token type: jwt or admin', 'jwt')
     .action((name: string, opts: { url: string; token?: string; tokenType?: string }) => {
       const mgr = new NodeConfigManager()
-      mgr.add(name, {
-        url: opts.url,
-        token: opts.token,
-        tokenType: opts.token ? (opts.tokenType as 'jwt' | 'admin') : undefined,
-      })
+      const entry: NodeEntry = { url: opts.url }
+      if (opts.token) {
+        entry.token = opts.token
+        entry.tokenType = (opts.tokenType as 'jwt' | 'admin') ?? 'jwt'
+      }
+      mgr.add(name, entry)
       console.log(`Added node "${name}" → ${opts.url}`)
     })
 

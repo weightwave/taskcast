@@ -24,11 +24,12 @@ export async function runDoctor(
     const body = await res.json()
 
     const authStatus = (!node.token && body.auth.mode !== 'none') ? 'warn' : 'ok'
-    const authMessage = authStatus === 'warn' ? 'no token configured for this node' : undefined
+    const auth: DoctorResult['auth'] = { status: authStatus, mode: body.auth.mode }
+    if (authStatus === 'warn') auth.message = 'no token configured for this node'
 
     return {
       server: { ok: true, url: node.url, uptime: body.uptime },
-      auth: { status: authStatus, mode: body.auth.mode, message: authMessage },
+      auth,
       adapters: body.adapters,
     }
   } catch (err) {
