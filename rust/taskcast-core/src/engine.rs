@@ -118,10 +118,8 @@ impl TaskEngine {
             .unwrap_or_else(|| ulid::Ulid::new().to_string());
 
         // Check for duplicate explicit ID
-        if input.id.is_some() {
-            if let Some(_) = self.short_term_store.get_task(&id).await? {
-                return Err(EngineError::TaskConflict(id));
-            }
+        if input.id.is_some() && self.short_term_store.get_task(&id).await?.is_some() {
+            return Err(EngineError::TaskConflict(id));
         }
 
         let task = Task {

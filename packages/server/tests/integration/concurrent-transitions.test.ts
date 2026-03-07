@@ -20,7 +20,7 @@ describe('Server integration — concurrent transitions', () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ status: 'completed' }),
     })
-    expect(second.status).toBe(400)
+    expect(second.status).toBe(409)
   })
 
   it('task state is consistent after concurrent race', async () => {
