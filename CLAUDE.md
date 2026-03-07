@@ -164,3 +164,7 @@ Server-side packages (core, server, cli, redis, postgres) have a planned Rust re
 The Rust server must produce **identical HTTP behavior** — same paths, same JSON format, same SSE events, same status codes.
 
 **IMPORTANT: When changing any server-side feature, both the Node.js (TypeScript) and Rust implementations MUST be updated simultaneously.** Do not merge a feature change that only modifies one side — the two implementations must stay in sync at all times.
+
+## Workflow Reminders
+
+- **Proactively check CI status for open PRs** — Before starting new work, check whether existing open PRs have passing CI. If CI is failing, prioritize fixing CI issues before moving on to other tasks.

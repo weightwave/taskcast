@@ -33,12 +33,16 @@
     "test:watch": "vitest"
   },
   "dependencies": {
-    "@taskcast/core": "workspace:*",
     "eventsource-parser": "^2.0.1"
   },
+  "peerDependencies": {
+    "@taskcast/core": "workspace:*"
+  },
   "devDependencies": {
+    "@taskcast/core": "workspace:*",
+    "@taskcast/server": "workspace:*",
+    "@vitest/coverage-v8": "^2.1.0",
     "typescript": "^5.7.0",
-    "vitest": "^2.1.0",
-    "@vitest/coverage-v8": "^2.1.0"
+    "vitest": "^2.1.0"
   }
 }

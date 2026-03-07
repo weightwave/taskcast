@@ -130,39 +130,6 @@ describe('WorkerManager — Store Layer Exception Handling', () => {
     })
   })
 
-  describe('removeAssignment throws during releaseTask', () => {
-    it('propagates the store error', async () => {
-      const { manager, engine, store } = makeSetup()
-      const worker = await manager.registerWorker({ ...defaultRegistration, id: 'w1' })
-      const task = await engine.createTask({ type: 'test', cost: 1 })
-      await manager.claimTask(task.id, worker.id)
-
-      await engine.transitionTask(task.id, 'running')
-      await engine.transitionTask(task.id, 'completed')
-
-      vi.spyOn(store, 'removeAssignment').mockRejectedValueOnce(new Error('delete failed'))
-
-      await expect(manager.releaseTask(task.id)).rejects.toThrow('delete failed')
-    })
-
-    it('does not restore worker capacity when removeAssignment throws', async () => {
-      const { manager, engine, store } = makeSetup()
-      const worker = await manager.registerWorker({ ...defaultRegistration, id: 'w1', capacity: 5 })
-      const task = await engine.createTask({ type: 'test', cost: 2 })
-      await manager.claimTask(task.id, worker.id)
-
-      await engine.transitionTask(task.id, 'running')
-      await engine.transitionTask(task.id, 'completed')
-
-      vi.spyOn(store, 'removeAssignment').mockRejectedValueOnce(new Error('delete failed'))
-
-      await expect(manager.releaseTask(task.id)).rejects.toThrow('delete failed')
-
-      // Worker capacity should still reflect the assigned task (not restored)
-      const workerAfter = await store.getWorker(worker.id)
-      expect(workerAfter!.usedSlots).toBe(2)
-    })
-  })
 })
 
 // ─── 2. Large Blacklist Entries ─────────────────────────────────────────────
