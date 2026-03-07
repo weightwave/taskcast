@@ -410,22 +410,25 @@ describe('MemoryShortTermStore.claimTask', () => {
     expect(result).toBe(false)
   })
 
-  it('rejects claim for running task', async () => {
+  it('rejects claim for running task when worker exists', async () => {
     const store = new MemoryShortTermStore()
+    await store.saveWorker(makeWorker({ id: 'w1', capacity: 10 }))
     await store.saveTask(makeTask({ id: 't1', status: 'running' }))
     const result = await store.claimTask('t1', 'w1', 1)
     expect(result).toBe(false)
   })
 
-  it('rejects claim for completed task', async () => {
+  it('rejects claim for completed task when worker exists', async () => {
     const store = new MemoryShortTermStore()
+    await store.saveWorker(makeWorker({ id: 'w1', capacity: 10 }))
     await store.saveTask(makeTask({ id: 't1', status: 'completed' }))
     const result = await store.claimTask('t1', 'w1', 1)
     expect(result).toBe(false)
   })
 
-  it('rejects claim for failed task', async () => {
+  it('rejects claim for failed task when worker exists', async () => {
     const store = new MemoryShortTermStore()
+    await store.saveWorker(makeWorker({ id: 'w1', capacity: 10 }))
     await store.saveTask(makeTask({ id: 't1', status: 'failed' }))
     const result = await store.claimTask('t1', 'w1', 1)
     expect(result).toBe(false)

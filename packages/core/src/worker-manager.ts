@@ -119,6 +119,10 @@ export class WorkerManager {
   // ─── Worker Registration & Lifecycle ────────────────────────────────────
 
   async registerWorker(config: WorkerRegistration): Promise<Worker> {
+    if (config.capacity <= 0) {
+      throw new Error(`Invalid capacity: ${config.capacity}. Capacity must be a positive number.`)
+    }
+
     const now = Date.now()
     const worker: Worker = {
       id: config.id ?? ulid(),

@@ -19,6 +19,12 @@ pub enum EngineError {
     #[error("Task not found: {0}")]
     TaskNotFound(String),
 
+    #[error("Task already exists: {0}")]
+    TaskAlreadyExists(String),
+
+    #[error("{0}")]
+    InvalidInput(String),
+
     #[error("Invalid transition: {from:?} \u{2192} {to:?}")]
     InvalidTransition { from: TaskStatus, to: TaskStatus },
 
@@ -126,9 +132,30 @@ impl TaskEngine {
     }
 
     pub async fn create_task(&self, input: CreateTaskInput) -> Result<Task, EngineError> {
+        if let Some(ttl) = input.ttl {
+            if ttl == 0 {
+                return Err(EngineError::InvalidInput(
+                    "Invalid TTL: 0. TTL must be a positive number.".to_string(),
+                ));
+            }
+        }
+
+        let id = input
+            .id
+            .clone()
+            .unwrap_or_else(|| ulid::Ulid::new().to_string());
+
+        // Check for duplicate user-supplied IDs
+        if input.id.is_some() {
+            let existing = self.short_term_store.get_task(&id).await?;
+            if existing.is_some() {
+                return Err(EngineError::TaskAlreadyExists(id));
+            }
+        }
+
         let now = now_millis();
         let task = Task {
-            id: input.id.unwrap_or_else(|| ulid::Ulid::new().to_string()),
+            id,
             status: TaskStatus::Pending,
             created_at: now,
             updated_at: now,
@@ -668,6 +695,51 @@ mod tests {
         assert_eq!(task.assigned_worker, None);
         assert_eq!(task.disconnect_policy, Some(DisconnectPolicy::Reassign));
         assert_eq!(task.status, TaskStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn create_task_rejects_ttl_zero() {
+        let engine = make_engine();
+        let result = engine
+            .create_task(CreateTaskInput {
+                ttl: Some(0),
+                ..Default::default()
+            })
+            .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, EngineError::InvalidInput(_)),
+            "Expected InvalidInput error, got: {err}"
+        );
+        assert!(err.to_string().contains("TTL"));
+    }
+
+    #[tokio::test]
+    async fn create_task_rejects_duplicate_user_supplied_id() {
+        let engine = make_engine();
+        engine
+            .create_task(CreateTaskInput {
+                id: Some("dup-id".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let result = engine
+            .create_task(CreateTaskInput {
+                id: Some("dup-id".to_string()),
+                ..Default::default()
+            })
+            .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, EngineError::TaskAlreadyExists(_)),
+            "Expected TaskAlreadyExists error, got: {err}"
+        );
     }
 
     // ─── get_task ────────────────────────────────────────────────────────

@@ -162,6 +162,106 @@ describe('TaskcastServerClient.transitionTask with payload', () => {
   })
 })
 
+describe('Network failures and error responses', () => {
+  it('propagates fetch TypeError from createTask', async () => {
+    const fetch = vi.fn().mockRejectedValue(new TypeError('fetch failed'))
+    const client = new TaskcastServerClient({ baseUrl: 'http://taskcast', fetch })
+    await expect(client.createTask({})).rejects.toThrow('fetch failed')
+    await expect(client.createTask({})).rejects.toBeInstanceOf(TypeError)
+  })
+
+  it('propagates fetch TypeError from getTask', async () => {
+    const fetch = vi.fn().mockRejectedValue(new TypeError('fetch failed'))
+    const client = new TaskcastServerClient({ baseUrl: 'http://taskcast', fetch })
+    await expect(client.getTask('task-1')).rejects.toThrow('fetch failed')
+  })
+
+  it('propagates fetch TypeError from transitionTask', async () => {
+    const fetch = vi.fn().mockRejectedValue(new TypeError('fetch failed'))
+    const client = new TaskcastServerClient({ baseUrl: 'http://taskcast', fetch })
+    await expect(client.transitionTask('task-1', 'running')).rejects.toThrow('fetch failed')
+  })
+
+  it('propagates fetch TypeError from publishEvent', async () => {
+    const fetch = vi.fn().mockRejectedValue(new TypeError('fetch failed'))
+    const client = new TaskcastServerClient({ baseUrl: 'http://taskcast', fetch })
+    await expect(
+      client.publishEvent('task-1', { type: 'log', level: 'info', data: null })
+    ).rejects.toThrow('fetch failed')
+  })
+
+  it('propagates fetch TypeError from publishEvents', async () => {
+    const fetch = vi.fn().mockRejectedValue(new TypeError('fetch failed'))
+    const client = new TaskcastServerClient({ baseUrl: 'http://taskcast', fetch })
+    await expect(
+      client.publishEvents('task-1', [{ type: 'log', level: 'info', data: null }])
+    ).rejects.toThrow('fetch failed')
+  })
+
+  it('propagates fetch TypeError from getHistory', async () => {
+    const fetch = vi.fn().mockRejectedValue(new TypeError('fetch failed'))
+    const client = new TaskcastServerClient({ baseUrl: 'http://taskcast', fetch })
+    await expect(client.getHistory('task-1')).rejects.toThrow('fetch failed')
+  })
+
+  it('throws error message from 401 response', async () => {
+    const fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ error: 'Unauthorized' }), {
+        status: 401,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    )
+    const client = new TaskcastServerClient({ baseUrl: 'http://taskcast', fetch })
+    await expect(client.getTask('task-1')).rejects.toThrow('Unauthorized')
+  })
+
+  it('throws error on 200 with invalid JSON body', async () => {
+    const fetch = vi.fn().mockResolvedValue(
+      new Response('not valid json {{{', {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    )
+    const client = new TaskcastServerClient({ baseUrl: 'http://taskcast', fetch })
+    await expect(client.getTask('task-1')).rejects.toThrow()
+  })
+
+  it('extracts error message from 500 JSON response', async () => {
+    const fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ error: 'Internal error' }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    )
+    const client = new TaskcastServerClient({ baseUrl: 'http://taskcast', fetch })
+    await expect(client.getTask('task-1')).rejects.toThrow('Internal error')
+  })
+
+  it('does not include Authorization header when no token set', async () => {
+    const fetch = makeFetch([{ status: 200, body: { id: 'task-1', status: 'pending' } }])
+    const client = new TaskcastServerClient({ baseUrl: 'http://taskcast', fetch })
+    await client.getTask('task-1')
+    const [, opts] = fetch.mock.calls[0]!
+    expect(opts.headers['Authorization']).toBeUndefined()
+  })
+
+  it('does not include Content-Type when body is undefined (GET requests)', async () => {
+    const fetch = makeFetch([{ status: 200, body: { id: 'task-1', status: 'pending' } }])
+    const client = new TaskcastServerClient({ baseUrl: 'http://taskcast', fetch })
+    await client.getTask('task-1')
+    const [, opts] = fetch.mock.calls[0]!
+    expect(opts.headers['Content-Type']).toBeUndefined()
+    expect(opts.body).toBeUndefined()
+  })
+
+  it('strips trailing slash from baseUrl', async () => {
+    const fetch = makeFetch([{ status: 200, body: { id: 'task-1', status: 'pending' } }])
+    const client = new TaskcastServerClient({ baseUrl: 'http://taskcast/', fetch })
+    await client.getTask('task-1')
+    expect(fetch.mock.calls[0]![0]).toBe('http://taskcast/tasks/task-1')
+  })
+})
+
 describe('TaskcastServerClient re-exported from index', () => {
   it('is the same class exported from index', async () => {
     const fetch = vi.fn().mockResolvedValue(

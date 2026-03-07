@@ -85,9 +85,26 @@ export class TaskEngine {
   }
 
   async createTask(input: CreateTaskInput): Promise<Task> {
+    if (input.ttl !== undefined && input.ttl <= 0) {
+      throw new Error(`Invalid TTL: ${input.ttl}. TTL must be a positive number.`)
+    }
+    if (input.cost !== undefined && input.cost < 0) {
+      throw new Error(`Invalid cost: ${input.cost}. Cost must be non-negative.`)
+    }
+
     const now = Date.now()
+    const id = input.id ?? ulid()
+
+    // Check for duplicate user-supplied IDs
+    if (input.id !== undefined) {
+      const existing = await this.shortTermStore.getTask(id)
+      if (existing) {
+        throw new Error(`Task already exists: ${id}`)
+      }
+    }
+
     const task: Task = {
-      id: input.id ?? ulid(),
+      id,
       status: 'pending',
       createdAt: now,
       updatedAt: now,

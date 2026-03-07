@@ -147,9 +147,35 @@ jobs:
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
+  # ── Build playground dist once, share via artifact ────────────────────────
+  prepare-playground:
+    needs: get-version
+    if: ${{ !cancelled() && needs.get-version.result == 'success' && needs.get-version.outputs.version != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Build playground dist
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm --filter @taskcast/playground... build
+      - name: Upload playground dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: playground-dist
+          path: packages/playground/dist
+          retention-days: 1
+
   # ── Rust binary builds (5 platforms, native runners) ──────────────────────
   rust-build:
-    needs: get-version
+    needs: [get-version, prepare-playground]
     if: ${{ !cancelled() && needs.get-version.result == 'success' && needs.get-version.outputs.version != '' }}
     strategy:
       fail-fast: false
@@ -182,18 +208,11 @@ jobs:
         with:
           workspaces: rust
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - name: Download playground dist
+        uses: actions/download-artifact@v4
         with:
-          node-version: 22
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-
-      - name: Build playground dist
-        run: |
-          pnpm install --frozen-lockfile
-          pnpm --filter @taskcast/playground... build
+          name: playground-dist
+          path: packages/playground/dist
 
       - name: Sync Rust version
         shell: bash
@@ -228,7 +247,7 @@ jobs:
 
   # ── Docker builds (2 platforms, native runners) ───────────────────────────
   docker-build:
-    needs: get-version
+    needs: [get-version, prepare-playground]
     if: ${{ !cancelled() && needs.get-version.result == 'success' && needs.get-version.outputs.version != '' }}
     strategy:
       fail-fast: false
@@ -243,18 +262,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - name: Download playground dist
+        uses: actions/download-artifact@v4
         with:
-          node-version: 22
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-
-      - name: Build playground dist
-        run: |
-          pnpm install --frozen-lockfile
-          pnpm --filter @taskcast/playground... build
+          name: playground-dist
+          path: packages/playground/dist
 
       - name: Copy playground dist for Docker
         run: cp -r packages/playground/dist rust/playground-dist

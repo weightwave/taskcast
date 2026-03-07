@@ -139,8 +139,8 @@ export async function loadConfigFile(
     const fullPath = resolve(candidate)
     if (!existsSync(fullPath)) continue
 
+    /* v8 ignore start -- local config file loading is tested only in integration (requires real files on disk) */
     const ext = extname(fullPath).toLowerCase()
-    /* v8 ignore next 4 -- dynamic import of .ts/.js/.mjs config files */
     if (ext === '.ts' || ext === '.js' || ext === '.mjs') {
       const mod = await import(fullPath) as { default?: TaskcastConfig }
       return { config: mod.default ?? {}, source: 'local' }
@@ -149,6 +149,7 @@ export async function loadConfigFile(
     const content = readFileSync(fullPath, 'utf8')
     const format = ext === '.json' ? 'json' : 'yaml'
     return { config: parseConfig(content, format), source: 'local' }
+    /* v8 ignore stop */
   }
 
   // 3. Global directory (~/.taskcast/) — only static formats

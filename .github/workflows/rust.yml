@@ -23,13 +23,34 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
-  # check, test, coverage, and build have no `needs:` dependencies between them
-  # so they run fully in parallel. This trades runner minutes for wall-clock speed:
-  # wall time ≈ max(jobs) ≈ 3min instead of sum ≈ 10min if serialized.
-  # Do NOT merge these jobs — that would make CI slower.
 jobs:
+  # Build playground dist once, share via artifact to all Rust jobs.
+  # This eliminates redundant pnpm install + playground build from every job.
+  prepare:
+    name: Prepare Playground
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @taskcast/playground... build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: playground-dist
+          path: packages/playground/dist
+          retention-days: 1
+
+  # check, test, coverage, and build have no dependencies between them
+  # so they run fully in parallel. This trades runner minutes for wall-clock speed:
+  # wall time ≈ max(prepare + jobs) instead of sum if serialized.
+  # Do NOT merge these jobs — that would make CI slower.
   check:
     name: Check & Clippy
+    needs: [prepare]
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -42,15 +63,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
-      - uses: actions/setup-node@v4
+      - uses: actions/download-artifact@v4
         with:
-          node-version: '22'
-      - uses: pnpm/action-setup@v4
-      - name: Build playground dist
-        working-directory: .
-        run: |
-          pnpm install --frozen-lockfile
-          pnpm --filter @taskcast/playground... build
+          name: playground-dist
+          path: packages/playground/dist
       - name: Check
         run: cargo check --workspace
       - name: Clippy
@@ -58,6 +74,7 @@ jobs:
 
   test:
     name: Test
+    needs: [prepare]
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -68,20 +85,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
-      - uses: actions/setup-node@v4
+      - uses: actions/download-artifact@v4
         with:
-          node-version: '22'
-      - uses: pnpm/action-setup@v4
-      - name: Build playground dist
-        working-directory: .
-        run: |
-          pnpm install --frozen-lockfile
-          pnpm --filter @taskcast/playground... build
+          name: playground-dist
+          path: packages/playground/dist
       - name: Run tests
         run: cargo test --workspace
 
   coverage:
     name: Coverage
+    needs: [prepare]
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -95,15 +108,10 @@ jobs:
         with:
           workspaces: rust
       - uses: taiki-e/install-action@cargo-llvm-cov
-      - uses: actions/setup-node@v4
+      - uses: actions/download-artifact@v4
         with:
-          node-version: '22'
-      - uses: pnpm/action-setup@v4
-      - name: Build playground dist
-        working-directory: .
-        run: |
-          pnpm install --frozen-lockfile
-          pnpm --filter @taskcast/playground... build
+          name: playground-dist
+          path: packages/playground/dist
       - name: Generate coverage
         run: cargo llvm-cov --workspace --lcov --output-path lcov.info
       - name: Upload to Codecov
@@ -117,6 +125,7 @@ jobs:
 
   build:
     name: Build Release
+    needs: [prepare]
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -127,15 +136,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
-      - uses: actions/setup-node@v4
+      - uses: actions/download-artifact@v4
         with:
-          node-version: '22'
-      - uses: pnpm/action-setup@v4
-      - name: Build playground dist
-        working-directory: .
-        run: |
-          pnpm install --frozen-lockfile
-          pnpm --filter @taskcast/playground... build
+          name: playground-dist
+          path: packages/playground/dist
       - name: Build release
         run: cargo build --release -p taskcast-cli
       - name: Upload binary
