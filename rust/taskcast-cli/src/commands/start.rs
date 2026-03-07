@@ -46,7 +46,7 @@ pub async fn run(args: StartArgs) -> Result<(), Box<dyn std::error::Error>> {
         storage,
         db_path,
         playground,
-        verbose: _verbose,
+        verbose,
     } = args;
 
     // 1. Load config file
@@ -246,6 +246,19 @@ pub async fn run(args: StartArgs) -> Result<(), Box<dyn std::error::Error>> {
     // 9. Create and serve app
     let (app, _ws_registry) =
         taskcast_server::create_app(engine, auth_mode, worker_manager, None);
+
+    // Apply verbose request logging middleware if --verbose
+    let app = if verbose {
+        eprintln!("[taskcast] Verbose request logging enabled");
+        let logger: std::sync::Arc<dyn taskcast_server::VerboseLogger> =
+            std::sync::Arc::new(taskcast_server::StderrLogger);
+        app.layer(axum::middleware::from_fn_with_state(
+            logger,
+            taskcast_server::verbose_logger_middleware,
+        ))
+    } else {
+        app
+    };
 
     // Serve playground static files if --playground
     let app = if playground {
