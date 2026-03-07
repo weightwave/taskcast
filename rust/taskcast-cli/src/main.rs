@@ -37,6 +37,8 @@ enum Commands {
     Logs(commands::logs::LogsArgs),
     /// Stream events from all tasks in real-time
     Tail(commands::logs::TailArgs),
+    /// Manage tasks on a Taskcast server
+    Tasks(commands::tasks::TasksArgs),
     /// Start the server as a background service (not yet implemented)
     Daemon,
     /// Stop the background service (not yet implemented)
@@ -76,6 +78,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Some(Commands::Tail(args)) => {
             commands::logs::run_tail(args).await?;
+        }
+        Some(Commands::Tasks(args)) => {
+            commands::tasks::run(args).await?;
         }
         Some(Commands::Daemon) => {
             eprintln!("[taskcast] daemon mode is not yet implemented, use `taskcast start` for foreground mode");
@@ -512,6 +517,78 @@ mod tests {
                 assert_eq!(args.node, Some("staging".to_string()));
             }
             _ => panic!("expected Tail command"),
+        }
+    }
+
+    // ─── Tasks subcommand parsing ─────────────────────────────────────
+
+    #[test]
+    fn cli_tasks_list_subcommand_parses() {
+        let cli = Cli::parse_from(["taskcast", "tasks", "list"]);
+        match cli.command.unwrap() {
+            Commands::Tasks(args) => match args.command {
+                commands::tasks::TasksCommands::List { status, task_type, limit, node } => {
+                    assert!(status.is_none());
+                    assert!(task_type.is_none());
+                    assert_eq!(limit, 20);
+                    assert!(node.is_none());
+                }
+                _ => panic!("expected Tasks List command"),
+            },
+            _ => panic!("expected Tasks command"),
+        }
+    }
+
+    #[test]
+    fn cli_tasks_list_with_all_options() {
+        let cli = Cli::parse_from([
+            "taskcast", "tasks", "list",
+            "--status", "running",
+            "--type", "llm.*",
+            "--limit", "50",
+            "--node", "prod",
+        ]);
+        match cli.command.unwrap() {
+            Commands::Tasks(args) => match args.command {
+                commands::tasks::TasksCommands::List { status, task_type, limit, node } => {
+                    assert_eq!(status, Some("running".to_string()));
+                    assert_eq!(task_type, Some("llm.*".to_string()));
+                    assert_eq!(limit, 50);
+                    assert_eq!(node, Some("prod".to_string()));
+                }
+                _ => panic!("expected Tasks List command"),
+            },
+            _ => panic!("expected Tasks command"),
+        }
+    }
+
+    #[test]
+    fn cli_tasks_inspect_subcommand_parses() {
+        let cli = Cli::parse_from(["taskcast", "tasks", "inspect", "01JXX123"]);
+        match cli.command.unwrap() {
+            Commands::Tasks(args) => match args.command {
+                commands::tasks::TasksCommands::Inspect { task_id, node } => {
+                    assert_eq!(task_id, "01JXX123");
+                    assert!(node.is_none());
+                }
+                _ => panic!("expected Tasks Inspect command"),
+            },
+            _ => panic!("expected Tasks command"),
+        }
+    }
+
+    #[test]
+    fn cli_tasks_inspect_with_node() {
+        let cli = Cli::parse_from(["taskcast", "tasks", "inspect", "01JXX123", "--node", "prod"]);
+        match cli.command.unwrap() {
+            Commands::Tasks(args) => match args.command {
+                commands::tasks::TasksCommands::Inspect { task_id, node } => {
+                    assert_eq!(task_id, "01JXX123");
+                    assert_eq!(node, Some("prod".to_string()));
+                }
+                _ => panic!("expected Tasks Inspect command"),
+            },
+            _ => panic!("expected Tasks command"),
         }
     }
 

@@ -5,3 +5,4 @@ pub mod node;
 pub mod ping;
 pub mod playground;
 pub mod start;
+pub mod tasks;
