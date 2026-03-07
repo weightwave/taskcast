@@ -824,6 +824,16 @@ mod tests {
     // ─── register_worker ────────────────────────────────────────────────
 
     #[tokio::test]
+    async fn register_worker_rejects_zero_capacity() {
+        let ctx = make_context();
+        let mut reg = make_registration(ConnectionMode::Pull);
+        reg.capacity = 0;
+        let result = ctx.manager.register_worker(reg).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("capacity"));
+    }
+
+    #[tokio::test]
     async fn register_worker_creates_idle_worker() {
         let ctx = make_context();
         let worker = ctx

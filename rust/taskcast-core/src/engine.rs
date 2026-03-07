@@ -659,6 +659,51 @@ mod tests {
         assert_eq!(task.status, TaskStatus::Pending);
     }
 
+    #[tokio::test]
+    async fn create_task_rejects_ttl_zero() {
+        let engine = make_engine();
+        let result = engine
+            .create_task(CreateTaskInput {
+                ttl: Some(0),
+                ..Default::default()
+            })
+            .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, EngineError::InvalidInput(_)),
+            "Expected InvalidInput error, got: {err}"
+        );
+        assert!(err.to_string().contains("TTL"));
+    }
+
+    #[tokio::test]
+    async fn create_task_rejects_duplicate_user_supplied_id() {
+        let engine = make_engine();
+        engine
+            .create_task(CreateTaskInput {
+                id: Some("dup-id".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let result = engine
+            .create_task(CreateTaskInput {
+                id: Some("dup-id".to_string()),
+                ..Default::default()
+            })
+            .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, EngineError::TaskAlreadyExists(_)),
+            "Expected TaskAlreadyExists error, got: {err}"
+        );
+    }
+
     // ─── get_task ────────────────────────────────────────────────────────
 
     #[tokio::test]
