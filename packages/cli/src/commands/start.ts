@@ -107,6 +107,7 @@ export function registerStartCommand(program: Command): void {
         shortTermStore,
         auth: { mode: authMode },
         config: fileConfig,
+        verbose: options.verbose ?? false,
       }
       if (workerManager !== undefined) serverOpts.workerManager = workerManager
       const { app, stop } = createTaskcastApp(serverOpts)
