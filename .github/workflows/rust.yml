@@ -22,9 +22,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # sccache uses GHA cache as backend, shared across all jobs
-  SCCACHE_GHA_ENABLED: "true"
-  RUSTC_WRAPPER: "sccache"
 
 jobs:
   # Build playground dist once, share via artifact to all Rust jobs.
@@ -52,10 +49,9 @@ jobs:
   # wall time ≈ max(prepare + jobs) instead of sum if serialized.
   # Do NOT merge these jobs — that would make CI slower.
   #
-  # sccache (GHA cache backend) replaces Swatinem/rust-cache:
-  # - Shares compiled crate artifacts across ALL jobs (not per-job isolation)
-  # - Granularity is per-crate, not whole target directory
-  # - First run populates the cache; subsequent runs (and parallel jobs) reuse it
+  # shared-key groups jobs by cargo profile so they share the same cache:
+  # - check/test/coverage all use debug profile → shared-key: debug
+  # - build uses release profile → shared-key: release
   check:
     name: Check & Clippy
     needs: [prepare]
@@ -68,7 +64,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - uses: mozilla-actions/sccache-action@v0.0.7
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          shared-key: debug
       - uses: actions/download-artifact@v4
         with:
           name: playground-dist
@@ -88,7 +87,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: mozilla-actions/sccache-action@v0.0.7
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          shared-key: debug
       - uses: actions/download-artifact@v4
         with:
           name: playground-dist
@@ -108,7 +110,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
-      - uses: mozilla-actions/sccache-action@v0.0.7
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          shared-key: debug
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: actions/download-artifact@v4
         with:
@@ -135,7 +140,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: mozilla-actions/sccache-action@v0.0.7
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          shared-key: release
       - uses: actions/download-artifact@v4
         with:
           name: playground-dist
