@@ -14,6 +14,27 @@ import type {
   EventQueryOptions,
 } from './types.js'
 
+// ─── Error Classes ──────────────────────────────────────────────────────────
+
+export class TaskConflictError extends Error {
+  constructor(taskId: string) {
+    super(`Task already exists: ${taskId}`)
+    this.name = 'TaskConflictError'
+  }
+}
+
+export class InvalidTransitionError extends Error {
+  public readonly from: TaskStatus
+  public readonly to: TaskStatus
+
+  constructor(from: TaskStatus, to: TaskStatus) {
+    super(`Invalid transition: ${from} → ${to}`)
+    this.name = 'InvalidTransitionError'
+    this.from = from
+    this.to = to
+  }
+}
+
 interface TaskEngineOptionsBase {
   broadcast: BroadcastProvider
   hooks?: TaskcastHooks
@@ -86,8 +107,16 @@ export class TaskEngine {
 
   async createTask(input: CreateTaskInput): Promise<Task> {
     const now = Date.now()
+    const id = input.id ?? ulid()
+
+    // Check for duplicate explicit ID
+    if (input.id !== undefined) {
+      const existing = await this.shortTermStore.getTask(id)
+      if (existing) throw new TaskConflictError(id)
+    }
+
     const task: Task = {
-      id: input.id ?? ulid(),
+      id,
       status: 'pending',
       createdAt: now,
       updatedAt: now,
@@ -142,7 +171,7 @@ export class TaskEngine {
     const task = await this.getTask(taskId)
     if (!task) throw new Error(`Task not found: ${taskId}`)
     if (!canTransition(task.status, to)) {
-      throw new Error(`Invalid transition: ${task.status} → ${to}`)
+      throw new InvalidTransitionError(task.status, to)
     }
 
     const now = Date.now()

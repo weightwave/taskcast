@@ -14,7 +14,7 @@ use taskcast_core::{
     BroadcastProvider, ConnectionMode, MemoryBroadcastProvider, MemoryShortTermStore,
     ShortTermStore, TaskEngine, TaskEngineOptions, WorkerMatchRule, WorkerStatus,
 };
-use taskcast_server::{create_app, AuthMode};
+use taskcast_server::{create_app, AuthMode, CorsConfig};
 
 // ─── Test Helpers ────────────────────────────────────────────────────────────
 
@@ -41,6 +41,7 @@ fn make_worker_server() -> (Arc<TaskEngine>, Arc<WorkerManager>, TestServer) {
         AuthMode::None,
         Some(Arc::clone(&manager)),
         None,
+        CorsConfig::default(),
     );
     let server = TestServer::new(router);
     (engine, manager, server)

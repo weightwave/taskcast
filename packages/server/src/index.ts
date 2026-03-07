@@ -15,6 +15,7 @@ export {
 
 import type { Hono } from 'hono'
 import { OpenAPIHono } from '@hono/zod-openapi'
+import { cors } from 'hono/cors'
 import { apiReference } from '@scalar/hono-api-reference'
 import { createAuthMiddleware } from './auth.js'
 import { createTasksRouter } from './routes/tasks.js'
@@ -41,6 +42,7 @@ export interface TaskcastServerOptions {
   shortTermStore?: ShortTermStore
   auth?: AuthConfig
   config?: TaskcastConfig
+  cors?: boolean | { origin: string | string[] }
   scheduler?: {
     enabled?: boolean
     checkIntervalMs?: number
@@ -71,6 +73,13 @@ export interface TaskcastApp {
  */
 export function createTaskcastApp(opts: TaskcastServerOptions): TaskcastApp {
   const app = new OpenAPIHono()
+
+  // CORS middleware
+  if (opts.cors) {
+    const origin = opts.cors === true ? '*' : opts.cors.origin
+    app.use('*', cors({ origin }))
+  }
+
   app.get('/health', (c) => c.json({ ok: true }))
 
   // Admin route is mounted BEFORE auth middleware so it bypasses JWT/custom auth.

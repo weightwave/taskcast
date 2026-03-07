@@ -13,7 +13,7 @@ use taskcast_core::{
     BroadcastProvider, ConnectionMode, Level, MemoryBroadcastProvider, MemoryShortTermStore,
     ShortTermStore, TaskEngine, TaskEngineOptions, TaskStatus, WorkerMatchRule,
 };
-use taskcast_server::{create_app, AuthMode};
+use taskcast_server::{create_app, AuthMode, CorsConfig};
 
 // ─── Test Helpers ────────────────────────────────────────────────────────────
 
@@ -42,6 +42,7 @@ fn make_sse_worker_app() -> (Arc<TaskEngine>, Arc<WorkerManager>, axum::Router) 
         AuthMode::None,
         Some(Arc::clone(&manager)),
         None,
+        CorsConfig::default(),
     );
     (engine, manager, router)
 }

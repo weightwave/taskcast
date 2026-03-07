@@ -44,7 +44,7 @@ describe('Task Lifecycle API', () => {
     expect(task.type).toBe('custom')
   })
 
-  it('overwrites task when creating with duplicate ID (no conflict enforcement in memory)', async () => {
+  it('rejects duplicate task ID with 409', async () => {
     const id = 'dup-id-' + Date.now()
 
     const res1 = await fetch(`${server.baseUrl}/tasks`, {
@@ -54,19 +54,21 @@ describe('Task Lifecycle API', () => {
     })
     expect(res1.status).toBe(201)
 
-    // Second create with same ID overwrites (memory adapter has no uniqueness constraint)
+    // Second create with same ID should be rejected
     const res2 = await fetch(`${server.baseUrl}/tasks`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ id, type: 'second' }),
     })
-    expect(res2.status).toBe(201)
+    expect(res2.status).toBe(409)
+    const body = await res2.json()
+    expect(body.error).toContain('already exists')
 
-    // The task now has the second type
+    // Original task should be unchanged
     const getRes = await fetch(`${server.baseUrl}/tasks/${id}`)
     expect(getRes.status).toBe(200)
     const task = await getRes.json()
-    expect(task.type).toBe('second')
+    expect(task.type).toBe('first')
   })
 
   // ─── Get ──────────────────────────────────────────────────────────────────
@@ -238,7 +240,7 @@ describe('Task Lifecycle API', () => {
     expect(completedTask.result).toEqual({ output: 'done' })
   })
 
-  it('rejects invalid transition (completed -> running) with 400', async () => {
+  it('rejects invalid transition (completed -> running) with 409', async () => {
     const createRes = await fetch(`${server.baseUrl}/tasks`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -264,9 +266,9 @@ describe('Task Lifecycle API', () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ status: 'running' }),
     })
-    expect(res.status).toBe(400)
+    expect(res.status).toBe(409)
     const body = await res.json()
-    expect(body.error).toBeDefined()
+    expect(body.error).toContain('Invalid transition')
   })
 
   it('transitions to failed with error payload', async () => {

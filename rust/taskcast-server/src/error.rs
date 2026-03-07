@@ -29,12 +29,13 @@ impl IntoResponse for AppError {
         let (status, message) = match &self {
             AppError::Engine(e) => match e {
                 EngineError::TaskNotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
+                EngineError::TaskConflict(msg) => (StatusCode::CONFLICT, format!("Task already exists: {msg}")),
                 EngineError::InvalidTransition { from, to } => (
-                    StatusCode::BAD_REQUEST,
+                    StatusCode::CONFLICT,
                     format!("Invalid transition: {from:?} \u{2192} {to:?}"),
                 ),
                 EngineError::TaskTerminal(status) => (
-                    StatusCode::BAD_REQUEST,
+                    StatusCode::CONFLICT,
                     format!("Cannot publish to task in terminal status: {status:?}"),
                 ),
                 EngineError::Store(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),

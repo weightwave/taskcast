@@ -40,7 +40,7 @@ describe('Concurrency API', () => {
     )
 
     const successes = results.filter((s) => s === 200)
-    const failures = results.filter((s) => s === 400)
+    const failures = results.filter((s) => s === 409)
 
     expect(successes.length).toBe(1)
     expect(failures.length).toBe(9)
