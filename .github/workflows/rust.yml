@@ -5,16 +5,28 @@ on:
     branches: [main, feature/*]
     paths:
       - 'rust/**'
+      - 'packages/playground/**'
       - '.github/workflows/rust.yml'
+      - 'pnpm-lock.yaml'
+      - 'package.json'
+      - 'pnpm-workspace.yaml'
   pull_request:
     branches: [main]
     paths:
       - 'rust/**'
+      - 'packages/playground/**'
       - '.github/workflows/rust.yml'
+      - 'pnpm-lock.yaml'
+      - 'package.json'
+      - 'pnpm-workspace.yaml'
 
 env:
   CARGO_TERM_COLOR: always
 
+  # check, test, coverage, and build have no `needs:` dependencies between them
+  # so they run fully in parallel. This trades runner minutes for wall-clock speed:
+  # wall time ≈ max(jobs) ≈ 3min instead of sum ≈ 10min if serialized.
+  # Do NOT merge these jobs — that would make CI slower.
 jobs:
   check:
     name: Check & Clippy
@@ -30,6 +42,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: pnpm/action-setup@v4
+      - name: Build playground dist
+        working-directory: .
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm --filter @taskcast/playground... build
       - name: Check
         run: cargo check --workspace
       - name: Clippy
@@ -47,6 +68,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: pnpm/action-setup@v4
+      - name: Build playground dist
+        working-directory: .
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm --filter @taskcast/playground... build
       - name: Run tests
         run: cargo test --workspace
 
@@ -65,6 +95,15 @@ jobs:
         with:
           workspaces: rust
       - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: pnpm/action-setup@v4
+      - name: Build playground dist
+        working-directory: .
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm --filter @taskcast/playground... build
       - name: Generate coverage
         run: cargo llvm-cov --workspace --lcov --output-path lcov.info
       - name: Upload to Codecov
@@ -88,6 +127,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: pnpm/action-setup@v4
+      - name: Build playground dist
+        working-directory: .
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm --filter @taskcast/playground... build
       - name: Build release
         run: cargo build --release -p taskcast-cli
       - name: Upload binary
