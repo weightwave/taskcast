@@ -4,6 +4,7 @@ import { registerStartCommand } from './commands/start.js'
 import { registerMigrateCommand } from './commands/migrate.js'
 import { registerPlaygroundCommand } from './commands/playground.js'
 import { registerUiCommand } from './commands/ui.js'
+import { registerNodeCommand } from './commands/node.js'
 
 const program = new Command()
 
@@ -16,6 +17,7 @@ registerStartCommand(program)
 registerMigrateCommand(program)
 registerPlaygroundCommand(program)
 registerUiCommand(program)
+registerNodeCommand(program)
 
 // Placeholders for unimplemented commands
 program.command('daemon').description('Start as background service (not yet implemented)')
