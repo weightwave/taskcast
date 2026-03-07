@@ -4,7 +4,7 @@ WORKDIR /app
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
 COPY packages/ packages/
 COPY tsconfig.base.json ./
-RUN pnpm install --frozen-lockfile && pnpm --filter @taskcast/dashboard-web build
+RUN pnpm install --frozen-lockfile && pnpm --filter @taskcast/dashboard-web... build
 
 FROM nginx:alpine
 RUN apk add --no-cache jq
