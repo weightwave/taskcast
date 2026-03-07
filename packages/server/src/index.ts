@@ -70,8 +70,33 @@ export interface TaskcastApp {
  * clean up scheduler/heartbeat timers.
  */
 export function createTaskcastApp(opts: TaskcastServerOptions): TaskcastApp {
+  const startTime = Date.now()
   const app = new OpenAPIHono()
   app.get('/health', (c) => c.json({ ok: true }))
+
+  app.get('/health/detail', (c) => {
+    const uptime = Math.floor((Date.now() - startTime) / 1000)
+    const authMode = opts.auth?.mode ?? 'none'
+    const broadcastProvider = opts.config?.adapters?.broadcast?.provider ?? 'memory'
+    const shortTermProvider = opts.config?.adapters?.shortTermStore?.provider ?? 'memory'
+    const longTermProvider = opts.config?.adapters?.longTermStore?.provider
+
+    const adapters: Record<string, { provider: string; status: string }> = {
+      broadcast: { provider: broadcastProvider, status: 'ok' },
+      shortTermStore: { provider: shortTermProvider, status: 'ok' },
+    }
+
+    if (longTermProvider) {
+      adapters.longTermStore = { provider: longTermProvider, status: 'ok' }
+    }
+
+    return c.json({
+      ok: true,
+      uptime,
+      auth: { mode: authMode },
+      adapters,
+    })
+  })
 
   // Admin route is mounted BEFORE auth middleware so it bypasses JWT/custom auth.
   // It authenticates via admin token independently.
