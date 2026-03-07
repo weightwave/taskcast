@@ -29,6 +29,10 @@ enum Commands {
         #[command(subcommand)]
         command: commands::node::NodeCommands,
     },
+    /// Deep health check against a Taskcast server
+    Doctor(commands::doctor::DoctorArgs),
+    /// Quick connectivity check against a Taskcast server
+    Ping(commands::ping::PingArgs),
     /// Start the server as a background service (not yet implemented)
     Daemon,
     /// Stop the background service (not yet implemented)
@@ -56,6 +60,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Some(Commands::Node { command }) => {
             commands::node::run(command);
+        }
+        Some(Commands::Doctor(args)) => {
+            commands::doctor::run(args).await?;
+        }
+        Some(Commands::Ping(args)) => {
+            commands::ping::run(args).await;
         }
         Some(Commands::Daemon) => {
             eprintln!("[taskcast] daemon mode is not yet implemented, use `taskcast start` for foreground mode");
@@ -377,6 +387,30 @@ mod tests {
             cli.command.unwrap(),
             Commands::Node { command: commands::node::NodeCommands::List }
         ));
+    }
+
+    // ─── Doctor subcommand parsing ─────────────────────────────────────
+
+    #[test]
+    fn cli_doctor_subcommand_parses() {
+        let cli = Cli::parse_from(["taskcast", "doctor"]);
+        match cli.command.unwrap() {
+            Commands::Doctor(args) => {
+                assert!(args.node.is_none());
+            }
+            _ => panic!("expected Doctor command"),
+        }
+    }
+
+    #[test]
+    fn cli_doctor_with_node_flag() {
+        let cli = Cli::parse_from(["taskcast", "doctor", "--node", "prod"]);
+        match cli.command.unwrap() {
+            Commands::Doctor(args) => {
+                assert_eq!(args.node, Some("prod".to_string()));
+            }
+            _ => panic!("expected Doctor command"),
+        }
     }
 
     #[test]
