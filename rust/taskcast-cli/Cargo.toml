@@ -29,5 +29,10 @@ reqwest = { version = "0.12", features = ["json", "stream"] }
 chrono = "0.4"
 futures-util = "0.3"
 
+[lib]
+name = "taskcast_cli"
+path = "src/lib.rs"
+
 [dev-dependencies]
 tempfile = { workspace = true }
+axum-test = "19"
