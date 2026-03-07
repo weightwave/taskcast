@@ -1,5 +1,7 @@
 use std::sync::Arc;
+use std::time::Instant;
 
+use axum::extract::State as AxumState;
 use axum::middleware;
 use axum::response::IntoResponse;
 use axum::routing::{get, patch, post};
@@ -27,6 +29,8 @@ use crate::routes::{admin, sse, tasks};
 pub struct AppState {
     pub engine: Arc<TaskEngine>,
     pub auth_mode: Arc<AuthMode>,
+    pub start_time: Instant,
+    pub config: Option<Arc<TaskcastConfig>>,
 }
 
 /// Create the Axum router with all taskcast routes mounted.
@@ -41,6 +45,13 @@ pub fn create_app(
 ) -> (Router, Option<WsRegistry>) {
     let auth_mode = Arc::new(auth_mode);
     let subscriber_counts = create_subscriber_counts();
+
+    let app_state = AppState {
+        engine: Arc::clone(&engine),
+        auth_mode: Arc::clone(&auth_mode),
+        start_time: Instant::now(),
+        config: config.as_ref().map(|c| Arc::new(c.clone())),
+    };
 
     let task_routes = Router::new()
         .route("/", get(tasks::list_tasks).post(tasks::create_task))
@@ -58,6 +69,7 @@ pub fn create_app(
 
     let mut app = Router::new()
         .route("/health", get(health))
+        .route("/health/detail", get(health_detail).with_state(app_state))
         .nest("/tasks", task_routes);
 
     // Conditionally mount worker routes if a WorkerManager is provided
@@ -168,6 +180,43 @@ pub fn create_app(
 
 async fn health() -> impl IntoResponse {
     axum::Json(serde_json::json!({ "ok": true }))
+}
+
+async fn health_detail(AxumState(state): AxumState<AppState>) -> impl IntoResponse {
+    let uptime = state.start_time.elapsed().as_secs();
+    let auth_mode_str = match state.auth_mode.as_ref() {
+        AuthMode::None => "none",
+        AuthMode::Jwt(_) => "jwt",
+    };
+
+    let mut adapters = serde_json::json!({
+        "broadcast": { "provider": "memory", "status": "ok" },
+        "shortTermStore": { "provider": "memory", "status": "ok" }
+    });
+
+    if let Some(ref config) = state.config {
+        if let Some(ref adp) = config.adapters {
+            if let Some(ref b) = adp.broadcast {
+                adapters["broadcast"]["provider"] = serde_json::json!(b.provider);
+            }
+            if let Some(ref s) = adp.short_term_store {
+                adapters["shortTermStore"]["provider"] = serde_json::json!(s.provider);
+            }
+            if let Some(ref l) = adp.long_term_store {
+                adapters["longTermStore"] = serde_json::json!({
+                    "provider": l.provider,
+                    "status": "ok"
+                });
+            }
+        }
+    }
+
+    axum::Json(serde_json::json!({
+        "ok": true,
+        "uptime": uptime,
+        "auth": { "mode": auth_mode_str },
+        "adapters": adapters
+    }))
 }
 
 // ─── Extracted dispatch helpers (testable without closures) ─────────────────
