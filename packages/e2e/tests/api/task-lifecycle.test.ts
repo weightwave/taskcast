@@ -131,10 +131,10 @@ describe('Task Lifecycle API', () => {
     const runningBody = await runningRes.json()
     expect(runningBody.tasks.some((t: { id: string }) => t.id === id)).toBe(true)
 
-    const pendingRes = await fetch(`${server.baseUrl}/tasks?status=completed`)
-    expect(pendingRes.status).toBe(200)
-    const pendingBody = await pendingRes.json()
-    expect(pendingBody.tasks.some((t: { id: string }) => t.id === id)).toBe(false)
+    const completedRes = await fetch(`${server.baseUrl}/tasks?status=completed`)
+    expect(completedRes.status).toBe(200)
+    const completedBody = await completedRes.json()
+    expect(completedBody.tasks.some((t: { id: string }) => t.id === id)).toBe(false)
   })
 
   // ─── Events ───────────────────────────────────────────────────────────────

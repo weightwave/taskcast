@@ -112,6 +112,7 @@ function shutdown() {
   stop()
   apiServer.close()
   dashboardServer.close()
+  process.exit(0)
 }
 
 process.on('SIGTERM', shutdown)

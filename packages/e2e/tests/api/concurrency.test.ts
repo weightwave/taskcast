@@ -1,55 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import { startServer, type TestServer } from '../helpers/server.js'
-
-// ─── SSE Helper ───────────────────────────────────────────────────────────────
-
-interface SSEMessage {
-  event: string
-  data: string
-  id?: string
-}
-
-async function collectSSE(
-  response: Response,
-  opts?: { signal?: AbortSignal },
-): Promise<SSEMessage[]> {
-  const messages: SSEMessage[] = []
-  const reader = response.body!.getReader()
-  const decoder = new TextDecoder()
-  let buffer = ''
-
-  try {
-    // eslint-disable-next-line no-constant-condition
-    while (true) {
-      if (opts?.signal?.aborted) break
-      const { done, value } = await reader.read()
-      if (done) break
-
-      buffer += decoder.decode(value, { stream: true })
-      const parts = buffer.split('\n\n')
-      buffer = parts.pop()!
-
-      for (const part of parts) {
-        if (!part.trim()) continue
-        const msg: SSEMessage = { event: '', data: '' }
-        for (const line of part.split('\n')) {
-          if (line.startsWith('event:')) msg.event = line.slice(6).trim()
-          else if (line.startsWith('data:')) msg.data = line.slice(5).trim()
-          else if (line.startsWith('id:')) msg.id = line.slice(3).trim()
-        }
-        if (msg.event || msg.data) messages.push(msg)
-      }
-    }
-  } catch (err) {
-    if (!(err instanceof DOMException && err.name === 'AbortError')) throw err
-  } finally {
-    reader.releaseLock()
-  }
-
-  return messages
-}
-
-// ─── Tests ────────────────────────────────────────────────────────────────────
+import { collectSSE } from '../helpers/sse.js'
 
 describe('Concurrency API', () => {
   let server: TestServer
