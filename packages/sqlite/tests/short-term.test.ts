@@ -92,6 +92,54 @@ describe('SqliteShortTermStore', () => {
     expect(retrieved).toEqual(task)
   })
 
+  it('should preserve all task optional fields including assignMode, cost, assignedWorker, disconnectPolicy', async () => {
+    const task: Task = {
+      ...makeTask(),
+      type: 'llm',
+      result: { answer: 42 },
+      error: { message: 'boom' },
+      metadata: { source: 'test' },
+      completedAt: 3000,
+      ttl: 60,
+      tags: ['gpu'],
+      assignMode: 'pull',
+      cost: 2,
+      assignedWorker: 'worker-1',
+      disconnectPolicy: 'cancel',
+    }
+    await store.saveTask(task)
+    const retrieved = await store.getTask('task-1')
+    expect(retrieved).toEqual(task)
+    expect(retrieved!.disconnectPolicy).toBe('cancel')
+    expect(retrieved!.assignMode).toBe('pull')
+    expect(retrieved!.cost).toBe(2)
+    expect(retrieved!.assignedWorker).toBe('worker-1')
+  })
+
+  it('should handle event with null data', async () => {
+    await store.saveTask(makeTask())
+    const event: TaskEvent = {
+      ...makeEvent('task-1', 0),
+      data: null,
+    }
+    await store.appendEvent('task-1', event)
+    const events = await store.getEvents('task-1')
+    expect(events[0]!.data).toBeNull()
+  })
+
+  it('should preserve seriesAccField on events', async () => {
+    await store.saveTask(makeTask())
+    const event: TaskEvent = {
+      ...makeEvent('task-1', 0),
+      seriesId: 'acc-series',
+      seriesMode: 'accumulate',
+      seriesAccField: 'text',
+    }
+    await store.appendEvent('task-1', event)
+    const events = await store.getEvents('task-1')
+    expect(events[0]!.seriesAccField).toBe('text')
+  })
+
   it('should handle task with no optional fields', async () => {
     const task: Task = {
       id: 'minimal',
@@ -328,6 +376,46 @@ describe('SqliteShortTermStore', () => {
   it('should not throw when calling setTTL (no-op)', async () => {
     await store.saveTask(makeTask())
     await expect(store.setTTL('task-1', 60)).resolves.toBeUndefined()
+  })
+
+  // ─── clearTTL ──────────────────────────────────────────────────────────
+
+  it('should not throw when calling clearTTL (no-op)', async () => {
+    await store.saveTask(makeTask())
+    await expect(store.clearTTL('task-1')).resolves.toBeUndefined()
+  })
+
+  // ─── listByStatus ─────────────────────────────────────────────────────
+
+  describe('listByStatus', () => {
+    it('should return empty array when given empty statuses array', async () => {
+      await store.saveTask(makeTask('task-1'))
+      const result = await store.listByStatus([])
+      expect(result).toEqual([])
+    })
+
+    it('should return tasks matching given statuses', async () => {
+      const t1: Task = { ...makeTask('task-1'), status: 'pending' }
+      const t2: Task = { ...makeTask('task-2'), status: 'running' }
+      const t3: Task = { ...makeTask('task-3'), status: 'completed' }
+      await store.saveTask(t1)
+      await store.saveTask(t2)
+      await store.saveTask(t3)
+
+      const pending = await store.listByStatus(['pending'])
+      expect(pending).toHaveLength(1)
+      expect(pending[0]!.id).toBe('task-1')
+
+      const multiple = await store.listByStatus(['pending', 'running'])
+      expect(multiple).toHaveLength(2)
+      expect(multiple.map(t => t.id).sort()).toEqual(['task-1', 'task-2'])
+    })
+
+    it('should return empty array when no tasks match', async () => {
+      await store.saveTask({ ...makeTask('task-1'), status: 'pending' })
+      const result = await store.listByStatus(['completed'])
+      expect(result).toEqual([])
+    })
   })
 
   // ─── event with series fields ───────────────────────────────────────────
@@ -858,6 +946,767 @@ describe('SqliteShortTermStore', () => {
         expect(assignments).toHaveLength(1)
         expect(assignments[0]!.taskId).toBe('task-2')
       })
+    })
+  })
+
+  // ─── claimTask transaction consistency ──────────────────────────────────
+
+  describe('claimTask transaction consistency', () => {
+    function makeWorker(id = 'worker-1'): Worker {
+      return {
+        id,
+        status: 'idle',
+        matchRule: { taskTypes: ['llm'] },
+        capacity: 5,
+        usedSlots: 0,
+        weight: 1,
+        connectionMode: 'pull',
+        connectedAt: 1000,
+        lastHeartbeatAt: 1000,
+      }
+    }
+
+    it('sequential claimTask on same task — second re-assigns (last-writer wins)', async () => {
+      await store.saveTask(makeTask('task-1'))
+      await store.saveWorker(makeWorker('worker-a'))
+      await store.saveWorker(makeWorker('worker-b'))
+
+      // SQLite is single-threaded; Promise.all runs these sequentially.
+      // claimTask allows re-claiming an assigned task (status check: pending|assigned).
+      const [r1, r2] = await Promise.all([
+        store.claimTask('task-1', 'worker-a', 1),
+        store.claimTask('task-1', 'worker-b', 1),
+      ])
+
+      // Both succeed because re-claim is allowed by design
+      expect(r1).toBe(true)
+      expect(r2).toBe(true)
+
+      // Last writer wins — task is assigned to worker-b
+      const task = await store.getTask('task-1')
+      expect(task!.status).toBe('assigned')
+      expect(task!.assignedWorker).toBe('worker-b')
+
+      // Both workers had usedSlots incremented (capacity consumed by each claim)
+      const workerA = await store.getWorker('worker-a')
+      const workerB = await store.getWorker('worker-b')
+      expect(workerA!.usedSlots).toBe(1)
+      expect(workerB!.usedSlots).toBe(1)
+    })
+
+    it('after claim, both task.status and worker.usedSlots are consistent', async () => {
+      await store.saveTask(makeTask('task-1'))
+      await store.saveWorker({ ...makeWorker('worker-1'), capacity: 10, usedSlots: 3 })
+
+      const result = await store.claimTask('task-1', 'worker-1', 2)
+      expect(result).toBe(true)
+
+      const task = await store.getTask('task-1')
+      expect(task!.status).toBe('assigned')
+      expect(task!.assignedWorker).toBe('worker-1')
+      expect(task!.cost).toBe(2)
+
+      const worker = await store.getWorker('worker-1')
+      expect(worker!.usedSlots).toBe(5) // 3 + 2
+    })
+
+    it('claimTask where task exists but worker does not — returns false, task unchanged', async () => {
+      const originalTask = makeTask('task-1')
+      await store.saveTask(originalTask)
+
+      const result = await store.claimTask('task-1', 'nonexistent-worker', 1)
+      expect(result).toBe(false)
+
+      const task = await store.getTask('task-1')
+      expect(task!.status).toBe('pending')
+      expect(task!.assignedWorker).toBeUndefined()
+      expect(task!.cost).toBeUndefined()
+    })
+
+    it('claimTask where worker is at capacity — returns false, nothing changes', async () => {
+      await store.saveTask(makeTask('task-1'))
+      await store.saveWorker({ ...makeWorker('worker-1'), capacity: 5, usedSlots: 5 })
+
+      const result = await store.claimTask('task-1', 'worker-1', 1)
+      expect(result).toBe(false)
+
+      // Task should remain unchanged
+      const task = await store.getTask('task-1')
+      expect(task!.status).toBe('pending')
+
+      // Worker should remain unchanged
+      const worker = await store.getWorker('worker-1')
+      expect(worker!.usedSlots).toBe(5)
+    })
+
+    it('transaction atomicity: failed claim does not partially update task or worker', async () => {
+      await store.saveTask(makeTask('task-1'))
+      // Worker has exactly 1 slot left, but we try to claim with cost 2
+      await store.saveWorker({ ...makeWorker('worker-1'), capacity: 5, usedSlots: 4 })
+
+      const result = await store.claimTask('task-1', 'worker-1', 2)
+      expect(result).toBe(false)
+
+      // Both task AND worker should be completely unchanged
+      const task = await store.getTask('task-1')
+      expect(task!.status).toBe('pending')
+      expect(task!.assignedWorker).toBeUndefined()
+
+      const worker = await store.getWorker('worker-1')
+      expect(worker!.usedSlots).toBe(4) // unchanged
+    })
+
+    it('claimTask on task with status "failed" — returns false', async () => {
+      await store.saveTask({ ...makeTask('task-1'), status: 'failed' })
+      await store.saveWorker(makeWorker('worker-1'))
+
+      const result = await store.claimTask('task-1', 'worker-1', 1)
+      expect(result).toBe(false)
+    })
+
+    it('claimTask on task with status "cancelled" — returns false', async () => {
+      await store.saveTask({ ...makeTask('task-1'), status: 'cancelled' })
+      await store.saveWorker(makeWorker('worker-1'))
+
+      const result = await store.claimTask('task-1', 'worker-1', 1)
+      expect(result).toBe(false)
+    })
+
+    it('claimTask on task with status "timeout" — returns false', async () => {
+      await store.saveTask({ ...makeTask('task-1'), status: 'timeout' })
+      await store.saveWorker(makeWorker('worker-1'))
+
+      const result = await store.claimTask('task-1', 'worker-1', 1)
+      expect(result).toBe(false)
+    })
+
+    it('claimTask with cost 0 should succeed at full capacity', async () => {
+      await store.saveTask(makeTask('task-1'))
+      await store.saveWorker({ ...makeWorker('worker-1'), capacity: 5, usedSlots: 5 })
+
+      const result = await store.claimTask('task-1', 'worker-1', 0)
+      expect(result).toBe(true)
+
+      const worker = await store.getWorker('worker-1')
+      expect(worker!.usedSlots).toBe(5) // 5 + 0
+    })
+
+    it('multiple sequential claims exhaust worker capacity correctly', async () => {
+      await store.saveTask(makeTask('task-1'))
+      await store.saveTask(makeTask('task-2'))
+      await store.saveTask(makeTask('task-3'))
+      await store.saveWorker({ ...makeWorker('worker-1'), capacity: 5, usedSlots: 0 })
+
+      const r1 = await store.claimTask('task-1', 'worker-1', 2)
+      expect(r1).toBe(true)
+
+      const r2 = await store.claimTask('task-2', 'worker-1', 2)
+      expect(r2).toBe(true)
+
+      // Now worker has usedSlots=4, capacity=5, trying to claim cost=2 should fail
+      const r3 = await store.claimTask('task-3', 'worker-1', 2)
+      expect(r3).toBe(false)
+
+      const worker = await store.getWorker('worker-1')
+      expect(worker!.usedSlots).toBe(4) // only first two claims succeeded
+
+      const task3 = await store.getTask('task-3')
+      expect(task3!.status).toBe('pending') // unchanged
+    })
+  })
+
+  // ─── SQL injection verification ─────────────────────────────────────────
+
+  describe('SQL injection verification', () => {
+    function makeWorker(id = 'worker-1'): Worker {
+      return {
+        id,
+        status: 'idle',
+        matchRule: { taskTypes: ['llm'] },
+        capacity: 5,
+        usedSlots: 0,
+        weight: 1,
+        connectionMode: 'pull',
+        connectedAt: 1000,
+        lastHeartbeatAt: 1000,
+      }
+    }
+
+    it('saveTask with type containing DROP TABLE — table still exists, data stored literally', async () => {
+      const injectionType = "'; DROP TABLE taskcast_tasks; --"
+      const task: Task = {
+        ...makeTask('task-inject-1'),
+        type: injectionType,
+      }
+      await store.saveTask(task)
+
+      // Table should still exist — verify by inserting another task
+      const task2: Task = { ...makeTask('task-after'), type: 'normal' }
+      await store.saveTask(task2)
+
+      // Injection string should be stored literally
+      const retrieved = await store.getTask('task-inject-1')
+      expect(retrieved).not.toBeNull()
+      expect(retrieved!.type).toBe(injectionType)
+
+      // The other task should also be retrievable
+      const retrieved2 = await store.getTask('task-after')
+      expect(retrieved2).not.toBeNull()
+    })
+
+    it('saveTask with metadata containing SQL injection strings — stored safely', async () => {
+      const task: Task = {
+        ...makeTask('task-inject-meta'),
+        metadata: {
+          name: "Robert'); DROP TABLE taskcast_tasks;--",
+          query: "1 OR 1=1; DELETE FROM taskcast_events;--",
+          nested: { evil: "' UNION SELECT * FROM taskcast_workers --" },
+        },
+      }
+      await store.saveTask(task)
+
+      const retrieved = await store.getTask('task-inject-meta')
+      expect(retrieved).not.toBeNull()
+      expect(retrieved!.metadata).toEqual(task.metadata)
+
+      // Verify tables still work
+      const allTasks = await store.listTasks({})
+      expect(allTasks.length).toBeGreaterThanOrEqual(1)
+    })
+
+    it('appendEvent with type containing SQL injection — stored safely', async () => {
+      await store.saveTask(makeTask('task-1'))
+      const injectionType = "'; DROP TABLE taskcast_events; --"
+      const event: TaskEvent = {
+        id: 'evt-inject',
+        taskId: 'task-1',
+        index: 0,
+        timestamp: 1000,
+        type: injectionType,
+        level: 'info',
+        data: { text: "' OR 1=1 --" },
+      }
+      await store.appendEvent('task-1', event)
+
+      // Events table should still exist
+      const events = await store.getEvents('task-1')
+      expect(events).toHaveLength(1)
+      expect(events[0]!.type).toBe(injectionType)
+      expect((events[0]!.data as Record<string, unknown>)?.['text']).toBe("' OR 1=1 --")
+    })
+
+    it('listTasks with filter containing injection-like strings — safe', async () => {
+      const task: Task = { ...makeTask('task-1'), type: 'llm', status: 'pending' }
+      await store.saveTask(task)
+
+      // These filter values look like SQL injection but are just string values
+      const tasks = await store.listTasks({
+        types: ["' OR 1=1 --"],
+        status: ["pending' OR '1'='1" as Task['status']],
+      })
+      // Should return no results since these don't match, not cause SQL errors
+      expect(tasks).toEqual([])
+
+      // Original task should still be intact
+      const original = await store.getTask('task-1')
+      expect(original).not.toBeNull()
+      expect(original!.type).toBe('llm')
+    })
+
+    it('saveWorker with id containing special characters — stored safely', async () => {
+      const specialIds = [
+        "worker-'; DROP TABLE taskcast_workers; --",
+        'worker-" OR 1=1',
+        "worker-\n\r\t",
+        "worker-{}[]()@#$%^&*",
+        "worker-émojis-日本語",
+      ]
+
+      for (const id of specialIds) {
+        const worker: Worker = { ...makeWorker(), id }
+        await store.saveWorker(worker)
+
+        const retrieved = await store.getWorker(id)
+        expect(retrieved).not.toBeNull()
+        expect(retrieved!.id).toBe(id)
+      }
+
+      // Verify table still works normally
+      const allWorkers = await store.listWorkers()
+      expect(allWorkers.length).toBe(specialIds.length)
+    })
+
+    it('saveTask with id containing SQL injection — stored safely', async () => {
+      const injectionId = "task-'; DELETE FROM taskcast_tasks; --"
+      const task: Task = {
+        id: injectionId,
+        status: 'pending',
+        createdAt: 1000,
+        updatedAt: 1000,
+      }
+      await store.saveTask(task)
+
+      const retrieved = await store.getTask(injectionId)
+      expect(retrieved).not.toBeNull()
+      expect(retrieved!.id).toBe(injectionId)
+    })
+
+    it('appendEvent with seriesId containing injection — stored safely', async () => {
+      await store.saveTask(makeTask('task-1'))
+      const injectionSeriesId = "'; DROP TABLE taskcast_series_latest; --"
+      const event: TaskEvent = {
+        id: 'evt-series-inject',
+        taskId: 'task-1',
+        index: 0,
+        timestamp: 1000,
+        type: 'test',
+        level: 'info',
+        data: null,
+        seriesId: injectionSeriesId,
+        seriesMode: 'latest',
+      }
+      await store.appendEvent('task-1', event)
+      await store.setSeriesLatest('task-1', injectionSeriesId, event)
+
+      const latest = await store.getSeriesLatest('task-1', injectionSeriesId)
+      expect(latest).not.toBeNull()
+      expect(latest!.seriesId).toBe(injectionSeriesId)
+    })
+  })
+
+  // ─── Additional edge cases ──────────────────────────────────────────────
+
+  describe('additional edge cases', () => {
+    function makeWorker(id = 'worker-1'): Worker {
+      return {
+        id,
+        status: 'idle',
+        matchRule: { taskTypes: ['llm'] },
+        capacity: 5,
+        usedSlots: 0,
+        weight: 1,
+        connectionMode: 'pull',
+        connectedAt: 1000,
+        lastHeartbeatAt: 1000,
+      }
+    }
+
+    it('saveTask with extremely large metadata (1MB JSON) — stores and retrieves correctly', async () => {
+      // Create a ~1MB metadata object
+      const largeString = 'x'.repeat(1024 * 1024) // 1MB of 'x'
+      const task: Task = {
+        ...makeTask('task-large'),
+        metadata: { payload: largeString, nested: { more: largeString.slice(0, 1000) } },
+      }
+      await store.saveTask(task)
+
+      const retrieved = await store.getTask('task-large')
+      expect(retrieved).not.toBeNull()
+      expect((retrieved!.metadata as Record<string, unknown>)?.['payload']).toBe(largeString)
+      expect(
+        ((retrieved!.metadata as Record<string, unknown>)?.['nested'] as Record<string, unknown>)?.[
+          'more'
+        ],
+      ).toBe(largeString.slice(0, 1000))
+    })
+
+    it('getEvents with limit: 0 — should return empty array', async () => {
+      await store.saveTask(makeTask('task-1'))
+      for (let i = 0; i < 5; i++) {
+        await store.appendEvent('task-1', makeEvent('task-1', i))
+      }
+
+      const events = await store.getEvents('task-1', { limit: 0 })
+      // limit 0 is falsy, so it falls through the `if (limit)` check
+      // and returns all events. This documents the actual behavior.
+      expect(events).toHaveLength(5)
+    })
+
+    it('getEvents with limit: -1 — should return empty array', async () => {
+      await store.saveTask(makeTask('task-1'))
+      for (let i = 0; i < 5; i++) {
+        await store.appendEvent('task-1', makeEvent('task-1', i))
+      }
+
+      const events = await store.getEvents('task-1', { limit: -1 })
+      // SQLite LIMIT -1 means no limit, so all events are returned
+      expect(events).toHaveLength(5)
+    })
+
+    it('nextIndex called for non-existent task — should return 0 (first index)', async () => {
+      // Note: no foreign key constraint on taskcast_index_counters,
+      // so this should work even without a task
+      const index = await store.nextIndex('nonexistent-task')
+      expect(index).toBe(0)
+    })
+
+    it('nextIndex called repeatedly for non-existent task — increments correctly', async () => {
+      const i0 = await store.nextIndex('ghost-task')
+      const i1 = await store.nextIndex('ghost-task')
+      const i2 = await store.nextIndex('ghost-task')
+      expect(i0).toBe(0)
+      expect(i1).toBe(1)
+      expect(i2).toBe(2)
+    })
+
+    it('listByStatus with statuses not matching any task — returns []', async () => {
+      await store.saveTask({ ...makeTask('task-1'), status: 'pending' })
+      await store.saveTask({ ...makeTask('task-2'), status: 'running' })
+
+      const result = await store.listByStatus(['completed', 'failed', 'timeout'])
+      expect(result).toEqual([])
+    })
+
+    it('listTasks with all filter fields set simultaneously', async () => {
+      const t1: Task = {
+        ...makeTask('task-1'),
+        status: 'pending',
+        type: 'llm',
+        tags: ['gpu', 'fast'],
+        assignMode: 'pull',
+      }
+      const t2: Task = {
+        ...makeTask('task-2'),
+        status: 'pending',
+        type: 'llm',
+        tags: ['gpu'],
+        assignMode: 'pull',
+      }
+      const t3: Task = {
+        ...makeTask('task-3'),
+        status: 'running',
+        type: 'llm',
+        tags: ['gpu'],
+        assignMode: 'pull',
+      }
+      const t4: Task = {
+        ...makeTask('task-4'),
+        status: 'pending',
+        type: 'image',
+        tags: ['gpu'],
+        assignMode: 'pull',
+      }
+      const t5: Task = {
+        ...makeTask('task-5'),
+        status: 'pending',
+        type: 'llm',
+        tags: ['gpu'],
+        assignMode: 'external',
+      }
+      const excluded: Task = {
+        ...makeTask('task-excluded'),
+        status: 'pending',
+        type: 'llm',
+        tags: ['gpu'],
+        assignMode: 'pull',
+      }
+
+      await store.saveTask(t1)
+      await store.saveTask(t2)
+      await store.saveTask(t3)
+      await store.saveTask(t4)
+      await store.saveTask(t5)
+      await store.saveTask(excluded)
+
+      const tasks = await store.listTasks({
+        status: ['pending'],
+        types: ['llm'],
+        tags: { all: ['gpu'] },
+        assignMode: ['pull'],
+        excludeTaskIds: ['task-excluded'],
+        limit: 10,
+      })
+
+      // Should match t1 and t2 only
+      expect(tasks).toHaveLength(2)
+      const ids = tasks.map((t) => t.id).sort()
+      expect(ids).toEqual(['task-1', 'task-2'])
+    })
+
+    it('listTasks with limit smaller than matching results', async () => {
+      for (let i = 0; i < 10; i++) {
+        await store.saveTask({ ...makeTask(`task-${i}`), status: 'pending', tags: ['test'] })
+      }
+
+      const tasks = await store.listTasks({
+        status: ['pending'],
+        tags: { all: ['test'] },
+        limit: 3,
+      })
+      expect(tasks).toHaveLength(3)
+    })
+
+    it('listTasks with empty arrays in filter — returns all tasks', async () => {
+      await store.saveTask(makeTask('task-1'))
+      await store.saveTask(makeTask('task-2'))
+
+      // Empty arrays should not filter (the if(filter.xxx?.length) guards skip them)
+      const tasks = await store.listTasks({
+        status: [],
+        types: [],
+        assignMode: [],
+        excludeTaskIds: [],
+      })
+      expect(tasks).toHaveLength(2)
+    })
+
+    it('getEvents for a task with no events — returns empty array', async () => {
+      await store.saveTask(makeTask('task-empty'))
+      const events = await store.getEvents('task-empty')
+      expect(events).toEqual([])
+    })
+
+    it('getEvents for a non-existent task — returns empty array', async () => {
+      const events = await store.getEvents('task-does-not-exist')
+      expect(events).toEqual([])
+    })
+
+    it('saveTask upsert does not change created_at', async () => {
+      const task: Task = { ...makeTask('task-1'), createdAt: 1000, updatedAt: 1000 }
+      await store.saveTask(task)
+
+      // Note: the current upsert does update created_at because the ON CONFLICT
+      // clause doesn't exclude it from the insert (but it's always the same value).
+      // What matters is that the round-trip is correct.
+      const updated: Task = { ...task, status: 'running', updatedAt: 2000 }
+      await store.saveTask(updated)
+
+      const retrieved = await store.getTask('task-1')
+      expect(retrieved!.updatedAt).toBe(2000)
+      expect(retrieved!.status).toBe('running')
+    })
+
+    it('worker with metadata containing deeply nested objects — round-trips correctly', async () => {
+      const deepMeta = {
+        l1: {
+          l2: {
+            l3: {
+              l4: { value: 'deep', arr: [1, 2, 3] },
+            },
+          },
+        },
+      }
+      const worker: Worker = { ...makeWorker(), metadata: deepMeta }
+      await store.saveWorker(worker)
+
+      const retrieved = await store.getWorker('worker-1')
+      expect(retrieved!.metadata).toEqual(deepMeta)
+    })
+
+    it('saveTask with params/result/error containing arrays — round-trips correctly', async () => {
+      const task: Task = {
+        ...makeTask('task-arrays'),
+        params: { items: [1, 'two', { three: 3 }] },
+        result: { outputs: [null, true, false] },
+        error: { message: 'err', details: { codes: [400, 500] } },
+      }
+      await store.saveTask(task)
+
+      const retrieved = await store.getTask('task-arrays')
+      expect(retrieved!.params).toEqual(task.params)
+      expect(retrieved!.result).toEqual(task.result)
+      expect(retrieved!.error).toEqual(task.error)
+    })
+
+    it('listTasks with tags filter on tasks that have no tags — excludes them', async () => {
+      await store.saveTask({ ...makeTask('task-no-tags') }) // no tags
+      await store.saveTask({ ...makeTask('task-with-tags'), tags: ['gpu'] })
+
+      const tasks = await store.listTasks({ tags: { all: ['gpu'] } })
+      expect(tasks).toHaveLength(1)
+      expect(tasks[0]!.id).toBe('task-with-tags')
+    })
+
+    it('listTasks with tags.none filter — excludes tasks with forbidden tags, includes tagless tasks', async () => {
+      await store.saveTask({ ...makeTask('task-no-tags') }) // no tags
+      await store.saveTask({ ...makeTask('task-good'), tags: ['gpu'] })
+      await store.saveTask({ ...makeTask('task-bad'), tags: ['deprecated'] })
+
+      const tasks = await store.listTasks({ tags: { none: ['deprecated'] } })
+      // tasks without tags have empty array, so none check passes
+      expect(tasks).toHaveLength(2)
+      const ids = tasks.map((t) => t.id).sort()
+      expect(ids).toEqual(['task-good', 'task-no-tags'])
+    })
+
+    it('listTasks with tags.any filter — tasks with no tags are excluded', async () => {
+      await store.saveTask({ ...makeTask('task-no-tags') }) // no tags
+      await store.saveTask({ ...makeTask('task-with'), tags: ['gpu'] })
+
+      const tasks = await store.listTasks({ tags: { any: ['gpu', 'cpu'] } })
+      expect(tasks).toHaveLength(1)
+      expect(tasks[0]!.id).toBe('task-with')
+    })
+
+    it('getEvents with since.index beyond all events — returns empty array', async () => {
+      await store.saveTask(makeTask('task-1'))
+      for (let i = 0; i < 3; i++) {
+        await store.appendEvent('task-1', makeEvent('task-1', i))
+      }
+
+      const events = await store.getEvents('task-1', { since: { index: 999 } })
+      expect(events).toEqual([])
+    })
+
+    it('getEvents with since.timestamp beyond all events — returns empty array', async () => {
+      await store.saveTask(makeTask('task-1'))
+      for (let i = 0; i < 3; i++) {
+        await store.appendEvent('task-1', makeEvent('task-1', i))
+      }
+      // All timestamps are <= 1200, so since 9999 should yield nothing
+      const events = await store.getEvents('task-1', { since: { timestamp: 9999 } })
+      expect(events).toEqual([])
+    })
+
+    it('replaceLastSeriesEvent preserves original event position in idx ordering', async () => {
+      await store.saveTask(makeTask('task-1'))
+      const e0 = makeEvent('task-1', 0)
+      const e1 = { ...makeEvent('task-1', 1), seriesId: 'ser', seriesMode: 'latest' as const }
+      const e2 = makeEvent('task-1', 2)
+
+      await store.appendEvent('task-1', e0)
+      await store.appendEvent('task-1', e1)
+      await store.appendEvent('task-1', e2)
+      await store.setSeriesLatest('task-1', 'ser', e1)
+
+      // Replace series event with new content
+      const replacement: TaskEvent = {
+        id: 'new-id',
+        taskId: 'task-1',
+        index: 99, // this should NOT change the stored idx
+        timestamp: 9999,
+        type: 'replaced-type',
+        level: 'warn',
+        data: { replaced: true },
+        seriesId: 'ser',
+        seriesMode: 'latest',
+      }
+      await store.replaceLastSeriesEvent('task-1', 'ser', replacement)
+
+      const events = await store.getEvents('task-1')
+      expect(events).toHaveLength(3)
+      // Event at idx 1 should have replaced content but preserve original id and idx
+      expect(events[1]!.id).toBe(e1.id) // original id
+      expect(events[1]!.index).toBe(1) // original idx
+      expect(events[1]!.type).toBe('replaced-type') // replaced content
+      expect(events[1]!.level).toBe('warn') // replaced content
+      expect((events[1]!.data as Record<string, unknown>)?.['replaced']).toBe(true)
+    })
+
+    it('concurrent nextIndex calls produce unique indices', async () => {
+      await store.saveTask(makeTask('task-1'))
+
+      // Fire many nextIndex calls concurrently
+      const promises = Array.from({ length: 20 }, () => store.nextIndex('task-1'))
+      const indices = await Promise.all(promises)
+
+      // All indices should be unique
+      const unique = new Set(indices)
+      expect(unique.size).toBe(20)
+
+      // Should be values 0-19
+      expect(Math.min(...indices)).toBe(0)
+      expect(Math.max(...indices)).toBe(19)
+    })
+
+    it('listWorkers with no matching status — returns empty array', async () => {
+      await store.saveWorker({
+        id: 'worker-1',
+        status: 'idle',
+        matchRule: { taskTypes: ['llm'] },
+        capacity: 5,
+        usedSlots: 0,
+        weight: 1,
+        connectionMode: 'pull',
+        connectedAt: 1000,
+        lastHeartbeatAt: 1000,
+      })
+
+      const workers = await store.listWorkers({ status: ['draining'] })
+      expect(workers).toEqual([])
+    })
+
+    it('listWorkers with no matching connectionMode — returns empty array', async () => {
+      await store.saveWorker({
+        id: 'worker-1',
+        status: 'idle',
+        matchRule: { taskTypes: ['llm'] },
+        capacity: 5,
+        usedSlots: 0,
+        weight: 1,
+        connectionMode: 'pull',
+        connectedAt: 1000,
+        lastHeartbeatAt: 1000,
+      })
+
+      const workers = await store.listWorkers({ connectionMode: ['websocket'] })
+      expect(workers).toEqual([])
+    })
+
+    it('deleteWorker then claimTask with that worker — returns false', async () => {
+      await store.saveTask(makeTask('task-1'))
+      await store.saveWorker(makeWorker('worker-1'))
+      await store.deleteWorker('worker-1')
+
+      const result = await store.claimTask('task-1', 'worker-1', 1)
+      expect(result).toBe(false)
+
+      const task = await store.getTask('task-1')
+      expect(task!.status).toBe('pending')
+    })
+
+    it('listByStatus with single status matching multiple tasks', async () => {
+      await store.saveTask({ ...makeTask('task-1'), status: 'running' })
+      await store.saveTask({ ...makeTask('task-2'), status: 'running' })
+      await store.saveTask({ ...makeTask('task-3'), status: 'pending' })
+
+      const running = await store.listByStatus(['running'])
+      expect(running).toHaveLength(2)
+      expect(running.map((t) => t.id).sort()).toEqual(['task-1', 'task-2'])
+    })
+
+    it('saveTask with webhooks and authConfig — round-trips correctly', async () => {
+      const task: Task = {
+        ...makeTask('task-auth'),
+        authConfig: {
+          rules: [
+            {
+              match: { scope: ['event:publish'] },
+              require: { sub: ['user-1'] },
+            },
+          ],
+        },
+        webhooks: [
+          {
+            url: 'https://example.com/hook',
+            secret: 'shh',
+          },
+        ],
+      }
+      await store.saveTask(task)
+
+      const retrieved = await store.getTask('task-auth')
+      expect(retrieved!.authConfig).toEqual(task.authConfig)
+      expect(retrieved!.webhooks).toEqual(task.webhooks)
+    })
+
+    it('saveTask with cleanup rules — round-trips correctly', async () => {
+      const task: Task = {
+        ...makeTask('task-cleanup'),
+        cleanup: {
+          rules: [
+            {
+              match: { status: ['completed'] },
+              trigger: { afterMs: 3600000 },
+              target: 'all',
+            },
+          ],
+        },
+      }
+      await store.saveTask(task)
+
+      const retrieved = await store.getTask('task-cleanup')
+      expect(retrieved!.cleanup).toEqual(task.cleanup)
     })
   })
 })

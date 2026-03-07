@@ -52,4 +52,5 @@ describe('Server integration — concurrent transitions', () => {
     const final = await getRes.json()
     expect(['completed', 'failed']).toContain(final.status)
   })
+
 })

@@ -69,6 +69,52 @@ auth:
   })
 })
 
+describe('parseConfig - malformed input', () => {
+  it('throws SyntaxError on invalid JSON', () => {
+    expect(() => parseConfig('not json at all', 'json')).toThrow(SyntaxError)
+  })
+
+  it('throws on truncated JSON', () => {
+    expect(() => parseConfig('{"port": 3721', 'json')).toThrow()
+  })
+
+  it('throws on empty string JSON', () => {
+    expect(() => parseConfig('', 'json')).toThrow()
+  })
+
+  it('provides useful error message on invalid JSON', () => {
+    try {
+      parseConfig('not json', 'json')
+      expect.fail('should have thrown')
+    } catch (e: any) {
+      // The error message should indicate a parse problem
+      expect(e.message).toBeTruthy()
+      expect(typeof e.message).toBe('string')
+    }
+  })
+
+  it('handles invalid YAML without crashing', () => {
+    // Invalid YAML that js-yaml should reject
+    expect(() => parseConfig('not: [yaml', 'yaml')).toThrow()
+  })
+
+  it('returns empty-ish config for YAML that parses to a scalar', () => {
+    // "hello" is valid YAML but parses to a string, not an object
+    const config = parseConfig('hello', 'yaml')
+    // interpolateObject returns the string itself; cast to config means no fields
+    expect(typeof config).not.toBe('undefined')
+  })
+
+  it('rejects YAML with duplicate keys', () => {
+    const yaml = `
+port: 3721
+port: 9999
+`
+    // js-yaml 4.x throws on duplicate keys by default
+    expect(() => parseConfig(yaml, 'yaml')).toThrow(/duplicated mapping key/i)
+  })
+})
+
 describe('parseConfig - interpolateObject non-string primitives', () => {
   it('returns numbers and booleans unchanged', () => {
     const json = JSON.stringify({ port: 8080, sentry: { captureTaskFailures: true } })

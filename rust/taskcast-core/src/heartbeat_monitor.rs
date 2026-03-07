@@ -49,7 +49,7 @@ impl HeartbeatMonitor {
             worker_manager: opts.worker_manager,
             engine: opts.engine,
             short_term_store: opts.short_term_store,
-            check_interval_ms: opts.check_interval_ms,
+            check_interval_ms: opts.check_interval_ms.max(100),
             heartbeat_timeout_ms: opts.heartbeat_timeout_ms,
             default_disconnect_policy: opts.default_disconnect_policy,
             disconnect_grace_ms: opts.disconnect_grace_ms,

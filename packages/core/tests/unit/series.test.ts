@@ -116,6 +116,74 @@ describe('processSeries - latest', () => {
   })
 })
 
+describe('processSeries - accumulate with non-object data', () => {
+  it('handles data: null for new event (no previous)', async () => {
+    const store = makeStore()
+    const event = makeEvent({ data: null, seriesId: 's1', seriesMode: 'accumulate' })
+    const result = await processSeries(event, store)
+    // null data is treated as empty object — no crash, event stored
+    expect(result.data).toBeNull()
+    expect(store.setSeriesLatest).toHaveBeenCalled()
+  })
+
+  it('handles data: "just a string" (not an object)', async () => {
+    const store = makeStore()
+    const event = makeEvent({ data: 'just a string', seriesId: 's1', seriesMode: 'accumulate' })
+    const result = await processSeries(event, store)
+    // Non-object data should be treated as {} for accumulation — no crash
+    expect(result.data).toBe('just a string')
+    expect(store.setSeriesLatest).toHaveBeenCalled()
+  })
+
+  it('handles data: "string" with previous string data', async () => {
+    const prev = makeEvent({ data: 'prev string', seriesId: 's1', seriesMode: 'accumulate' })
+    const store = makeStore(prev)
+    const event = makeEvent({ data: 'new string', seriesId: 's1', seriesMode: 'accumulate' })
+    const result = await processSeries(event, store)
+    // Strings are not objects, so prevData and newData both become {}
+    // The delta field comparison fails, so event is returned unchanged
+    expect(result.data).toBe('new string')
+    expect(store.setSeriesLatest).toHaveBeenCalled()
+  })
+
+  it('handles data: [1,2,3] (array)', async () => {
+    const store = makeStore()
+    const event = makeEvent({ data: [1, 2, 3], seriesId: 's1', seriesMode: 'accumulate' })
+    const result = await processSeries(event, store)
+    // Arrays are objects, so they pass typeof check, but delta field is undefined
+    // No concat happens, event returned as-is
+    expect(result.data).toEqual([1, 2, 3])
+    expect(store.setSeriesLatest).toHaveBeenCalled()
+  })
+
+  it('handles data: [1,2,3] with previous array data', async () => {
+    const prev = makeEvent({ data: [4, 5], seriesId: 's1', seriesMode: 'accumulate' })
+    const store = makeStore(prev)
+    const event = makeEvent({ data: [1, 2, 3], seriesId: 's1', seriesMode: 'accumulate' })
+    const result = await processSeries(event, store)
+    // Both are objects/arrays, delta field is undefined on both, no concat
+    expect(result.data).toEqual([1, 2, 3])
+    expect(store.setSeriesLatest).toHaveBeenCalled()
+  })
+
+  it('handles data: number (primitive)', async () => {
+    const store = makeStore()
+    const event = makeEvent({ data: 42, seriesId: 's1', seriesMode: 'accumulate' })
+    const result = await processSeries(event, store)
+    expect(result.data).toBe(42)
+    expect(store.setSeriesLatest).toHaveBeenCalled()
+  })
+
+  it('handles data: boolean (primitive)', async () => {
+    const prev = makeEvent({ data: true, seriesId: 's1', seriesMode: 'accumulate' })
+    const store = makeStore(prev)
+    const event = makeEvent({ data: false, seriesId: 's1', seriesMode: 'accumulate' })
+    const result = await processSeries(event, store)
+    expect(result.data).toBe(false)
+    expect(store.setSeriesLatest).toHaveBeenCalled()
+  })
+})
+
 describe('processSeries - no seriesId', () => {
   it('returns event unchanged when no seriesId', async () => {
     const store = makeStore()

@@ -197,6 +197,14 @@ impl WorkerManager {
     // ─── Worker Registration & Lifecycle ────────────────────────────────
 
     pub async fn register_worker(&self, config: WorkerRegistration) -> ManagerResult<Worker> {
+        if config.capacity == 0 {
+            return Err(format!(
+                "Invalid capacity: {}. Capacity must be a positive number.",
+                config.capacity
+            )
+            .into());
+        }
+
         let now = now_millis();
         let worker = Worker {
             id: config.worker_id.unwrap_or_else(|| ulid::Ulid::new().to_string()),
@@ -814,6 +822,16 @@ mod tests {
     }
 
     // ─── register_worker ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn register_worker_rejects_zero_capacity() {
+        let ctx = make_context();
+        let mut reg = make_registration(ConnectionMode::Pull);
+        reg.capacity = 0;
+        let result = ctx.manager.register_worker(reg).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("capacity"));
+    }
 
     #[tokio::test]
     async fn register_worker_creates_idle_worker() {

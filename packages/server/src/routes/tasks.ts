@@ -172,6 +172,8 @@ export function createTasksRouter(engine: TaskEngine, subscriberCounts: Subscrib
       return c.json(task, 201)
     } catch (err) {
       if (err instanceof TaskConflictError) return c.json({ error: err.message }, 409)
+      const msg = err instanceof Error ? err.message : String(err)
+      if (msg.includes('Invalid TTL') || msg.includes('Invalid cost')) return c.json({ error: msg }, 400)
       throw err
     }
   })

@@ -103,6 +103,29 @@ describe('TaskScheduler', () => {
 
       vi.useRealTimers()
     })
+
+    it('catches error when engine.transitionTask throws during resume', async () => {
+      const { engine, scheduler } = makeSetup()
+
+      const task = await engine.createTask({})
+      await engine.transitionTask(task.id, 'running')
+      await engine.transitionTask(task.id, 'blocked', {
+        resumeAfterMs: 1000,
+      })
+
+      const blockedTask = await engine.getTask(task.id)
+
+      vi.useFakeTimers()
+      vi.setSystemTime(blockedTask!.resumeAt! + 1)
+
+      // Mock transitionTask to throw (e.g., store error)
+      vi.spyOn(engine, 'transitionTask').mockRejectedValue(new Error('store connection lost'))
+
+      // tick should not throw — the catch block handles the error
+      await expect(scheduler.tick()).resolves.toBeUndefined()
+
+      vi.useRealTimers()
+    })
   })
 
   // ─── Cold Demotion Tests ─────────────────────────────────────────────
@@ -239,6 +262,62 @@ describe('TaskScheduler', () => {
       expect(coldCalls).toHaveLength(0)
 
       vi.useRealTimers()
+    })
+  })
+
+  // ─── checkIntervalMs validation ─────────────────────────────────────
+
+  describe('checkIntervalMs: 0 or negative', () => {
+    beforeEach(() => {
+      vi.useFakeTimers()
+    })
+
+    afterEach(() => {
+      vi.useRealTimers()
+    })
+
+    it('clamps checkIntervalMs: 0 to minimum 100ms', () => {
+      const store = new MemoryShortTermStore()
+      const broadcast = new MemoryBroadcastProvider()
+      const engine = new TaskEngine({ shortTermStore: store, broadcast })
+      const scheduler = new TaskScheduler({
+        engine,
+        shortTermStore: store,
+        checkIntervalMs: 0,
+      })
+      const tickSpy = vi.spyOn(scheduler, 'tick').mockResolvedValue(undefined)
+
+      scheduler.start()
+
+      // Should not have ticked yet at 0ms
+      expect(tickSpy).not.toHaveBeenCalled()
+
+      // At 100ms (the minimum clamp), it should tick
+      vi.advanceTimersByTime(100)
+      expect(tickSpy).toHaveBeenCalledTimes(1)
+
+      scheduler.stop()
+    })
+
+    it('clamps negative checkIntervalMs to minimum 100ms', () => {
+      const store = new MemoryShortTermStore()
+      const broadcast = new MemoryBroadcastProvider()
+      const engine = new TaskEngine({ shortTermStore: store, broadcast })
+      const scheduler = new TaskScheduler({
+        engine,
+        shortTermStore: store,
+        checkIntervalMs: -1000,
+      })
+      const tickSpy = vi.spyOn(scheduler, 'tick').mockResolvedValue(undefined)
+
+      scheduler.start()
+
+      expect(tickSpy).not.toHaveBeenCalled()
+
+      vi.advanceTimersByTime(100)
+      expect(tickSpy).toHaveBeenCalledTimes(1)
+
+      scheduler.stop()
     })
   })
 

@@ -44,7 +44,7 @@ describe('Task Lifecycle API', () => {
     expect(task.type).toBe('custom')
   })
 
-  it('rejects duplicate task ID with 409', async () => {
+  it('rejects duplicate user-supplied task ID with 409', async () => {
     const id = 'dup-id-' + Date.now()
 
     const res1 = await fetch(`${server.baseUrl}/tasks`, {
@@ -54,7 +54,7 @@ describe('Task Lifecycle API', () => {
     })
     expect(res1.status).toBe(201)
 
-    // Second create with same ID should be rejected
+    // Second create with same ID is rejected
     const res2 = await fetch(`${server.baseUrl}/tasks`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -64,7 +64,7 @@ describe('Task Lifecycle API', () => {
     const body = await res2.json()
     expect(body.error).toContain('already exists')
 
-    // Original task should be unchanged
+    // Original task is untouched
     const getRes = await fetch(`${server.baseUrl}/tasks/${id}`)
     expect(getRes.status).toBe(200)
     const task = await getRes.json()
