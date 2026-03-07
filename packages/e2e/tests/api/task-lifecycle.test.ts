@@ -44,7 +44,7 @@ describe('Task Lifecycle API', () => {
     expect(task.type).toBe('custom')
   })
 
-  it('overwrites task when creating with duplicate ID (no conflict enforcement in memory)', async () => {
+  it('rejects duplicate user-supplied task ID with 409', async () => {
     const id = 'dup-id-' + Date.now()
 
     const res1 = await fetch(`${server.baseUrl}/tasks`, {
@@ -54,19 +54,21 @@ describe('Task Lifecycle API', () => {
     })
     expect(res1.status).toBe(201)
 
-    // Second create with same ID overwrites (memory adapter has no uniqueness constraint)
+    // Second create with same ID is rejected
     const res2 = await fetch(`${server.baseUrl}/tasks`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ id, type: 'second' }),
     })
-    expect(res2.status).toBe(201)
+    expect(res2.status).toBe(409)
+    const body = await res2.json()
+    expect(body.error).toContain('already exists')
 
-    // The task now has the second type
+    // Original task is untouched
     const getRes = await fetch(`${server.baseUrl}/tasks/${id}`)
     expect(getRes.status).toBe(200)
     const task = await getRes.json()
-    expect(task.type).toBe('second')
+    expect(task.type).toBe('first')
   })
 
   // ─── Get ──────────────────────────────────────────────────────────────────

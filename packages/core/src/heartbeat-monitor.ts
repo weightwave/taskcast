@@ -28,7 +28,7 @@ export class HeartbeatMonitor {
     this.workerManager = opts.workerManager
     this.engine = opts.engine
     this.shortTermStore = opts.shortTermStore
-    this.checkIntervalMs = opts.checkIntervalMs ?? 30_000
+    this.checkIntervalMs = Math.max(opts.checkIntervalMs ?? 30_000, 100)
     this.heartbeatTimeoutMs = opts.heartbeatTimeoutMs ?? 90_000
     this.defaultDisconnectPolicy = opts.defaultDisconnectPolicy ?? 'reassign'
     this.disconnectGraceMs = opts.disconnectGraceMs ?? 30_000

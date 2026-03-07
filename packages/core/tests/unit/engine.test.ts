@@ -372,6 +372,33 @@ describe('TaskEngine.getEvents', () => {
     const events = await engine.getEvents(task.id)
     expect(events.length).toBeGreaterThan(0)
   })
+
+  it('passes opts through to shortTermStore.getEvents', async () => {
+    const { engine } = makeEngine()
+    const task = await engine.createTask({})
+    await engine.transitionTask(task.id, 'running')
+    await engine.publishEvent(task.id, { type: 'a', level: 'info', data: null })
+    await engine.publishEvent(task.id, { type: 'b', level: 'info', data: null })
+    const events = await engine.getEvents(task.id, { limit: 1 })
+    expect(events).toHaveLength(1)
+  })
+})
+
+describe('TaskEngine.listTasks', () => {
+  it('proxies to shortTermStore.listTasks with filter', async () => {
+    const { engine } = makeEngine()
+    await engine.createTask({ type: 'alpha' })
+    await engine.createTask({ type: 'beta' })
+    const result = await engine.listTasks({ types: ['alpha'] })
+    expect(result).toHaveLength(1)
+    expect(result[0]!.type).toBe('alpha')
+  })
+
+  it('returns empty array when no tasks match', async () => {
+    const { engine } = makeEngine()
+    const result = await engine.listTasks({ status: ['completed'] })
+    expect(result).toEqual([])
+  })
 })
 
 describe('TaskEngine.subscribe', () => {
@@ -386,6 +413,164 @@ describe('TaskEngine.subscribe', () => {
     await engine.publishEvent(task.id, { type: 'live.event', level: 'info', data: null })
     expect(received).toContain('live.event')
     unsub()
+  })
+})
+
+describe('TaskEngine.addTransitionListener', () => {
+  it('calls transition listeners on status change', async () => {
+    const { engine } = makeEngine()
+    const listener = vi.fn()
+    engine.addTransitionListener(listener)
+    const task = await engine.createTask({})
+    await engine.transitionTask(task.id, 'running')
+    expect(listener).toHaveBeenCalledOnce()
+    expect(listener).toHaveBeenCalledWith(
+      expect.objectContaining({ id: task.id, status: 'running' }),
+      'pending',
+      'running',
+    )
+  })
+
+  it('catches and ignores errors thrown by transition listeners', async () => {
+    const { engine } = makeEngine()
+    const throwingListener = vi.fn(() => {
+      throw new Error('listener kaboom')
+    })
+    const secondListener = vi.fn()
+    engine.addTransitionListener(throwingListener)
+    engine.addTransitionListener(secondListener)
+    const task = await engine.createTask({})
+
+    // Should not throw despite the listener error
+    await expect(engine.transitionTask(task.id, 'running')).resolves.toBeDefined()
+
+    // Both listeners should have been called
+    expect(throwingListener).toHaveBeenCalledOnce()
+    expect(secondListener).toHaveBeenCalledOnce()
+  })
+})
+
+describe('TaskEngine.addCreationListener', () => {
+  it('calls creation listeners on task creation', async () => {
+    const { engine } = makeEngine()
+    const listener = vi.fn()
+    engine.addCreationListener(listener)
+    const task = await engine.createTask({ type: 'test' })
+    expect(listener).toHaveBeenCalledOnce()
+    expect(listener).toHaveBeenCalledWith(expect.objectContaining({ id: task.id }))
+  })
+
+  it('catches and ignores errors thrown by creation listeners', async () => {
+    const { engine } = makeEngine()
+    engine.addCreationListener(() => {
+      throw new Error('creation listener error')
+    })
+    // Should not throw
+    await expect(engine.createTask({ type: 'test' })).resolves.toBeDefined()
+  })
+})
+
+// ─── Negative / Bad-Case Tests ──────────────────────────────────────────────
+
+describe('TaskEngine.createTask — duplicate task ID', () => {
+  it('should reject a second createTask with the same user-supplied ID', async () => {
+    const { engine } = makeEngine()
+    await engine.createTask({ id: 'dup-id' })
+    await expect(engine.createTask({ id: 'dup-id' })).rejects.toThrow(/already exists/i)
+  })
+
+  it('auto-generated IDs never collide (ULID)', async () => {
+    const { engine } = makeEngine()
+    const tasks = await Promise.all(
+      Array.from({ length: 100 }, () => engine.createTask({}))
+    )
+    const ids = tasks.map((t) => t.id)
+    expect(new Set(ids).size).toBe(100)
+  })
+
+  it('first task is untouched after duplicate rejection', async () => {
+    const { engine } = makeEngine()
+    const first = await engine.createTask({ id: 'dup-id', type: 'original' })
+    try {
+      await engine.createTask({ id: 'dup-id', type: 'overwrite' })
+    } catch { /* expected */ }
+    const stored = await engine.getTask('dup-id')
+    expect(stored?.type).toBe('original')
+    expect(stored?.createdAt).toBe(first.createdAt)
+  })
+})
+
+describe('TaskEngine — store failure mid-transition', () => {
+  it('longTermStore.saveTask failure during transitionTask does not corrupt shortTermStore', async () => {
+    const store = new MemoryShortTermStore()
+    const broadcast = new MemoryBroadcastProvider()
+    const longTermStore = makeLongTermStore({
+      saveTask: vi.fn()
+        .mockResolvedValueOnce(undefined)  // createTask
+        .mockRejectedValueOnce(new Error('LT write fail')), // transitionTask
+    })
+    const engine = new TaskEngine({ shortTermStore: store, broadcast, longTermStore })
+    const task = await engine.createTask({})
+
+    // longTermStore.saveTask will throw on the transition call
+    await expect(engine.transitionTask(task.id, 'running')).rejects.toThrow('LT write fail')
+
+    // shortTermStore should have the task saved with running status
+    // because saveTask on shortTermStore happens BEFORE longTermStore
+    const shortTask = await store.getTask(task.id)
+    expect(shortTask?.status).toBe('running')
+  })
+
+  it('broadcast.publish failure during publishEvent surfaces the error', async () => {
+    const store = new MemoryShortTermStore()
+    const broadcast = new MemoryBroadcastProvider()
+    const engine = new TaskEngine({ shortTermStore: store, broadcast })
+    const task = await engine.createTask({})
+    await engine.transitionTask(task.id, 'running')
+
+    // Now break broadcast for publishEvent
+    vi.spyOn(broadcast, 'publish').mockRejectedValue(new Error('broadcast down'))
+    await expect(
+      engine.publishEvent(task.id, { type: 'test', level: 'info', data: null })
+    ).rejects.toThrow('broadcast down')
+
+    // shortTermStore should still have the event appended (it happens before broadcast)
+    const events = await store.getEvents(task.id)
+    const testEvents = events.filter((e) => e.type === 'test')
+    expect(testEvents).toHaveLength(1)
+  })
+
+  it('shortTermStore.appendEvent failure during publishEvent propagates error', async () => {
+    const store = new MemoryShortTermStore()
+    const broadcast = new MemoryBroadcastProvider()
+    const engine = new TaskEngine({ shortTermStore: store, broadcast })
+    const task = await engine.createTask({})
+    await engine.transitionTask(task.id, 'running')
+
+    // Break appendEvent after nextIndex succeeds
+    vi.spyOn(store, 'appendEvent').mockRejectedValueOnce(new Error('append fail'))
+
+    await expect(
+      engine.publishEvent(task.id, { type: 'test', level: 'info', data: null })
+    ).rejects.toThrow('append fail')
+  })
+})
+
+describe('TaskEngine.createTask — negative/zero TTL', () => {
+  it('rejects negative TTL', async () => {
+    const { engine } = makeEngine()
+    await expect(engine.createTask({ ttl: -1 })).rejects.toThrow(/ttl/i)
+  })
+
+  it('rejects zero TTL', async () => {
+    const { engine } = makeEngine()
+    await expect(engine.createTask({ ttl: 0 })).rejects.toThrow(/ttl/i)
+  })
+
+  it('accepts positive TTL', async () => {
+    const { engine } = makeEngine()
+    const task = await engine.createTask({ ttl: 60 })
+    expect(task.ttl).toBe(60)
   })
 })
 
@@ -417,5 +602,14 @@ describe('TaskEngine constructor validation', () => {
     const broadcast = new MemoryBroadcastProvider()
     const engine = new TaskEngine({ shortTerm: store, broadcast } as any)
     expect(engine).toBeInstanceOf(TaskEngine)
+  })
+
+  it('accepts legacy longTerm option name and uses it as longTermStore', async () => {
+    const store = new MemoryShortTermStore()
+    const broadcast = new MemoryBroadcastProvider()
+    const longTermStore = makeLongTermStore()
+    const engine = new TaskEngine({ shortTerm: store, longTerm: longTermStore, broadcast } as any)
+    const task = await engine.createTask({ type: 'test' })
+    expect(longTermStore.saveTask).toHaveBeenCalledWith(expect.objectContaining({ id: task.id }))
   })
 })

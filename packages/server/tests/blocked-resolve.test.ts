@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest'
 import { Hono } from 'hono'
 import { TaskEngine, MemoryBroadcastProvider, MemoryShortTermStore } from '@taskcast/core'
 import { createTasksRouter } from '../src/routes/tasks.js'
+import { createSubscriberCounts } from '../src/routes/sse.js'
 import type { AuthContext } from '../src/auth.js'
 
 function makeApp() {
@@ -14,7 +15,7 @@ function makeApp() {
     c.set('auth', auth)
     await next()
   })
-  app.route('/tasks', createTasksRouter(engine))
+  app.route('/tasks', createTasksRouter(engine, createSubscriberCounts()))
   return { app, engine }
 }
 
@@ -82,6 +83,36 @@ describe('POST /tasks/:id/resolve', () => {
     expect(res.status).toBe(404)
     const body = await res.json()
     expect(body.error).toBe('Task not found')
+  })
+
+  it('returns 400 for completed (terminal) task', async () => {
+    const { app, engine } = makeApp()
+    const task = await engine.createTask({})
+    await engine.transitionTask(task.id, 'running')
+    await engine.transitionTask(task.id, 'completed', { result: { done: true } })
+
+    const res = await app.request(`/tasks/${task.id}/resolve`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ data: {} }),
+    })
+    expect(res.status).toBe(400)
+    const body = await res.json()
+    expect(body.error).toBe('Task is not blocked')
+  })
+
+  it('returns 400 for pending task', async () => {
+    const { app, engine } = makeApp()
+    const task = await engine.createTask({})
+
+    const res = await app.request(`/tasks/${task.id}/resolve`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ data: {} }),
+    })
+    expect(res.status).toBe(400)
+    const body = await res.json()
+    expect(body.error).toBe('Task is not blocked')
   })
 
   it('returns 400 for invalid request body', async () => {

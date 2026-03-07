@@ -76,6 +76,32 @@ describe('createSqliteAdapters', () => {
     expect(await longTermStore.getTask('factory-1')).toEqual(task)
   })
 
+  it('should use default path ./taskcast.db when no path or env var given', () => {
+    // Ensure the env var is not set
+    const original = process.env['TASKCAST_SQLITE_PATH']
+    delete process.env['TASKCAST_SQLITE_PATH']
+
+    // Use a temp dir as CWD so we don't pollute the repo
+    dir = mkdtempSync(join(tmpdir(), 'taskcast-factory-default-'))
+    const prevCwd = process.cwd()
+    process.chdir(dir)
+
+    try {
+      const result = createSqliteAdapters()
+      cleanup = () => {
+        result.db.close()
+        rmSync(dir, { recursive: true, force: true })
+      }
+      // The db name should be the default ./taskcast.db resolved from cwd
+      expect(result.db.name).toContain('taskcast.db')
+    } finally {
+      process.chdir(prevCwd)
+      if (original !== undefined) {
+        process.env['TASKCAST_SQLITE_PATH'] = original
+      }
+    }
+  })
+
   it('should use TASKCAST_SQLITE_PATH env var as default', () => {
     dir = mkdtempSync(join(tmpdir(), 'taskcast-factory-'))
     const envPath = join(dir, 'env-default.db')

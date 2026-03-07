@@ -20,7 +20,7 @@ export class TaskScheduler {
   constructor(opts: TaskSchedulerOptions) {
     this.engine = opts.engine
     this.shortTermStore = opts.shortTermStore
-    this.checkIntervalMs = opts.checkIntervalMs ?? 60_000
+    this.checkIntervalMs = Math.max(opts.checkIntervalMs ?? 60_000, 100)
     if (opts.pausedColdAfterMs !== undefined) this.pausedColdAfterMs = opts.pausedColdAfterMs
     if (opts.blockedColdAfterMs !== undefined) this.blockedColdAfterMs = opts.blockedColdAfterMs
   }

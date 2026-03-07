@@ -36,7 +36,7 @@ impl TaskScheduler {
         Self {
             engine: opts.engine,
             short_term_store: opts.short_term_store,
-            check_interval_ms: opts.check_interval_ms,
+            check_interval_ms: opts.check_interval_ms.max(100),
             paused_cold_after_ms: opts.paused_cold_after_ms,
             blocked_cold_after_ms: opts.blocked_cold_after_ms,
             handle: None,
