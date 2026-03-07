@@ -1,3 +1,4 @@
+mod client;
 mod commands;
 mod helpers;
 mod node_config;
