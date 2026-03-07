@@ -46,6 +46,7 @@
     "@taskcast/postgres": "workspace:*",
     "@taskcast/redis": "workspace:*",
     "@taskcast/server": "workspace:*",
+    "@taskcast/server-sdk": "workspace:*",
     "@taskcast/sqlite": "workspace:*",
     "commander": "^12.1.0",
     "ioredis": "^5.4.0",
