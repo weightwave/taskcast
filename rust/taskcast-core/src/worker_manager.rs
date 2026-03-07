@@ -197,6 +197,14 @@ impl WorkerManager {
     // ─── Worker Registration & Lifecycle ────────────────────────────────
 
     pub async fn register_worker(&self, config: WorkerRegistration) -> ManagerResult<Worker> {
+        if config.capacity == 0 {
+            return Err(format!(
+                "Invalid capacity: {}. Capacity must be a positive number.",
+                config.capacity
+            )
+            .into());
+        }
+
         let now = now_millis();
         let worker = Worker {
             id: config.worker_id.unwrap_or_else(|| ulid::Ulid::new().to_string()),

@@ -19,6 +19,12 @@ pub enum EngineError {
     #[error("Task not found: {0}")]
     TaskNotFound(String),
 
+    #[error("Task already exists: {0}")]
+    TaskAlreadyExists(String),
+
+    #[error("{0}")]
+    InvalidInput(String),
+
     #[error("Invalid transition: {from:?} \u{2192} {to:?}")]
     InvalidTransition { from: TaskStatus, to: TaskStatus },
 
@@ -108,9 +114,30 @@ impl TaskEngine {
     }
 
     pub async fn create_task(&self, input: CreateTaskInput) -> Result<Task, EngineError> {
+        if let Some(ttl) = input.ttl {
+            if ttl == 0 {
+                return Err(EngineError::InvalidInput(
+                    "Invalid TTL: 0. TTL must be a positive number.".to_string(),
+                ));
+            }
+        }
+
+        let id = input
+            .id
+            .clone()
+            .unwrap_or_else(|| ulid::Ulid::new().to_string());
+
+        // Check for duplicate user-supplied IDs
+        if input.id.is_some() {
+            let existing = self.short_term_store.get_task(&id).await?;
+            if existing.is_some() {
+                return Err(EngineError::TaskAlreadyExists(id));
+            }
+        }
+
         let now = now_millis();
         let task = Task {
-            id: input.id.unwrap_or_else(|| ulid::Ulid::new().to_string()),
+            id,
             status: TaskStatus::Pending,
             created_at: now,
             updated_at: now,
