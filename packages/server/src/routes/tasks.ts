@@ -164,8 +164,15 @@ export function createTasksRouter(engine: TaskEngine, subscriberCounts: Subscrib
     if (d.cleanup !== undefined) input.cleanup = d.cleanup as CreateTaskInput['cleanup']
     if (d.authConfig !== undefined) input.authConfig = d.authConfig as unknown as CreateTaskInput['authConfig']
 
-    const task = await engine.createTask(input)
-    return c.json(task, 201)
+    try {
+      const task = await engine.createTask(input)
+      return c.json(task, 201)
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      if (msg.includes('already exists')) return c.json({ error: msg }, 409)
+      if (msg.includes('Invalid TTL') || msg.includes('Invalid cost')) return c.json({ error: msg }, 400)
+      throw err
+    }
   })
 
   register(listTasksRoute, async (c) => {
