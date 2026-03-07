@@ -591,6 +591,46 @@ describe('HeartbeatMonitor', () => {
     })
   })
 
+  // ─── disconnectGraceMs: 0 ────────────────────────────────────────
+
+  describe('tick() with reassign policy — disconnectGraceMs: 0', () => {
+    beforeEach(() => {
+      vi.useFakeTimers()
+    })
+
+    afterEach(() => {
+      vi.useRealTimers()
+    })
+
+    it('reassigns tasks immediately when disconnectGraceMs is 0', async () => {
+      const { store, engine, manager, monitor } = makeSetup({
+        heartbeatTimeoutMs: 5000,
+        defaultDisconnectPolicy: 'reassign',
+        disconnectGraceMs: 0,
+      })
+
+      const { worker, task } = await setupWorkerWithTask(manager, engine)
+
+      // Expire the heartbeat
+      const w = await store.getWorker(worker.id)
+      w!.lastHeartbeatAt = Date.now() - 10_000
+      await store.saveWorker(w!)
+
+      await monitor.tick()
+
+      // setTimeout(fn, 0) should fire on next tick
+      await vi.advanceTimersByTimeAsync(1)
+
+      // Task should be reverted to pending
+      const reassigned = await engine.getTask(task.id)
+      expect(reassigned!.status).toBe('pending')
+
+      // Assignment should be removed
+      const assignment = await store.getTaskAssignment(task.id)
+      expect(assignment).toBeNull()
+    })
+  })
+
   // ─── Start/Stop Lifecycle ──────────────────────────────────────────
 
   describe('start/stop lifecycle', () => {

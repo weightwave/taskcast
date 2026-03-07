@@ -265,6 +265,62 @@ describe('TaskScheduler', () => {
     })
   })
 
+  // ─── checkIntervalMs validation ─────────────────────────────────────
+
+  describe('checkIntervalMs: 0 or negative', () => {
+    beforeEach(() => {
+      vi.useFakeTimers()
+    })
+
+    afterEach(() => {
+      vi.useRealTimers()
+    })
+
+    it('clamps checkIntervalMs: 0 to minimum 100ms', () => {
+      const store = new MemoryShortTermStore()
+      const broadcast = new MemoryBroadcastProvider()
+      const engine = new TaskEngine({ shortTermStore: store, broadcast })
+      const scheduler = new TaskScheduler({
+        engine,
+        shortTermStore: store,
+        checkIntervalMs: 0,
+      })
+      const tickSpy = vi.spyOn(scheduler, 'tick').mockResolvedValue(undefined)
+
+      scheduler.start()
+
+      // Should not have ticked yet at 0ms
+      expect(tickSpy).not.toHaveBeenCalled()
+
+      // At 100ms (the minimum clamp), it should tick
+      vi.advanceTimersByTime(100)
+      expect(tickSpy).toHaveBeenCalledTimes(1)
+
+      scheduler.stop()
+    })
+
+    it('clamps negative checkIntervalMs to minimum 100ms', () => {
+      const store = new MemoryShortTermStore()
+      const broadcast = new MemoryBroadcastProvider()
+      const engine = new TaskEngine({ shortTermStore: store, broadcast })
+      const scheduler = new TaskScheduler({
+        engine,
+        shortTermStore: store,
+        checkIntervalMs: -1000,
+      })
+      const tickSpy = vi.spyOn(scheduler, 'tick').mockResolvedValue(undefined)
+
+      scheduler.start()
+
+      expect(tickSpy).not.toHaveBeenCalled()
+
+      vi.advanceTimersByTime(100)
+      expect(tickSpy).toHaveBeenCalledTimes(1)
+
+      scheduler.stop()
+    })
+  })
+
   // ─── Lifecycle Tests ─────────────────────────────────────────────────
 
   describe('start/stop lifecycle', () => {

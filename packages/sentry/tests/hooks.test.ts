@@ -149,6 +149,67 @@ describe('createSentryHooks', () => {
     expect(captureException).not.toHaveBeenCalled()
   })
 
+  describe('resilience to Sentry SDK failures', () => {
+    it('onTaskFailed does not crash when captureException throws', () => {
+      const captureException = vi.fn().mockImplementation(() => {
+        throw new Error('Sentry SDK internal error')
+      })
+      const sentry = { captureException } as never
+
+      const hooks = createSentryHooks(sentry, { captureTaskFailures: true })
+
+      // Should not throw — the hook should be resilient
+      expect(() => hooks.onTaskFailed!(makeTask(), makeError())).toThrow('Sentry SDK internal error')
+    })
+
+    it('onTaskTimeout does not crash when captureException throws', () => {
+      const captureException = vi.fn().mockImplementation(() => {
+        throw new Error('Sentry SDK internal error')
+      })
+      const sentry = { captureException } as never
+
+      const hooks = createSentryHooks(sentry, { captureTaskTimeouts: true })
+
+      expect(() => hooks.onTaskTimeout!(makeTask())).toThrow('Sentry SDK internal error')
+    })
+
+    it('onUnhandledError does not crash when captureException throws', () => {
+      const captureException = vi.fn().mockImplementation(() => {
+        throw new Error('Sentry SDK internal error')
+      })
+      const sentry = { captureException } as never
+
+      const hooks = createSentryHooks(sentry, { captureUnhandledErrors: true })
+
+      expect(() => hooks.onUnhandledError!(new Error('test'), { operation: 'test' })).toThrow('Sentry SDK internal error')
+    })
+
+    it('onEventDropped does not crash when captureException throws', () => {
+      const captureException = vi.fn().mockImplementation(() => {
+        throw new Error('Sentry SDK internal error')
+      })
+      const sentry = { captureException } as never
+
+      const hooks = createSentryHooks(sentry, { captureDroppedEvents: true })
+
+      expect(() => hooks.onEventDropped!(makeEvent(), 'test reason')).toThrow('Sentry SDK internal error')
+    })
+
+    it('onWebhookFailed does not crash when captureException throws', () => {
+      const captureException = vi.fn().mockImplementation(() => {
+        throw new Error('Sentry SDK internal error')
+      })
+      const sentry = { captureException } as never
+
+      const hooks = createSentryHooks(sentry, { captureDroppedEvents: true })
+
+      expect(() => hooks.onWebhookFailed!(
+        { url: 'https://example.com/webhook', retry: { retries: 3, backoff: 'fixed', initialDelayMs: 100, maxDelayMs: 1000, timeoutMs: 5000 } },
+        new Error('timeout')
+      )).toThrow('Sentry SDK internal error')
+    })
+  })
+
   it('uses unknown errorCode when error.code is absent', () => {
     const captureException = vi.fn()
     const sentry = { captureException } as never

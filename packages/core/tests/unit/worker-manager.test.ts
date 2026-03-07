@@ -1231,3 +1231,46 @@ describe('WorkerManager — declineTask with longTermStore', () => {
     expect(savedTask).toBeDefined()
   })
 })
+
+// ─── Negative / Bad-Case Tests ──────────────────────────────────────────────
+
+describe('WorkerManager — negative capacity/cost validation', () => {
+  it('rejects registerWorker with negative capacity', async () => {
+    const { manager } = makeSetup()
+    await expect(
+      manager.registerWorker({ matchRule: {}, capacity: -5, connectionMode: 'pull' })
+    ).rejects.toThrow(/capacity/i)
+  })
+
+  it('rejects registerWorker with zero capacity', async () => {
+    const { manager } = makeSetup()
+    await expect(
+      manager.registerWorker({ matchRule: {}, capacity: 0, connectionMode: 'pull' })
+    ).rejects.toThrow(/capacity/i)
+  })
+
+  it('accepts registerWorker with positive capacity', async () => {
+    const { manager } = makeSetup()
+    const worker = await manager.registerWorker({ matchRule: {}, capacity: 1, connectionMode: 'pull' })
+    expect(worker.capacity).toBe(1)
+  })
+
+  it('rejects task creation with negative cost', async () => {
+    const { engine } = makeSetup()
+    await expect(
+      engine.createTask({ cost: -3 })
+    ).rejects.toThrow(/cost/i)
+  })
+
+  it('accepts task creation with zero cost (free tasks)', async () => {
+    const { engine } = makeSetup()
+    const task = await engine.createTask({ cost: 0 })
+    expect(task.cost).toBe(0)
+  })
+
+  it('accepts task creation with positive cost', async () => {
+    const { engine } = makeSetup()
+    const task = await engine.createTask({ cost: 2 })
+    expect(task.cost).toBe(2)
+  })
+})

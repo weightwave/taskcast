@@ -203,6 +203,120 @@ describe('TaskcastClient', () => {
     })
   })
 
+  describe('non-200 HTTP responses', () => {
+    it('throws error with status info on HTTP 500', async () => {
+      const onEvent = vi.fn()
+      const onDone = vi.fn()
+
+      const mockFetch = vi.fn().mockResolvedValue(
+        new Response('Internal Server Error', { status: 500 })
+      )
+
+      const client = new TaskcastClient({ baseUrl: 'http://localhost:3000', fetch: mockFetch })
+
+      await expect(
+        client.subscribe('task-abc', { onEvent, onDone })
+      ).rejects.toThrow('Failed to subscribe: HTTP 500')
+    })
+
+    it('throws error with status info on HTTP 404', async () => {
+      const onEvent = vi.fn()
+      const onDone = vi.fn()
+
+      const mockFetch = vi.fn().mockResolvedValue(
+        new Response('Not Found', { status: 404 })
+      )
+
+      const client = new TaskcastClient({ baseUrl: 'http://localhost:3000', fetch: mockFetch })
+
+      const err = await client.subscribe('task-abc', { onEvent, onDone }).catch(e => e)
+      expect(err).toBeInstanceOf(Error)
+      expect(err.message).toContain('404')
+    })
+
+    it('throws "No response body" when status 200 but body is null', async () => {
+      const onEvent = vi.fn()
+      const onDone = vi.fn()
+
+      const mockFetch = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        body: null,
+      })
+
+      const client = new TaskcastClient({ baseUrl: 'http://localhost:3000', fetch: mockFetch })
+
+      await expect(
+        client.subscribe('task-abc', { onEvent, onDone })
+      ).rejects.toThrow('No response body')
+    })
+  })
+
+  describe('AbortController mid-stream', () => {
+    it('resolves cleanly when reader is aborted mid-stream', async () => {
+      const onEvent = vi.fn()
+      const onDone = vi.fn()
+
+      // Create a readable stream that we can control
+      let controller!: ReadableStreamDefaultController<Uint8Array>
+      const stream = new ReadableStream<Uint8Array>({
+        start(ctrl) {
+          controller = ctrl
+        },
+      })
+
+      const mockFetch = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        body: stream,
+      })
+
+      const client = new TaskcastClient({ baseUrl: 'http://localhost:3000', fetch: mockFetch })
+
+      // Start subscribe in background
+      const subscribePromise = client.subscribe('task-abc', { onEvent, onDone })
+
+      // Feed some data, then close the stream
+      const encoder = new TextEncoder()
+      controller.enqueue(encoder.encode('event: taskcast.event\ndata: {"filteredIndex":0,"rawIndex":0,"eventId":"e1","taskId":"t1","type":"log","timestamp":1000,"level":"info","data":{}}\n\n'))
+      controller.close()
+
+      // subscribe should resolve cleanly
+      await subscribePromise
+
+      expect(onEvent).toHaveBeenCalledTimes(1)
+    })
+
+    it('rejects when stream errors mid-read', async () => {
+      const onEvent = vi.fn()
+      const onDone = vi.fn()
+
+      // Create a readable stream that errors immediately
+      let controller!: ReadableStreamDefaultController<Uint8Array>
+      const stream = new ReadableStream<Uint8Array>({
+        start(ctrl) {
+          controller = ctrl
+        },
+      })
+
+      const mockFetch = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        body: stream,
+      })
+
+      const client = new TaskcastClient({ baseUrl: 'http://localhost:3000', fetch: mockFetch })
+
+      const subscribePromise = client.subscribe('task-abc', { onEvent, onDone })
+
+      // Error the stream — per spec, controller.error() clears the queue
+      controller.error(new Error('Connection reset'))
+
+      // subscribe should reject with the stream error
+      await expect(subscribePromise).rejects.toThrow('Connection reset')
+    })
+  })
+
   describe('_buildURL', () => {
     it('returns plain URL with no query string when no filter given', () => {
       const client = new TaskcastClient({ baseUrl: 'http://localhost:3000', fetch: vi.fn() })
