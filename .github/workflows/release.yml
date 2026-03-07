@@ -49,6 +49,9 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # Build + lint + test intentionally duplicates ci.yml here.
+      # npm publish is near-irreversible — this ensures the exact checkout
+      # passes all checks before publishing, independent of other workflows.
       - name: Build
         run: pnpm build
 

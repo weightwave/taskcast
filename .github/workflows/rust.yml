@@ -23,6 +23,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+  # check, test, coverage, and build have no `needs:` dependencies between them
+  # so they run fully in parallel. This trades runner minutes for wall-clock speed:
+  # wall time ≈ max(jobs) ≈ 3min instead of sum ≈ 10min if serialized.
+  # Do NOT merge these jobs — that would make CI slower.
 jobs:
   check:
     name: Check & Clippy

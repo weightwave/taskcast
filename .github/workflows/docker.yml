@@ -10,6 +10,10 @@ permissions:
   contents: read
 
 jobs:
+  # This test gate intentionally duplicates ci.yml. docker.yml can be triggered
+  # via tags (which may be pushed manually to any commit) or workflow_dispatch,
+  # paths that don't necessarily go through ci.yml. Re-running tests here
+  # prevents pushing untested Docker images.
   test:
     runs-on: ubuntu-latest
     steps:

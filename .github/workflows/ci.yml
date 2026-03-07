@@ -3,8 +3,14 @@ name: CI
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - 'rust/**'
+      - '.github/workflows/rust.yml'
   pull_request:
     branches: [main]
+    paths-ignore:
+      - 'rust/**'
+      - '.github/workflows/rust.yml'
 
 permissions:
   contents: read
@@ -28,6 +34,11 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # pnpm build (pnpm -r tsc) produces .js + .d.ts output for each package.
+      # pnpm lint (tsc -b) uses project references to validate cross-package
+      # type consistency. Because all packages set composite: true, tsc -b
+      # reads the .tsbuildinfo left by the build step and finishes near-instantly.
+      # They look redundant but serve different purposes and the second is cheap.
       - name: Build
         run: pnpm build
 
