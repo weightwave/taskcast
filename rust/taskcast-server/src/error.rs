@@ -38,7 +38,6 @@ impl IntoResponse for AppError {
                     StatusCode::CONFLICT,
                     format!("Cannot publish to task in terminal status: {status:?}"),
                 ),
-                EngineError::TaskConflict(msg) => (StatusCode::CONFLICT, format!("Task already exists: {msg}")),
                 EngineError::InvalidInput(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
                 EngineError::Store(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
             },
