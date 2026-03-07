@@ -214,9 +214,18 @@ importers:
       '@taskcast/core':
         specifier: workspace:*
         version: link:../core
+      '@taskcast/dashboard-web':
+        specifier: workspace:*
+        version: link:../dashboard-web
       '@taskcast/server':
         specifier: workspace:*
         version: link:../server
+      hono:
+        specifier: ^4.0.0
+        version: 4.12.3
+      tsx:
+        specifier: ^4.0.0
+        version: 4.21.0
       typescript:
         specifier: ^5.7.0
         version: 5.9.3
