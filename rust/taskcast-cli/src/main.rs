@@ -33,6 +33,10 @@ enum Commands {
     Doctor(commands::doctor::DoctorArgs),
     /// Quick connectivity check against a Taskcast server
     Ping(commands::ping::PingArgs),
+    /// Stream events from a task in real-time
+    Logs(commands::logs::LogsArgs),
+    /// Stream events from all tasks in real-time
+    Tail(commands::logs::TailArgs),
     /// Start the server as a background service (not yet implemented)
     Daemon,
     /// Stop the background service (not yet implemented)
@@ -66,6 +70,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Some(Commands::Ping(args)) => {
             commands::ping::run(args).await;
+        }
+        Some(Commands::Logs(args)) => {
+            commands::logs::run_logs(args).await?;
+        }
+        Some(Commands::Tail(args)) => {
+            commands::logs::run_tail(args).await?;
         }
         Some(Commands::Daemon) => {
             eprintln!("[taskcast] daemon mode is not yet implemented, use `taskcast start` for foreground mode");
@@ -434,6 +444,74 @@ mod tests {
                 assert_eq!(args.node, Some("prod".to_string()));
             }
             _ => panic!("expected Ping command"),
+        }
+    }
+
+    // ─── Logs subcommand parsing ──────────────────────────────────────
+
+    #[test]
+    fn cli_logs_subcommand_parses() {
+        let cli = Cli::parse_from(["taskcast", "logs", "01JXX123"]);
+        match cli.command.unwrap() {
+            Commands::Logs(args) => {
+                assert_eq!(args.task_id, "01JXX123");
+                assert!(args.types.is_none());
+                assert!(args.levels.is_none());
+                assert!(args.node.is_none());
+            }
+            _ => panic!("expected Logs command"),
+        }
+    }
+
+    #[test]
+    fn cli_logs_with_all_options() {
+        let cli = Cli::parse_from([
+            "taskcast", "logs", "01JXX123",
+            "--types", "llm.*",
+            "--levels", "info,warn",
+            "--node", "prod",
+        ]);
+        match cli.command.unwrap() {
+            Commands::Logs(args) => {
+                assert_eq!(args.task_id, "01JXX123");
+                assert_eq!(args.types, Some("llm.*".to_string()));
+                assert_eq!(args.levels, Some("info,warn".to_string()));
+                assert_eq!(args.node, Some("prod".to_string()));
+            }
+            _ => panic!("expected Logs command"),
+        }
+    }
+
+    // ─── Tail subcommand parsing ──────────────────────────────────────
+
+    #[test]
+    fn cli_tail_subcommand_parses() {
+        let cli = Cli::parse_from(["taskcast", "tail"]);
+        match cli.command.unwrap() {
+            Commands::Tail(args) => {
+                assert!(args.types.is_none());
+                assert!(args.levels.is_none());
+                assert!(args.node.is_none());
+            }
+            _ => panic!("expected Tail command"),
+        }
+    }
+
+    #[test]
+    fn cli_tail_with_all_options() {
+        let cli = Cli::parse_from([
+            "taskcast", "tail",
+            "--types", "agent.*",
+            "--levels", "error",
+            "--node", "staging",
+        ]);
+        match cli.command.unwrap() {
+            Commands::Tail(args) => {
+                assert_eq!(args.types, Some("agent.*".to_string()));
+                assert_eq!(args.levels, Some("error".to_string()));
+                assert_eq!(args.node, Some("staging".to_string()));
+            }
+            _ => panic!("expected Tail command"),
         }
     }
 

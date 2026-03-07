@@ -1,4 +1,5 @@
 pub mod doctor;
+pub mod logs;
 pub mod migrate;
 pub mod node;
 pub mod ping;
