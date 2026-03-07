@@ -168,3 +168,4 @@ The Rust server must produce **identical HTTP behavior** — same paths, same JS
 ## Workflow Reminders
 
 - **Proactively check CI status for open PRs** — Before starting new work, check whether existing open PRs have passing CI. If CI is failing, prioritize fixing CI issues before moving on to other tasks.
+- **PR merge requirements: 100% test coverage + all CI passing** — PRs must achieve 100% test coverage and all CI checks must pass before merging. If CI fails, proactively investigate and fix. If a file needs to be excluded from coverage, get explicit user approval first.
