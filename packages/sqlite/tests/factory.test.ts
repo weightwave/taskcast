@@ -90,12 +90,12 @@ describe('createSqliteAdapters', () => {
       const result = createSqliteAdapters()
       cleanup = () => {
         result.db.close()
-        process.chdir(prevCwd)
         rmSync(dir, { recursive: true, force: true })
       }
       // The db name should be the default ./taskcast.db resolved from cwd
       expect(result.db.name).toContain('taskcast.db')
     } finally {
+      process.chdir(prevCwd)
       if (original !== undefined) {
         process.env['TASKCAST_SQLITE_PATH'] = original
       }

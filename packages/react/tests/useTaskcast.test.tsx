@@ -130,11 +130,8 @@ describe('useTaskEvents', () => {
       useTaskEvents('task-1', { baseUrl: 'http://taskcast' })
     )
 
-    // Wait for effect to fire
-    await new Promise(resolve => setTimeout(resolve, 10))
-
-    // Verify subscribe was called and we captured opts
-    expect(capturedOpts).not.toBeNull()
+    // Wait for effect to fire and subscribe to be called
+    await waitFor(() => expect(capturedOpts).not.toBeNull())
 
     // Unmount triggers the cleanup function (lines 60-62: cancelled = true)
     unmount()
