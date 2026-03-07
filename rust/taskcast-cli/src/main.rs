@@ -1,5 +1,6 @@
 mod commands;
 mod helpers;
+mod node_config;
 
 use clap::{Parser, Subcommand};
 

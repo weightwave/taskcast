@@ -23,3 +23,8 @@ redis = { version = "0.27", features = ["tokio-comp", "aio"] }
 jsonwebtoken = "9"
 rust-embed = "8"
 mime_guess = "2"
+serde = { workspace = true }
+dirs = "6"
+
+[dev-dependencies]
+tempfile = { workspace = true }
