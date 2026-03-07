@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import postgres from 'postgres'
-import { GenericContainer, type StartedTestContainer } from 'testcontainers'
+import { GenericContainer, Wait, type StartedTestContainer } from 'testcontainers'
 import { join } from 'node:path'
 import { readFileSync } from 'node:fs'
 import { runMigrations, computeChecksum } from '../../src/migration-runner.js'
@@ -18,6 +18,7 @@ beforeAll(async () => {
       POSTGRES_DB: 'testdb',
     })
     .withExposedPorts(5432)
+    .withWaitStrategy(Wait.forLogMessage(/ready to accept connections/, 2))
     .start()
 
   const connUri = `postgres://test:test@localhost:${container.getMappedPort(5432)}/testdb`
