@@ -24,6 +24,11 @@ enum Commands {
     Playground(commands::playground::PlaygroundArgs),
     /// Run Postgres database migrations
     Migrate(commands::migrate::MigrateArgs),
+    /// Manage Taskcast server connections
+    Node {
+        #[command(subcommand)]
+        command: commands::node::NodeCommands,
+    },
     /// Start the server as a background service (not yet implemented)
     Daemon,
     /// Stop the background service (not yet implemented)
@@ -48,6 +53,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Some(Commands::Playground(args)) => {
             commands::playground::run(args).await?;
+        }
+        Some(Commands::Node { command }) => {
+            commands::node::run(command);
         }
         Some(Commands::Daemon) => {
             eprintln!("[taskcast] daemon mode is not yet implemented, use `taskcast start` for foreground mode");
@@ -302,6 +310,73 @@ mod tests {
             }
             _ => panic!("expected Migrate command"),
         }
+    }
+
+    // ─── Node subcommand parsing ─────────────────────────────────────────
+
+    #[test]
+    fn cli_node_add_subcommand_parses() {
+        let cli = Cli::parse_from([
+            "taskcast", "node", "add", "prod",
+            "--url", "https://tc.example.com",
+            "--token", "ey...",
+            "--token-type", "jwt",
+        ]);
+        match cli.command.unwrap() {
+            Commands::Node { command: commands::node::NodeCommands::Add { name, url, token, token_type } } => {
+                assert_eq!(name, "prod");
+                assert_eq!(url, "https://tc.example.com");
+                assert_eq!(token, Some("ey...".to_string()));
+                assert_eq!(token_type, "jwt");
+            }
+            _ => panic!("expected Node Add command"),
+        }
+    }
+
+    #[test]
+    fn cli_node_add_default_token_type() {
+        let cli = Cli::parse_from([
+            "taskcast", "node", "add", "local",
+            "--url", "http://localhost:3721",
+        ]);
+        match cli.command.unwrap() {
+            Commands::Node { command: commands::node::NodeCommands::Add { token_type, token, .. } } => {
+                assert_eq!(token_type, "jwt");
+                assert!(token.is_none());
+            }
+            _ => panic!("expected Node Add command"),
+        }
+    }
+
+    #[test]
+    fn cli_node_remove_subcommand_parses() {
+        let cli = Cli::parse_from(["taskcast", "node", "remove", "prod"]);
+        match cli.command.unwrap() {
+            Commands::Node { command: commands::node::NodeCommands::Remove { name } } => {
+                assert_eq!(name, "prod");
+            }
+            _ => panic!("expected Node Remove command"),
+        }
+    }
+
+    #[test]
+    fn cli_node_use_subcommand_parses() {
+        let cli = Cli::parse_from(["taskcast", "node", "use", "prod"]);
+        match cli.command.unwrap() {
+            Commands::Node { command: commands::node::NodeCommands::Use { name } } => {
+                assert_eq!(name, "prod");
+            }
+            _ => panic!("expected Node Use command"),
+        }
+    }
+
+    #[test]
+    fn cli_node_list_subcommand_parses() {
+        let cli = Cli::parse_from(["taskcast", "node", "list"]);
+        assert!(matches!(
+            cli.command.unwrap(),
+            Commands::Node { command: commands::node::NodeCommands::List }
+        ));
     }
 
     #[test]
