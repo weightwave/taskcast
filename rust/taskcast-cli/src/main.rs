@@ -413,6 +413,30 @@ mod tests {
         }
     }
 
+    // ─── Ping subcommand parsing ──────────────────────────────────────
+
+    #[test]
+    fn cli_ping_subcommand_parses() {
+        let cli = Cli::parse_from(["taskcast", "ping"]);
+        match cli.command.unwrap() {
+            Commands::Ping(args) => {
+                assert!(args.node.is_none());
+            }
+            _ => panic!("expected Ping command"),
+        }
+    }
+
+    #[test]
+    fn cli_ping_with_node_flag() {
+        let cli = Cli::parse_from(["taskcast", "ping", "--node", "prod"]);
+        match cli.command.unwrap() {
+            Commands::Ping(args) => {
+                assert_eq!(args.node, Some("prod".to_string()));
+            }
+            _ => panic!("expected Ping command"),
+        }
+    }
+
     #[test]
     fn cli_daemon_subcommand_parses() {
         let cli = Cli::parse_from(["taskcast", "daemon"]);
