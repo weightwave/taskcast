@@ -130,6 +130,46 @@ describe('TaskcastClient', () => {
       expect(onDone).not.toHaveBeenCalled()
     })
 
+    it('silently ignores invalid JSON in taskcast.event data', async () => {
+      const onEvent = vi.fn()
+      const onDone = vi.fn()
+
+      // Send raw SSE with invalid JSON for a taskcast.event
+      const lines = [
+        'event: taskcast.event',
+        'data: not-valid-json{{{',
+        '',
+      ]
+      const mockFetch = vi.fn().mockResolvedValue(makeSSEResponse(lines))
+
+      const client = new TaskcastClient({ baseUrl: 'http://localhost:3000', fetch: mockFetch })
+      await client.subscribe('task-abc', { onEvent, onDone })
+
+      // Should not crash and should not call onEvent
+      expect(onEvent).not.toHaveBeenCalled()
+      expect(onDone).not.toHaveBeenCalled()
+    })
+
+    it('silently ignores invalid JSON in taskcast.done data', async () => {
+      const onEvent = vi.fn()
+      const onDone = vi.fn()
+
+      // Send raw SSE with invalid JSON for a taskcast.done
+      const lines = [
+        'event: taskcast.done',
+        'data: <<<broken>>>',
+        '',
+      ]
+      const mockFetch = vi.fn().mockResolvedValue(makeSSEResponse(lines))
+
+      const client = new TaskcastClient({ baseUrl: 'http://localhost:3000', fetch: mockFetch })
+      await client.subscribe('task-abc', { onEvent, onDone })
+
+      // Should not crash and should not call onDone
+      expect(onEvent).not.toHaveBeenCalled()
+      expect(onDone).not.toHaveBeenCalled()
+    })
+
     it('handles multiple SSE events in a stream', async () => {
       const onEvent = vi.fn()
       const onDone = vi.fn()

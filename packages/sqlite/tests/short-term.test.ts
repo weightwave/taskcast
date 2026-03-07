@@ -92,6 +92,54 @@ describe('SqliteShortTermStore', () => {
     expect(retrieved).toEqual(task)
   })
 
+  it('should preserve all task optional fields including assignMode, cost, assignedWorker, disconnectPolicy', async () => {
+    const task: Task = {
+      ...makeTask(),
+      type: 'llm',
+      result: { answer: 42 },
+      error: { message: 'boom' },
+      metadata: { source: 'test' },
+      completedAt: 3000,
+      ttl: 60,
+      tags: ['gpu'],
+      assignMode: 'pull',
+      cost: 2,
+      assignedWorker: 'worker-1',
+      disconnectPolicy: 'cancel',
+    }
+    await store.saveTask(task)
+    const retrieved = await store.getTask('task-1')
+    expect(retrieved).toEqual(task)
+    expect(retrieved!.disconnectPolicy).toBe('cancel')
+    expect(retrieved!.assignMode).toBe('pull')
+    expect(retrieved!.cost).toBe(2)
+    expect(retrieved!.assignedWorker).toBe('worker-1')
+  })
+
+  it('should handle event with null data', async () => {
+    await store.saveTask(makeTask())
+    const event: TaskEvent = {
+      ...makeEvent('task-1', 0),
+      data: null,
+    }
+    await store.appendEvent('task-1', event)
+    const events = await store.getEvents('task-1')
+    expect(events[0]!.data).toBeNull()
+  })
+
+  it('should preserve seriesAccField on events', async () => {
+    await store.saveTask(makeTask())
+    const event: TaskEvent = {
+      ...makeEvent('task-1', 0),
+      seriesId: 'acc-series',
+      seriesMode: 'accumulate',
+      seriesAccField: 'text',
+    }
+    await store.appendEvent('task-1', event)
+    const events = await store.getEvents('task-1')
+    expect(events[0]!.seriesAccField).toBe('text')
+  })
+
   it('should handle task with no optional fields', async () => {
     const task: Task = {
       id: 'minimal',
@@ -328,6 +376,46 @@ describe('SqliteShortTermStore', () => {
   it('should not throw when calling setTTL (no-op)', async () => {
     await store.saveTask(makeTask())
     await expect(store.setTTL('task-1', 60)).resolves.toBeUndefined()
+  })
+
+  // ─── clearTTL ──────────────────────────────────────────────────────────
+
+  it('should not throw when calling clearTTL (no-op)', async () => {
+    await store.saveTask(makeTask())
+    await expect(store.clearTTL('task-1')).resolves.toBeUndefined()
+  })
+
+  // ─── listByStatus ─────────────────────────────────────────────────────
+
+  describe('listByStatus', () => {
+    it('should return empty array when given empty statuses array', async () => {
+      await store.saveTask(makeTask('task-1'))
+      const result = await store.listByStatus([])
+      expect(result).toEqual([])
+    })
+
+    it('should return tasks matching given statuses', async () => {
+      const t1: Task = { ...makeTask('task-1'), status: 'pending' }
+      const t2: Task = { ...makeTask('task-2'), status: 'running' }
+      const t3: Task = { ...makeTask('task-3'), status: 'completed' }
+      await store.saveTask(t1)
+      await store.saveTask(t2)
+      await store.saveTask(t3)
+
+      const pending = await store.listByStatus(['pending'])
+      expect(pending).toHaveLength(1)
+      expect(pending[0]!.id).toBe('task-1')
+
+      const multiple = await store.listByStatus(['pending', 'running'])
+      expect(multiple).toHaveLength(2)
+      expect(multiple.map(t => t.id).sort()).toEqual(['task-1', 'task-2'])
+    })
+
+    it('should return empty array when no tasks match', async () => {
+      await store.saveTask({ ...makeTask('task-1'), status: 'pending' })
+      const result = await store.listByStatus(['completed'])
+      expect(result).toEqual([])
+    })
   })
 
   // ─── event with series fields ───────────────────────────────────────────

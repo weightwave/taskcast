@@ -108,6 +108,11 @@ describe('SqliteLongTermStore', () => {
       },
       completedAt: 3000,
       ttl: 60,
+      tags: ['gpu', 'priority'],
+      assignMode: 'pull',
+      cost: 3,
+      assignedWorker: 'worker-1',
+      disconnectPolicy: 'cancel',
     }
     await store.saveTask(task)
     const retrieved = await store.getTask('task-1')
@@ -235,6 +240,31 @@ describe('SqliteLongTermStore', () => {
     expect(events[0]).toEqual(event)
     expect(events[0]!.seriesId).toBe('my-series')
     expect(events[0]!.seriesMode).toBe('accumulate')
+  })
+
+  it('should preserve seriesAccField on events', async () => {
+    await store.saveTask(makeTask())
+    const event: TaskEvent = {
+      ...makeEvent('task-1', 0),
+      seriesId: 'acc-series',
+      seriesMode: 'accumulate',
+      seriesAccField: 'text',
+    }
+    await store.saveEvent(event)
+    const events = await store.getEvents('task-1')
+    expect(events[0]).toEqual(event)
+    expect(events[0]!.seriesAccField).toBe('text')
+  })
+
+  it('should save event with null data', async () => {
+    await store.saveTask(makeTask())
+    const event: TaskEvent = {
+      ...makeEvent('task-1', 0),
+      data: null,
+    }
+    await store.saveEvent(event)
+    const events = await store.getEvents('task-1')
+    expect(events[0]!.data).toBeNull()
   })
 })
 

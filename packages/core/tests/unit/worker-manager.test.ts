@@ -19,6 +19,28 @@ const defaultRegistration: WorkerRegistration = {
   connectionMode: 'pull',
 }
 
+// ─── heartbeatIntervalMs getter ─────────────────────────────────────────────
+
+describe('WorkerManager — heartbeatIntervalMs getter', () => {
+  it('returns default 30000 when no defaults are configured', () => {
+    const { manager } = makeSetup()
+    expect(manager.heartbeatIntervalMs).toBe(30_000)
+  })
+
+  it('returns custom value when defaults.heartbeatIntervalMs is set', () => {
+    const store = new MemoryShortTermStore()
+    const broadcast = new MemoryBroadcastProvider()
+    const engine = new TaskEngine({ shortTermStore: store, broadcast })
+    const manager = new WorkerManager({
+      engine,
+      shortTermStore: store,
+      broadcast,
+      defaults: { heartbeatIntervalMs: 15_000 },
+    })
+    expect(manager.heartbeatIntervalMs).toBe(15_000)
+  })
+})
+
 // ─── Worker Registration & Lifecycle (Task 3.1) ────────────────────────────
 
 describe('WorkerManager — Registration & Lifecycle', () => {

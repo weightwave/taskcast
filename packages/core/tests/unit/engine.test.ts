@@ -372,6 +372,33 @@ describe('TaskEngine.getEvents', () => {
     const events = await engine.getEvents(task.id)
     expect(events.length).toBeGreaterThan(0)
   })
+
+  it('passes opts through to shortTermStore.getEvents', async () => {
+    const { engine } = makeEngine()
+    const task = await engine.createTask({})
+    await engine.transitionTask(task.id, 'running')
+    await engine.publishEvent(task.id, { type: 'a', level: 'info', data: null })
+    await engine.publishEvent(task.id, { type: 'b', level: 'info', data: null })
+    const events = await engine.getEvents(task.id, { limit: 1 })
+    expect(events).toHaveLength(1)
+  })
+})
+
+describe('TaskEngine.listTasks', () => {
+  it('proxies to shortTermStore.listTasks with filter', async () => {
+    const { engine } = makeEngine()
+    await engine.createTask({ type: 'alpha' })
+    await engine.createTask({ type: 'beta' })
+    const result = await engine.listTasks({ types: ['alpha'] })
+    expect(result).toHaveLength(1)
+    expect(result[0]!.type).toBe('alpha')
+  })
+
+  it('returns empty array when no tasks match', async () => {
+    const { engine } = makeEngine()
+    const result = await engine.listTasks({ status: ['completed'] })
+    expect(result).toEqual([])
+  })
 })
 
 describe('TaskEngine.subscribe', () => {
@@ -386,6 +413,60 @@ describe('TaskEngine.subscribe', () => {
     await engine.publishEvent(task.id, { type: 'live.event', level: 'info', data: null })
     expect(received).toContain('live.event')
     unsub()
+  })
+})
+
+describe('TaskEngine.addTransitionListener', () => {
+  it('calls transition listeners on status change', async () => {
+    const { engine } = makeEngine()
+    const listener = vi.fn()
+    engine.addTransitionListener(listener)
+    const task = await engine.createTask({})
+    await engine.transitionTask(task.id, 'running')
+    expect(listener).toHaveBeenCalledOnce()
+    expect(listener).toHaveBeenCalledWith(
+      expect.objectContaining({ id: task.id, status: 'running' }),
+      'pending',
+      'running',
+    )
+  })
+
+  it('catches and ignores errors thrown by transition listeners', async () => {
+    const { engine } = makeEngine()
+    const throwingListener = vi.fn(() => {
+      throw new Error('listener kaboom')
+    })
+    const secondListener = vi.fn()
+    engine.addTransitionListener(throwingListener)
+    engine.addTransitionListener(secondListener)
+    const task = await engine.createTask({})
+
+    // Should not throw despite the listener error
+    await expect(engine.transitionTask(task.id, 'running')).resolves.toBeDefined()
+
+    // Both listeners should have been called
+    expect(throwingListener).toHaveBeenCalledOnce()
+    expect(secondListener).toHaveBeenCalledOnce()
+  })
+})
+
+describe('TaskEngine.addCreationListener', () => {
+  it('calls creation listeners on task creation', async () => {
+    const { engine } = makeEngine()
+    const listener = vi.fn()
+    engine.addCreationListener(listener)
+    const task = await engine.createTask({ type: 'test' })
+    expect(listener).toHaveBeenCalledOnce()
+    expect(listener).toHaveBeenCalledWith(expect.objectContaining({ id: task.id }))
+  })
+
+  it('catches and ignores errors thrown by creation listeners', async () => {
+    const { engine } = makeEngine()
+    engine.addCreationListener(() => {
+      throw new Error('creation listener error')
+    })
+    // Should not throw
+    await expect(engine.createTask({ type: 'test' })).resolves.toBeDefined()
   })
 })
 
@@ -417,5 +498,14 @@ describe('TaskEngine constructor validation', () => {
     const broadcast = new MemoryBroadcastProvider()
     const engine = new TaskEngine({ shortTerm: store, broadcast } as any)
     expect(engine).toBeInstanceOf(TaskEngine)
+  })
+
+  it('accepts legacy longTerm option name and uses it as longTermStore', async () => {
+    const store = new MemoryShortTermStore()
+    const broadcast = new MemoryBroadcastProvider()
+    const longTermStore = makeLongTermStore()
+    const engine = new TaskEngine({ shortTerm: store, longTerm: longTermStore, broadcast } as any)
+    const task = await engine.createTask({ type: 'test' })
+    expect(longTermStore.saveTask).toHaveBeenCalledWith(expect.objectContaining({ id: task.id }))
   })
 })

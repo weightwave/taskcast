@@ -113,6 +113,52 @@ describe('useTaskEvents', () => {
     expect(result.current.error?.message).toBe('onError callback')
   })
 
+  it('runs cleanup on unmount (sets cancelled=true so callbacks after unmount are ignored)', async () => {
+    const { TaskcastClient } = await import('@taskcast/client')
+
+    // Create a subscribe that delays emitting events until after unmount
+    let capturedOpts: { onEvent: (e: SSEEnvelope) => void; onDone: (r: string) => void; onError?: (e: Error) => void } | null = null
+    vi.mocked(TaskcastClient).mockImplementationOnce(() => ({
+      subscribe: vi.fn((_taskId: string, opts: { onEvent: (e: SSEEnvelope) => void; onDone: (r: string) => void; onError?: (e: Error) => void }) => {
+        capturedOpts = opts
+        // Never resolves — simulates a long-running subscription
+        return new Promise<void>(() => {})
+      }),
+    }))
+
+    const { result, unmount } = renderHook(() =>
+      useTaskEvents('task-1', { baseUrl: 'http://taskcast' })
+    )
+
+    // Wait for effect to fire
+    await new Promise(resolve => setTimeout(resolve, 10))
+
+    // Verify subscribe was called and we captured opts
+    expect(capturedOpts).not.toBeNull()
+
+    // Unmount triggers the cleanup function (lines 60-62: cancelled = true)
+    unmount()
+
+    // Now fire callbacks after unmount — they should be ignored due to cancelled=true
+    capturedOpts!.onEvent({
+      filteredIndex: 0,
+      rawIndex: 0,
+      eventId: 'e-late',
+      taskId: 'task-1',
+      type: 'llm.delta',
+      timestamp: 2000,
+      level: 'info',
+      data: { text: 'late' },
+    })
+    capturedOpts!.onDone('completed')
+    capturedOpts!.onError?.(new Error('late error'))
+
+    // Events/state should remain at initial values (nothing updated after unmount)
+    expect(result.current.events).toEqual([])
+    expect(result.current.isDone).toBe(false)
+    expect(result.current.error).toBeNull()
+  })
+
   it('passes filter option when provided', async () => {
     const { TaskcastClient } = await import('@taskcast/client')
     const subscribeMock = vi.fn((_taskId: string, _opts: unknown) => {

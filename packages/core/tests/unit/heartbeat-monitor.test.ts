@@ -352,6 +352,203 @@ describe('HeartbeatMonitor', () => {
     })
   })
 
+  // ─── Blocked status reassignment ─────────────────────────────────────
+
+  describe('tick() with reassign policy — blocked task', () => {
+    beforeEach(() => {
+      vi.useFakeTimers()
+    })
+
+    afterEach(() => {
+      vi.useRealTimers()
+    })
+
+    it('transitions blocked → assigned → pending on worker disconnect (covers _findPathToPending for blocked)', async () => {
+      const { store, engine, manager, monitor } = makeSetup({
+        heartbeatTimeoutMs: 5000,
+        defaultDisconnectPolicy: 'reassign',
+        disconnectGraceMs: 3000,
+      })
+
+      const { worker, task } = await setupWorkerWithTask(manager, engine)
+
+      // Transition task to blocked (running → blocked)
+      await engine.transitionTask(task.id, 'blocked', { reason: 'waiting input' })
+      const blockedTask = await engine.getTask(task.id)
+      expect(blockedTask!.status).toBe('blocked')
+
+      // Expire the heartbeat
+      const w = await store.getWorker(worker.id)
+      w!.lastHeartbeatAt = Date.now() - 10_000
+      await store.saveWorker(w!)
+
+      await monitor.tick()
+
+      // Advance past grace period
+      await vi.advanceTimersByTimeAsync(3500)
+
+      // Task should be reverted to pending via blocked → assigned → pending
+      const reassigned = await engine.getTask(task.id)
+      expect(reassigned!.status).toBe('pending')
+    })
+
+    it('transitions paused → assigned → pending on worker disconnect (covers _findPathToPending for paused)', async () => {
+      const { store, engine, manager, monitor } = makeSetup({
+        heartbeatTimeoutMs: 5000,
+        defaultDisconnectPolicy: 'reassign',
+        disconnectGraceMs: 3000,
+      })
+
+      const { worker, task } = await setupWorkerWithTask(manager, engine)
+
+      // Transition task to paused (running → paused)
+      await engine.transitionTask(task.id, 'paused')
+      const pausedTask = await engine.getTask(task.id)
+      expect(pausedTask!.status).toBe('paused')
+
+      // Expire the heartbeat
+      const w = await store.getWorker(worker.id)
+      w!.lastHeartbeatAt = Date.now() - 10_000
+      await store.saveWorker(w!)
+
+      await monitor.tick()
+
+      // Advance past grace period
+      await vi.advanceTimersByTimeAsync(3500)
+
+      // Task should be reverted to pending via paused → assigned → pending
+      const reassigned = await engine.getTask(task.id)
+      expect(reassigned!.status).toBe('pending')
+    })
+  })
+
+  // ─── Assigned status reassignment ──────────────────────────────────
+
+  describe('tick() with reassign policy — assigned task', () => {
+    beforeEach(() => {
+      vi.useFakeTimers()
+    })
+
+    afterEach(() => {
+      vi.useRealTimers()
+    })
+
+    it('transitions assigned → pending on worker disconnect (covers _findPathToPending direct transition)', async () => {
+      const { store, engine, manager, monitor } = makeSetup({
+        heartbeatTimeoutMs: 5000,
+        defaultDisconnectPolicy: 'reassign',
+        disconnectGraceMs: 3000,
+      })
+
+      // Register worker, create task, claim it but do NOT transition to running
+      const worker = await manager.registerWorker({
+        matchRule: {},
+        capacity: 5,
+        connectionMode: 'pull',
+      })
+      const task = await engine.createTask({ assignMode: 'pull' })
+      await manager.claimTask(task.id, worker.id)
+      // Task is now 'assigned'
+      const assignedTask = await engine.getTask(task.id)
+      expect(assignedTask!.status).toBe('assigned')
+
+      // Expire the heartbeat
+      const w = await store.getWorker(worker.id)
+      w!.lastHeartbeatAt = Date.now() - 10_000
+      await store.saveWorker(w!)
+
+      await monitor.tick()
+
+      // Advance past grace period
+      await vi.advanceTimersByTimeAsync(3500)
+
+      // Task should be reverted to pending via assigned → pending
+      const reassigned = await engine.getTask(task.id)
+      expect(reassigned!.status).toBe('pending')
+    })
+  })
+
+  // ─── _findPathToPending fallback (terminal status) ─────────────────
+
+  describe('tick() with reassign policy — terminal task', () => {
+    beforeEach(() => {
+      vi.useFakeTimers()
+    })
+
+    afterEach(() => {
+      vi.useRealTimers()
+    })
+
+    it('does not attempt transitions for a task in terminal status (covers _findPathToPending returning [])', async () => {
+      const { store, engine, manager, monitor } = makeSetup({
+        heartbeatTimeoutMs: 5000,
+        defaultDisconnectPolicy: 'reassign',
+        disconnectGraceMs: 3000,
+      })
+
+      const { worker, task } = await setupWorkerWithTask(manager, engine)
+
+      // Complete the task (terminal status)
+      await engine.transitionTask(task.id, 'completed')
+
+      // Expire the heartbeat
+      const w = await store.getWorker(worker.id)
+      w!.lastHeartbeatAt = Date.now() - 10_000
+      await store.saveWorker(w!)
+
+      await monitor.tick()
+
+      // Advance past grace period
+      await vi.advanceTimersByTimeAsync(3500)
+
+      // Task should still be completed (no path to pending from terminal)
+      const final = await engine.getTask(task.id)
+      expect(final!.status).toBe('completed')
+    })
+  })
+
+  // ─── _transitionToPending catch block (transition fails mid-path) ──
+
+  describe('tick() with reassign — transition failure mid-path', () => {
+    beforeEach(() => {
+      vi.useFakeTimers()
+    })
+
+    afterEach(() => {
+      vi.useRealTimers()
+    })
+
+    it('catches and stops when transition fails mid-path', async () => {
+      const { store, engine, manager, monitor } = makeSetup({
+        heartbeatTimeoutMs: 5000,
+        defaultDisconnectPolicy: 'reassign',
+        disconnectGraceMs: 3000,
+      })
+
+      const { worker, task } = await setupWorkerWithTask(manager, engine)
+
+      // Expire the heartbeat
+      const w = await store.getWorker(worker.id)
+      w!.lastHeartbeatAt = Date.now() - 10_000
+      await store.saveWorker(w!)
+
+      await monitor.tick()
+
+      // Make transitionTask throw on the next call (during grace timer)
+      const originalTransition = engine.transitionTask.bind(engine)
+      vi.spyOn(engine, 'transitionTask').mockRejectedValue(new Error('external conflict'))
+
+      // Advance past grace period
+      await vi.advanceTimersByTimeAsync(3500)
+
+      // Task should still be running because transition failed
+      // Restore so we can read it
+      vi.spyOn(engine, 'transitionTask').mockImplementation(originalTransition)
+      const final = await engine.getTask(task.id)
+      expect(final!.status).toBe('running')
+    })
+  })
+
   // ─── Multiple Assignments ──────────────────────────────────────────
 
   describe('multiple assignments per worker', () => {
