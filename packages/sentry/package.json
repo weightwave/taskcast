@@ -1,6 +1,6 @@
 {
   "name": "@taskcast/sentry",
-  "version": "0.3.1",
+  "version": "1.0.0",
   "description": "Sentry error monitoring hooks for Taskcast.",
   "repository": {
     "type": "git",
