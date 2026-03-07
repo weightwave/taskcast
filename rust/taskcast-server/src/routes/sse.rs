@@ -11,8 +11,8 @@ use tokio::sync::Mutex;
 use tokio_stream::wrappers::ReceiverStream;
 
 use taskcast_core::{
-    apply_filtered_index, matches_filter, Level, SSEEnvelope, SinceCursor, SubscribeFilter,
-    TaskEngine, TaskEvent, TaskStatus,
+    apply_filtered_index, matches_filter, matches_type, CreationListener, Level, SSEEnvelope,
+    SinceCursor, SubscribeFilter, TaskEngine, TaskEvent, TaskStatus,
 };
 
 use crate::auth::{check_scope, AuthContext};
@@ -278,6 +278,128 @@ pub async fn sse_events(
         }
         unsub();
         decrement_subscriber_count(&sub_counts, &task_id_clone).await;
+    });
+
+    let stream = ReceiverStream::new(rx);
+    Ok(Sse::new(stream))
+}
+
+// ─── Global SSE Query Parameters ────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub struct GlobalSseQuery {
+    pub types: Option<String>,
+    pub levels: Option<String>,
+}
+
+// ─── Global SSE Handler ─────────────────────────────────────────────────────
+
+#[utoipa::path(
+    get,
+    path = "/events",
+    tag = "Events",
+    summary = "Subscribe to events from all tasks via SSE",
+    description = "Global SSE stream. Streams events from all tasks created after the connection is established. Runs indefinitely until client disconnects.",
+    security(("Bearer" = [])),
+    params(GlobalSseQuery),
+    responses(
+        (status = 200, description = "SSE event stream (text/event-stream)"),
+        (status = 403, description = "Forbidden"),
+    )
+)]
+pub async fn global_sse_events(
+    State(engine): State<Arc<TaskEngine>>,
+    Extension(auth): Extension<AuthContext>,
+    Query(query): Query<GlobalSseQuery>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
+    if !check_scope(
+        &auth,
+        taskcast_core::PermissionScope::EventSubscribe,
+        None,
+    ) {
+        return Err(AppError::Forbidden);
+    }
+
+    let types: Option<Vec<String>> = query
+        .types
+        .as_ref()
+        .map(|t| t.split(',').filter(|s| !s.is_empty()).map(String::from).collect());
+    let levels: Option<Vec<Level>> = query.levels.as_ref().map(|l| {
+        l.split(',')
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| serde_json::from_value(serde_json::Value::String(s.to_string())).ok())
+            .collect()
+    });
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(256);
+
+    // Collect all per-task unsubscribe functions for cleanup on disconnect.
+    let unsubscribes: Arc<std::sync::Mutex<Vec<Box<dyn Fn() + Send + Sync>>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let tx_for_listener = tx.clone();
+    let types_for_listener = types;
+    let levels_for_listener = levels;
+    let engine_for_listener = Arc::clone(&engine);
+    let unsubs_for_listener = Arc::clone(&unsubscribes);
+
+    // The creation listener subscribes to each new task's events synchronously
+    // using `subscribe_sync`. This is critical: if we used the async `subscribe`
+    // (via tokio::spawn), there would be a race condition — events published
+    // right after task creation could be missed before the subscription is
+    // established, especially on single-threaded runtimes where the spawned
+    // task may not get scheduled in time.
+    let creation_listener: CreationListener = Arc::new(move |task| {
+        let tx_for_sub = tx_for_listener.clone();
+        let types_for_sub = types_for_listener.clone();
+        let levels_for_sub = levels_for_listener.clone();
+
+        let unsub = engine_for_listener.subscribe_sync(
+            &task.id,
+            Box::new(move |event| {
+                // Apply type filter
+                if let Some(ref type_patterns) = types_for_sub {
+                    if !matches_type(&event.r#type, Some(type_patterns)) {
+                        return;
+                    }
+                }
+
+                // Apply level filter
+                if let Some(ref level_list) = levels_for_sub {
+                    if !level_list.contains(&event.level) {
+                        return;
+                    }
+                }
+
+                let envelope = to_envelope(&event, 0);
+                let payload = serde_json::to_value(envelope).unwrap();
+                let sse_event = Event::default()
+                    .event("taskcast.event")
+                    .data(serde_json::to_string(&payload).unwrap())
+                    .id(event.id.clone());
+                let _ = tx_for_sub.try_send(Ok(sse_event));
+            }),
+        );
+
+        unsubs_for_listener.lock().unwrap().push(unsub);
+    });
+
+    engine.add_creation_listener(creation_listener.clone());
+
+    // Spawn a cleanup task that waits for client disconnect
+    tokio::spawn(async move {
+        // Wait for client disconnect (rx is dropped when the SSE stream ends)
+        tx.closed().await;
+
+        // Cleanup: remove creation listener and all per-task subscriptions
+        engine.remove_creation_listener(&creation_listener);
+        let unsubs = {
+            let mut guard = unsubscribes.lock().unwrap();
+            std::mem::take(&mut *guard)
+        };
+        for unsub in unsubs {
+            unsub();
+        }
     });
 
     let stream = ReceiverStream::new(rx);

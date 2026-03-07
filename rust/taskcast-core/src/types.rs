@@ -469,6 +469,20 @@ pub trait BroadcastProvider: Send + Sync {
         channel: &str,
         handler: Box<dyn Fn(TaskEvent) + Send + Sync>,
     ) -> Box<dyn Fn() + Send + Sync>;
+
+    /// Synchronous version of `subscribe` for use in contexts where async is not
+    /// available (e.g., inside creation listener callbacks).
+    ///
+    /// The default implementation panics. Providers that support synchronous
+    /// subscription should override this.
+    fn subscribe_sync(
+        &self,
+        channel: &str,
+        handler: Box<dyn Fn(TaskEvent) + Send + Sync>,
+    ) -> Box<dyn Fn() + Send + Sync> {
+        let _ = (channel, handler);
+        panic!("subscribe_sync is not supported by this BroadcastProvider")
+    }
 }
 
 #[async_trait]

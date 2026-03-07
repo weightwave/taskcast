@@ -67,10 +67,15 @@ pub fn create_app(
         .layer(Extension(subscriber_counts))
         .with_state(Arc::clone(&engine));
 
+    let events_route = Router::new()
+        .route("/events", get(sse::global_sse_events))
+        .with_state(Arc::clone(&engine));
+
     let mut app = Router::new()
         .route("/health", get(health))
         .route("/health/detail", get(health_detail).with_state(app_state))
-        .nest("/tasks", task_routes);
+        .nest("/tasks", task_routes)
+        .merge(events_route);
 
     // Conditionally mount worker routes if a WorkerManager is provided
     let mut ws_registry_out: Option<WsRegistry> = None;

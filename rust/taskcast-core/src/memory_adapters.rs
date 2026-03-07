@@ -55,6 +55,14 @@ impl BroadcastProvider for MemoryBroadcastProvider {
         channel: &str,
         handler: Box<dyn Fn(TaskEvent) + Send + Sync>,
     ) -> Box<dyn Fn() + Send + Sync> {
+        self.subscribe_sync(channel, handler)
+    }
+
+    fn subscribe_sync(
+        &self,
+        channel: &str,
+        handler: Box<dyn Fn(TaskEvent) + Send + Sync>,
+    ) -> Box<dyn Fn() + Send + Sync> {
         let handler: Handler = Arc::from(handler);
         {
             let mut listeners = self.listeners.write().unwrap();
