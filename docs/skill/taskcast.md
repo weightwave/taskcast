@@ -269,3 +269,148 @@ adapters:
 ```
 
 Scopes: `task:create`, `task:manage`, `event:publish`, `event:subscribe`, `event:history`, `webhook:create`, `*`
+
+## Debugging
+
+### CLI Quick Checks
+
+```bash
+taskcast ping                          # Server reachable?
+taskcast doctor                        # Storage + auth + connectivity
+taskcast tasks list --status running   # Any stuck tasks?
+taskcast tasks inspect <taskId>        # Full task details + recent events
+taskcast logs <taskId>                 # Real-time event stream for one task
+taskcast tail                          # Watch all tasks globally
+```
+
+### Common Errors and Fixes
+
+| Error | Cause | Fix |
+|-------|-------|-----|
+| `Task not found: <id>` | Task expired (TTL) or was cleaned up | Check TTL settings; query long-term store if configured |
+| `Cannot publish to task in terminal status` | Task already completed/failed/cancelled | Check task status before publishing; create a new task |
+| `Invalid transition: pending → completed` | Must go through `running` first | Call `transitionTask(id, 'running')` before `transitionTask(id, 'completed')` |
+| `403 Forbidden` | JWT missing required scope | Check token scopes; need `event:publish`, `task:create`, etc. |
+| SSE connects but no events appear | Task still in `pending` status | Transition to `running` — SSE holds connection until task is running |
+| `ECONNREFUSED` | Server not running or wrong port | Run `taskcast ping` to verify; check with `taskcast doctor` |
+
+### Verbose Server Mode
+
+Start the server with `--verbose` to see every request:
+
+```bash
+taskcast start --verbose
+# [2026-03-07 14:32:01] POST   /tasks                    → 201  12ms
+# [2026-03-07 14:32:02] PATCH  /tasks/01JXX../status     → 200   3ms
+```
+
+### State Machine Reference
+
+```
+pending → running → completed | failed | timeout | cancelled
+pending → assigned → running (worker assignment)
+pending → cancelled
+running → paused → running (resumable)
+running → blocked → running (after resolve)
+```
+
+## Agent Workflow Patterns
+
+### Agent as Producer (streaming output)
+
+```typescript
+import { TaskcastServerClient } from '@taskcast/server-sdk'
+
+const taskcast = new TaskcastServerClient({ baseUrl: 'http://localhost:3721' })
+
+const task = await taskcast.createTask({ type: 'llm.chat', params: { prompt } })
+await taskcast.transitionTask(task.id, 'running')
+
+try {
+  for await (const chunk of llmStream) {
+    await taskcast.publishEvent(task.id, {
+      type: 'llm.delta',
+      level: 'info',
+      data: { delta: chunk.text },
+      seriesId: 'response',
+      seriesMode: 'accumulate',
+    })
+  }
+  await taskcast.transitionTask(task.id, 'completed', {
+    result: { output: fullText },
+  })
+} catch (err) {
+  await taskcast.transitionTask(task.id, 'failed', {
+    error: { message: err.message, code: 'LLM_ERROR' },
+  })
+}
+```
+
+### Agent as Orchestrator (subtask management)
+
+```typescript
+// Create subtasks
+const subtasks = await Promise.all(
+  steps.map(step =>
+    taskcast.createTask({ type: 'agent.step', params: step })
+  )
+)
+
+// Monitor all subtasks
+const poll = setInterval(async () => {
+  const results = await Promise.all(
+    subtasks.map(t => taskcast.getTask(t.id))
+  )
+  const allDone = results.every(t =>
+    ['completed', 'failed'].includes(t.status)
+  )
+  if (allDone) {
+    clearInterval(poll)
+    // Process results...
+  }
+}, 1000)
+```
+
+### Error Recovery Pattern
+
+```typescript
+try {
+  await taskcast.transitionTask(taskId, 'running')
+  // ... do work ...
+  await taskcast.transitionTask(taskId, 'completed', { result })
+} catch (err) {
+  // Always transition to failed so subscribers know
+  await taskcast.transitionTask(taskId, 'failed', {
+    error: {
+      message: err.message,
+      code: err.code ?? 'UNKNOWN',
+      details: { stack: err.stack },
+    },
+  }).catch(() => {}) // task may already be terminal
+}
+```
+
+## Node Management (CLI)
+
+Manage connections to multiple Taskcast servers:
+
+```bash
+# Add connections
+taskcast node add local --url http://localhost:3721
+taskcast node add prod --url https://tc.example.com --token <jwt> --token-type jwt
+taskcast node add staging --url https://s.tc.io --token <admin-token> --token-type admin
+
+# Switch default target
+taskcast node use prod
+
+# All commands now target prod
+taskcast tasks list
+taskcast logs <taskId>
+
+# Override per-command
+taskcast tasks list --node local
+```
+
+Token types:
+- `jwt` — Used directly as Bearer token
+- `admin` — Exchanged for JWT via `/admin/token` endpoint automatically
