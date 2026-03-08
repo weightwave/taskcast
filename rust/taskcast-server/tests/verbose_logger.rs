@@ -183,3 +183,53 @@ async fn logs_multiple_requests() {
     let lines = logger.lines.lock().unwrap();
     assert_eq!(lines.len(), 3);
 }
+
+#[tokio::test]
+async fn logs_body_too_large_when_content_length_exceeds_64kb() {
+    let (engine, server, logger) = make_verbose_server();
+    let task = engine
+        .create_task(CreateTaskInput {
+            r#type: Some("test".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    engine
+        .transition_task(&task.id, TaskStatus::Running, None)
+        .await
+        .unwrap();
+
+    logger.lines.lock().unwrap().clear();
+
+    // Create a body larger than 64KB
+    let large_text = "x".repeat(65537);
+    let body = json!({
+        "type": "llm.delta",
+        "level": "info",
+        "data": { "text": large_text }
+    });
+
+    // Explicitly set Content-Length so the middleware detects the oversized body
+    // without consuming the stream (axum_test may not set it automatically).
+    let body_bytes = serde_json::to_vec(&body).unwrap();
+    let content_length = body_bytes.len().to_string();
+    let res = server
+        .post(&format!("/tasks/{}/events", task.id))
+        .content_type("application/json")
+        .add_header(
+            axum_test::http::header::CONTENT_LENGTH,
+            axum_test::http::HeaderValue::from_str(&content_length).unwrap(),
+        )
+        .bytes(body_bytes.into())
+        .await;
+    // Handler should still receive the full body and process the request normally
+    res.assert_status(axum_test::http::StatusCode::CREATED);
+
+    let lines = logger.lines.lock().unwrap();
+    assert_eq!(lines.len(), 1);
+    assert!(
+        lines[0].contains("body too large to log"),
+        "Expected 'body too large to log' in: {}",
+        &lines[0]
+    );
+}

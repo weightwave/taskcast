@@ -17,7 +17,12 @@ pub struct PingResult {
 
 pub async fn ping_server(url: &str) -> PingResult {
     let start = std::time::Instant::now();
-    match reqwest::get(&format!("{}/health", url)).await {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
+    match client.get(&format!("{}/health", url)).send().await {
         Ok(res) if res.status().is_success() => PingResult {
             ok: true,
             latency_ms: Some(start.elapsed().as_millis() as u64),

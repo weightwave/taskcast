@@ -71,9 +71,13 @@ pub fn create_app(
         .route("/events", get(sse::global_sse_events))
         .with_state(Arc::clone(&engine));
 
-    let mut app = Router::new()
+    // Public routes bypass auth (health endpoints)
+    let public_routes = Router::new()
         .route("/health", get(health))
-        .route("/health/detail", get(health_detail).with_state(app_state))
+        .route("/health/detail", get(health_detail).with_state(app_state));
+
+    // Authenticated routes (tasks, events, workers, etc.)
+    let mut authenticated_routes = Router::new()
         .nest("/tasks", task_routes)
         .merge(events_route);
 
@@ -135,7 +139,7 @@ pub fn create_app(
             .with_state(Arc::clone(&manager));
 
         // Mount WS route at top level for /workers/ws (with registry)
-        app = app
+        authenticated_routes = authenticated_routes
             .route(
                 "/workers/ws",
                 get(crate::routes::worker_ws::ws_handler)
@@ -148,7 +152,7 @@ pub fn create_app(
 
     // OpenAPI spec and Scalar UI
     let openapi_spec = ApiDoc::openapi();
-    app = app
+    authenticated_routes = authenticated_routes
         .route(
             "/openapi.json",
             get({
@@ -158,16 +162,19 @@ pub fn create_app(
         )
         .merge(Scalar::with_url("/docs", openapi_spec));
 
-    // Auth middleware must be applied AFTER routes are mounted but BEFORE
-    // admin routes are merged, so admin routes bypass auth.
-    let app_with_auth = app.layer(middleware::from_fn_with_state(
+    // Auth middleware is applied only to authenticated routes, so health
+    // endpoints (public_routes) bypass auth — matching the TS implementation.
+    let authenticated_with_auth = authenticated_routes.layer(middleware::from_fn_with_state(
         Arc::clone(&auth_mode),
         auth_middleware,
     ));
 
+    // Merge public (no auth) + authenticated (with auth)
+    let mut app = public_routes.merge(authenticated_with_auth);
+
     // Admin route is merged AFTER the auth layer so it bypasses JWT/custom auth.
     // It authenticates via admin token independently.
-    let final_app = if let Some(cfg) = config {
+    if let Some(cfg) = config {
         let admin_state = Arc::new(admin::AdminState {
             config: Arc::new(cfg),
             auth_mode: Arc::clone(&auth_mode),
@@ -175,12 +182,10 @@ pub fn create_app(
         let admin_routes = Router::new()
             .route("/admin/token", post(admin::admin_token))
             .with_state(admin_state);
-        app_with_auth.merge(admin_routes)
-    } else {
-        app_with_auth
-    };
+        app = app.merge(admin_routes);
+    }
 
-    (final_app, ws_registry_out)
+    (app, ws_registry_out)
 }
 
 async fn health() -> impl IntoResponse {

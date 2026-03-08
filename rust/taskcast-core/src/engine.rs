@@ -456,7 +456,7 @@ impl TaskEngine {
         &self,
         task_id: &str,
         handler: Box<dyn Fn(TaskEvent) + Send + Sync>,
-    ) -> Box<dyn Fn() + Send + Sync> {
+    ) -> Result<Box<dyn Fn() + Send + Sync>, Box<dyn std::error::Error + Send + Sync>> {
         self.broadcast.subscribe_sync(task_id, handler)
     }
 

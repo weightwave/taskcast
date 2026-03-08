@@ -22,6 +22,9 @@ pub enum AppError {
 
     #[error("Invalid or expired token")]
     InvalidToken,
+
+    #[error("{0}")]
+    NotImplemented(String),
 }
 
 impl IntoResponse for AppError {
@@ -47,6 +50,9 @@ impl IntoResponse for AppError {
             AppError::MissingToken => (StatusCode::UNAUTHORIZED, "Missing Bearer token".to_string()),
             AppError::InvalidToken => {
                 (StatusCode::UNAUTHORIZED, "Invalid or expired token".to_string())
+            }
+            AppError::NotImplemented(msg) => {
+                (StatusCode::NOT_IMPLEMENTED, msg.clone())
             }
         };
 

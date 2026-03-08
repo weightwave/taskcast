@@ -236,4 +236,28 @@ describe('verbose logger middleware', () => {
     expect(logs[0]).toContain('/resolve')
     expect(logs[0]).toContain('resolve')
   })
+
+  it('logs "body too large to log" when Content-Length exceeds 64KB and handler still receives body', async () => {
+    const { app, engine, logs } = makeVerboseApp()
+    const task = await engine.createTask({ type: 'test' })
+    await engine.transitionTask(task.id, 'running')
+    logs.length = 0
+
+    // Create a body larger than 64KB
+    const largeData = 'x'.repeat(65537)
+    const body = JSON.stringify({ type: 'llm.delta', level: 'info', data: { text: largeData } })
+
+    const res = await app.request(`/tasks/${task.id}/events`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': String(Buffer.byteLength(body)),
+      },
+      body,
+    })
+    // Handler should still receive the full body and process the request normally
+    expect(res.status).toBe(201)
+    expect(logs).toHaveLength(1)
+    expect(logs[0]).toContain('body too large to log')
+  })
 })

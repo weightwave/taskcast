@@ -331,6 +331,21 @@ pub async fn global_sse_events(
             .collect()
     });
 
+    // Probe whether the broadcast provider supports subscribe_sync.
+    // If it doesn't, return 501 immediately instead of panicking later
+    // when a task is created and the creation listener fires.
+    {
+        let probe = engine.subscribe_sync("__probe__", Box::new(|_| {}));
+        match probe {
+            Ok(unsub) => unsub(), // clean up probe subscription
+            Err(_) => {
+                return Err(AppError::NotImplemented(
+                    "Global SSE not supported with this broadcast provider".to_string(),
+                ));
+            }
+        }
+    }
+
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(256);
 
     // Collect all per-task unsubscribe functions for cleanup on disconnect.
@@ -354,7 +369,7 @@ pub async fn global_sse_events(
         let types_for_sub = types_for_listener.clone();
         let levels_for_sub = levels_for_listener.clone();
 
-        let unsub = engine_for_listener.subscribe_sync(
+        let unsub = match engine_for_listener.subscribe_sync(
             &task.id,
             Box::new(move |event| {
                 // Apply type filter
@@ -379,7 +394,10 @@ pub async fn global_sse_events(
                     .id(event.id.clone());
                 let _ = tx_for_sub.try_send(Ok(sse_event));
             }),
-        );
+        ) {
+            Ok(unsub) => unsub,
+            Err(_) => return, // provider doesn't support subscribe_sync; skip
+        };
 
         unsubs_for_listener.lock().unwrap().push(unsub);
     });

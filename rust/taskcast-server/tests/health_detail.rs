@@ -4,7 +4,7 @@ use axum_test::TestServer;
 use taskcast_core::{
     MemoryBroadcastProvider, MemoryShortTermStore, TaskEngine, TaskEngineOptions,
 };
-use taskcast_server::{create_app, AuthMode};
+use taskcast_server::{create_app, AuthMode, JwtConfig};
 
 fn make_server() -> TestServer {
     let engine = Arc::new(TaskEngine::new(TaskEngineOptions {
@@ -46,4 +46,52 @@ async fn health_detail_reports_memory_adapters_by_default() {
     assert_eq!(body["adapters"]["broadcast"]["status"], "ok");
     assert_eq!(body["adapters"]["shortTermStore"]["provider"], "memory");
     assert_eq!(body["adapters"]["shortTermStore"]["status"], "ok");
+}
+
+fn make_jwt_server() -> TestServer {
+    let engine = Arc::new(TaskEngine::new(TaskEngineOptions {
+        short_term_store: Arc::new(MemoryShortTermStore::new()),
+        broadcast: Arc::new(MemoryBroadcastProvider::new()),
+        long_term_store: None,
+        hooks: None,
+    }));
+    let auth = AuthMode::Jwt(JwtConfig {
+        algorithm: jsonwebtoken::Algorithm::HS256,
+        secret: Some("test-secret-key-for-jwt-signing".to_string()),
+        public_key: None,
+        issuer: None,
+        audience: None,
+    });
+    let (app, _) = create_app(engine, auth, None, None);
+    TestServer::new(app)
+}
+
+#[tokio::test]
+async fn health_bypasses_jwt_auth() {
+    let server = make_jwt_server();
+    // No Bearer token — should still return 200
+    let res = server.get("/health").await;
+    res.assert_status_ok();
+    let body: serde_json::Value = res.json();
+    assert_eq!(body["ok"], true);
+}
+
+#[tokio::test]
+async fn health_detail_bypasses_jwt_auth() {
+    let server = make_jwt_server();
+    // No Bearer token — should still return 200
+    let res = server.get("/health/detail").await;
+    res.assert_status_ok();
+    let body: serde_json::Value = res.json();
+    assert_eq!(body["ok"], true);
+    assert!(body["uptime"].is_number());
+    assert_eq!(body["auth"]["mode"], "jwt");
+}
+
+#[tokio::test]
+async fn authenticated_routes_still_require_jwt() {
+    let server = make_jwt_server();
+    // No Bearer token — should return 401 for task routes
+    let res = server.get("/tasks").await;
+    res.assert_status(axum_test::http::StatusCode::UNAUTHORIZED);
 }

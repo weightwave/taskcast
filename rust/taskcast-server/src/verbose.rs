@@ -53,22 +53,37 @@ pub async fn verbose_logger_middleware(
     let method = req.method().to_string();
     let path = req.uri().path().to_string();
 
-    // Try to read the body for context extraction (buffer then reconstruct)
-    let (parts, body) = req.into_parts();
-    let body_bytes = match axum::body::to_bytes(body, 1024 * 64).await {
-        Ok(b) => b,
-        Err(_) => bytes::Bytes::new(),
-    };
+    const MAX_BODY_SIZE: usize = 64 * 1024;
 
-    let request_body: Option<serde_json::Value> =
-        if matches!(method.as_str(), "POST" | "PATCH" | "PUT") {
-            serde_json::from_slice(&body_bytes).ok()
+    // Check Content-Length to decide if we should parse the body
+    let content_length = req
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok());
+
+    let body_too_large = content_length.is_some_and(|len| len > MAX_BODY_SIZE);
+
+    let (request_body, req) =
+        if !body_too_large && matches!(method.as_str(), "POST" | "PATCH" | "PUT") {
+            let (parts, body) = req.into_parts();
+            match axum::body::to_bytes(body, MAX_BODY_SIZE).await {
+                Ok(bytes) => {
+                    let parsed: Option<serde_json::Value> =
+                        serde_json::from_slice(&bytes).ok();
+                    let req = Request::from_parts(parts, axum::body::Body::from(bytes));
+                    (parsed, req)
+                }
+                Err(_) => {
+                    // Body exceeded limit during read (no Content-Length or incorrect).
+                    // The body stream is consumed; reconstruct empty.
+                    let req = Request::from_parts(parts, axum::body::Body::empty());
+                    (None, req)
+                }
+            }
         } else {
-            None
+            (None, req)
         };
-
-    // Reconstruct the request with the buffered body
-    let req = Request::from_parts(parts, axum::body::Body::from(body_bytes));
 
     let start = Instant::now();
     let response = next.run(req).await;
@@ -85,7 +100,8 @@ pub async fn verbose_logger_middleware(
         status.to_string()
     };
 
-    let context = extract_context(&method, &path, status, request_body.as_ref());
+    let context =
+        extract_context(&method, &path, status, request_body.as_ref(), body_too_large);
 
     let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S");
 
@@ -107,7 +123,13 @@ fn extract_context(
     path: &str,
     status: u16,
     body: Option<&serde_json::Value>,
+    body_too_large: bool,
 ) -> String {
+    // If the body was too large to parse, note it in context for methods that normally show body info
+    if body_too_large && matches!(method, "POST" | "PATCH" | "PUT") {
+        return "body too large to log".to_string();
+    }
+
     // POST /tasks -> task created
     if method == "POST" && path == "/tasks" && status == 201 {
         return "task created".to_string();

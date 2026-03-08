@@ -2,6 +2,14 @@ use serde::Serialize;
 
 use crate::node_config::{NodeEntry, TokenType};
 
+fn default_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap()
+}
+
 /// HTTP client for communicating with a Taskcast server.
 ///
 /// Wraps `reqwest::Client` with base URL and optional auth token handling.
@@ -25,7 +33,7 @@ impl TaskcastClient {
     /// Create a client directly with optional token.
     pub fn new(base_url: String, token: Option<String>) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: default_client(),
             base_url: base_url.trim_end_matches('/').to_string(),
             token,
         }
@@ -37,7 +45,7 @@ impl TaskcastClient {
 
         if node.token_type == Some(TokenType::Admin) {
             if let Some(ref admin_token) = node.token {
-                let http = reqwest::Client::new();
+                let http = default_client();
                 let res = http
                     .post(format!("{base_url}/admin/token"))
                     .json(&serde_json::json!({ "adminToken": admin_token }))
@@ -66,14 +74,10 @@ impl TaskcastClient {
             }
         }
 
-        let token = if node.token_type == Some(TokenType::Jwt) {
-            node.token.clone()
-        } else {
-            node.token.clone()
-        };
+        let token = node.token.clone();
 
         Ok(Self {
-            http: reqwest::Client::new(),
+            http: default_client(),
             base_url,
             token,
         })

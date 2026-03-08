@@ -19,13 +19,22 @@ export function createVerboseLogger(
     const method = c.req.method
     const path = c.req.path
 
+    const MAX_BODY_SIZE = 64 * 1024
+
+    // Check Content-Length to decide if we should parse the body
+    const contentLengthRaw = c.req.header('content-length')
+    const contentLength = contentLengthRaw ? parseInt(contentLengthRaw, 10) : NaN
+    const bodyTooLarge = !isNaN(contentLength) && contentLength > MAX_BODY_SIZE
+
     // Capture request body for context extraction (clone to avoid consuming)
     let requestBody: Record<string, unknown> | undefined
     if (method === 'POST' || method === 'PATCH' || method === 'PUT') {
-      try {
-        requestBody = await c.req.raw.clone().json()
-      } catch {
-        // not JSON — ignore
+      if (!bodyTooLarge) {
+        try {
+          requestBody = await c.req.raw.clone().json()
+        } catch {
+          // not JSON — ignore
+        }
       }
     }
 
@@ -40,7 +49,7 @@ export function createVerboseLogger(
     const statusStr = isSSE || isGlobalSSE ? 'SSE' : String(status)
 
     // Extract contextual info
-    const context = extractContext(method, path, status, requestBody, c.res)
+    const context = extractContext(method, path, status, requestBody, c.res, bodyTooLarge)
 
     const timestamp = new Date().toISOString().replace('T', ' ').slice(0, 19)
 
@@ -56,7 +65,13 @@ function extractContext(
   status: number,
   requestBody: Record<string, unknown> | undefined,
   _res: Response,
+  bodyTooLarge = false,
 ): string {
+  // If the body was too large to parse, note it in context
+  if (bodyTooLarge && (method === 'POST' || method === 'PATCH' || method === 'PUT')) {
+    return 'body too large to log'
+  }
+
   // POST /tasks → show task ID (from response path or status)
   if (method === 'POST' && path === '/tasks' && status === 201) {
     return 'task created'
