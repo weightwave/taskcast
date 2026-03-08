@@ -316,6 +316,48 @@ impl ShortTermStore for SqliteShortTermStore {
         Ok(())
     }
 
+    async fn accumulate_series(
+        &self,
+        task_id: &str,
+        series_id: &str,
+        event: TaskEvent,
+        field: &str,
+    ) -> Result<TaskEvent, Box<dyn std::error::Error + Send + Sync>> {
+        let prev = self.get_series_latest(task_id, series_id).await?;
+        let accumulated = if let Some(prev) = prev {
+            let should_concat = prev
+                .data
+                .as_object()
+                .and_then(|po| po.get(field)?.as_str().map(|s| s.to_string()))
+                .and_then(|prev_val| {
+                    event
+                        .data
+                        .as_object()
+                        .and_then(|no| no.get(field)?.as_str().map(|s| s.to_string()))
+                        .map(|new_val| (prev_val, new_val))
+                });
+
+            if let Some((prev_val, new_val)) = should_concat {
+                let mut new_data = event.data.as_object().cloned().unwrap_or_default();
+                new_data.insert(
+                    field.to_string(),
+                    serde_json::Value::String(prev_val + &new_val),
+                );
+                TaskEvent {
+                    data: serde_json::Value::Object(new_data),
+                    ..event
+                }
+            } else {
+                event
+            }
+        } else {
+            event
+        };
+        self.set_series_latest(task_id, series_id, accumulated.clone())
+            .await?;
+        Ok(accumulated)
+    }
+
     async fn replace_last_series_event(
         &self,
         task_id: &str,

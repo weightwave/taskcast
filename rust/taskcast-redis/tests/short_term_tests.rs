@@ -60,6 +60,8 @@ fn make_event(task_id: &str, index: u64) -> TaskEvent {
         series_id: None,
         series_mode: None,
         series_acc_field: None,
+        series_snapshot: None,
+        _accumulated_data: None,
     }
 }
 

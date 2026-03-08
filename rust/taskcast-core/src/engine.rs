@@ -432,6 +432,18 @@ impl TaskEngine {
         self.broadcast.subscribe(task_id, handler).await
     }
 
+    /// Get the latest accumulated event for a series.
+    pub async fn get_series_latest(
+        &self,
+        task_id: &str,
+        series_id: &str,
+    ) -> Result<Option<TaskEvent>, EngineError> {
+        Ok(self
+            .short_term_store
+            .get_series_latest(task_id, series_id)
+            .await?)
+    }
+
     // ─── Private ─────────────────────────────────────────────────────────
 
     async fn emit(
@@ -451,23 +463,38 @@ impl TaskEngine {
             series_id: input.series_id,
             series_mode: input.series_mode,
             series_acc_field: input.series_acc_field,
+            series_snapshot: None,
+            _accumulated_data: None,
         };
 
-        let event = process_series(raw, self.short_term_store.as_ref()).await?;
+        let series_result = process_series(raw, self.short_term_store.as_ref()).await?;
+        let event = series_result.event;
 
+        // Store delta event in short-term store
         self.short_term_store
             .append_event(task_id, event.clone())
             .await?;
-        self.broadcast.publish(task_id, event.clone()).await?;
+
+        // Attach accumulated data to broadcast event for SSE accumulated subscribers
+        let broadcast_event = if let Some(ref accumulated) = series_result.accumulated_event {
+            TaskEvent {
+                _accumulated_data: Some(accumulated.data.clone()),
+                ..event.clone()
+            }
+        } else {
+            event.clone()
+        };
+        self.broadcast.publish(task_id, broadcast_event).await?;
 
         if let Some(ref long_term_store) = self.long_term_store {
             let long_term_store = Arc::clone(long_term_store);
-            let event_clone = event.clone();
+            // LongTermStore gets accumulated event (or delta if non-accumulate)
+            let store_event = series_result.accumulated_event.unwrap_or_else(|| event.clone());
             let hooks = self.hooks.clone();
             tokio::spawn(async move {
-                if let Err(err) = long_term_store.save_event(event_clone.clone()).await {
+                if let Err(err) = long_term_store.save_event(store_event.clone()).await {
                     if let Some(hooks) = hooks {
-                        hooks.on_event_dropped(&event_clone, &err.to_string());
+                        hooks.on_event_dropped(&store_event, &err.to_string());
                     }
                 }
             });

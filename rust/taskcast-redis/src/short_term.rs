@@ -239,6 +239,49 @@ impl ShortTermStore for RedisShortTermStore {
         Ok(())
     }
 
+    async fn accumulate_series(
+        &self,
+        task_id: &str,
+        series_id: &str,
+        event: TaskEvent,
+        field: &str,
+    ) -> Result<TaskEvent, Box<dyn std::error::Error + Send + Sync>> {
+        let prev = self.get_series_latest(task_id, series_id).await?;
+        let accumulated = if let Some(prev) = prev {
+            let prev_val = prev
+                .data
+                .as_object()
+                .and_then(|o| o.get(field))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let new_val = event
+                .data
+                .as_object()
+                .and_then(|o| o.get(field))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
+            if let (Some(prev_val), Some(new_val)) = (prev_val, new_val) {
+                let mut new_data = event.data.as_object().cloned().unwrap_or_default();
+                new_data.insert(
+                    field.to_string(),
+                    serde_json::Value::String(prev_val + &new_val),
+                );
+                TaskEvent {
+                    data: serde_json::Value::Object(new_data),
+                    ..event
+                }
+            } else {
+                event
+            }
+        } else {
+            event
+        };
+        self.set_series_latest(task_id, series_id, accumulated.clone())
+            .await?;
+        Ok(accumulated)
+    }
+
     async fn replace_last_series_event(
         &self,
         task_id: &str,

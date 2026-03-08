@@ -11,8 +11,8 @@ use tokio::sync::Mutex;
 use tokio_stream::wrappers::ReceiverStream;
 
 use taskcast_core::{
-    apply_filtered_index, matches_filter, Level, SSEEnvelope, SinceCursor, SubscribeFilter,
-    TaskEngine, TaskEvent, TaskStatus,
+    apply_filtered_index, matches_filter, Level, SSEEnvelope, SeriesFormat, SinceCursor,
+    SubscribeFilter, TaskEngine, TaskEvent, TaskStatus,
 };
 
 use crate::auth::{check_scope, AuthContext};
@@ -56,6 +56,8 @@ pub struct SseQuery {
     #[serde(rename = "includeStatus")]
     pub include_status: Option<String>,
     pub wrap: Option<String>,
+    #[serde(rename = "seriesFormat")]
+    pub series_format: Option<String>,
     #[serde(rename = "since.id")]
     pub since_id: Option<String>,
     #[serde(rename = "since.index")]
@@ -82,6 +84,12 @@ fn parse_filter(query: &SseQuery) -> SubscribeFilter {
     let include_status = query.include_status.as_ref().map(|v| v != "false");
     let wrap = query.wrap.as_ref().map(|v| v != "false");
 
+    let series_format = query.series_format.as_ref().and_then(|s| match s.as_str() {
+        "delta" => Some(SeriesFormat::Delta),
+        "accumulated" => Some(SeriesFormat::Accumulated),
+        _ => None,
+    });
+
     let since = if query.since_id.is_some()
         || query.since_index.is_some()
         || query.since_timestamp.is_some()
@@ -101,6 +109,7 @@ fn parse_filter(query: &SseQuery) -> SubscribeFilter {
         include_status,
         wrap,
         since,
+        series_format,
     }
 }
 
@@ -119,6 +128,7 @@ fn to_envelope(event: &TaskEvent, filtered_index: u64) -> SSEEnvelope {
         series_id: event.series_id.clone(),
         series_mode: event.series_mode.clone(),
         series_acc_field: event.series_acc_field.clone(),
+        series_snapshot: event.series_snapshot,
     }
 }
 
@@ -173,18 +183,36 @@ pub async fn sse_events(
     let task_id_clone = task_id.clone();
     let sub_counts = subscriber_counts.clone();
 
+    let series_format = filter
+        .series_format
+        .clone()
+        .unwrap_or(SeriesFormat::Delta);
+
     tokio::spawn(async move {
         increment_subscriber_count(&sub_counts, &task_id_clone).await;
 
+        let series_format_for_send = series_format.clone();
+
         // Helper closures
-        let send_event = |tx: &tokio::sync::mpsc::Sender<Result<Event, Infallible>>,
+        let send_event = move |tx: &tokio::sync::mpsc::Sender<Result<Event, Infallible>>,
                           event: &TaskEvent,
                           filtered_index: u64,
                           wrap: bool| {
+            let mut event_to_send = event.clone();
+
+            // For accumulated format, swap data with accumulated data if present
+            if series_format_for_send == SeriesFormat::Accumulated {
+                if let Some(ref acc_data) = event._accumulated_data {
+                    event_to_send.data = acc_data.clone();
+                }
+            }
+            // Strip transient field before sending
+            event_to_send._accumulated_data = None;
+
             let payload: serde_json::Value = if wrap {
-                serde_json::to_value(to_envelope(event, filtered_index)).unwrap()
+                serde_json::to_value(to_envelope(&event_to_send, filtered_index)).unwrap()
             } else {
-                serde_json::to_value(event).unwrap()
+                serde_json::to_value(&event_to_send).unwrap()
             };
             let sse_event = Event::default()
                 .event("taskcast.event")
@@ -211,7 +239,55 @@ pub async fn sse_events(
             }
         };
 
-        let filtered = apply_filtered_index(&history, &filter);
+        let has_since_cursor = filter.since.is_some();
+
+        // Collect accumulate series IDs
+        let mut accumulate_series_ids = std::collections::HashSet::new();
+        for e in &history {
+            if e.series_mode.as_ref() == Some(&taskcast_core::SeriesMode::Accumulate) {
+                if let Some(ref sid) = e.series_id {
+                    accumulate_series_ids.insert(sid.clone());
+                }
+            }
+        }
+
+        // Build replay events with late-join snapshot collapse
+        let replay_events = if !accumulate_series_ids.is_empty() && !has_since_cursor {
+            // Collapse accumulate series into snapshots
+            let mut snapshots = std::collections::HashMap::new();
+            for sid in &accumulate_series_ids {
+                if let Ok(Some(latest)) = engine.get_series_latest(&task_id_clone, sid).await {
+                    let mut snapshot = latest;
+                    snapshot.series_snapshot = Some(true);
+                    snapshots.insert(sid.clone(), snapshot);
+                }
+            }
+
+            let mut emitted_snapshots = std::collections::HashSet::new();
+            let mut replay = Vec::new();
+            for event in &history {
+                if event.series_mode.as_ref() == Some(&taskcast_core::SeriesMode::Accumulate) {
+                    if let Some(ref sid) = event.series_id {
+                        if accumulate_series_ids.contains(sid) {
+                            if !emitted_snapshots.contains(sid) {
+                                if let Some(snapshot) = snapshots.get(sid) {
+                                    replay.push(snapshot.clone());
+                                    emitted_snapshots.insert(sid.clone());
+                                }
+                            }
+                            // Skip remaining events in this accumulate series
+                            continue;
+                        }
+                    }
+                }
+                replay.push(event.clone());
+            }
+            replay
+        } else {
+            history
+        };
+
+        let filtered = apply_filtered_index(&replay_events, &filter);
         for fe in &filtered {
             send_event(&tx, &fe.event, fe.filtered_index, wrap);
         }
