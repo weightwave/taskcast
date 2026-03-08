@@ -98,6 +98,26 @@ export class RedisShortTermStore implements ShortTermStore {
     await this.redis.sadd(this.KEY.seriesIds(taskId), seriesId)
   }
 
+  async accumulateSeries(taskId: string, seriesId: string, event: TaskEvent, field: string): Promise<TaskEvent> {
+    // TODO(Task 8): Replace with Lua script for atomic JSON-aware accumulation
+    const prev = await this.getSeriesLatest(taskId, seriesId)
+    let accumulated = event
+    if (prev !== null) {
+      const prevData = (typeof prev.data === 'object' && prev.data !== null)
+        ? prev.data as Record<string, unknown> : {}
+      const newData = (typeof event.data === 'object' && event.data !== null)
+        ? event.data as Record<string, unknown> : {}
+      if (typeof prevData[field] === 'string' && typeof newData[field] === 'string') {
+        accumulated = {
+          ...event,
+          data: { ...newData, [field]: prevData[field] + newData[field] },
+        }
+      }
+    }
+    await this.setSeriesLatest(taskId, seriesId, accumulated)
+    return accumulated
+  }
+
   async replaceLastSeriesEvent(taskId: string, seriesId: string, event: TaskEvent): Promise<void> {
     const prev = await this.getSeriesLatest(taskId, seriesId)
     if (prev) {
