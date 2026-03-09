@@ -314,7 +314,8 @@ mod tests {
         let result = delivery.send(&event, &config).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.to_string().contains("3 attempts")); // 1 initial + 2 retries
+        let WebhookError::DeliveryFailed { attempts, .. } = err;
+        assert_eq!(attempts, 3); // 1 initial + 2 retries
         assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 3);
     }
 
@@ -383,7 +384,7 @@ mod tests {
                 let count = call_count_clone.clone();
                 async move {
                     count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                     axum::http::StatusCode::OK
                 }
             }),
