@@ -270,4 +270,244 @@ mod tests {
         let result = delivery.send(&event, &config).await;
         assert!(result.is_ok());
     }
+
+    // ─── Failure scenario tests ────────────────────────────────────────────
+
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn send_fails_after_retries_on_server_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let call_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let cc = call_count.clone();
+
+        let mock_app = axum::Router::new().route(
+            "/hook",
+            axum::routing::post(move || {
+                let c = cc.clone();
+                async move {
+                    c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, mock_app).await.unwrap();
+        });
+
+        let delivery = WebhookDelivery::new();
+        let config = WebhookConfig {
+            url: format!("http://{addr}/hook"),
+            filter: None,
+            secret: None,
+            wrap: None,
+            retry: Some(RetryConfig {
+                retries: 2,
+                backoff: BackoffStrategy::Fixed,
+                initial_delay_ms: 1,
+                max_delay_ms: 1,
+                timeout_ms: 5000,
+            }),
+        };
+
+        let result = delivery.send(&make_test_event(), &config).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("3 attempts"));
+        assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn send_succeeds_after_transient_failure() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let call_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let cc = call_count.clone();
+
+        let mock_app = axum::Router::new().route(
+            "/hook",
+            axum::routing::post(move || {
+                let c = cc.clone();
+                async move {
+                    let n = c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if n < 2 {
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                    } else {
+                        axum::http::StatusCode::OK
+                    }
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, mock_app).await.unwrap();
+        });
+
+        let delivery = WebhookDelivery::new();
+        let config = WebhookConfig {
+            url: format!("http://{addr}/hook"),
+            filter: None,
+            secret: None,
+            wrap: None,
+            retry: Some(RetryConfig {
+                retries: 3,
+                backoff: BackoffStrategy::Fixed,
+                initial_delay_ms: 1,
+                max_delay_ms: 1,
+                timeout_ms: 5000,
+            }),
+        };
+
+        let result = delivery.send(&make_test_event(), &config).await;
+        assert!(result.is_ok());
+        assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn send_timeout_counts_as_failure() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let call_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let cc = call_count.clone();
+
+        let mock_app = axum::Router::new().route(
+            "/hook",
+            axum::routing::post(move || {
+                let c = cc.clone();
+                async move {
+                    c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                    axum::http::StatusCode::OK
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, mock_app).await.unwrap();
+        });
+
+        let delivery = WebhookDelivery::new();
+        let config = WebhookConfig {
+            url: format!("http://{addr}/hook"),
+            filter: None,
+            secret: None,
+            wrap: None,
+            retry: Some(RetryConfig {
+                retries: 1,
+                backoff: BackoffStrategy::Fixed,
+                initial_delay_ms: 1,
+                max_delay_ms: 1,
+                timeout_ms: 50,
+            }),
+        };
+
+        let result = delivery.send(&make_test_event(), &config).await;
+        assert!(result.is_err());
+        assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn send_dns_failure_retries_and_fails() {
+        let delivery = WebhookDelivery::new();
+        let config = WebhookConfig {
+            url: "http://nonexistent.invalid:9999/hook".to_string(),
+            filter: None,
+            secret: None,
+            wrap: None,
+            retry: Some(RetryConfig {
+                retries: 1,
+                backoff: BackoffStrategy::Fixed,
+                initial_delay_ms: 1,
+                max_delay_ms: 1,
+                timeout_ms: 1000,
+            }),
+        };
+
+        let result = delivery.send(&make_test_event(), &config).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn send_without_secret_omits_signature_header() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let had_signature = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hs = had_signature.clone();
+
+        let mock_app = axum::Router::new().route(
+            "/hook",
+            axum::routing::post(move |headers: axum::http::HeaderMap| {
+                let sig = hs.clone();
+                async move {
+                    if headers.contains_key("x-taskcast-signature") {
+                        sig.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    axum::http::StatusCode::OK
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, mock_app).await.unwrap();
+        });
+
+        let delivery = WebhookDelivery::new();
+        let config = WebhookConfig {
+            url: format!("http://{addr}/hook"),
+            filter: None,
+            secret: None,
+            wrap: None,
+            retry: Some(RetryConfig {
+                retries: 0,
+                backoff: BackoffStrategy::Fixed,
+                initial_delay_ms: 0,
+                max_delay_ms: 0,
+                timeout_ms: 5000,
+            }),
+        };
+
+        delivery.send(&make_test_event(), &config).await.unwrap();
+        assert!(!had_signature.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn send_uses_default_retry_when_none_provided() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let call_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let cc = call_count.clone();
+
+        let mock_app = axum::Router::new().route(
+            "/hook",
+            axum::routing::post(move || {
+                let c = cc.clone();
+                async move {
+                    let n = c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if n == 0 {
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                    } else {
+                        axum::http::StatusCode::OK
+                    }
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, mock_app).await.unwrap();
+        });
+
+        let delivery = WebhookDelivery::new();
+        let config = WebhookConfig {
+            url: format!("http://{addr}/hook"),
+            filter: None,
+            secret: None,
+            wrap: None,
+            retry: None, // Uses default retry config
+        };
+
+        let result = delivery.send(&make_test_event(), &config).await;
+        assert!(result.is_ok());
+        assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
 }

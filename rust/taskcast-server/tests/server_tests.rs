@@ -3527,3 +3527,183 @@ async fn docs_returns_html() {
         "expected text/html content type, got: {content_type}"
     );
 }
+
+// ─── GET /tasks (list) — bad case tests ────────────────────────────────────
+
+#[tokio::test]
+async fn list_tasks_requires_event_subscribe_scope() {
+    let (_engine, server) = make_jwt_server();
+
+    let token = make_token(json!({
+        "sub": "user",
+        "scope": ["task:create"],
+        "taskIds": "*",
+        "exp": 9999999999u64
+    }));
+
+    let response = server
+        .get("/tasks")
+        .add_header(
+            axum_test::http::header::AUTHORIZATION,
+            bearer_header(&token),
+        )
+        .await;
+
+    response.assert_status(axum_test::http::StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn list_tasks_returns_empty_array_when_no_tasks() {
+    let (_engine, server) = make_no_auth_server();
+
+    let response = server.get("/tasks").await;
+    response.assert_status(axum_test::http::StatusCode::OK);
+    let body: serde_json::Value = response.json();
+    assert!(body["tasks"].is_array());
+    assert_eq!(body["tasks"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn list_tasks_filter_by_status_returns_matching() {
+    let (engine, server) = make_no_auth_server();
+
+    engine
+        .create_task(taskcast_core::CreateTaskInput {
+            id: Some("list-1".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let t2 = engine
+        .create_task(taskcast_core::CreateTaskInput {
+            id: Some("list-2".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    engine
+        .transition_task(&t2.id, TaskStatus::Running, None)
+        .await
+        .unwrap();
+
+    let response = server.get("/tasks?status=running").await;
+    response.assert_status(axum_test::http::StatusCode::OK);
+    let body: serde_json::Value = response.json();
+    let tasks = body["tasks"].as_array().unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0]["id"], "list-2");
+}
+
+#[tokio::test]
+async fn list_tasks_filter_no_match_returns_empty() {
+    let (_engine, server) = make_no_auth_server();
+
+    server
+        .post("/tasks")
+        .json(&json!({ "id": "list-nomatch" }))
+        .await;
+
+    let response = server.get("/tasks?status=completed").await;
+    response.assert_status(axum_test::http::StatusCode::OK);
+    let body: serde_json::Value = response.json();
+    assert_eq!(body["tasks"].as_array().unwrap().len(), 0);
+}
+
+// ─── Sequential double-complete (HTTP layer) ───────────────────────────────
+
+#[tokio::test]
+async fn double_complete_second_attempt_returns_conflict() {
+    let (_engine, server) = make_no_auth_server();
+
+    server
+        .post("/tasks")
+        .json(&json!({ "id": "double-1" }))
+        .await;
+    server
+        .patch("/tasks/double-1/status")
+        .json(&json!({ "status": "running" }))
+        .await;
+
+    let r1 = server
+        .patch("/tasks/double-1/status")
+        .json(&json!({ "status": "completed" }))
+        .await;
+    r1.assert_status(axum_test::http::StatusCode::OK);
+
+    let r2 = server
+        .patch("/tasks/double-1/status")
+        .json(&json!({ "status": "completed" }))
+        .await;
+    let status = r2.status_code().as_u16();
+    assert!(
+        status == 409 || status == 400,
+        "expected 409 or 400, got {status}"
+    );
+}
+
+// ─── Publish event to terminal task (HTTP layer) ───────────────────────────
+
+#[tokio::test]
+async fn publish_event_to_completed_task_returns_error() {
+    let (_engine, server) = make_no_auth_server();
+
+    server
+        .post("/tasks")
+        .json(&json!({ "id": "term-1" }))
+        .await;
+    server
+        .patch("/tasks/term-1/status")
+        .json(&json!({ "status": "running" }))
+        .await;
+    server
+        .patch("/tasks/term-1/status")
+        .json(&json!({ "status": "completed" }))
+        .await;
+
+    let response = server
+        .post("/tasks/term-1/events")
+        .json(&json!({
+            "type": "progress",
+            "level": "info",
+            "data": null
+        }))
+        .await;
+
+    let status = response.status_code().as_u16();
+    assert!(status >= 400, "expected 4xx, got {status}");
+}
+
+// ─── Health endpoint ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn health_endpoint_returns_ok() {
+    let (_engine, server) = make_no_auth_server();
+
+    let response = server.get("/health").await;
+    response.assert_status(axum_test::http::StatusCode::OK);
+    let body: serde_json::Value = response.json();
+    assert_eq!(body["ok"], true);
+}
+
+// ─── Invalid status value ──────────────────────────────────────────────────
+
+#[tokio::test]
+async fn patch_status_invalid_status_value_returns_4xx() {
+    let (_engine, server) = make_no_auth_server();
+
+    server
+        .post("/tasks")
+        .json(&json!({ "id": "bad-status" }))
+        .await;
+
+    let response = server
+        .patch("/tasks/bad-status/status")
+        .json(&json!({ "status": "invalid-state" }))
+        .await;
+
+    let status = response.status_code().as_u16();
+    assert!(
+        status >= 400 && status < 500,
+        "expected 4xx, got {status}"
+    );
+}
