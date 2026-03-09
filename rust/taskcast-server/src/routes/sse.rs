@@ -359,3 +359,198 @@ pub async fn sse_events(
     let stream = ReceiverStream::new(rx);
     Ok(Sse::new(stream))
 }
+
+// ─── Unit Tests ──────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use taskcast_core::{Level, SeriesFormat, SeriesMode};
+
+    // ── parse_filter: seriesFormat ──────────────────────────────────────────
+
+    #[test]
+    fn parse_filter_series_format_delta() {
+        let query = SseQuery {
+            types: None,
+            levels: None,
+            include_status: None,
+            wrap: None,
+            series_format: Some("delta".to_string()),
+            since_id: None,
+            since_index: None,
+            since_timestamp: None,
+        };
+        let filter = parse_filter(&query);
+        assert_eq!(filter.series_format, Some(SeriesFormat::Delta));
+    }
+
+    #[test]
+    fn parse_filter_series_format_accumulated() {
+        let query = SseQuery {
+            types: None,
+            levels: None,
+            include_status: None,
+            wrap: None,
+            series_format: Some("accumulated".to_string()),
+            since_id: None,
+            since_index: None,
+            since_timestamp: None,
+        };
+        let filter = parse_filter(&query);
+        assert_eq!(filter.series_format, Some(SeriesFormat::Accumulated));
+    }
+
+    #[test]
+    fn parse_filter_series_format_invalid_returns_none() {
+        let query = SseQuery {
+            types: None,
+            levels: None,
+            include_status: None,
+            wrap: None,
+            series_format: Some("bogus".to_string()),
+            since_id: None,
+            since_index: None,
+            since_timestamp: None,
+        };
+        let filter = parse_filter(&query);
+        assert_eq!(filter.series_format, None);
+    }
+
+    #[test]
+    fn parse_filter_series_format_none() {
+        let query = SseQuery {
+            types: None,
+            levels: None,
+            include_status: None,
+            wrap: None,
+            series_format: None,
+            since_id: None,
+            since_index: None,
+            since_timestamp: None,
+        };
+        let filter = parse_filter(&query);
+        assert_eq!(filter.series_format, None);
+    }
+
+    // ── to_envelope ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn to_envelope_includes_series_snapshot_true() {
+        let event = TaskEvent {
+            id: "e1".to_string(),
+            task_id: "t1".to_string(),
+            index: 5,
+            timestamp: 1000.0,
+            r#type: "llm.chunk".to_string(),
+            level: Level::Info,
+            data: json!({"text": "hello world"}),
+            series_id: Some("s1".to_string()),
+            series_mode: Some(SeriesMode::Accumulate),
+            series_acc_field: Some("text".to_string()),
+            series_snapshot: Some(true),
+            _accumulated_data: None,
+        };
+        let envelope = to_envelope(&event, 3);
+        assert_eq!(envelope.series_snapshot, Some(true));
+        assert_eq!(envelope.filtered_index, 3);
+        assert_eq!(envelope.raw_index, 5);
+        assert_eq!(envelope.event_id, "e1");
+        assert_eq!(envelope.task_id, "t1");
+        assert_eq!(envelope.series_id, Some("s1".to_string()));
+        assert_eq!(envelope.series_mode, Some(SeriesMode::Accumulate));
+        assert_eq!(envelope.series_acc_field, Some("text".to_string()));
+    }
+
+    #[test]
+    fn to_envelope_series_snapshot_none_when_absent() {
+        let event = TaskEvent {
+            id: "e2".to_string(),
+            task_id: "t1".to_string(),
+            index: 0,
+            timestamp: 500.0,
+            r#type: "log".to_string(),
+            level: Level::Debug,
+            data: json!("msg"),
+            series_id: None,
+            series_mode: None,
+            series_acc_field: None,
+            series_snapshot: None,
+            _accumulated_data: None,
+        };
+        let envelope = to_envelope(&event, 0);
+        assert_eq!(envelope.series_snapshot, None);
+        assert_eq!(envelope.series_id, None);
+        assert_eq!(envelope.series_mode, None);
+    }
+
+    #[test]
+    fn to_envelope_preserves_all_fields() {
+        let event = TaskEvent {
+            id: "evt_abc".to_string(),
+            task_id: "task_xyz".to_string(),
+            index: 42,
+            timestamp: 1234567890.123,
+            r#type: "progress".to_string(),
+            level: Level::Warn,
+            data: json!({"pct": 75}),
+            series_id: None,
+            series_mode: None,
+            series_acc_field: None,
+            series_snapshot: None,
+            _accumulated_data: None,
+        };
+        let envelope = to_envelope(&event, 10);
+        assert_eq!(envelope.filtered_index, 10);
+        assert_eq!(envelope.raw_index, 42);
+        assert_eq!(envelope.event_id, "evt_abc");
+        assert_eq!(envelope.task_id, "task_xyz");
+        assert_eq!(envelope.r#type, "progress");
+        assert_eq!(envelope.timestamp, 1234567890.123);
+        assert_eq!(envelope.level, Level::Warn);
+        assert_eq!(envelope.data, json!({"pct": 75}));
+    }
+
+    #[test]
+    fn to_envelope_serializes_series_snapshot_in_json() {
+        let event = TaskEvent {
+            id: "e3".to_string(),
+            task_id: "t3".to_string(),
+            index: 1,
+            timestamp: 100.0,
+            r#type: "chunk".to_string(),
+            level: Level::Info,
+            data: json!("acc"),
+            series_id: Some("s1".to_string()),
+            series_mode: Some(SeriesMode::Accumulate),
+            series_acc_field: None,
+            series_snapshot: Some(true),
+            _accumulated_data: None,
+        };
+        let envelope = to_envelope(&event, 0);
+        let json_val = serde_json::to_value(&envelope).unwrap();
+        assert_eq!(json_val["seriesSnapshot"], true);
+    }
+
+    #[test]
+    fn to_envelope_omits_series_snapshot_when_none() {
+        let event = TaskEvent {
+            id: "e4".to_string(),
+            task_id: "t4".to_string(),
+            index: 0,
+            timestamp: 0.0,
+            r#type: "log".to_string(),
+            level: Level::Info,
+            data: json!(null),
+            series_id: None,
+            series_mode: None,
+            series_acc_field: None,
+            series_snapshot: None,
+            _accumulated_data: None,
+        };
+        let envelope = to_envelope(&event, 0);
+        let json_val = serde_json::to_value(&envelope).unwrap();
+        assert!(json_val.get("seriesSnapshot").is_none());
+    }
+}
