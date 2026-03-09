@@ -305,6 +305,10 @@ export class TaskEngine {
     return this.broadcast.subscribe(taskId, handler)
   }
 
+  async getSeriesLatest(taskId: string, seriesId: string): Promise<TaskEvent | null> {
+    return this.shortTermStore.getSeriesLatest(taskId, seriesId)
+  }
+
   private async _emit(taskId: string, input: PublishEventInput): Promise<TaskEvent> {
     const index = await this.shortTermStore.nextIndex(taskId)
     const raw: TaskEvent = {
@@ -320,13 +324,20 @@ export class TaskEngine {
       ...(input.seriesAccField !== undefined && { seriesAccField: input.seriesAccField }),
     }
 
-    const event = await processSeries(raw, this.shortTermStore)
+    const { event, accumulatedEvent } = await processSeries(raw, this.shortTermStore)
     await this.shortTermStore.appendEvent(taskId, event)
-    await this.broadcast.publish(taskId, event)
+
+    // Attach accumulated data to broadcast for SSE accumulated subscribers
+    const broadcastEvent = accumulatedEvent
+      ? { ...event, _accumulatedData: accumulatedEvent.data }
+      : event
+    await this.broadcast.publish(taskId, broadcastEvent)
 
     if (this.longTermStore) {
-      this.longTermStore.saveEvent(event).catch((err) => {
-        this.hooks?.onEventDropped?.(event, String(err))
+      // LongTermStore gets accumulated event (or delta if non-accumulate)
+      const storeEvent = accumulatedEvent ?? event
+      this.longTermStore.saveEvent(storeEvent).catch((err) => {
+        this.hooks?.onEventDropped?.(storeEvent, String(err))
       })
     }
 

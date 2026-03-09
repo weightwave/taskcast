@@ -246,6 +246,8 @@ mod tests {
             series_id: None,
             series_mode: None,
             series_acc_field: None,
+            series_snapshot: None,
+            _accumulated_data: None,
         }
     }
 
@@ -261,6 +263,7 @@ mod tests {
                 include_status: None,
                 wrap: None,
                 since: None,
+                series_format: None,
             }),
             secret: None,
             wrap: None,

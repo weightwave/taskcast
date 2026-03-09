@@ -316,6 +316,84 @@ impl ShortTermStore for SqliteShortTermStore {
         Ok(())
     }
 
+    async fn accumulate_series(
+        &self,
+        task_id: &str,
+        series_id: &str,
+        event: TaskEvent,
+        field: &str,
+    ) -> Result<TaskEvent, Box<dyn std::error::Error + Send + Sync>> {
+        // Atomic read-modify-write in a single IMMEDIATE transaction
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
+            .await?;
+
+        let row = sqlx::query(
+            "SELECT event_json FROM taskcast_series_latest WHERE task_id = ?1 AND series_id = ?2",
+        )
+        .bind(task_id)
+        .bind(series_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+
+        let prev: Option<TaskEvent> = match row {
+            Some(r) => {
+                let json_str: String = r.get("event_json");
+                Some(serde_json::from_str(&json_str)?)
+            }
+            None => None,
+        };
+
+        let accumulated = if let Some(prev) = prev {
+            let should_concat = prev
+                .data
+                .as_object()
+                .and_then(|po| po.get(field)?.as_str().map(|s| s.to_string()))
+                .and_then(|prev_val| {
+                    event
+                        .data
+                        .as_object()
+                        .and_then(|no| no.get(field)?.as_str().map(|s| s.to_string()))
+                        .map(|new_val| (prev_val, new_val))
+                });
+
+            if let Some((prev_val, new_val)) = should_concat {
+                let mut new_data = event.data.as_object().cloned().unwrap_or_default();
+                new_data.insert(
+                    field.to_string(),
+                    serde_json::Value::String(prev_val + &new_val),
+                );
+                TaskEvent {
+                    data: serde_json::Value::Object(new_data),
+                    ..event
+                }
+            } else {
+                event
+            }
+        } else {
+            event
+        };
+
+        let event_json = serde_json::to_string(&accumulated)?;
+        sqlx::query(
+            r#"
+            INSERT INTO taskcast_series_latest (task_id, series_id, event_json)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT (task_id, series_id) DO UPDATE SET
+                event_json = excluded.event_json
+            "#,
+        )
+        .bind(task_id)
+        .bind(series_id)
+        .bind(&event_json)
+        .execute(&mut *conn)
+        .await?;
+
+        sqlx::query("COMMIT").execute(&mut *conn).await?;
+        Ok(accumulated)
+    }
+
     async fn replace_last_series_event(
         &self,
         task_id: &str,

@@ -142,8 +142,19 @@ Events with the same `seriesId` are grouped:
 | Mode | Behavior | Use Case |
 |------|----------|----------|
 | `keep-all` | Store all events independently | Full history needed |
-| `accumulate` | Concatenate `data.delta` across events (field customizable via `seriesAccField`) | LLM streaming text |
+| `accumulate` | Concatenate `data.delta` across events (field customizable via `seriesAccField`). Short-term store holds deltas; long-term store holds accumulated values. | LLM streaming text |
 | `latest` | Replace previous event in series | Progress bars, status indicators |
+
+### Series Format (SSE)
+
+SSE subscribers can choose how `accumulate` series events are delivered via `seriesFormat` query parameter:
+
+| Format | Behavior |
+|--------|----------|
+| `delta` (default) | Each event carries the original incremental delta |
+| `accumulated` | Each event carries the full accumulated value |
+
+Late-joining subscribers always receive a single snapshot per series (`seriesSnapshot: true`), regardless of format. Reconnection with a `since` cursor does NOT collapse — events resume from the breakpoint.
 
 ## Browser SSE Subscription
 
@@ -160,6 +171,7 @@ await client.subscribe(taskId, {
     types: ['llm.*'],          // Wildcard type matching
     levels: ['info', 'warn'],  // Level filtering
     since: { index: 0 },       // Resume from beginning
+    seriesFormat: 'delta',     // 'delta' (default) or 'accumulated'
   },
   onEvent: (envelope) => {
     // envelope.filteredIndex, envelope.data, envelope.type, etc.
@@ -219,7 +231,7 @@ GET    /tasks/:taskId               Get task status
 PATCH  /tasks/:taskId/status        Transition status
 DELETE /tasks/:taskId               Delete task (planned)
 POST   /tasks/:taskId/events        Publish event(s)
-GET    /tasks/:taskId/events        SSE subscribe
+GET    /tasks/:taskId/events        SSE subscribe (?seriesFormat=delta|accumulated)
 GET    /tasks/:taskId/events/history Query history
 ```
 

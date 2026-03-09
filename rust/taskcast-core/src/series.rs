@@ -1,81 +1,39 @@
-use crate::types::{SeriesMode, ShortTermStore, TaskEvent};
+use crate::types::{SeriesMode, SeriesResult, ShortTermStore, TaskEvent};
 
 /// Process a task event through its series mode logic.
 ///
 /// - If the event has no `series_id` or `series_mode`, it is returned unchanged.
 /// - `keep-all`: returned unchanged with no store interaction.
-/// - `accumulate`: merges `data.<field>` (string concatenation) with the previous
-///   series event, then stores the merged event as the series latest.
-///   The field name is determined by `series_acc_field`, defaulting to `"delta"`.
+/// - `accumulate`: delegates to `store.accumulate_series()`, returns both delta and accumulated.
 /// - `latest`: replaces the last series event in the store and returns the event.
 pub async fn process_series(
     event: TaskEvent,
     store: &dyn ShortTermStore,
-) -> Result<TaskEvent, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<SeriesResult, Box<dyn std::error::Error + Send + Sync>> {
     let (series_id, series_mode) = match (&event.series_id, &event.series_mode) {
         (Some(sid), Some(mode)) => (sid.clone(), mode.clone()),
-        _ => return Ok(event),
+        _ => return Ok(SeriesResult { event, accumulated_event: None }),
     };
 
     match series_mode {
-        SeriesMode::KeepAll => Ok(event),
+        SeriesMode::KeepAll => Ok(SeriesResult { event, accumulated_event: None }),
 
         SeriesMode::Accumulate => {
             let field = event
                 .series_acc_field
                 .as_deref()
                 .unwrap_or("delta");
-            let prev = store
-                .get_series_latest(&event.task_id, &series_id)
+            let accumulated = store
+                .accumulate_series(&event.task_id, &series_id, event.clone(), field)
                 .await?;
-
-            let merged = if let Some(prev) = prev {
-                // Try to concatenate the accumulation field if both prev and
-                // new data are objects containing a string value at that key.
-                let should_concat = prev
-                    .data
-                    .as_object()
-                    .and_then(|po| po.get(field)?.as_str().map(|s| s.to_string()))
-                    .and_then(|prev_val| {
-                        event
-                            .data
-                            .as_object()
-                            .and_then(|no| no.get(field)?.as_str().map(|s| s.to_string()))
-                            .map(|new_val| (prev_val, new_val))
-                    });
-
-                if let Some((prev_val, new_val)) = should_concat {
-                    let mut new_data = event
-                        .data
-                        .as_object()
-                        .cloned()
-                        .unwrap_or_default();
-                    new_data.insert(
-                        field.to_string(),
-                        serde_json::Value::String(prev_val + &new_val),
-                    );
-                    TaskEvent {
-                        data: serde_json::Value::Object(new_data),
-                        ..event
-                    }
-                } else {
-                    event
-                }
-            } else {
-                event
-            };
-
-            store
-                .set_series_latest(&merged.task_id, &series_id, merged.clone())
-                .await?;
-            Ok(merged)
+            Ok(SeriesResult { event, accumulated_event: Some(accumulated) })
         }
 
         SeriesMode::Latest => {
             store
                 .replace_last_series_event(&event.task_id, &series_id, event.clone())
                 .await?;
-            Ok(event)
+            Ok(SeriesResult { event, accumulated_event: None })
         }
     }
 }
@@ -104,6 +62,8 @@ mod tests {
             series_id: None,
             series_mode: None,
             series_acc_field: None,
+            series_snapshot: None,
+            _accumulated_data: None,
         }
     }
 
@@ -129,7 +89,8 @@ mod tests {
         let store = MemoryShortTermStore::new();
         let event = make_event("e1", "t1", 0, json!({ "text": "hello" }));
         let result = process_series(event.clone(), &store).await.unwrap();
-        assert_eq!(result, event);
+        assert_eq!(result.event, event);
+        assert!(result.accumulated_event.is_none());
     }
 
     #[tokio::test]
@@ -139,7 +100,8 @@ mod tests {
         event.series_id = Some("s1".to_string());
         // series_mode is still None
         let result = process_series(event.clone(), &store).await.unwrap();
-        assert_eq!(result, event);
+        assert_eq!(result.event, event);
+        assert!(result.accumulated_event.is_none());
     }
 
     #[tokio::test]
@@ -149,7 +111,8 @@ mod tests {
         event.series_mode = Some(SeriesMode::Accumulate);
         // series_id is still None
         let result = process_series(event.clone(), &store).await.unwrap();
-        assert_eq!(result, event);
+        assert_eq!(result.event, event);
+        assert!(result.accumulated_event.is_none());
     }
 
     // ─── keep-all mode → returned unchanged, no store interaction ────────
@@ -166,7 +129,8 @@ mod tests {
             SeriesMode::KeepAll,
         );
         let result = process_series(event.clone(), &store).await.unwrap();
-        assert_eq!(result, event);
+        assert_eq!(result.event, event);
+        assert!(result.accumulated_event.is_none());
 
         // Store should have no series data
         let latest = store.get_series_latest("t1", "s1").await.unwrap();
@@ -188,8 +152,12 @@ mod tests {
         );
         let result = process_series(event.clone(), &store).await.unwrap();
 
-        // Should return event unchanged (no prior delta to concat)
-        assert_eq!(result, event);
+        // Delta event should be the original event
+        assert_eq!(result.event, event);
+        // Accumulated event should exist (same as delta for first event)
+        let acc = result.accumulated_event.unwrap();
+        assert_eq!(acc.id, "e1");
+        assert_eq!(acc.data, json!({ "delta": "hello" }));
 
         // Store should now have the event as series latest
         let latest = store.get_series_latest("t1", "s1").await.unwrap().unwrap();
@@ -223,10 +191,16 @@ mod tests {
             "s1",
             SeriesMode::Accumulate,
         );
-        let result = process_series(event2, &store).await.unwrap();
+        let result = process_series(event2.clone(), &store).await.unwrap();
 
-        assert_eq!(result.data["delta"], "hello world");
-        assert_eq!(result.id, "e2"); // event metadata from the new event
+        // Delta event should be the original (not accumulated)
+        assert_eq!(result.event.data["delta"], " world");
+        assert_eq!(result.event.id, "e2");
+
+        // Accumulated event should have the concatenated text
+        let acc = result.accumulated_event.unwrap();
+        assert_eq!(acc.data["delta"], "hello world");
+        assert_eq!(acc.id, "e2");
 
         // Series latest should be the merged event
         let latest = store.get_series_latest("t1", "s1").await.unwrap().unwrap();
@@ -267,7 +241,8 @@ mod tests {
         );
         let result = process_series(e3, &store).await.unwrap();
 
-        assert_eq!(result.data["delta"], "abc");
+        let acc = result.accumulated_event.unwrap();
+        assert_eq!(acc.data["delta"], "abc");
     }
 
     // ─── accumulate mode: non-matching field data → no concatenation ─────
@@ -298,8 +273,9 @@ mod tests {
         );
         let result = process_series(event2, &store).await.unwrap();
 
-        // Should return second event unchanged since no accumulate field
-        assert_eq!(result.data, json!({ "count": 2 }));
+        // Accumulated event data should match (no concatenation for non-string)
+        let acc = result.accumulated_event.unwrap();
+        assert_eq!(acc.data, json!({ "count": 2 }));
     }
 
     #[tokio::test]
@@ -329,7 +305,8 @@ mod tests {
         let result = process_series(event2, &store).await.unwrap();
 
         // No concatenation since data is not an object with accumulate field
-        assert_eq!(result.data, json!("another string"));
+        let acc = result.accumulated_event.unwrap();
+        assert_eq!(acc.data, json!("another string"));
     }
 
     #[tokio::test]
@@ -357,7 +334,8 @@ mod tests {
         let result = process_series(event2, &store).await.unwrap();
 
         // No concatenation since new event has no accumulate field
-        assert_eq!(result.data, json!({ "count": 42 }));
+        let acc = result.accumulated_event.unwrap();
+        assert_eq!(acc.data, json!({ "count": 42 }));
     }
 
     #[tokio::test]
@@ -384,8 +362,9 @@ mod tests {
         );
         let result = process_series(event2, &store).await.unwrap();
 
-        assert_eq!(result.data["delta"], "hello world");
-        assert_eq!(result.data["extra"], true);
+        let acc = result.accumulated_event.unwrap();
+        assert_eq!(acc.data["delta"], "hello world");
+        assert_eq!(acc.data["extra"], true);
     }
 
     // ─── accumulate mode: custom series_acc_field ─────────────────────────
@@ -416,7 +395,8 @@ mod tests {
         event2.series_acc_field = Some("content".to_string());
         let result = process_series(event2, &store).await.unwrap();
 
-        assert_eq!(result.data["content"], "hello world");
+        let acc = result.accumulated_event.unwrap();
+        assert_eq!(acc.data["content"], "hello world");
 
         let latest = store.get_series_latest("t1", "s1").await.unwrap().unwrap();
         assert_eq!(latest.data["content"], "hello world");
@@ -448,7 +428,8 @@ mod tests {
         event2.series_acc_field = Some("text".to_string());
         let result = process_series(event2, &store).await.unwrap();
 
-        assert_eq!(result.data["text"], "hello world");
+        let acc = result.accumulated_event.unwrap();
+        assert_eq!(acc.data["text"], "hello world");
 
         let latest = store.get_series_latest("t1", "s1").await.unwrap().unwrap();
         assert_eq!(latest.data["text"], "hello world");
@@ -471,7 +452,8 @@ mod tests {
         let result = process_series(event.clone(), &store).await.unwrap();
 
         // Should return event unchanged
-        assert_eq!(result, event);
+        assert_eq!(result.event, event);
+        assert!(result.accumulated_event.is_none());
 
         // Store should have updated series latest via replace_last_series_event
         let latest = store.get_series_latest("t1", "s1").await.unwrap().unwrap();
@@ -516,5 +498,141 @@ mod tests {
 
         let latest = store.get_series_latest("t1", "s1").await.unwrap().unwrap();
         assert_eq!(latest.id, "e2");
+    }
+
+    // ─── accumulate mode: non-standard data types (TS parity) ────────────
+
+    #[tokio::test]
+    async fn accumulate_null_data() {
+        let store = MemoryShortTermStore::new();
+        let event = make_series_event(
+            "e1",
+            "t1",
+            0,
+            json!(null),
+            "s1",
+            SeriesMode::Accumulate,
+        );
+        let result = process_series(event.clone(), &store).await.unwrap();
+        assert_eq!(result.event.data, json!(null));
+        assert!(result.accumulated_event.is_some());
+    }
+
+    #[tokio::test]
+    async fn accumulate_string_data_not_object() {
+        let store = MemoryShortTermStore::new();
+        let event = make_series_event(
+            "e1",
+            "t1",
+            0,
+            json!("just a string"),
+            "s1",
+            SeriesMode::Accumulate,
+        );
+        let result = process_series(event.clone(), &store).await.unwrap();
+        assert_eq!(result.event.data, json!("just a string"));
+    }
+
+    #[tokio::test]
+    async fn accumulate_array_data() {
+        let store = MemoryShortTermStore::new();
+        let event = make_series_event(
+            "e1",
+            "t1",
+            0,
+            json!([1, 2, 3]),
+            "s1",
+            SeriesMode::Accumulate,
+        );
+        let result = process_series(event.clone(), &store).await.unwrap();
+        assert_eq!(result.event.data, json!([1, 2, 3]));
+    }
+
+    #[tokio::test]
+    async fn accumulate_number_primitive_data() {
+        let store = MemoryShortTermStore::new();
+        let event = make_series_event(
+            "e1",
+            "t1",
+            0,
+            json!(42),
+            "s1",
+            SeriesMode::Accumulate,
+        );
+        let result = process_series(event.clone(), &store).await.unwrap();
+        assert_eq!(result.event.data, json!(42));
+    }
+
+    #[tokio::test]
+    async fn accumulate_boolean_data() {
+        let store = MemoryShortTermStore::new();
+        let event = make_series_event(
+            "e1",
+            "t1",
+            0,
+            json!(false),
+            "s1",
+            SeriesMode::Accumulate,
+        );
+        let result = process_series(event.clone(), &store).await.unwrap();
+        assert_eq!(result.event.data, json!(false));
+    }
+
+    #[tokio::test]
+    async fn accumulate_two_string_data_events_no_concat() {
+        let store = MemoryShortTermStore::new();
+
+        let event1 = make_series_event(
+            "e1",
+            "t1",
+            0,
+            json!("first string"),
+            "s1",
+            SeriesMode::Accumulate,
+        );
+        process_series(event1, &store).await.unwrap();
+
+        let event2 = make_series_event(
+            "e2",
+            "t1",
+            1,
+            json!("second string"),
+            "s1",
+            SeriesMode::Accumulate,
+        );
+        let result = process_series(event2, &store).await.unwrap();
+
+        // Strings aren't objects, so accumulate field logic can't find the field to concat
+        let acc = result.accumulated_event.unwrap();
+        assert_eq!(acc.data, json!("second string"));
+    }
+
+    #[tokio::test]
+    async fn accumulate_two_array_data_events_no_concat() {
+        let store = MemoryShortTermStore::new();
+
+        let event1 = make_series_event(
+            "e1",
+            "t1",
+            0,
+            json!([1, 2, 3]),
+            "s1",
+            SeriesMode::Accumulate,
+        );
+        process_series(event1, &store).await.unwrap();
+
+        let event2 = make_series_event(
+            "e2",
+            "t1",
+            1,
+            json!([4, 5, 6]),
+            "s1",
+            SeriesMode::Accumulate,
+        );
+        let result = process_series(event2, &store).await.unwrap();
+
+        // Arrays aren't objects with named fields, so no concatenation happens
+        let acc = result.accumulated_event.unwrap();
+        assert_eq!(acc.data, json!([4, 5, 6]));
     }
 }

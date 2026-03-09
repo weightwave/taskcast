@@ -180,6 +180,9 @@ export interface TaskEvent {
   seriesId?: string
   seriesMode?: SeriesMode
   seriesAccField?: string
+  seriesSnapshot?: boolean
+  /** Transient: accumulated data attached during broadcast, not persisted in ShortTermStore */
+  _accumulatedData?: unknown
 }
 
 export interface SSEEnvelope {
@@ -194,6 +197,7 @@ export interface SSEEnvelope {
   seriesId?: string
   seriesMode?: SeriesMode
   seriesAccField?: string
+  seriesSnapshot?: boolean
 }
 
 // ─── Subscription ────────────────────────────────────────────────────────────
@@ -204,17 +208,27 @@ export interface SinceCursor {
   timestamp?: number
 }
 
+export type SeriesFormat = 'delta' | 'accumulated'
+
 export interface SubscribeFilter {
   since?: SinceCursor
   types?: string[]
   levels?: Level[]
   includeStatus?: boolean
   wrap?: boolean
+  seriesFormat?: SeriesFormat
 }
 
 export interface EventQueryOptions {
   since?: SinceCursor
   limit?: number
+}
+
+export interface SeriesResult {
+  /** The original delta event (stored in ShortTermStore) */
+  event: TaskEvent
+  /** The event with accumulated data (for LongTermStore + broadcast). Undefined for non-accumulate modes. */
+  accumulatedEvent?: TaskEvent
 }
 
 // ─── Storage Interfaces ──────────────────────────────────────────────────────
@@ -234,6 +248,8 @@ export interface ShortTermStore {
   setTTL(taskId: string, ttlSeconds: number): Promise<void>
   getSeriesLatest(taskId: string, seriesId: string): Promise<TaskEvent | null>
   setSeriesLatest(taskId: string, seriesId: string, event: TaskEvent): Promise<void>
+  /** Atomically read previous accumulated value, concatenate with new delta, write back. Returns the accumulated event. */
+  accumulateSeries(taskId: string, seriesId: string, event: TaskEvent, field: string): Promise<TaskEvent>
   replaceLastSeriesEvent(taskId: string, seriesId: string, event: TaskEvent): Promise<void>
 
   // Task query
