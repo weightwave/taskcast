@@ -1206,3 +1206,134 @@ async fn list_tasks_with_exclude_task_ids() {
     assert_eq!(tasks.len(), 1);
     assert_eq!(tasks[0].id, "t-ex-2");
 }
+
+// ── accumulate_series Tests ─────────────────────────────────────────────────
+
+fn make_accumulate_event(task_id: &str, index: u64, field: &str, value: serde_json::Value) -> TaskEvent {
+    TaskEvent {
+        id: format!("evt-{}-{}", task_id, index),
+        task_id: task_id.to_string(),
+        index,
+        timestamp: 1000.0 + index as f64 * 100.0,
+        r#type: "llm.chunk".to_string(),
+        level: Level::Info,
+        data: serde_json::json!({ field: value }),
+        series_id: Some("s".to_string()),
+        series_mode: Some(SeriesMode::Accumulate),
+        series_acc_field: Some(field.to_string()),
+        series_snapshot: None,
+        _accumulated_data: None,
+    }
+}
+
+#[tokio::test]
+async fn accumulate_series_first_event_returns_unchanged() {
+    let (_container, redis_url) = start_redis().await;
+    flush_redis(&redis_url).await;
+    let store = make_store(&redis_url).await;
+
+    let event = make_accumulate_event("task-acc", 0, "delta", serde_json::json!("hello"));
+
+    let result = store
+        .accumulate_series("task-acc", "s", event.clone(), "delta")
+        .await
+        .unwrap();
+
+    assert_eq!(result.data, serde_json::json!({"delta": "hello"}));
+    assert_eq!(result.id, event.id);
+}
+
+#[tokio::test]
+async fn accumulate_series_concatenates_string_field() {
+    let (_container, redis_url) = start_redis().await;
+    flush_redis(&redis_url).await;
+    let store = make_store(&redis_url).await;
+
+    let e0 = make_accumulate_event("task-acc2", 0, "delta", serde_json::json!("hello"));
+    store.accumulate_series("task-acc2", "s", e0, "delta").await.unwrap();
+
+    let e1 = make_accumulate_event("task-acc2", 1, "delta", serde_json::json!(" world"));
+
+    let result = store.accumulate_series("task-acc2", "s", e1.clone(), "delta").await.unwrap();
+    assert_eq!(result.data, serde_json::json!({"delta": "hello world"}));
+    assert_eq!(result.id, e1.id);
+}
+
+#[tokio::test]
+async fn accumulate_series_three_events_chain() {
+    let (_container, redis_url) = start_redis().await;
+    flush_redis(&redis_url).await;
+    let store = make_store(&redis_url).await;
+
+    for (i, text) in ["A", "B", "C"].iter().enumerate() {
+        let e = make_accumulate_event("task-acc3", i as u64, "delta", serde_json::json!(text));
+        let r = store.accumulate_series("task-acc3", "s", e, "delta").await.unwrap();
+        if i == 2 {
+            assert_eq!(r.data, serde_json::json!({"delta": "ABC"}));
+        }
+    }
+}
+
+#[tokio::test]
+async fn accumulate_series_non_string_field_no_concat() {
+    let (_container, redis_url) = start_redis().await;
+    flush_redis(&redis_url).await;
+    let store = make_store(&redis_url).await;
+
+    let e0 = make_accumulate_event("task-acc4", 0, "delta", serde_json::json!(42));
+    store.accumulate_series("task-acc4", "s", e0, "delta").await.unwrap();
+
+    let e1 = make_accumulate_event("task-acc4", 1, "delta", serde_json::json!(99));
+
+    let result = store.accumulate_series("task-acc4", "s", e1, "delta").await.unwrap();
+    // Non-string field: no concatenation, returns the new event as-is
+    assert_eq!(result.data, serde_json::json!({"delta": 99}));
+}
+
+#[tokio::test]
+async fn accumulate_series_missing_field_no_concat() {
+    let (_container, redis_url) = start_redis().await;
+    flush_redis(&redis_url).await;
+    let store = make_store(&redis_url).await;
+
+    let e0 = make_accumulate_event("task-acc5", 0, "other", serde_json::json!("value"));
+    store.accumulate_series("task-acc5", "s", e0, "delta").await.unwrap();
+
+    let e1 = make_accumulate_event("task-acc5", 1, "other", serde_json::json!("value2"));
+
+    let result = store.accumulate_series("task-acc5", "s", e1, "delta").await.unwrap();
+    // Field "delta" missing from both events — no concatenation
+    assert_eq!(result.data, serde_json::json!({"other": "value2"}));
+}
+
+#[tokio::test]
+async fn accumulate_series_custom_field_name() {
+    let (_container, redis_url) = start_redis().await;
+    flush_redis(&redis_url).await;
+    let store = make_store(&redis_url).await;
+
+    let e0 = make_accumulate_event("task-acc6", 0, "content", serde_json::json!("foo"));
+    store.accumulate_series("task-acc6", "s", e0, "content").await.unwrap();
+
+    let e1 = make_accumulate_event("task-acc6", 1, "content", serde_json::json!("bar"));
+
+    let result = store.accumulate_series("task-acc6", "s", e1, "content").await.unwrap();
+    assert_eq!(result.data, serde_json::json!({"content": "foobar"}));
+}
+
+#[tokio::test]
+async fn accumulate_series_updates_series_latest() {
+    let (_container, redis_url) = start_redis().await;
+    flush_redis(&redis_url).await;
+    let store = make_store(&redis_url).await;
+
+    let e0 = make_accumulate_event("task-acc7", 0, "delta", serde_json::json!("first"));
+    store.accumulate_series("task-acc7", "s", e0, "delta").await.unwrap();
+
+    let e1 = make_accumulate_event("task-acc7", 1, "delta", serde_json::json!("second"));
+    store.accumulate_series("task-acc7", "s", e1.clone(), "delta").await.unwrap();
+
+    let latest = store.get_series_latest("task-acc7", "s").await.unwrap().unwrap();
+    assert_eq!(latest.data, serde_json::json!({"delta": "firstsecond"}));
+    assert_eq!(latest.id, e1.id);
+}

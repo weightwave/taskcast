@@ -499,4 +499,140 @@ mod tests {
         let latest = store.get_series_latest("t1", "s1").await.unwrap().unwrap();
         assert_eq!(latest.id, "e2");
     }
+
+    // ─── accumulate mode: non-standard data types (TS parity) ────────────
+
+    #[tokio::test]
+    async fn accumulate_null_data() {
+        let store = MemoryShortTermStore::new();
+        let event = make_series_event(
+            "e1",
+            "t1",
+            0,
+            json!(null),
+            "s1",
+            SeriesMode::Accumulate,
+        );
+        let result = process_series(event.clone(), &store).await.unwrap();
+        assert_eq!(result.event.data, json!(null));
+        assert!(result.accumulated_event.is_some());
+    }
+
+    #[tokio::test]
+    async fn accumulate_string_data_not_object() {
+        let store = MemoryShortTermStore::new();
+        let event = make_series_event(
+            "e1",
+            "t1",
+            0,
+            json!("just a string"),
+            "s1",
+            SeriesMode::Accumulate,
+        );
+        let result = process_series(event.clone(), &store).await.unwrap();
+        assert_eq!(result.event.data, json!("just a string"));
+    }
+
+    #[tokio::test]
+    async fn accumulate_array_data() {
+        let store = MemoryShortTermStore::new();
+        let event = make_series_event(
+            "e1",
+            "t1",
+            0,
+            json!([1, 2, 3]),
+            "s1",
+            SeriesMode::Accumulate,
+        );
+        let result = process_series(event.clone(), &store).await.unwrap();
+        assert_eq!(result.event.data, json!([1, 2, 3]));
+    }
+
+    #[tokio::test]
+    async fn accumulate_number_primitive_data() {
+        let store = MemoryShortTermStore::new();
+        let event = make_series_event(
+            "e1",
+            "t1",
+            0,
+            json!(42),
+            "s1",
+            SeriesMode::Accumulate,
+        );
+        let result = process_series(event.clone(), &store).await.unwrap();
+        assert_eq!(result.event.data, json!(42));
+    }
+
+    #[tokio::test]
+    async fn accumulate_boolean_data() {
+        let store = MemoryShortTermStore::new();
+        let event = make_series_event(
+            "e1",
+            "t1",
+            0,
+            json!(false),
+            "s1",
+            SeriesMode::Accumulate,
+        );
+        let result = process_series(event.clone(), &store).await.unwrap();
+        assert_eq!(result.event.data, json!(false));
+    }
+
+    #[tokio::test]
+    async fn accumulate_two_string_data_events_no_concat() {
+        let store = MemoryShortTermStore::new();
+
+        let event1 = make_series_event(
+            "e1",
+            "t1",
+            0,
+            json!("first string"),
+            "s1",
+            SeriesMode::Accumulate,
+        );
+        process_series(event1, &store).await.unwrap();
+
+        let event2 = make_series_event(
+            "e2",
+            "t1",
+            1,
+            json!("second string"),
+            "s1",
+            SeriesMode::Accumulate,
+        );
+        let result = process_series(event2, &store).await.unwrap();
+
+        // Strings aren't objects, so accumulate field logic can't find the field to concat
+        let acc = result.accumulated_event.unwrap();
+        assert_eq!(acc.data, json!("second string"));
+    }
+
+    #[tokio::test]
+    async fn accumulate_two_array_data_events_no_concat() {
+        let store = MemoryShortTermStore::new();
+
+        let event1 = make_series_event(
+            "e1",
+            "t1",
+            0,
+            json!([1, 2, 3]),
+            "s1",
+            SeriesMode::Accumulate,
+        );
+        process_series(event1, &store).await.unwrap();
+
+        let event2 = make_series_event(
+            "e2",
+            "t1",
+            1,
+            json!([4, 5, 6]),
+            "s1",
+            SeriesMode::Accumulate,
+        );
+        let result = process_series(event2, &store).await.unwrap();
+
+        // Arrays aren't objects with named fields, so no concatenation happens
+        let acc = result.accumulated_event.unwrap();
+        assert_eq!(acc.data, json!([4, 5, 6]));
+    }
 }

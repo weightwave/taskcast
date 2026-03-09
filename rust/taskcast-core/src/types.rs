@@ -1073,6 +1073,73 @@ mod tests {
         assert_eq!(json["wrap"], false);
     }
 
+    // ─── SeriesFormat ──────────────────────────────────────────────────
+
+    #[test]
+    fn series_format_serde_roundtrip() {
+        // Serialize
+        let delta = SeriesFormat::Delta;
+        let acc = SeriesFormat::Accumulated;
+        let delta_json = serde_json::to_value(&delta).unwrap();
+        let acc_json = serde_json::to_value(&acc).unwrap();
+        assert_eq!(delta_json, "delta");
+        assert_eq!(acc_json, "accumulated");
+
+        // Deserialize
+        let delta_back: SeriesFormat = serde_json::from_value(delta_json).unwrap();
+        let acc_back: SeriesFormat = serde_json::from_value(acc_json).unwrap();
+        assert_eq!(delta_back, SeriesFormat::Delta);
+        assert_eq!(acc_back, SeriesFormat::Accumulated);
+    }
+
+    #[test]
+    fn series_format_in_subscribe_filter_roundtrip() {
+        let filter = SubscribeFilter {
+            since: None,
+            types: None,
+            levels: None,
+            include_status: None,
+            wrap: None,
+            series_format: Some(SeriesFormat::Accumulated),
+        };
+        let json = serde_json::to_value(&filter).unwrap();
+        assert_eq!(json["seriesFormat"], "accumulated");
+
+        let back: SubscribeFilter = serde_json::from_value(json).unwrap();
+        assert_eq!(back.series_format, Some(SeriesFormat::Accumulated));
+    }
+
+    #[test]
+    fn series_result_fields() {
+        let event = TaskEvent {
+            id: "e".to_string(),
+            task_id: "t".to_string(),
+            index: 0,
+            timestamp: 0.0,
+            r#type: "x".to_string(),
+            level: Level::Info,
+            data: serde_json::json!(null),
+            series_id: None,
+            series_mode: None,
+            series_acc_field: None,
+            series_snapshot: None,
+            _accumulated_data: None,
+        };
+        let result = SeriesResult {
+            event: event.clone(),
+            accumulated_event: Some(event.clone()),
+        };
+        assert_eq!(result.event.id, "e");
+        assert!(result.accumulated_event.is_some());
+
+        let cloned = result.clone();
+        assert_eq!(cloned.event.id, "e");
+
+        // Debug
+        let debug_str = format!("{:?}", result);
+        assert!(debug_str.contains("SeriesResult"));
+    }
+
     // ─── EventQueryOptions ──────────────────────────────────────────────
 
     #[test]
