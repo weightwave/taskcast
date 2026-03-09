@@ -65,16 +65,21 @@ Stored:  [Event 1, Event 2]  ← both retained
 
 ### accumulate
 
-Text accumulation mode. The `data.delta` field of each new event is appended to the series' existing value (like ChatCompletion streaming). Storage holds the full accumulated text; broadcasts send the original incremental delta. The field name defaults to `delta` but can be customized via `seriesAccField` (e.g. `"text"` or `"content"`).
+Text accumulation mode. The `data.delta` field of each new event is appended to the series' existing value (like ChatCompletion streaming). The field name defaults to `delta` but can be customized via `seriesAccField` (e.g. `"text"` or `"content"`).
 
 ```
 Event 1: { seriesId: "s1", data: { delta: "Hello" }, seriesMode: "accumulate" }
 Event 2: { seriesId: "s1", data: { delta: " world" }, seriesMode: "accumulate" }
-Stored:  accumulated result → data.delta = "Hello world"
-Broadcast: each event sends only the original delta
+Short-term store: deltas → ["Hello", " world"]
+Long-term store:  accumulated → "Hello world"
 ```
 
-**This is the most common mode for LLM streaming output.** When a client reconnects after a refresh or disconnect, it receives the full accumulated text up to that point rather than having to replay every individual delta.
+**This is the most common mode for LLM streaming output.** SSE subscribers choose their preferred format via the `seriesFormat` query parameter:
+
+- **`seriesFormat=delta`** (default) — Each event carries the original incremental delta. Ideal for streaming UIs that concatenate chunks as they arrive.
+- **`seriesFormat=accumulated`** — Each event carries the full accumulated value up to that point. Useful for simple displays.
+
+When a client connects mid-stream or after a refresh, it receives a single **snapshot** containing the full accumulated text, followed by subsequent events in the chosen format. This avoids replaying every individual delta.
 
 ### latest
 
@@ -127,11 +132,13 @@ For scenarios requiring long-term retention of task history, a long-term store c
 
 ```
 Publish event
-  → Series merging (processed according to seriesMode)
-  → Write to short-term store (synchronous, ordered)
-  → Broadcast to subscribers (synchronous, real-time)
-  → Write to long-term store (asynchronous, non-blocking)
+  → Series processing (accumulate: compute delta + accumulated)
+  → Write delta to short-term store (synchronous, ordered)
+  → Broadcast delta + transient accumulated value (synchronous, real-time)
+  → Write accumulated value to long-term store (asynchronous, non-blocking)
 ```
+
+For `accumulate` mode: the short-term store holds deltas (ephemeral), the long-term store holds accumulated values (self-contained). For `keep-all` and `latest`, both stores hold the same data.
 
 ## Event Filtering
 
