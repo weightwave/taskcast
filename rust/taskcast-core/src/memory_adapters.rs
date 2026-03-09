@@ -247,7 +247,11 @@ impl ShortTermStore for MemoryShortTermStore {
         event: TaskEvent,
         field: &str,
     ) -> Result<TaskEvent, Box<dyn std::error::Error + Send + Sync>> {
-        let prev = self.get_series_latest(task_id, series_id).await?;
+        // Atomic read-modify-write under a single write lock
+        let key = format!("{task_id}:{series_id}");
+        let mut series = self.series_latest.write().unwrap();
+        let prev = series.get(&key).cloned();
+
         let accumulated = if let Some(prev) = prev {
             let should_concat = prev
                 .data
@@ -277,8 +281,7 @@ impl ShortTermStore for MemoryShortTermStore {
         } else {
             event
         };
-        self.set_series_latest(task_id, series_id, accumulated.clone())
-            .await?;
+        series.insert(key, accumulated.clone());
         Ok(accumulated)
     }
 

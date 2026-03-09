@@ -323,7 +323,28 @@ impl ShortTermStore for SqliteShortTermStore {
         event: TaskEvent,
         field: &str,
     ) -> Result<TaskEvent, Box<dyn std::error::Error + Send + Sync>> {
-        let prev = self.get_series_latest(task_id, series_id).await?;
+        // Atomic read-modify-write in a single IMMEDIATE transaction
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
+            .await?;
+
+        let row = sqlx::query(
+            "SELECT event_json FROM taskcast_series_latest WHERE task_id = ?1 AND series_id = ?2",
+        )
+        .bind(task_id)
+        .bind(series_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+
+        let prev: Option<TaskEvent> = match row {
+            Some(r) => {
+                let json_str: String = r.get("event_json");
+                Some(serde_json::from_str(&json_str)?)
+            }
+            None => None,
+        };
+
         let accumulated = if let Some(prev) = prev {
             let should_concat = prev
                 .data
@@ -353,8 +374,23 @@ impl ShortTermStore for SqliteShortTermStore {
         } else {
             event
         };
-        self.set_series_latest(task_id, series_id, accumulated.clone())
-            .await?;
+
+        let event_json = serde_json::to_string(&accumulated)?;
+        sqlx::query(
+            r#"
+            INSERT INTO taskcast_series_latest (task_id, series_id, event_json)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT (task_id, series_id) DO UPDATE SET
+                event_json = excluded.event_json
+            "#,
+        )
+        .bind(task_id)
+        .bind(series_id)
+        .bind(&event_json)
+        .execute(&mut *conn)
+        .await?;
+
+        sqlx::query("COMMIT").execute(&mut *conn).await?;
         Ok(accumulated)
     }
 

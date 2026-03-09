@@ -246,39 +246,47 @@ impl ShortTermStore for RedisShortTermStore {
         event: TaskEvent,
         field: &str,
     ) -> Result<TaskEvent, Box<dyn std::error::Error + Send + Sync>> {
-        let prev = self.get_series_latest(task_id, series_id).await?;
-        let accumulated = if let Some(prev) = prev {
-            let prev_val = prev
-                .data
-                .as_object()
-                .and_then(|o| o.get(field))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            let new_val = event
-                .data
-                .as_object()
-                .and_then(|o| o.get(field))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
+        // Atomic read-modify-write via Lua script (matches TS implementation)
+        let lua = r#"
+            local prevJson = redis.call('GET', KEYS[1])
+            local newEvent = cjson.decode(ARGV[1])
+            local field = ARGV[2]
+            local seriesId = ARGV[3]
 
-            if let (Some(prev_val), Some(new_val)) = (prev_val, new_val) {
-                let mut new_data = event.data.as_object().cloned().unwrap_or_default();
-                new_data.insert(
-                    field.to_string(),
-                    serde_json::Value::String(prev_val + &new_val),
-                );
-                TaskEvent {
-                    data: serde_json::Value::Object(new_data),
-                    ..event
-                }
-            } else {
-                event
-            }
-        } else {
-            event
-        };
-        self.set_series_latest(task_id, series_id, accumulated.clone())
+            if prevJson then
+              local prev = cjson.decode(prevJson)
+              local prevData = prev.data
+              local newData = newEvent.data
+
+              if type(prevData) == 'table' and type(newData) == 'table'
+                 and type(prevData[field]) == 'string' and type(newData[field]) == 'string' then
+                newData[field] = prevData[field] .. newData[field]
+                newEvent.data = newData
+              end
+            end
+
+            local result = cjson.encode(newEvent)
+            redis.call('SET', KEYS[1], result)
+            redis.call('SADD', KEYS[2], seriesId)
+            return result
+        "#;
+
+        let series_latest_key = self.keys.series_latest(task_id, series_id);
+        let series_ids_key = self.keys.series_ids(task_id);
+        let event_json = serde_json::to_string(&event)?;
+
+        let script = redis::Script::new(lua);
+        let mut conn = self.conn.clone();
+        let result_json: String = script
+            .key(&series_latest_key)
+            .key(&series_ids_key)
+            .arg(&event_json)
+            .arg(field)
+            .arg(series_id)
+            .invoke_async(&mut conn)
             .await?;
+
+        let accumulated: TaskEvent = serde_json::from_str(&result_json)?;
         Ok(accumulated)
     }
 
