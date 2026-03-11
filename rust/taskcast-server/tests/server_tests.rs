@@ -177,7 +177,7 @@ async fn patch_task_status_transitions_successfully() {
 }
 
 #[tokio::test]
-async fn patch_task_status_returns_400_for_invalid_transition() {
+async fn patch_task_status_returns_409_for_invalid_transition() {
     let (_engine, server) = make_no_auth_server();
 
     // Create a task (pending)
@@ -192,7 +192,7 @@ async fn patch_task_status_returns_400_for_invalid_transition() {
         .json(&json!({ "status": "completed" }))
         .await;
 
-    response.assert_status(axum_test::http::StatusCode::BAD_REQUEST);
+    response.assert_status(axum_test::http::StatusCode::CONFLICT);
     let body: serde_json::Value = response.json();
     assert!(body["error"].as_str().unwrap().contains("Invalid transition"));
 }
@@ -1398,7 +1398,7 @@ async fn transition_task_returns_403_without_task_manage_scope() {
 // ─── TaskTerminal error in transition_task ──────────────────────────────────
 
 #[tokio::test]
-async fn transition_task_returns_400_for_terminal_task() {
+async fn transition_task_returns_409_for_terminal_task() {
     let (_engine, server) = make_no_auth_server();
 
     // Create -> run -> complete the task
@@ -1421,7 +1421,7 @@ async fn transition_task_returns_400_for_terminal_task() {
         .json(&json!({ "status": "running" }))
         .await;
 
-    response.assert_status(axum_test::http::StatusCode::BAD_REQUEST);
+    response.assert_status(axum_test::http::StatusCode::CONFLICT);
     let body: serde_json::Value = response.json();
     let error_msg = body["error"].as_str().unwrap();
     assert!(
@@ -3639,8 +3639,7 @@ async fn double_complete_second_attempt_returns_conflict() {
         .patch("/tasks/double-1/status")
         .json(&json!({ "status": "completed" }))
         .await;
-    // Rust server returns 400 for invalid transitions (TS returns 409 — parity issue tracked separately)
-    r2.assert_status(axum_test::http::StatusCode::BAD_REQUEST);
+    r2.assert_status(axum_test::http::StatusCode::CONFLICT);
 }
 
 // ─── Publish event to terminal task (HTTP layer) ───────────────────────────

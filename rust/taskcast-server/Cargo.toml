@@ -26,4 +26,5 @@ utoipa-scalar = { version = "0.3", features = ["axum"] }
 
 [dev-dependencies]
 axum-test = { version = "19", features = ["ws"] }
+async-trait = { workspace = true }
 tempfile = { workspace = true }

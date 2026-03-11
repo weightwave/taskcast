@@ -532,4 +532,55 @@ mod tests {
         assert!(matches!(ctx.task_ids, TaskIdAccess::All));
         assert_eq!(ctx.scope, vec![PermissionScope::All]);
     }
+
+    // ─── EC (ES256) key tests ────────────────────────────────────────────────
+
+    const EC_PRIVATE_KEY: &str = "-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg/6Svroa6zf7uKd0i
+zrZ8KPrakdGXm6F/lpULNSuRYWqhRANCAAQ6TbQS2VOf2iV/EQInVdbvWJEOn/KX
+EEyPwMDxwmDKHaZg6OU8BGyN6UdEFRgEq4CITvgsfDfOtGW2BazLuzVX
+-----END PRIVATE KEY-----";
+
+    const EC_PUBLIC_KEY: &str = "-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEOk20EtlTn9olfxECJ1XW71iRDp/y
+lxBMj8DA8cJgyh2mYOjlPARsjelHRBUYBKuAiE74LHw3zrRltgWsy7s1Vw==
+-----END PUBLIC KEY-----";
+
+    fn es256_config() -> JwtConfig {
+        JwtConfig {
+            algorithm: Algorithm::ES256,
+            secret: None,
+            public_key: Some(EC_PUBLIC_KEY.to_string()),
+            issuer: None,
+            audience: None,
+        }
+    }
+
+    fn make_es256_token(claims: &JwtClaims) -> String {
+        encode(
+            &Header::new(Algorithm::ES256),
+            claims,
+            &EncodingKey::from_ec_pem(EC_PRIVATE_KEY.as_bytes()).unwrap(),
+        )
+        .expect("failed to encode ES256 JWT")
+    }
+
+    #[test]
+    fn decode_jwt_es256_with_ec_public_key() {
+        let claims = base_claims();
+        let token = make_es256_token(&claims);
+        let ctx = decode_jwt(&token, &es256_config()).expect("should decode ES256 JWT");
+        assert_eq!(ctx.sub, Some("test-user".to_string()));
+    }
+
+    #[test]
+    fn decode_jwt_es256_wrong_key_fails() {
+        let claims = base_claims();
+        let token = make_es256_token(&claims);
+        let mut config = es256_config();
+        // Use a different (invalid) public key
+        config.public_key = Some("-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEAAAAAAAAAAAAAAAAAAAAAAAAAAAA\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n-----END PUBLIC KEY-----".to_string());
+        let result = decode_jwt(&token, &config);
+        assert!(result.is_err());
+    }
 }

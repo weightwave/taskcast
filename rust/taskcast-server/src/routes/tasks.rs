@@ -298,7 +298,7 @@ pub async fn transition_task(
         .await
         .map_err(|e| match &e {
             EngineError::TaskNotFound(_) => AppError::NotFound(e.to_string()),
-            EngineError::InvalidTransition { .. } => AppError::BadRequest(e.to_string()),
+            EngineError::InvalidTransition { .. } => AppError::Engine(e),
             EngineError::TaskTerminal(_) => AppError::BadRequest(e.to_string()),
             _ => AppError::Engine(e),
         })?;

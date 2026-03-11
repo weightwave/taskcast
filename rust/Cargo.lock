@@ -3095,6 +3095,7 @@ dependencies = [
 name = "taskcast-server"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
  "axum-test",
  "futures",
