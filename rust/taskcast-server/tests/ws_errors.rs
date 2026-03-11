@@ -107,6 +107,18 @@ impl ShortTermStore for FailingShortTermStore {
         self.inner.set_series_latest(task_id, series_id, event).await
     }
 
+    async fn accumulate_series(
+        &self,
+        task_id: &str,
+        series_id: &str,
+        event: TaskEvent,
+        field: &str,
+    ) -> Result<TaskEvent, Box<dyn std::error::Error + Send + Sync>> {
+        self.inner
+            .accumulate_series(task_id, series_id, event, field)
+            .await
+    }
+
     async fn replace_last_series_event(
         &self,
         task_id: &str,
