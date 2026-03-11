@@ -32,6 +32,7 @@ The behavior of an SSE connection depends on the current task state:
 | `levels` | string | — | Comma-separated level filter. e.g. `info,warn,error` |
 | `includeStatus` | boolean | `true` | Whether to include the built-in `taskcast:status` status events. |
 | `wrap` | boolean | `true` | Whether to wrap each event in an SSEEnvelope. |
+| `seriesFormat` | string | `delta` | Format for `accumulate` series events: `delta` (original incremental data) or `accumulated` (running total). See [Series Format](#series-format) below. |
 
 ### Examples
 
@@ -47,6 +48,9 @@ GET /tasks/01HXXX/events?since.index=5&levels=info,warn,error
 
 # Exclude status events, no envelope wrapping
 GET /tasks/01HXXX/events?includeStatus=false&wrap=false
+
+# Receive accumulated values instead of deltas for accumulate series
+GET /tasks/01HXXX/events?seriesFormat=accumulated
 ```
 
 ## Event Stream Format
@@ -105,6 +109,7 @@ interface SSEEnvelope {
   data: unknown          // Event payload
   seriesId?: string
   seriesMode?: string
+  seriesSnapshot?: boolean  // true when this event is a late-join snapshot (not an incremental delta)
 }
 ```
 
@@ -150,6 +155,38 @@ client.subscribe(taskId, {
   },
 })
 ```
+
+## Series Format
+
+The `seriesFormat` query parameter controls how `accumulate` series events are delivered.
+
+### `seriesFormat=delta` (default)
+
+Each event carries its original incremental data. This is the natural format for streaming UIs that concatenate chunks as they arrive.
+
+### `seriesFormat=accumulated`
+
+Each event carries the running total — the full accumulated value up to that point. Useful for simple displays that just show the current result without tracking individual deltas.
+
+### Late-Join Behavior
+
+When a subscriber connects to a task that already has `accumulate` series events (i.e., the subscriber is "late-joining"), the server **collapses** all historical events for each accumulate series into a single snapshot event. This applies regardless of `seriesFormat`.
+
+The snapshot event has `seriesSnapshot: true` in the envelope and contains the full accumulated value.
+
+| Scenario | Behavior |
+|----------|----------|
+| Subscribe from start | Live events in chosen format (delta or accumulated) |
+| Late-join (series active) | One snapshot per series + subsequent events in chosen format |
+| Late-join (series inactive) | Single snapshot per series |
+| Terminal task replay | Single snapshot per series |
+| Reconnect with `since` cursor | **No collapse** — events from breakpoint in chosen format |
+
+Non-series events are unaffected by `seriesFormat` and are always delivered as-is.
+
+### Storage Semantics
+
+In `accumulate` mode, the short-term store holds **delta events** while the long-term store holds **accumulated events**. The REST history endpoint (`GET /tasks/:taskId/events/history`) returns data as-stored without transformation.
 
 ## Authentication
 

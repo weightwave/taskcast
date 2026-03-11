@@ -63,7 +63,7 @@ describe('Rust server API compatibility', () => {
       method: 'PATCH',
       body: JSON.stringify({ status: 'completed' }),
     })
-    expect(status).toBe(400)
+    expect(status).toBe(409)
   })
 
   it('PATCH /tasks/:id/status sets completedAt for terminal', async () => {

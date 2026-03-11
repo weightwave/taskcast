@@ -177,7 +177,7 @@ async fn patch_task_status_transitions_successfully() {
 }
 
 #[tokio::test]
-async fn patch_task_status_returns_400_for_invalid_transition() {
+async fn patch_task_status_returns_409_for_invalid_transition() {
     let (_engine, server) = make_no_auth_server();
 
     // Create a task (pending)
@@ -192,7 +192,7 @@ async fn patch_task_status_returns_400_for_invalid_transition() {
         .json(&json!({ "status": "completed" }))
         .await;
 
-    response.assert_status(axum_test::http::StatusCode::BAD_REQUEST);
+    response.assert_status(axum_test::http::StatusCode::CONFLICT);
     let body: serde_json::Value = response.json();
     assert!(body["error"].as_str().unwrap().contains("Invalid transition"));
 }
@@ -996,6 +996,8 @@ async fn webhook_delivery_sends_to_mock_server() {
         series_mode: None,
 
         series_acc_field: None,
+        series_snapshot: None,
+        _accumulated_data: None,
     };
     let config = taskcast_core::WebhookConfig {
         url: format!("http://{addr}/hook"),
@@ -1052,6 +1054,8 @@ async fn webhook_delivery_retries_on_failure() {
         series_mode: None,
 
         series_acc_field: None,
+        series_snapshot: None,
+        _accumulated_data: None,
     };
     let config = taskcast_core::WebhookConfig {
         url: format!("http://{addr}/hook"),
@@ -1114,6 +1118,8 @@ async fn webhook_delivery_succeeds_on_retry() {
         series_mode: None,
 
         series_acc_field: None,
+        series_snapshot: None,
+        _accumulated_data: None,
     };
     let config = taskcast_core::WebhookConfig {
         url: format!("http://{addr}/hook"),
@@ -1398,7 +1404,7 @@ async fn transition_task_returns_403_without_task_manage_scope() {
 // ─── TaskTerminal error in transition_task ──────────────────────────────────
 
 #[tokio::test]
-async fn transition_task_returns_400_for_terminal_task() {
+async fn transition_task_returns_409_for_terminal_task() {
     let (_engine, server) = make_no_auth_server();
 
     // Create -> run -> complete the task
@@ -1421,7 +1427,7 @@ async fn transition_task_returns_400_for_terminal_task() {
         .json(&json!({ "status": "running" }))
         .await;
 
-    response.assert_status(axum_test::http::StatusCode::BAD_REQUEST);
+    response.assert_status(axum_test::http::StatusCode::CONFLICT);
     let body: serde_json::Value = response.json();
     let error_msg = body["error"].as_str().unwrap();
     assert!(
@@ -1600,6 +1606,8 @@ async fn webhook_uses_default_retry_when_none_provided() {
         series_mode: None,
 
         series_acc_field: None,
+        series_snapshot: None,
+        _accumulated_data: None,
     };
     let config = taskcast_core::WebhookConfig {
         url: format!("http://{addr}/hook"),
@@ -1631,6 +1639,8 @@ async fn webhook_network_error_captures_error_string() {
         series_mode: None,
 
         series_acc_field: None,
+        series_snapshot: None,
+        _accumulated_data: None,
     };
     // Unreachable address — should trigger a network error (not an HTTP status error)
     let config = taskcast_core::WebhookConfig {
@@ -3528,12 +3538,13 @@ async fn docs_returns_html() {
     );
 }
 
-// ─── GET /tasks (list) — bad case tests ────────────────────────────────────
+// ─── GET /tasks (list) ─────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn list_tasks_requires_event_subscribe_scope() {
     let (_engine, server) = make_jwt_server();
 
+    // Token with only task:create scope (no event:subscribe)
     let token = make_token(json!({
         "sub": "user",
         "scope": ["task:create"],
@@ -3567,6 +3578,7 @@ async fn list_tasks_returns_empty_array_when_no_tasks() {
 async fn list_tasks_filter_by_status_returns_matching() {
     let (engine, server) = make_no_auth_server();
 
+    // Create two tasks, transition one to running
     engine
         .create_task(taskcast_core::CreateTaskInput {
             id: Some("list-1".into()),
@@ -3582,7 +3594,7 @@ async fn list_tasks_filter_by_status_returns_matching() {
         .await
         .unwrap();
     engine
-        .transition_task(&t2.id, TaskStatus::Running, None)
+        .transition_task(&t2.id, taskcast_core::TaskStatus::Running, None)
         .await
         .unwrap();
 
@@ -3598,6 +3610,7 @@ async fn list_tasks_filter_by_status_returns_matching() {
 async fn list_tasks_filter_no_match_returns_empty() {
     let (_engine, server) = make_no_auth_server();
 
+    // Create a pending task, filter for completed
     server
         .post("/tasks")
         .json(&json!({ "id": "list-nomatch" }))
@@ -3624,21 +3637,19 @@ async fn double_complete_second_attempt_returns_conflict() {
         .json(&json!({ "status": "running" }))
         .await;
 
+    // First complete — should succeed
     let r1 = server
         .patch("/tasks/double-1/status")
         .json(&json!({ "status": "completed" }))
         .await;
     r1.assert_status(axum_test::http::StatusCode::OK);
 
+    // Second complete — should fail (terminal state, no backward transitions)
     let r2 = server
         .patch("/tasks/double-1/status")
         .json(&json!({ "status": "completed" }))
         .await;
-    let status = r2.status_code().as_u16();
-    assert!(
-        status == 409 || status == 400,
-        "expected 409 or 400, got {status}"
-    );
+    r2.assert_status(axum_test::http::StatusCode::CONFLICT);
 }
 
 // ─── Publish event to terminal task (HTTP layer) ───────────────────────────
@@ -3669,14 +3680,22 @@ async fn publish_event_to_completed_task_returns_error() {
         }))
         .await;
 
-    let status = response.status_code().as_u16();
-    assert!(status >= 400, "expected 4xx, got {status}");
+    response.assert_status(axum_test::http::StatusCode::BAD_REQUEST);
 }
 
-// ─── Health endpoint ───────────────────────────────────────────────────────
+// ─── Health endpoint ────────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn health_endpoint_returns_ok() {
+async fn health_endpoint_requires_auth_in_jwt_mode() {
+    let server = make_jwt_server().1;
+
+    // Health requires auth when JWT mode is enabled
+    let response = server.get("/health").await;
+    response.assert_status(axum_test::http::StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn health_endpoint_returns_ok_without_auth_mode() {
     let (_engine, server) = make_no_auth_server();
 
     let response = server.get("/health").await;

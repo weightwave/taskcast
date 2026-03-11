@@ -180,7 +180,7 @@ async fn create_task(
 
 #[tokio::test]
 async fn ws_offer_complete_flow_register_dispatch_accept_assigned() {
-    let (engine, manager, server) = make_worker_ws_server();
+    let (engine, _manager, server) = make_worker_ws_server();
 
     let mut ws = server
         .get_websocket("/workers/ws")

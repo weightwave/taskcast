@@ -96,6 +96,8 @@ pub fn row_to_event(row: &SqliteRow) -> TaskEvent {
         series_id: row.get("series_id"),
         series_mode,
         series_acc_field: row.get("series_acc_field"),
+        series_snapshot: None,
+        _accumulated_data: None,
     }
 }
 

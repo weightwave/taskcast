@@ -160,6 +160,8 @@ mod tests {
             series_id: None,
             series_mode: None,
             series_acc_field: None,
+            series_snapshot: None,
+            _accumulated_data: None,
         }
     }
 

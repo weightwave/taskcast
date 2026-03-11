@@ -125,7 +125,7 @@ curl -X POST http://localhost:3721/tasks/{taskId}/events \
 
 订阅终端会实时收到这些事件。
 
-> **注意：** 在 `accumulate` 模式下，默认拼接的字段为 `delta`。可通过 `seriesAccField` 自定义拼接字段名。
+> **注意：** 在 `accumulate` 模式下，默认拼接的字段为 `delta`。可通过 `seriesAccField` 自定义拼接字段名。默认情况下，SSE 订阅者收到的是原始增量（`seriesFormat=delta`）。添加 `?seriesFormat=accumulated` 可改为接收累加值。中途加入的订阅者始终会先收到当前累加值的快照。
 
 ### 6. 完成任务
 
@@ -184,9 +184,10 @@ async function processChat(taskId: string, prompt: string) {
   await engine.transitionTask(taskId, 'running')
 
   for await (const chunk of callLLM(prompt)) {
-    // 发布流式事件。seriesMode: 'accumulate' 表示引擎会将所有 delta 合并
-    // 为一条累积的系列记录（类似 ChatCompletion 流式输出）。
-    // 后加入的订阅者看到的是已累积的完整文本，而非单独的 chunk。
+    // 发布流式事件。seriesMode: 'accumulate' 表示引擎会追踪累加值。
+    // SSE 订阅者通过 seriesFormat 参数选择格式：
+    // 'delta'（默认）发原始 chunk，'accumulated' 发累加值。
+    // 后加入的订阅者会先收到当前累加值的快照。
     await engine.publishEvent(taskId, {
       type: 'llm.delta',
       level: 'info',
@@ -272,7 +273,8 @@ async function processAndComplete(taskId: string, params: Record<string, unknown
   })
 
   // 发布流式事件 —— 每个事件会实时广播给所有 SSE 订阅者。
-  // seriesMode: 'accumulate' 会合并 delta，后加入的订阅者看到的是完整文本。
+  // seriesMode: 'accumulate' 追踪累加值；后加入的订阅者会先收到快照。
+  // 订阅者通过 seriesFormat 参数选择格式：'delta'（默认）或 'accumulated'。
   for await (const chunk of callLLM(params.prompt as string)) {
     await fetch(`${TASKCAST_URL}/tasks/${taskId}/events`, {
       method: 'POST',

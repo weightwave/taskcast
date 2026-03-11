@@ -461,6 +461,148 @@ async fn only_replace_correct_series_event_not_others() {
     assert_eq!(events[2], e2);
 }
 
+// ─── accumulate_series ───────────────────────────────────────────────────
+
+#[tokio::test]
+async fn accumulate_series_first_event_returns_unchanged() {
+    let ctx = setup().await;
+    ctx.short.save_task(make_task("task-1")).await.unwrap();
+
+    let mut event = make_event("task-1", 0);
+    event.series_id = Some("series-a".to_string());
+    event.series_mode = Some(SeriesMode::Accumulate);
+    event.data = serde_json::json!({"delta": "hello"});
+
+    let result = ctx
+        .short
+        .accumulate_series("task-1", "series-a", event.clone(), "delta")
+        .await
+        .unwrap();
+
+    assert_eq!(result.data, serde_json::json!({"delta": "hello"}));
+    assert_eq!(result.id, event.id);
+}
+
+#[tokio::test]
+async fn accumulate_series_concatenates_string_field() {
+    let ctx = setup().await;
+    ctx.short.save_task(make_task("task-1")).await.unwrap();
+
+    let mut e0 = make_event("task-1", 0);
+    e0.series_id = Some("series-a".to_string());
+    e0.series_mode = Some(SeriesMode::Accumulate);
+    e0.data = serde_json::json!({"delta": "hello"});
+    ctx.short.accumulate_series("task-1", "series-a", e0, "delta").await.unwrap();
+
+    let mut e1 = make_event("task-1", 1);
+    e1.series_id = Some("series-a".to_string());
+    e1.series_mode = Some(SeriesMode::Accumulate);
+    e1.data = serde_json::json!({"delta": " world"});
+
+    let result = ctx.short.accumulate_series("task-1", "series-a", e1.clone(), "delta").await.unwrap();
+    assert_eq!(result.data, serde_json::json!({"delta": "hello world"}));
+    assert_eq!(result.id, e1.id);
+}
+
+#[tokio::test]
+async fn accumulate_series_three_events_chain() {
+    let ctx = setup().await;
+    ctx.short.save_task(make_task("task-1")).await.unwrap();
+
+    for (i, text) in ["A", "B", "C"].iter().enumerate() {
+        let mut e = make_event("task-1", i as u64);
+        e.series_id = Some("s".to_string());
+        e.series_mode = Some(SeriesMode::Accumulate);
+        e.data = serde_json::json!({"delta": text});
+        let r = ctx.short.accumulate_series("task-1", "s", e, "delta").await.unwrap();
+        if i == 2 {
+            assert_eq!(r.data, serde_json::json!({"delta": "ABC"}));
+        }
+    }
+}
+
+#[tokio::test]
+async fn accumulate_series_non_string_field_no_concat() {
+    let ctx = setup().await;
+    ctx.short.save_task(make_task("task-1")).await.unwrap();
+
+    let mut e0 = make_event("task-1", 0);
+    e0.series_id = Some("s".to_string());
+    e0.series_mode = Some(SeriesMode::Accumulate);
+    e0.data = serde_json::json!({"delta": 42});
+    ctx.short.accumulate_series("task-1", "s", e0, "delta").await.unwrap();
+
+    let mut e1 = make_event("task-1", 1);
+    e1.series_id = Some("s".to_string());
+    e1.series_mode = Some(SeriesMode::Accumulate);
+    e1.data = serde_json::json!({"delta": 99});
+
+    let result = ctx.short.accumulate_series("task-1", "s", e1, "delta").await.unwrap();
+    assert_eq!(result.data, serde_json::json!({"delta": 99}));
+}
+
+#[tokio::test]
+async fn accumulate_series_missing_field_no_concat() {
+    let ctx = setup().await;
+    ctx.short.save_task(make_task("task-1")).await.unwrap();
+
+    let mut e0 = make_event("task-1", 0);
+    e0.series_id = Some("s".to_string());
+    e0.series_mode = Some(SeriesMode::Accumulate);
+    e0.data = serde_json::json!({"other": "value"});
+    ctx.short.accumulate_series("task-1", "s", e0, "delta").await.unwrap();
+
+    let mut e1 = make_event("task-1", 1);
+    e1.series_id = Some("s".to_string());
+    e1.series_mode = Some(SeriesMode::Accumulate);
+    e1.data = serde_json::json!({"other": "value2"});
+
+    let result = ctx.short.accumulate_series("task-1", "s", e1, "delta").await.unwrap();
+    assert_eq!(result.data, serde_json::json!({"other": "value2"}));
+}
+
+#[tokio::test]
+async fn accumulate_series_custom_field_name() {
+    let ctx = setup().await;
+    ctx.short.save_task(make_task("task-1")).await.unwrap();
+
+    let mut e0 = make_event("task-1", 0);
+    e0.series_id = Some("s".to_string());
+    e0.series_mode = Some(SeriesMode::Accumulate);
+    e0.data = serde_json::json!({"content": "foo"});
+    ctx.short.accumulate_series("task-1", "s", e0, "content").await.unwrap();
+
+    let mut e1 = make_event("task-1", 1);
+    e1.series_id = Some("s".to_string());
+    e1.series_mode = Some(SeriesMode::Accumulate);
+    e1.data = serde_json::json!({"content": "bar"});
+
+    let result = ctx.short.accumulate_series("task-1", "s", e1, "content").await.unwrap();
+    assert_eq!(result.data, serde_json::json!({"content": "foobar"}));
+}
+
+#[tokio::test]
+async fn accumulate_series_updates_series_latest() {
+    let ctx = setup().await;
+    ctx.short.save_task(make_task("task-1")).await.unwrap();
+
+    let mut e0 = make_event("task-1", 0);
+    e0.series_id = Some("s".to_string());
+    e0.series_mode = Some(SeriesMode::Accumulate);
+    e0.data = serde_json::json!({"delta": "first"});
+    ctx.short.accumulate_series("task-1", "s", e0, "delta").await.unwrap();
+
+    let mut e1 = make_event("task-1", 1);
+    e1.series_id = Some("s".to_string());
+    e1.series_mode = Some(SeriesMode::Accumulate);
+    e1.data = serde_json::json!({"delta": "second"});
+    ctx.short.accumulate_series("task-1", "s", e1.clone(), "delta").await.unwrap();
+
+    let latest = ctx.short.get_series_latest("task-1", "s").await.unwrap().unwrap();
+    assert_eq!(latest.data, serde_json::json!({"delta": "firstsecond"}));
+    assert_eq!(latest.id, e1.id);
+}
+
 // ─── set_ttl ─────────────────────────────────────────────────────────────
 
 #[tokio::test]

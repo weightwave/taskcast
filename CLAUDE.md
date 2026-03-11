@@ -87,7 +87,9 @@ Each layer has a distinct responsibility and can be independently configured:
 2. **ShortTermStore** — Event buffer + task state. Sync writes ensure ordering. (Redis or memory)
 3. **LongTermStore** — Permanent archive. Async writes, non-blocking. (PostgreSQL, optional)
 
-**Write path:** `publish → series merge → ShortTerm (sync) → Broadcast (sync) → LongTerm (async)`
+**Write path:** `publish → series processing → ShortTerm delta (sync) → Broadcast delta+acc (sync) → LongTerm accumulated (async)`
+
+For `accumulate` mode: ShortTermStore stores deltas, LongTermStore stores accumulated values. SSE subscribers choose format via `seriesFormat` query parameter (`delta` or `accumulated`).
 
 ### Concurrent Safety
 
@@ -135,11 +137,14 @@ Task lifecycle: pending → running → completed|failed|timeout|cancelled
 
 Event filtering: wildcard type matching (e.g. "llm.*"), level filtering, since cursor
 Series modes: keep-all | accumulate (text concat) | latest (replace)
+Series format (SSE): seriesFormat=delta (default) | accumulated
+  - Late-join: accumulate series collapsed to single snapshot (seriesSnapshot: true)
+  - Reconnect with since cursor: no collapse, deltas from breakpoint
 
 SSE behavior:
   pending  → hold, auto-stream when running
-  running  → replay history + stream live
-  terminal → replay history, then close
+  running  → replay history (collapse accumulate series) + stream live
+  terminal → replay collapsed history, then close
 
 Auth modes: none | jwt | custom
 Permission scopes: task:create, task:manage, event:publish, event:subscribe, event:history, webhook:create, *

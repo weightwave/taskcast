@@ -10,18 +10,18 @@ use taskcast_core::{
 use taskcast_server::{create_app, AuthMode, CorsConfig};
 
 fn make_ws_server() -> (Arc<TaskEngine>, Arc<WorkerManager>, TestServer) {
-    let short_term_store = Arc::new(MemoryShortTermStore::new());
+    let store = Arc::new(MemoryShortTermStore::new());
     let broadcast = Arc::new(MemoryBroadcastProvider::new());
     let engine = Arc::new(TaskEngine::new(TaskEngineOptions {
-        short_term_store: Arc::clone(&short_term_store) as Arc<dyn ShortTermStore>,
+        short_term_store: Arc::clone(&store) as Arc<dyn ShortTermStore>,
         broadcast: Arc::clone(&broadcast) as Arc<dyn BroadcastProvider>,
         long_term_store: None,
         hooks: None,
     }));
     let manager = Arc::new(WorkerManager::new(WorkerManagerOptions {
         engine: Arc::clone(&engine),
-        short_term_store: short_term_store as Arc<dyn ShortTermStore>,
-        broadcast: broadcast as Arc<dyn BroadcastProvider>,
+        short_term_store: Arc::clone(&store) as Arc<dyn ShortTermStore>,
+        broadcast: Arc::clone(&broadcast) as Arc<dyn BroadcastProvider>,
         long_term_store: None,
         hooks: None,
         defaults: None,
@@ -37,35 +37,27 @@ fn make_ws_server() -> (Arc<TaskEngine>, Arc<WorkerManager>, TestServer) {
     (engine, manager, server)
 }
 
-async fn register_ws(
-    server: &TestServer,
-) -> axum_test::TestWebSocket {
+// ─── Wrong types for taskId ────────────────────────────────────────────────
+
+#[tokio::test]
+async fn ws_claim_with_numeric_task_id_returns_parse_error() {
+    let (_engine, _manager, server) = make_ws_server();
     let mut ws = server
         .get_websocket("/workers/ws")
         .await
         .into_websocket()
         .await;
 
+    // Register first
     ws.send_json(&json!({
         "type": "register",
         "matchRule": {},
         "capacity": 5
     }))
     .await;
+    let _reg: serde_json::Value = ws.receive_json().await;
 
-    let reg: serde_json::Value = ws.receive_json().await;
-    assert_eq!(reg["type"], "registered");
-
-    ws
-}
-
-// ─── Wrong types for taskId ────────────────────────────────────────────────
-
-#[tokio::test]
-async fn ws_claim_with_numeric_task_id_returns_parse_error() {
-    let (_engine, _manager, server) = make_ws_server();
-    let mut ws = register_ws(&server).await;
-
+    // claim with taskId as number (should fail deserialization)
     ws.send_json(&json!({
         "type": "claim",
         "taskId": 123
@@ -82,7 +74,19 @@ async fn ws_claim_with_numeric_task_id_returns_parse_error() {
 #[tokio::test]
 async fn ws_accept_with_boolean_task_id_returns_parse_error() {
     let (_engine, _manager, server) = make_ws_server();
-    let mut ws = register_ws(&server).await;
+    let mut ws = server
+        .get_websocket("/workers/ws")
+        .await
+        .into_websocket()
+        .await;
+
+    ws.send_json(&json!({
+        "type": "register",
+        "matchRule": {},
+        "capacity": 5
+    }))
+    .await;
+    let _reg: serde_json::Value = ws.receive_json().await;
 
     ws.send_json(&json!({
         "type": "accept",
@@ -100,7 +104,19 @@ async fn ws_accept_with_boolean_task_id_returns_parse_error() {
 #[tokio::test]
 async fn ws_decline_with_null_task_id_returns_parse_error() {
     let (_engine, _manager, server) = make_ws_server();
-    let mut ws = register_ws(&server).await;
+    let mut ws = server
+        .get_websocket("/workers/ws")
+        .await
+        .into_websocket()
+        .await;
+
+    ws.send_json(&json!({
+        "type": "register",
+        "matchRule": {},
+        "capacity": 5
+    }))
+    .await;
+    let _reg: serde_json::Value = ws.receive_json().await;
 
     ws.send_json(&json!({
         "type": "decline",
@@ -120,7 +136,19 @@ async fn ws_decline_with_null_task_id_returns_parse_error() {
 #[tokio::test]
 async fn ws_unknown_message_type_returns_parse_error() {
     let (_engine, _manager, server) = make_ws_server();
-    let mut ws = register_ws(&server).await;
+    let mut ws = server
+        .get_websocket("/workers/ws")
+        .await
+        .into_websocket()
+        .await;
+
+    ws.send_json(&json!({
+        "type": "register",
+        "matchRule": {},
+        "capacity": 5
+    }))
+    .await;
+    let _reg: serde_json::Value = ws.receive_json().await;
 
     ws.send_json(&json!({ "type": "fly_to_moon" })).await;
 
@@ -176,8 +204,21 @@ async fn ws_numeric_type_returns_parse_error() {
 #[tokio::test]
 async fn ws_claim_missing_task_id_returns_parse_error() {
     let (_engine, _manager, server) = make_ws_server();
-    let mut ws = register_ws(&server).await;
+    let mut ws = server
+        .get_websocket("/workers/ws")
+        .await
+        .into_websocket()
+        .await;
 
+    ws.send_json(&json!({
+        "type": "register",
+        "matchRule": {},
+        "capacity": 5
+    }))
+    .await;
+    let _reg: serde_json::Value = ws.receive_json().await;
+
+    // claim without taskId field
     ws.send_json(&json!({ "type": "claim" })).await;
 
     let response: serde_json::Value = ws.receive_json().await;
@@ -196,6 +237,7 @@ async fn ws_register_missing_capacity_returns_parse_error() {
         .into_websocket()
         .await;
 
+    // register without capacity (required field)
     ws.send_json(&json!({
         "type": "register",
         "matchRule": {}

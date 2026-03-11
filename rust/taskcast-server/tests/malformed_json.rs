@@ -1,10 +1,8 @@
 use std::sync::Arc;
 
-use axum::body::Bytes;
 use axum_test::TestServer;
 use taskcast_core::{
-    CreateTaskInput, MemoryBroadcastProvider, MemoryShortTermStore, TaskEngine, TaskEngineOptions,
-    TaskStatus,
+    MemoryBroadcastProvider, MemoryShortTermStore, TaskEngine, TaskEngineOptions,
 };
 use taskcast_server::{create_app, AuthMode, CorsConfig};
 
@@ -34,7 +32,7 @@ async fn post_tasks_malformed_json_not_json() {
     let response = server
         .post("/tasks")
         .content_type("application/json")
-        .bytes(Bytes::from("not json"))
+        .bytes("not json".into())
         .await;
     let status = response.status_code().as_u16();
     assert!(status >= 400 && status < 500, "expected 4xx, got {status}");
@@ -46,7 +44,7 @@ async fn post_tasks_malformed_json_empty_body() {
     let response = server
         .post("/tasks")
         .content_type("application/json")
-        .bytes(Bytes::from(""))
+        .bytes("".into())
         .await;
     let status = response.status_code().as_u16();
     assert!(status >= 400 && status < 500, "expected 4xx, got {status}");
@@ -58,7 +56,7 @@ async fn post_tasks_malformed_json_truncated() {
     let response = server
         .post("/tasks")
         .content_type("application/json")
-        .bytes(Bytes::from("{invalid"))
+        .bytes("{invalid".into())
         .await;
     let status = response.status_code().as_u16();
     assert!(status >= 400 && status < 500, "expected 4xx, got {status}");
@@ -69,22 +67,22 @@ async fn post_tasks_malformed_json_truncated() {
 #[tokio::test]
 async fn post_events_malformed_json_not_json() {
     let (engine, server) = make_server();
-    engine
-        .create_task(CreateTaskInput {
+    let task = engine
+        .create_task(taskcast_core::CreateTaskInput {
             id: Some("mal-evt-1".into()),
             ..Default::default()
         })
         .await
         .unwrap();
     engine
-        .transition_task("mal-evt-1", TaskStatus::Running, None)
+        .transition_task(&task.id, taskcast_core::TaskStatus::Running, None)
         .await
         .unwrap();
 
     let response = server
-        .post("/tasks/mal-evt-1/events")
+        .post(&format!("/tasks/{}/events", task.id))
         .content_type("application/json")
-        .bytes(Bytes::from("not json"))
+        .bytes("not json".into())
         .await;
     let status = response.status_code().as_u16();
     assert!(status >= 400 && status < 500, "expected 4xx, got {status}");
@@ -93,22 +91,22 @@ async fn post_events_malformed_json_not_json() {
 #[tokio::test]
 async fn post_events_malformed_json_truncated() {
     let (engine, server) = make_server();
-    engine
-        .create_task(CreateTaskInput {
+    let task = engine
+        .create_task(taskcast_core::CreateTaskInput {
             id: Some("mal-evt-2".into()),
             ..Default::default()
         })
         .await
         .unwrap();
     engine
-        .transition_task("mal-evt-2", TaskStatus::Running, None)
+        .transition_task(&task.id, taskcast_core::TaskStatus::Running, None)
         .await
         .unwrap();
 
     let response = server
-        .post("/tasks/mal-evt-2/events")
+        .post(&format!("/tasks/{}/events", task.id))
         .content_type("application/json")
-        .bytes(Bytes::from("{invalid"))
+        .bytes("{invalid".into())
         .await;
     let status = response.status_code().as_u16();
     assert!(status >= 400 && status < 500, "expected 4xx, got {status}");
@@ -119,8 +117,8 @@ async fn post_events_malformed_json_truncated() {
 #[tokio::test]
 async fn patch_status_malformed_json_not_json() {
     let (engine, server) = make_server();
-    engine
-        .create_task(CreateTaskInput {
+    let task = engine
+        .create_task(taskcast_core::CreateTaskInput {
             id: Some("mal-status-1".into()),
             ..Default::default()
         })
@@ -128,9 +126,9 @@ async fn patch_status_malformed_json_not_json() {
         .unwrap();
 
     let response = server
-        .patch("/tasks/mal-status-1/status")
+        .patch(&format!("/tasks/{}/status", task.id))
         .content_type("application/json")
-        .bytes(Bytes::from("not json"))
+        .bytes("not json".into())
         .await;
     let status = response.status_code().as_u16();
     assert!(status >= 400 && status < 500, "expected 4xx, got {status}");

@@ -90,6 +90,28 @@ export class MemoryShortTermStore implements ShortTermStore {
     this.seriesLatest.set(`${taskId}:${seriesId}`, { ...event })
   }
 
+  async accumulateSeries(taskId: string, seriesId: string, event: TaskEvent, field: string): Promise<TaskEvent> {
+    const key = `${taskId}:${seriesId}`
+    const prev = this.seriesLatest.get(key)
+
+    let accumulated = event
+    if (prev !== null && prev !== undefined) {
+      const prevData = (typeof prev.data === 'object' && prev.data !== null)
+        ? prev.data as Record<string, unknown> : {}
+      const newData = (typeof event.data === 'object' && event.data !== null)
+        ? event.data as Record<string, unknown> : {}
+      if (typeof prevData[field] === 'string' && typeof newData[field] === 'string') {
+        accumulated = {
+          ...event,
+          data: { ...newData, [field]: prevData[field] + newData[field] },
+        }
+      }
+    }
+
+    this.seriesLatest.set(key, { ...accumulated })
+    return accumulated
+  }
+
   async replaceLastSeriesEvent(taskId: string, seriesId: string, event: TaskEvent): Promise<void> {
     const key = `${taskId}:${seriesId}`
     const prev = this.seriesLatest.get(key)
