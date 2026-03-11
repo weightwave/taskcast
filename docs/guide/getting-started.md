@@ -125,7 +125,7 @@ curl -X POST http://localhost:3721/tasks/{taskId}/events \
 
 The subscribing terminal will receive these events in real time.
 
-> **Note:** In `accumulate` mode, the field defaults to `delta` but can be customized via `seriesAccField`.
+> **Note:** In `accumulate` mode, the field defaults to `delta` but can be customized via `seriesAccField`. By default, SSE subscribers receive original deltas (`seriesFormat=delta`). Add `?seriesFormat=accumulated` to receive running totals instead. Late-joining subscribers always receive a snapshot of the current accumulated value.
 
 ### 6. Complete the Task
 
@@ -184,9 +184,10 @@ async function processChat(taskId: string, prompt: string) {
   await engine.transitionTask(taskId, 'running')
 
   for await (const chunk of callLLM(prompt)) {
-    // Publish a streaming event. seriesMode: 'accumulate' means the engine merges
-    // all deltas into a single series entry (like ChatCompletion streaming).
-    // Late-joining subscribers see the accumulated result, not individual chunks.
+    // Publish a streaming event. seriesMode: 'accumulate' means the engine tracks
+    // the running total. SSE subscribers choose their format via seriesFormat param:
+    // 'delta' (default) for original chunks, 'accumulated' for running totals.
+    // Late-joining subscribers receive a snapshot of the current accumulated value.
     await engine.publishEvent(taskId, {
       type: 'llm.delta',
       level: 'info',
@@ -272,7 +273,8 @@ async function processAndComplete(taskId: string, params: Record<string, unknown
   })
 
   // Publish streaming events — each event is broadcast to all SSE subscribers in real time.
-  // seriesMode: 'accumulate' merges deltas so late-joiners see the full text so far.
+  // seriesMode: 'accumulate' tracks the running total; late-joiners get a snapshot.
+  // Subscribers choose format via seriesFormat param: 'delta' (default) or 'accumulated'.
   for await (const chunk of callLLM(params.prompt as string)) {
     await fetch(`${TASKCAST_URL}/tasks/${taskId}/events`, {
       method: 'POST',

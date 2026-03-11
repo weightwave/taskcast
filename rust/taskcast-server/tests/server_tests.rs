@@ -996,6 +996,8 @@ async fn webhook_delivery_sends_to_mock_server() {
         series_mode: None,
 
         series_acc_field: None,
+        series_snapshot: None,
+        _accumulated_data: None,
     };
     let config = taskcast_core::WebhookConfig {
         url: format!("http://{addr}/hook"),
@@ -1052,6 +1054,8 @@ async fn webhook_delivery_retries_on_failure() {
         series_mode: None,
 
         series_acc_field: None,
+        series_snapshot: None,
+        _accumulated_data: None,
     };
     let config = taskcast_core::WebhookConfig {
         url: format!("http://{addr}/hook"),
@@ -1114,6 +1118,8 @@ async fn webhook_delivery_succeeds_on_retry() {
         series_mode: None,
 
         series_acc_field: None,
+        series_snapshot: None,
+        _accumulated_data: None,
     };
     let config = taskcast_core::WebhookConfig {
         url: format!("http://{addr}/hook"),
@@ -1600,6 +1606,8 @@ async fn webhook_uses_default_retry_when_none_provided() {
         series_mode: None,
 
         series_acc_field: None,
+        series_snapshot: None,
+        _accumulated_data: None,
     };
     let config = taskcast_core::WebhookConfig {
         url: format!("http://{addr}/hook"),
@@ -1631,6 +1639,8 @@ async fn webhook_network_error_captures_error_string() {
         series_mode: None,
 
         series_acc_field: None,
+        series_snapshot: None,
+        _accumulated_data: None,
     };
     // Unreachable address — should trigger a network error (not an HTTP status error)
     let config = taskcast_core::WebhookConfig {

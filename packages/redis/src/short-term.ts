@@ -98,6 +98,19 @@ export class RedisShortTermStore implements ShortTermStore {
     await this.redis.sadd(this.KEY.seriesIds(taskId), seriesId)
   }
 
+  async accumulateSeries(taskId: string, seriesId: string, event: TaskEvent, field: string): Promise<TaskEvent> {
+    const resultJson = await this.redis.eval(
+      RedisShortTermStore.ACCUMULATE_LUA,
+      2,
+      this.KEY.seriesLatest(taskId, seriesId),
+      this.KEY.seriesIds(taskId),
+      JSON.stringify(event),
+      field,
+      seriesId,
+    )
+    return JSON.parse(resultJson as string) as TaskEvent
+  }
+
   async replaceLastSeriesEvent(taskId: string, seriesId: string, event: TaskEvent): Promise<void> {
     const prev = await this.getSeriesLatest(taskId, seriesId)
     if (prev) {
@@ -225,6 +238,32 @@ export class RedisShortTermStore implements ShortTermStore {
     await this.redis.del(this.KEY.worker(workerId))
     await this.redis.srem(this.KEY.workerSet, workerId)
   }
+
+  // Atomic accumulate — uses a Lua script so the read-merge-write is a single Redis command.
+  // This prevents two concurrent publishes from losing accumulated data.
+  private static ACCUMULATE_LUA = `
+    local prevJson = redis.call('GET', KEYS[1])
+    local newEvent = cjson.decode(ARGV[1])
+    local field = ARGV[2]
+    local seriesId = ARGV[3]
+
+    if prevJson then
+      local prev = cjson.decode(prevJson)
+      local prevData = prev.data
+      local newData = newEvent.data
+
+      if type(prevData) == 'table' and type(newData) == 'table'
+         and type(prevData[field]) == 'string' and type(newData[field]) == 'string' then
+        newData[field] = prevData[field] .. newData[field]
+        newEvent.data = newData
+      end
+    end
+
+    local result = cjson.encode(newEvent)
+    redis.call('SET', KEYS[1], result)
+    redis.call('SADD', KEYS[2], seriesId)
+    return result
+  `
 
   // Atomic claim — uses a Lua script so the read-check-write is a single Redis command.
   // This prevents two workers racing to claim the same task.
