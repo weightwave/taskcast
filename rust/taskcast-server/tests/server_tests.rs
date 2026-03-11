@@ -3639,11 +3639,8 @@ async fn double_complete_second_attempt_returns_conflict() {
         .patch("/tasks/double-1/status")
         .json(&json!({ "status": "completed" }))
         .await;
-    let status = r2.status_code().as_u16();
-    assert!(
-        status == 409 || status == 400,
-        "expected 409 or 400, got {status}"
-    );
+    // Rust server returns 400 for invalid transitions (TS returns 409 — parity issue tracked separately)
+    r2.assert_status(axum_test::http::StatusCode::BAD_REQUEST);
 }
 
 // ─── Publish event to terminal task (HTTP layer) ───────────────────────────
@@ -3674,8 +3671,7 @@ async fn publish_event_to_completed_task_returns_error() {
         }))
         .await;
 
-    let status = response.status_code().as_u16();
-    assert!(status >= 400, "expected 4xx, got {status}");
+    response.assert_status(axum_test::http::StatusCode::BAD_REQUEST);
 }
 
 // ─── Health endpoint ────────────────────────────────────────────────────────
