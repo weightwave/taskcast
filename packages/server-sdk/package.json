@@ -33,7 +33,7 @@
     "test:watch": "vitest"
   },
   "peerDependencies": {
-    "@taskcast/core": "workspace:*"
+    "@taskcast/core": "workspace:^"
   },
   "devDependencies": {
     "@taskcast/core": "workspace:*",
