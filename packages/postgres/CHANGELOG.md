@@ -1,5 +1,12 @@
 # @taskcast/postgres
 
+## 1.1.0
+
+### Patch Changes
+
+- Updated dependencies [771f7de]
+  - @taskcast/core@1.1.0
+
 ## 1.0.0
 
 ### Minor Changes
