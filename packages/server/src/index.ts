@@ -16,6 +16,7 @@ export {
 
 import type { Hono } from 'hono'
 import { OpenAPIHono } from '@hono/zod-openapi'
+import { cors } from 'hono/cors'
 import { apiReference } from '@scalar/hono-api-reference'
 import { createAuthMiddleware } from './auth.js'
 import { createTasksRouter } from './routes/tasks.js'
@@ -47,6 +48,7 @@ export interface TaskcastServerOptions {
   verbose?: boolean
   /** Custom logger function for verbose mode (defaults to console.log). Useful for testing. */
   verboseLogger?: (line: string) => void
+  cors?: boolean | { origin: string | string[] }
   scheduler?: {
     enabled?: boolean
     checkIntervalMs?: number
@@ -82,6 +84,12 @@ export function createTaskcastApp(opts: TaskcastServerOptions): TaskcastApp {
   // Apply verbose logger before all routes when enabled
   if (opts.verbose) {
     app.use('*', createVerboseLogger(opts.verboseLogger))
+  }
+
+  // CORS middleware
+  if (opts.cors) {
+    const origin = opts.cors === true ? '*' : opts.cors.origin
+    app.use('*', cors({ origin }))
   }
 
   app.get('/health', (c) => c.json({ ok: true }))

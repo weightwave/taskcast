@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
-import { TaskEngine } from '../../src/engine.js'
+import { TaskEngine, TaskConflictError, InvalidTransitionError } from '../../src/engine.js'
 import { MemoryBroadcastProvider, MemoryShortTermStore } from '../../src/memory-adapters.js'
 import type { LongTermStore } from '../../src/types.js'
 
@@ -107,6 +107,20 @@ describe('TaskEngine.createTask', () => {
     expect(onTaskCreated).toHaveBeenCalledOnce()
     expect(onTaskCreated).toHaveBeenCalledWith(expect.objectContaining({ id: task.id, status: 'pending' }))
   })
+
+  it('rejects duplicate explicit ID with TaskConflictError', async () => {
+    const { engine } = makeEngine()
+    await engine.createTask({ id: 'dup-test' })
+    await expect(engine.createTask({ id: 'dup-test' })).rejects.toThrow(TaskConflictError)
+    await expect(engine.createTask({ id: 'dup-test' })).rejects.toThrow('already exists')
+  })
+
+  it('allows auto-generated IDs without conflict', async () => {
+    const { engine } = makeEngine()
+    const t1 = await engine.createTask({})
+    const t2 = await engine.createTask({})
+    expect(t1.id).not.toBe(t2.id)
+  })
 })
 
 describe('TaskEngine.transitionTask', () => {
@@ -118,10 +132,11 @@ describe('TaskEngine.transitionTask', () => {
     expect(updated?.status).toBe('running')
   })
 
-  it('throws on invalid transition', async () => {
+  it('throws InvalidTransitionError on invalid transition', async () => {
     const { engine } = makeEngine()
     const task = await engine.createTask({})
-    await expect(engine.transitionTask(task.id, 'completed')).rejects.toThrow()
+    await expect(engine.transitionTask(task.id, 'completed')).rejects.toThrow(InvalidTransitionError)
+    await expect(engine.transitionTask(task.id, 'completed')).rejects.toThrow('Invalid transition')
   })
 
   it('throws when task not found', async () => {

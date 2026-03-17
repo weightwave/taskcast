@@ -12,6 +12,7 @@ import {
   TaskEventSchema,
   ErrorSchema,
 } from '../schemas.js'
+import { TaskConflictError, InvalidTransitionError } from '@taskcast/core'
 import type { TaskEngine, CreateTaskInput, PublishEventInput, SinceCursor, TaskError, BlockedRequest, TaskFilter, TaskStatus } from '@taskcast/core'
 
 // ─── Route Definitions ─────────────────────────────────────────────────────
@@ -29,6 +30,7 @@ const createTaskRoute = createRoute({
     201: { description: 'Task created', content: { 'application/json': { schema: TaskSchema } } },
     400: { description: 'Validation error', content: { 'application/json': { schema: ErrorSchema } } },
     403: { description: 'Forbidden', content: { 'application/json': { schema: ErrorSchema } } },
+    409: { description: 'Task ID already exists', content: { 'application/json': { schema: ErrorSchema } } },
   },
 })
 
@@ -79,9 +81,10 @@ const transitionRoute = createRoute({
   },
   responses: {
     200: { description: 'Updated task', content: { 'application/json': { schema: TaskSchema } } },
-    400: { description: 'Invalid transition', content: { 'application/json': { schema: ErrorSchema } } },
+    400: { description: 'Validation error', content: { 'application/json': { schema: ErrorSchema } } },
     404: { description: 'Task not found', content: { 'application/json': { schema: ErrorSchema } } },
     403: { description: 'Forbidden', content: { 'application/json': { schema: ErrorSchema } } },
+    409: { description: 'Invalid state transition', content: { 'application/json': { schema: ErrorSchema } } },
   },
 })
 
@@ -168,8 +171,8 @@ export function createTasksRouter(engine: TaskEngine, subscriberCounts: Subscrib
       const task = await engine.createTask(input)
       return c.json(task, 201)
     } catch (err) {
+      if (err instanceof TaskConflictError) return c.json({ error: err.message }, 409)
       const msg = err instanceof Error ? err.message : String(err)
-      if (msg.includes('already exists')) return c.json({ error: msg }, 409)
       if (msg.includes('Invalid TTL') || msg.includes('Invalid cost')) return c.json({ error: msg }, 400)
       throw err
     }
@@ -244,6 +247,7 @@ export function createTasksRouter(engine: TaskEngine, subscriberCounts: Subscrib
       const task = await engine.transitionTask(taskId, parsed.data.status, payload)
       return c.json(task)
     } catch (err) {
+      if (err instanceof InvalidTransitionError) return c.json({ error: err.message }, 409)
       const msg = err instanceof Error ? err.message : String(err)
       if (msg.toLowerCase().includes('not found')) return c.json({ error: msg }, 404)
       return c.json({ error: msg }, 400)
@@ -328,6 +332,7 @@ export function createTasksRouter(engine: TaskEngine, subscriberCounts: Subscrib
       })
       return c.json(updated)
     } catch (err) {
+      if (err instanceof InvalidTransitionError) return c.json({ error: err.message }, 409)
       const msg = err instanceof Error ? err.message : String(err)
       return c.json({ error: msg }, 400)
     }

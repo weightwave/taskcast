@@ -180,6 +180,41 @@ export class SqliteShortTermStore implements ShortTermStore {
       .run(taskId, seriesId, JSON.stringify(event))
   }
 
+  async accumulateSeries(taskId: string, seriesId: string, event: TaskEvent, field: string): Promise<TaskEvent> {
+    const accumulate = this.db.transaction(() => {
+      const row = this.db
+        .prepare('SELECT event_json FROM taskcast_series_latest WHERE task_id = ? AND series_id = ?')
+        .get(taskId, seriesId) as { event_json: string } | undefined
+
+      let accumulated = event
+      if (row) {
+        const prev = JSON.parse(row.event_json) as TaskEvent
+        const prevData = (typeof prev.data === 'object' && prev.data !== null)
+          ? prev.data as Record<string, unknown> : {}
+        const newData = (typeof event.data === 'object' && event.data !== null)
+          ? event.data as Record<string, unknown> : {}
+        if (typeof prevData[field] === 'string' && typeof newData[field] === 'string') {
+          accumulated = {
+            ...event,
+            data: { ...newData, [field]: prevData[field] + newData[field] },
+          }
+        }
+      }
+
+      this.db
+        .prepare(
+          `INSERT INTO taskcast_series_latest (task_id, series_id, event_json)
+           VALUES (?, ?, ?)
+           ON CONFLICT (task_id, series_id) DO UPDATE SET event_json = excluded.event_json`,
+        )
+        .run(taskId, seriesId, JSON.stringify(accumulated))
+
+      return accumulated
+    })
+
+    return accumulate()
+  }
+
   async replaceLastSeriesEvent(
     taskId: string,
     seriesId: string,

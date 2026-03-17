@@ -8,7 +8,7 @@ pub mod webhook;
 
 pub use app::{
     auto_release_worker, create_app, dispatch_ws_offer, dispatch_ws_race,
-    start_background_services, AppState, BackgroundServices,
+    start_background_services, AppState, BackgroundServices, CorsConfig,
 };
 pub use auth::{AuthContext, AuthMode, JwtConfig, TaskIdAccess, check_scope};
 pub use error::AppError;

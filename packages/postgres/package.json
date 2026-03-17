@@ -1,6 +1,6 @@
 {
   "name": "@taskcast/postgres",
-  "version": "0.3.1",
+  "version": "1.1.0",
   "description": "PostgreSQL long-term store adapter for Taskcast.",
   "repository": {
     "type": "git",

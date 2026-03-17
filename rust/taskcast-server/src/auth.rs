@@ -532,4 +532,133 @@ mod tests {
         assert!(matches!(ctx.task_ids, TaskIdAccess::All));
         assert_eq!(ctx.scope, vec![PermissionScope::All]);
     }
+
+    // ─── EC (ES256) key tests ────────────────────────────────────────────────
+
+    const EC_PRIVATE_KEY: &str = "-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg/6Svroa6zf7uKd0i
+zrZ8KPrakdGXm6F/lpULNSuRYWqhRANCAAQ6TbQS2VOf2iV/EQInVdbvWJEOn/KX
+EEyPwMDxwmDKHaZg6OU8BGyN6UdEFRgEq4CITvgsfDfOtGW2BazLuzVX
+-----END PRIVATE KEY-----";
+
+    const EC_PUBLIC_KEY: &str = "-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEOk20EtlTn9olfxECJ1XW71iRDp/y
+lxBMj8DA8cJgyh2mYOjlPARsjelHRBUYBKuAiE74LHw3zrRltgWsy7s1Vw==
+-----END PUBLIC KEY-----";
+
+    fn es256_config() -> JwtConfig {
+        JwtConfig {
+            algorithm: Algorithm::ES256,
+            secret: None,
+            public_key: Some(EC_PUBLIC_KEY.to_string()),
+            issuer: None,
+            audience: None,
+        }
+    }
+
+    fn make_es256_token(claims: &JwtClaims) -> String {
+        encode(
+            &Header::new(Algorithm::ES256),
+            claims,
+            &EncodingKey::from_ec_pem(EC_PRIVATE_KEY.as_bytes()).unwrap(),
+        )
+        .expect("failed to encode ES256 JWT")
+    }
+
+    #[test]
+    fn decode_jwt_es256_with_ec_public_key() {
+        let claims = base_claims();
+        let token = make_es256_token(&claims);
+        let ctx = decode_jwt(&token, &es256_config()).expect("should decode ES256 JWT");
+        assert_eq!(ctx.sub, Some("test-user".to_string()));
+    }
+
+    #[test]
+    fn decode_jwt_es256_wrong_key_fails() {
+        let claims = base_claims();
+        let token = make_es256_token(&claims);
+        let mut config = es256_config();
+        // Use a different (invalid) public key
+        config.public_key = Some("-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEAAAAAAAAAAAAAAAAAAAAAAAAAAAA\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n-----END PUBLIC KEY-----".to_string());
+        let result = decode_jwt(&token, &config);
+        assert!(result.is_err());
+    }
+
+    // ─── RSA (RS256) JWT tests ──────────────────────────────────────────────
+
+    const RSA_PRIVATE_KEY: &str = "-----BEGIN PRIVATE KEY-----
+MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDac9Dkk2KIhPUD
+PIQdAccvhEMLQcOfS1k93nSqpqO4RRATlUcFJ7OkTr+Lu0ZLwlzaN9zj5IR0MEF8
+HxIUZ06+CfyGMYQ3RgwvwIV+0Es4EHTVbwDVQSxjhCXr7i0VvwVvIczzpMJQs+Ar
+SR0kJVntHgeDrWI8WP8pfL0M7TgmS+ft3ovH4KwA3c2jcHsLjb5KOYGMN4PpEKsh
+vIFvaA9eKeBEcHTudhUH/qoJ+69eZgYhksIHP1Ar1c9ZDezzxq7blWFfIZ2pUXjP
+bPZIBye8dDJOEPvnSQdAIMfHY48KtXMYzBlihPTem3Olvhh0y72bv+TzS5eJj7Wj
+AFFBUplJAgMBAAECggEACWwvHvo306ap1i1mj2++XTopwChih+edSPy5mzYb4BIO
+ivcIkgbaifmhlnqJ94ZB22HHI9yn//D9lMfW+k1THqxZ7u8015jXDro8Uod+hG5l
+SQ2ELi6k+609YNYBritH+zlXLffghSWfw441n75YCNEfnC+UNKvWub3j06ppyRuu
+8ckAJCkGVSLQOD4Was/C/oZh1LBocwFzVRYwqSvfa3frzsjs6lpcfKYBiy0tT0GA
+Gp0gV/Drm4e244uc06O3wf0DV9s66TzAPWiXdY1iXIx2SeP7olJiRVDShMIuCWXw
+xFf9i1u/Wd9mygT3j3pfS+XbdpkNUQ+xWzDfSbhQFwKBgQD+9DTSFQQ5zIpdx62u
+EAyZd9zefkOy5Pz5ww3JFuf5m/lqNPP9iak++KdaXE4uLEDxNx/YpL3GaJYqZbDb
+54OqAtYKI/BAnqENTsIOZHCUcThOubDb2atdf4SM/d/LLqm90ws7GR9pl44kSX3m
+XWqu2ZYwTjUhxG2+slSSAEZAowKBgQDbWUUWw/JsPjbJnTdOw9qTNFB/8NDFpK4o
+pmeP8CBHUyGJ9xbS9KF422PaAip+qpAAVUZIwRKghzFbsZYOUsY8T7/1sa9TAe9z
+xkN/WpWC9CkkfqlfGeKd3vCOgNJgDfoYG9xg8wVGLxdFqZTc2TceR725fnJ2XQ/+
+64S3o35hIwKBgCX88yXeVcva6z7/8qP95jKzxmgsfh/YuMzqQFKXJCdwEyC9FSHQ
+8jPczurK2CdPFroaUZdxLIm0qbNVhZ2uiFK7q3LFWhX2zN5zvrxwQMoNeKtaRbzs
+WPlMd86eQUs//7C2EnVSz/hmyZokjSrW/n9hElzOOmJ2pzeD0NAUVGNrAoGBALCa
+2XOQ5HieRsJhYIx8SFnI/x9jptPa2ZZFFJDhhzumBRTt6mSDLhb+nRCEOe6uKS77
+eZFOUk8JSoZHH0f9ATrCAw4wt7afkkmm0eWR61r6dr25dWjqkHkHbKtvsPJBjqEm
+nXM5d3+gnp4qAX8nLKemn2zgEAyYtS5MNhkc+739AoGBAMjEFWQWfHS0wtIJ6Dzv
+aASJc3I+k0/+PPbCD29ES6OYnGcddzCeLpVCYiKYPaOczAsO/umEA56zVy0/i7ad
+P4urk6wm7nh9WEjHUdgKNxWxPPb5WgenJY5gveXxjvGmxJL2sifUsYpheNxCUv9o
+wFtaoSVhXzRhhDZtU+6uhp+A
+-----END PRIVATE KEY-----";
+
+    const RSA_PUBLIC_KEY: &str = "-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2nPQ5JNiiIT1AzyEHQHH
+L4RDC0HDn0tZPd50qqajuEUQE5VHBSezpE6/i7tGS8Jc2jfc4+SEdDBBfB8SFGdO
+vgn8hjGEN0YML8CFftBLOBB01W8A1UEsY4Ql6+4tFb8FbyHM86TCULPgK0kdJCVZ
+7R4Hg61iPFj/KXy9DO04Jkvn7d6Lx+CsAN3No3B7C42+SjmBjDeD6RCrIbyBb2gP
+XingRHB07nYVB/6qCfuvXmYGIZLCBz9QK9XPWQ3s88au25VhXyGdqVF4z2z2SAcn
+vHQyThD750kHQCDHx2OPCrVzGMwZYoT03ptzpb4YdMu9m7/k80uXiY+1owBRQVKZ
+SQIDAQAB
+-----END PUBLIC KEY-----";
+
+    fn rs256_config() -> JwtConfig {
+        JwtConfig {
+            algorithm: Algorithm::RS256,
+            secret: None,
+            public_key: Some(RSA_PUBLIC_KEY.to_string()),
+            issuer: None,
+            audience: None,
+        }
+    }
+
+    fn make_rs256_token(claims: &JwtClaims) -> String {
+        encode(
+            &Header::new(Algorithm::RS256),
+            claims,
+            &EncodingKey::from_rsa_pem(RSA_PRIVATE_KEY.as_bytes()).unwrap(),
+        )
+        .expect("failed to encode RS256 JWT")
+    }
+
+    #[test]
+    fn decode_jwt_rs256_with_rsa_public_key() {
+        let claims = base_claims();
+        let token = make_rs256_token(&claims);
+        let ctx = decode_jwt(&token, &rs256_config()).expect("should decode RS256 JWT");
+        assert_eq!(ctx.sub, Some("test-user".to_string()));
+    }
+
+    #[test]
+    fn decode_jwt_rs256_wrong_key_fails() {
+        let claims = base_claims();
+        let token = make_rs256_token(&claims);
+        let mut config = rs256_config();
+        config.public_key = Some(EC_PUBLIC_KEY.to_string()); // Wrong key type
+        let result = decode_jwt(&token, &config);
+        assert!(result.is_err());
+    }
 }

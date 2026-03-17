@@ -80,7 +80,7 @@ describe('PATCH /tasks/:taskId/status', () => {
     expect(body.status).toBe('running')
   })
 
-  it('returns 400 on invalid transition', async () => {
+  it('returns 409 on invalid transition', async () => {
     const { app, engine } = makeApp()
     const task = await engine.createTask({})
     const res = await app.request(`/tasks/${task.id}/status`, {
@@ -88,7 +88,7 @@ describe('PATCH /tasks/:taskId/status', () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ status: 'completed' }),
     })
-    expect(res.status).toBe(400)
+    expect(res.status).toBe(409)
   })
 })
 
@@ -452,7 +452,7 @@ describe('PATCH /tasks/:taskId/status – suspended states', () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ status: 'completed' }),
     })
-    expect(res.status).toBe(400)
+    expect(res.status).toBe(409)
   })
 })
 

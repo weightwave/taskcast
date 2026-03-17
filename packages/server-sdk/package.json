@@ -1,6 +1,6 @@
 {
   "name": "@taskcast/server-sdk",
-  "version": "0.3.1",
+  "version": "1.1.0",
   "description": "HTTP client SDK for Taskcast remote server mode.",
   "repository": {
     "type": "git",
@@ -33,7 +33,7 @@
     "test:watch": "vitest"
   },
   "peerDependencies": {
-    "@taskcast/core": "workspace:*"
+    "@taskcast/core": "workspace:^"
   },
   "devDependencies": {
     "@taskcast/core": "workspace:*",

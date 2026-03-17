@@ -48,6 +48,7 @@ const sseRoute = createRoute({
       levels: z.string().optional().openapi({ description: 'Comma-separated level filter' }),
       includeStatus: z.string().optional().openapi({ description: 'Include taskcast:status events (default: true)' }),
       wrap: z.string().optional().openapi({ description: 'Wrap in SSEEnvelope (default: true)' }),
+      seriesFormat: z.string().optional().openapi({ description: 'Series format: delta (default) or accumulated' }),
       'since.id': z.string().optional(),
       'since.index': z.string().optional(),
       'since.timestamp': z.string().optional(),
@@ -78,6 +79,11 @@ function parseFilter(query: Record<string, string | undefined>): SubscribeFilter
   const wrap = get('wrap')
   if (wrap !== undefined) filter.wrap = wrap !== 'false'
 
+  const seriesFormat = get('seriesFormat')
+  if (seriesFormat === 'delta' || seriesFormat === 'accumulated') {
+    filter.seriesFormat = seriesFormat
+  }
+
   const sinceId = get('since.id')
   const sinceIndex = get('since.index')
   const sinceTimestamp = get('since.timestamp')
@@ -106,6 +112,7 @@ function toEnvelope(event: TaskEvent, filteredIndex: number): SSEEnvelope {
   if (event.seriesId !== undefined) env.seriesId = event.seriesId
   if (event.seriesMode !== undefined) env.seriesMode = event.seriesMode
   if (event.seriesAccField !== undefined) env.seriesAccField = event.seriesAccField
+  if (event.seriesSnapshot !== undefined) env.seriesSnapshot = event.seriesSnapshot
   return env
 }
 
@@ -138,8 +145,16 @@ export function createSSERouter(engine: TaskEngine, subscriberCounts: Subscriber
         if (!decremented) { decremented = true; decrementSubscriberCount(subscriberCounts, taskId) }
       }
 
+      const seriesFormat = filter.seriesFormat ?? 'delta'
+
       const sendEvent = async (event: TaskEvent, filteredIndex: number) => {
-        const payload = wrap ? toEnvelope(event, filteredIndex) : event
+        let eventToSend = event
+        if (seriesFormat === 'accumulated' && event._accumulatedData !== undefined) {
+          eventToSend = { ...event, data: event._accumulatedData }
+        }
+        // Strip transient field
+        const { _accumulatedData: _, ...cleanEvent } = eventToSend as TaskEvent & { _accumulatedData?: unknown }
+        const payload = wrap ? toEnvelope(cleanEvent as TaskEvent, filteredIndex) : cleanEvent
         await stream.writeSSE({
           event: 'taskcast.event',
           data: JSON.stringify(payload),
@@ -162,7 +177,48 @@ export function createSSERouter(engine: TaskEngine, subscriberCounts: Subscriber
         cleanup()
         return
       }
-      const filtered = applyFilteredIndex(history, filter)
+
+      const hasSinceCursor = !!filter.since
+      const accumulateSeriesIds = new Set<string>()
+      for (const e of history) {
+        if (e.seriesMode === 'accumulate' && e.seriesId) {
+          accumulateSeriesIds.add(e.seriesId)
+        }
+      }
+
+      let replayEvents: TaskEvent[]
+
+      if (accumulateSeriesIds.size > 0 && !hasSinceCursor) {
+        // Collapse accumulate series into snapshots
+        const snapshots = new Map<string, TaskEvent>()
+        for (const sid of accumulateSeriesIds) {
+          const latest = await engine.getSeriesLatest(taskId, sid)
+          if (latest) {
+            snapshots.set(sid, { ...latest, seriesSnapshot: true })
+          }
+        }
+
+        const emittedSnapshots = new Set<string>()
+        replayEvents = []
+        for (const event of history) {
+          if (event.seriesMode === 'accumulate' && event.seriesId && accumulateSeriesIds.has(event.seriesId)) {
+            if (!emittedSnapshots.has(event.seriesId)) {
+              const snapshot = snapshots.get(event.seriesId)
+              if (snapshot) {
+                replayEvents.push(snapshot)
+                emittedSnapshots.add(event.seriesId)
+              }
+            }
+            // Skip remaining events in this accumulate series
+          } else {
+            replayEvents.push(event)
+          }
+        }
+      } else {
+        replayEvents = history
+      }
+
+      const filtered = applyFilteredIndex(replayEvents, filter)
       for (const { event, filteredIndex } of filtered) {
         await sendEvent(event, filteredIndex)
       }

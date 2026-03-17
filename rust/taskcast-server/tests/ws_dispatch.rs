@@ -7,7 +7,7 @@ use taskcast_core::{
     WorkerMatchRule,
 };
 use taskcast_server::{
-    auto_release_worker, create_app, dispatch_ws_offer, dispatch_ws_race,
+    auto_release_worker, create_app, CorsConfig, dispatch_ws_offer, dispatch_ws_race,
     start_background_services, AuthMode, BackgroundServices, WorkerCommand, WsRegistry,
 };
 
@@ -213,7 +213,7 @@ fn make_worker_manager(
 fn create_app_with_worker_manager_compiles() {
     let (engine, store) = make_engine_and_store();
     let manager = make_worker_manager(&engine, &store);
-    let (_app, registry) = create_app(engine, AuthMode::None, Some(manager), None);
+    let (_app, registry) = create_app(engine, AuthMode::None, Some(manager), None, CorsConfig::default());
     // If this compiles and runs, the routing/state wiring is correct.
     assert!(registry.is_some());
 }
@@ -221,7 +221,7 @@ fn create_app_with_worker_manager_compiles() {
 #[test]
 fn create_app_without_worker_manager_compiles() {
     let (engine, _store) = make_engine_and_store();
-    let (_app, registry) = create_app(engine, AuthMode::None, None, None);
+    let (_app, registry) = create_app(engine, AuthMode::None, None, None, CorsConfig::default());
     assert!(registry.is_none());
 }
 
@@ -334,6 +334,7 @@ async fn ws_offer_dispatch_sends_offer_to_best_worker() {
         AuthMode::None,
         Some(Arc::clone(&manager)),
         None,
+        CorsConfig::default(),
     );
     let ws_registry = ws_registry.unwrap();
 
@@ -429,6 +430,7 @@ async fn ws_race_dispatch_broadcasts_to_all_ws_workers() {
         AuthMode::None,
         Some(Arc::clone(&manager)),
         None,
+        CorsConfig::default(),
     );
     let ws_registry = ws_registry.unwrap();
 
@@ -513,6 +515,7 @@ async fn external_assign_mode_does_not_trigger_ws_dispatch() {
         AuthMode::None,
         Some(Arc::clone(&manager)),
         None,
+        CorsConfig::default(),
     );
     let ws_registry = ws_registry.unwrap();
 
@@ -575,6 +578,7 @@ async fn auto_release_fires_on_terminal_transition() {
         AuthMode::None,
         Some(Arc::clone(&manager)),
         None,
+        CorsConfig::default(),
     );
 
     // Create a task and claim it (which creates an assignment)
@@ -670,6 +674,7 @@ async fn auto_release_fires_on_failed_transition() {
         AuthMode::None,
         Some(Arc::clone(&manager)),
         None,
+        CorsConfig::default(),
     );
 
     engine
@@ -738,6 +743,7 @@ async fn auto_release_does_not_fire_on_non_terminal_transition() {
         AuthMode::None,
         Some(Arc::clone(&manager)),
         None,
+        CorsConfig::default(),
     );
 
     engine
@@ -793,6 +799,7 @@ async fn ws_offer_no_available_worker_does_not_send() {
         AuthMode::None,
         Some(Arc::clone(&manager)),
         None,
+        CorsConfig::default(),
     );
     let ws_registry = ws_registry.unwrap();
 
@@ -881,6 +888,7 @@ async fn ws_race_skips_draining_and_offline_workers() {
         AuthMode::None,
         Some(Arc::clone(&manager)),
         None,
+        CorsConfig::default(),
     );
     let ws_registry = ws_registry.unwrap();
 
@@ -954,6 +962,7 @@ async fn task_without_assign_mode_does_not_trigger_dispatch() {
         AuthMode::None,
         Some(Arc::clone(&manager)),
         None,
+        CorsConfig::default(),
     );
     let ws_registry = ws_registry.unwrap();
 
@@ -1016,6 +1025,7 @@ async fn non_pending_transition_does_not_trigger_ws_dispatch() {
         AuthMode::None,
         Some(Arc::clone(&manager)),
         None,
+        CorsConfig::default(),
     );
     let ws_registry = ws_registry.unwrap();
 
@@ -1165,6 +1175,7 @@ async fn ws_offer_dispatch_includes_task_metadata_in_summary() {
         AuthMode::None,
         Some(Arc::clone(&manager)),
         None,
+        CorsConfig::default(),
     );
     let ws_registry = ws_registry.unwrap();
 
@@ -1240,6 +1251,7 @@ async fn ws_race_dispatch_includes_task_metadata_in_summary() {
         AuthMode::None,
         Some(Arc::clone(&manager)),
         None,
+        CorsConfig::default(),
     );
     let ws_registry = ws_registry.unwrap();
 
@@ -1311,6 +1323,7 @@ async fn auto_release_fires_on_cancelled_transition() {
         AuthMode::None,
         Some(Arc::clone(&manager)),
         None,
+        CorsConfig::default(),
     );
 
     engine
@@ -1384,6 +1397,7 @@ async fn auto_release_fires_on_timeout_transition() {
         AuthMode::None,
         Some(Arc::clone(&manager)),
         None,
+        CorsConfig::default(),
     );
 
     engine

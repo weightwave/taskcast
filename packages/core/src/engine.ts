@@ -14,6 +14,27 @@ import type {
   EventQueryOptions,
 } from './types.js'
 
+// ─── Error Classes ──────────────────────────────────────────────────────────
+
+export class TaskConflictError extends Error {
+  constructor(taskId: string) {
+    super(`Task already exists: ${taskId}`)
+    this.name = 'TaskConflictError'
+  }
+}
+
+export class InvalidTransitionError extends Error {
+  public readonly from: TaskStatus
+  public readonly to: TaskStatus
+
+  constructor(from: TaskStatus, to: TaskStatus) {
+    super(`Invalid transition: ${from} → ${to}`)
+    this.name = 'InvalidTransitionError'
+    this.from = from
+    this.to = to
+  }
+}
+
 interface TaskEngineOptionsBase {
   broadcast: BroadcastProvider
   hooks?: TaskcastHooks
@@ -98,9 +119,7 @@ export class TaskEngine {
     // Check for duplicate user-supplied IDs
     if (input.id !== undefined) {
       const existing = await this.shortTermStore.getTask(id)
-      if (existing) {
-        throw new Error(`Task already exists: ${id}`)
-      }
+      if (existing) throw new TaskConflictError(id)
     }
 
     const task: Task = {
@@ -164,7 +183,7 @@ export class TaskEngine {
     const task = await this.getTask(taskId)
     if (!task) throw new Error(`Task not found: ${taskId}`)
     if (!canTransition(task.status, to)) {
-      throw new Error(`Invalid transition: ${task.status} → ${to}`)
+      throw new InvalidTransitionError(task.status, to)
     }
 
     const now = Date.now()
@@ -291,6 +310,10 @@ export class TaskEngine {
     return this.broadcast.subscribe(taskId, handler)
   }
 
+  async getSeriesLatest(taskId: string, seriesId: string): Promise<TaskEvent | null> {
+    return this.shortTermStore.getSeriesLatest(taskId, seriesId)
+  }
+
   private async _emit(taskId: string, input: PublishEventInput): Promise<TaskEvent> {
     const index = await this.shortTermStore.nextIndex(taskId)
     const raw: TaskEvent = {
@@ -306,13 +329,20 @@ export class TaskEngine {
       ...(input.seriesAccField !== undefined && { seriesAccField: input.seriesAccField }),
     }
 
-    const event = await processSeries(raw, this.shortTermStore)
+    const { event, accumulatedEvent } = await processSeries(raw, this.shortTermStore)
     await this.shortTermStore.appendEvent(taskId, event)
-    await this.broadcast.publish(taskId, event)
+
+    // Attach accumulated data to broadcast for SSE accumulated subscribers
+    const broadcastEvent = accumulatedEvent
+      ? { ...event, _accumulatedData: accumulatedEvent.data }
+      : event
+    await this.broadcast.publish(taskId, broadcastEvent)
 
     if (this.longTermStore) {
-      this.longTermStore.saveEvent(event).catch((err) => {
-        this.hooks?.onEventDropped?.(event, String(err))
+      // LongTermStore gets accumulated event (or delta if non-accumulate)
+      const storeEvent = accumulatedEvent ?? event
+      this.longTermStore.saveEvent(storeEvent).catch((err) => {
+        this.hooks?.onEventDropped?.(storeEvent, String(err))
       })
     }
 

@@ -169,7 +169,7 @@ POST /tasks/:taskId/events
 | `seriesMode` | string | No | `keep-all`/`accumulate`/`latest` |
 | `seriesAccField` | string | No | Field name to concatenate in `accumulate` mode (defaults to `delta`) |
 
-**Response:** `201 Created` — returns the created event (single) or event array (batch)
+**Response:** `201 Created` — returns the created event (single) or event array (batch). For `accumulate` series, the returned event contains the original delta data (not the accumulated value).
 
 **Errors:**
 - `400` — Cannot publish events when the task is not in `running` status

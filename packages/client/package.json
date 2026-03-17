@@ -1,6 +1,6 @@
 {
   "name": "@taskcast/client",
-  "version": "0.3.1",
+  "version": "1.1.0",
   "description": "Browser SSE subscription client for Taskcast.",
   "repository": {
     "type": "git",
@@ -36,7 +36,7 @@
     "eventsource-parser": "^2.0.1"
   },
   "peerDependencies": {
-    "@taskcast/core": "workspace:*"
+    "@taskcast/core": "workspace:^"
   },
   "devDependencies": {
     "@taskcast/core": "workspace:*",

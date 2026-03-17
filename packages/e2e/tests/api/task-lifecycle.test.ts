@@ -240,7 +240,7 @@ describe('Task Lifecycle API', () => {
     expect(completedTask.result).toEqual({ output: 'done' })
   })
 
-  it('rejects invalid transition (completed -> running) with 400', async () => {
+  it('rejects invalid transition (completed -> running) with 409', async () => {
     const createRes = await fetch(`${server.baseUrl}/tasks`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -266,9 +266,9 @@ describe('Task Lifecycle API', () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ status: 'running' }),
     })
-    expect(res.status).toBe(400)
+    expect(res.status).toBe(409)
     const body = await res.json()
-    expect(body.error).toBeDefined()
+    expect(body.error).toContain('Invalid transition')
   })
 
   it('transitions to failed with error payload', async () => {

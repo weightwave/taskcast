@@ -248,6 +248,51 @@ impl ShortTermStore for MemoryShortTermStore {
         Ok(())
     }
 
+    async fn accumulate_series(
+        &self,
+        task_id: &str,
+        series_id: &str,
+        event: TaskEvent,
+        field: &str,
+    ) -> Result<TaskEvent, Box<dyn std::error::Error + Send + Sync>> {
+        // Atomic read-modify-write under a single write lock
+        let key = format!("{task_id}:{series_id}");
+        let mut series = self.series_latest.write().unwrap();
+        let prev = series.get(&key).cloned();
+
+        let accumulated = if let Some(prev) = prev {
+            let should_concat = prev
+                .data
+                .as_object()
+                .and_then(|po| po.get(field)?.as_str().map(|s| s.to_string()))
+                .and_then(|prev_val| {
+                    event
+                        .data
+                        .as_object()
+                        .and_then(|no| no.get(field)?.as_str().map(|s| s.to_string()))
+                        .map(|new_val| (prev_val, new_val))
+                });
+
+            if let Some((prev_val, new_val)) = should_concat {
+                let mut new_data = event.data.as_object().cloned().unwrap_or_default();
+                new_data.insert(
+                    field.to_string(),
+                    serde_json::Value::String(prev_val + &new_val),
+                );
+                TaskEvent {
+                    data: serde_json::Value::Object(new_data),
+                    ..event
+                }
+            } else {
+                event
+            }
+        } else {
+            event
+        };
+        series.insert(key, accumulated.clone());
+        Ok(accumulated)
+    }
+
     async fn next_index(
         &self,
         task_id: &str,
@@ -513,6 +558,8 @@ mod tests {
             series_id: None,
             series_mode: None,
             series_acc_field: None,
+            series_snapshot: None,
+            _accumulated_data: None,
         }
     }
 

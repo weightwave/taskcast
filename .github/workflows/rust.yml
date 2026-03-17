@@ -48,6 +48,10 @@ jobs:
   # so they run fully in parallel. This trades runner minutes for wall-clock speed:
   # wall time ≈ max(prepare + jobs) instead of sum if serialized.
   # Do NOT merge these jobs — that would make CI slower.
+  #
+  # shared-key groups jobs by cargo profile so they share the same cache:
+  # - check/test/coverage all use debug profile → shared-key: debug
+  # - build uses release profile → shared-key: release
   check:
     name: Check & Clippy
     needs: [prepare]
@@ -63,6 +67,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
+          shared-key: debug
       - uses: actions/download-artifact@v4
         with:
           name: playground-dist
@@ -85,6 +90,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
+          shared-key: debug
       - uses: actions/download-artifact@v4
         with:
           name: playground-dist
@@ -107,6 +113,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
+          shared-key: debug
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: actions/download-artifact@v4
         with:
@@ -136,6 +143,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
+          shared-key: release
       - uses: actions/download-artifact@v4
         with:
           name: playground-dist
@@ -154,12 +162,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
-      - uses: pnpm/action-setup@v4
+          node-version: '22'
+          cache: pnpm
       - name: Install Node dependencies
-        run: pnpm install
+        run: pnpm install --frozen-lockfile
       - name: Build TypeScript packages
         run: pnpm -r build
       - name: Download Rust binary

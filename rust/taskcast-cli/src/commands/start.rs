@@ -245,7 +245,7 @@ pub async fn run(args: StartArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     // 9. Create and serve app
     let (app, _ws_registry) =
-        taskcast_server::create_app(engine, auth_mode, worker_manager, None);
+        taskcast_server::create_app(engine, auth_mode, worker_manager, None, taskcast_server::CorsConfig::default());
 
     // Apply verbose request logging middleware if --verbose
     let app = if verbose {

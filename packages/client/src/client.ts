@@ -75,6 +75,7 @@ export class TaskcastClient {
     if (filter?.since?.index !== undefined) params.set('since.index', String(filter.since.index))
     if (filter?.since?.timestamp !== undefined)
       params.set('since.timestamp', String(filter.since.timestamp))
+    if (filter?.seriesFormat) params.set('seriesFormat', filter.seriesFormat)
 
     const qs = params.toString()
     return `${this.baseUrl}/tasks/${taskId}/events${qs ? `?${qs}` : ''}`

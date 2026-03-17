@@ -8,3 +8,4 @@ coverage/
 rust/target/
 .claude/
 .playwright-cli/
+.DS_Store

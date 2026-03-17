@@ -6,6 +6,7 @@ use axum::middleware;
 use axum::response::IntoResponse;
 use axum::routing::{get, patch, post};
 use axum::{Extension, Router};
+use tower_http::cors::{Any, CorsLayer};
 use taskcast_core::config::TaskcastConfig;
 use taskcast_core::heartbeat_monitor::{HeartbeatMonitor, HeartbeatMonitorOptions};
 use taskcast_core::scheduler::{TaskScheduler, TaskSchedulerOptions};
@@ -37,11 +38,24 @@ pub struct AppState {
 ///
 /// Returns the router and an optional `WsRegistry` (present when a `WorkerManager`
 /// is provided) that can be used to send commands to connected WebSocket workers.
+/// CORS configuration for the server.
+#[derive(Clone, Default)]
+pub enum CorsConfig {
+    /// No CORS headers.
+    #[default]
+    Disabled,
+    /// Allow all origins (`*`).
+    AllowAll,
+    /// Allow specific origins.
+    AllowOrigins(Vec<String>),
+}
+
 pub fn create_app(
     engine: Arc<TaskEngine>,
     auth_mode: AuthMode,
     worker_manager: Option<Arc<WorkerManager>>,
     config: Option<TaskcastConfig>,
+    cors_config: CorsConfig,
 ) -> (Router, Option<WsRegistry>) {
     let auth_mode = Arc::new(auth_mode);
     let subscriber_counts = create_subscriber_counts();
@@ -184,6 +198,19 @@ pub fn create_app(
             .with_state(admin_state);
         app = app.merge(admin_routes);
     }
+
+    // Apply CORS layer
+    let app = match cors_config {
+        CorsConfig::Disabled => app,
+        CorsConfig::AllowAll => app.layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any)),
+        CorsConfig::AllowOrigins(origins) => {
+            let origins: Vec<_> = origins
+                .iter()
+                .filter_map(|o| o.parse().ok())
+                .collect();
+            app.layer(CorsLayer::new().allow_origin(origins).allow_methods(Any).allow_headers(Any))
+        }
+    };
 
     (app, ws_registry_out)
 }

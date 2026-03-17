@@ -401,6 +401,25 @@ pub struct TaskEvent {
     pub series_mode: Option<SeriesMode>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub series_acc_field: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub series_snapshot: Option<bool>,
+    /// Transient: accumulated data attached during broadcast, not persisted.
+    #[serde(skip)]
+    pub _accumulated_data: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum SeriesFormat {
+    Delta,
+    Accumulated,
+}
+
+/// Result of series processing: original delta event + optional accumulated event.
+#[derive(Debug, Clone)]
+pub struct SeriesResult {
+    pub event: TaskEvent,
+    pub accumulated_event: Option<TaskEvent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
@@ -420,6 +439,8 @@ pub struct SSEEnvelope {
     pub series_mode: Option<SeriesMode>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub series_acc_field: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub series_snapshot: Option<bool>,
 }
 
 // ─── Subscription ────────────────────────────────────────────────────────────
@@ -448,6 +469,8 @@ pub struct SubscribeFilter {
     pub include_status: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wrap: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub series_format: Option<SeriesFormat>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
@@ -495,6 +518,7 @@ pub trait ShortTermStore: Send + Sync {
     async fn get_series_latest(&self, task_id: &str, series_id: &str) -> Result<Option<TaskEvent>, Box<dyn std::error::Error + Send + Sync>>;
     async fn set_series_latest(&self, task_id: &str, series_id: &str, event: TaskEvent) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
     async fn replace_last_series_event(&self, task_id: &str, series_id: &str, event: TaskEvent) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn accumulate_series(&self, task_id: &str, series_id: &str, event: TaskEvent, field: &str) -> Result<TaskEvent, Box<dyn std::error::Error + Send + Sync>>;
     async fn next_index(&self, task_id: &str) -> Result<u64, Box<dyn std::error::Error + Send + Sync>>;
 
     // Task query
@@ -902,6 +926,8 @@ mod tests {
             series_id: None,
             series_mode: None,
             series_acc_field: None,
+            series_snapshot: None,
+            _accumulated_data: None,
         };
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["id"], "evt_01");
@@ -928,6 +954,8 @@ mod tests {
             series_id: Some("series_01".to_string()),
             series_mode: Some(SeriesMode::Accumulate),
             series_acc_field: None,
+            series_snapshot: None,
+            _accumulated_data: None,
         };
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["seriesId"], "series_01");
@@ -947,6 +975,8 @@ mod tests {
             series_id: Some("s1".to_string()),
             series_mode: Some(SeriesMode::Latest),
             series_acc_field: None,
+            series_snapshot: None,
+            _accumulated_data: None,
         };
         let json_str = serde_json::to_string(&event).unwrap();
         let back: TaskEvent = serde_json::from_str(&json_str).unwrap();
@@ -969,6 +999,7 @@ mod tests {
             series_id: None,
             series_mode: None,
             series_acc_field: None,
+            series_snapshot: None,
         };
         let json = serde_json::to_value(&envelope).unwrap();
         assert_eq!(json["filteredIndex"], 3);
@@ -997,6 +1028,7 @@ mod tests {
             series_id: Some("s1".to_string()),
             series_mode: Some(SeriesMode::KeepAll),
             series_acc_field: None,
+            series_snapshot: None,
         };
         let json = serde_json::to_value(&envelope).unwrap();
         assert_eq!(json["seriesId"], "s1");
@@ -1043,6 +1075,7 @@ mod tests {
             levels: Some(vec![Level::Info, Level::Error]),
             include_status: Some(true),
             wrap: Some(false),
+            series_format: None,
         };
         let json = serde_json::to_value(&filter).unwrap();
         assert_eq!(json["since"]["index"], 10);
@@ -1052,6 +1085,73 @@ mod tests {
         assert_eq!(json["levels"][1], "error");
         assert_eq!(json["includeStatus"], true);
         assert_eq!(json["wrap"], false);
+    }
+
+    // ─── SeriesFormat ──────────────────────────────────────────────────
+
+    #[test]
+    fn series_format_serde_roundtrip() {
+        // Serialize
+        let delta = SeriesFormat::Delta;
+        let acc = SeriesFormat::Accumulated;
+        let delta_json = serde_json::to_value(&delta).unwrap();
+        let acc_json = serde_json::to_value(&acc).unwrap();
+        assert_eq!(delta_json, "delta");
+        assert_eq!(acc_json, "accumulated");
+
+        // Deserialize
+        let delta_back: SeriesFormat = serde_json::from_value(delta_json).unwrap();
+        let acc_back: SeriesFormat = serde_json::from_value(acc_json).unwrap();
+        assert_eq!(delta_back, SeriesFormat::Delta);
+        assert_eq!(acc_back, SeriesFormat::Accumulated);
+    }
+
+    #[test]
+    fn series_format_in_subscribe_filter_roundtrip() {
+        let filter = SubscribeFilter {
+            since: None,
+            types: None,
+            levels: None,
+            include_status: None,
+            wrap: None,
+            series_format: Some(SeriesFormat::Accumulated),
+        };
+        let json = serde_json::to_value(&filter).unwrap();
+        assert_eq!(json["seriesFormat"], "accumulated");
+
+        let back: SubscribeFilter = serde_json::from_value(json).unwrap();
+        assert_eq!(back.series_format, Some(SeriesFormat::Accumulated));
+    }
+
+    #[test]
+    fn series_result_fields() {
+        let event = TaskEvent {
+            id: "e".to_string(),
+            task_id: "t".to_string(),
+            index: 0,
+            timestamp: 0.0,
+            r#type: "x".to_string(),
+            level: Level::Info,
+            data: serde_json::json!(null),
+            series_id: None,
+            series_mode: None,
+            series_acc_field: None,
+            series_snapshot: None,
+            _accumulated_data: None,
+        };
+        let result = SeriesResult {
+            event: event.clone(),
+            accumulated_event: Some(event.clone()),
+        };
+        assert_eq!(result.event.id, "e");
+        assert!(result.accumulated_event.is_some());
+
+        let cloned = result.clone();
+        assert_eq!(cloned.event.id, "e");
+
+        // Debug
+        let debug_str = format!("{:?}", result);
+        assert!(debug_str.contains("SeriesResult"));
     }
 
     // ─── EventQueryOptions ──────────────────────────────────────────────
@@ -1319,6 +1419,8 @@ mod tests {
             series_id: None,
             series_mode: None,
             series_acc_field: None,
+            series_snapshot: None,
+            _accumulated_data: None,
         };
         let json_str = serde_json::to_string(&event).unwrap();
         assert!(!json_str.contains("\"seriesId\""));
@@ -1339,6 +1441,7 @@ mod tests {
             series_id: None,
             series_mode: None,
             series_acc_field: None,
+            series_snapshot: None,
         };
         let json_str = serde_json::to_string(&envelope).unwrap();
         assert!(!json_str.contains("\"seriesId\""));
@@ -1398,6 +1501,7 @@ mod tests {
                 levels: None,
                 include_status: Some(true),
                 wrap: None,
+                series_format: None,
             }),
             secret: None,
             wrap: None,
@@ -1431,7 +1535,7 @@ mod tests {
             id: "e".to_string(), task_id: "t".to_string(), index: 0,
             timestamp: 0.0, r#type: "x".to_string(), level: Level::Info,
             data: json!(null), series_id: None, series_mode: None,
-            series_acc_field: None,
+            series_acc_field: None, series_snapshot: None, _accumulated_data: None,
         };
         let webhook = WebhookConfig {
             url: "https://example.com".to_string(),
@@ -1464,6 +1568,7 @@ mod tests {
         async fn get_series_latest(&self, _: &str, _: &str) -> Result<Option<TaskEvent>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
         async fn set_series_latest(&self, _: &str, _: &str, _: TaskEvent) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
         async fn replace_last_series_event(&self, _: &str, _: &str, _: TaskEvent) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
+        async fn accumulate_series(&self, _: &str, _: &str, event: TaskEvent, _: &str) -> Result<TaskEvent, Box<dyn std::error::Error + Send + Sync>> { Ok(event) }
         async fn next_index(&self, _: &str) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> { Ok(0) }
         async fn list_tasks(&self, _: TaskFilter) -> Result<Vec<Task>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
         async fn save_worker(&self, _: Worker) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
@@ -1514,6 +1619,8 @@ mod tests {
             series_id: None,
             series_mode: None,
             series_acc_field: None,
+            series_snapshot: None,
+            _accumulated_data: None,
         };
 
         assert!(store.save_task(task).await.is_ok());

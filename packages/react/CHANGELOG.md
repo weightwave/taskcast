@@ -1,5 +1,76 @@
 # @taskcast/react
 
+## 1.1.0
+
+### Minor Changes
+
+- 771f7de: Add `seriesFormat` SSE parameter for consumer-controlled accumulate output
+
+  **Breaking change:** `accumulate` series mode now stores deltas in ShortTermStore and accumulated values in LongTermStore. SSE subscribers receive deltas by default (`seriesFormat=delta`). Existing consumers that expected accumulated values must add `seriesFormat=accumulated` to their SSE subscription.
+
+  New features:
+
+  - `seriesFormat` query parameter on SSE endpoint: `delta` (default) or `accumulated`
+  - Late-join snapshot collapse: subscribers connecting mid-stream receive a single accumulated snapshot per series
+  - `seriesSnapshot` field on SSEEnvelope to distinguish snapshots from regular events
+  - Atomic `accumulateSeries` on storage adapters (Redis Lua script, SQLite transaction)
+  - `SeriesResult` type: `processSeries` returns both delta and accumulated events
+
+### Patch Changes
+
+- Updated dependencies [771f7de]
+  - @taskcast/core@1.1.0
+  - @taskcast/client@1.1.0
+
+## 1.0.0
+
+### Minor Changes
+
+- af1d289: ### Dashboard Web
+
+  - Add full-featured management dashboard with overview, tasks, events, and workers pages
+  - Docker support with nginx for standalone deployment
+  - `taskcast ui` / `taskcast dashboard` commands to serve the dashboard
+
+  ### Playground
+
+  - Embed interactive API playground via rust-embed in Rust CLI
+  - `taskcast playground` standalone command
+  - Backend, Browser SSE, Worker Pull, and Worker WS panels with per-panel auth
+
+  ### Migration CLI
+
+  - `taskcast migrate` subcommand for both TS and Rust CLIs
+  - sqlx-compatible migration runner for PostgreSQL
+
+  ### Server
+
+  - `GET /tasks` list endpoint with filters
+  - `PATCH /workers/:id/status` for drain control
+  - `POST /admin/token` route for dashboard authentication
+  - Return 409 Conflict for duplicate task IDs and invalid state transitions
+  - CORS support
+  - Add `hot`/`subscriberCount` to task responses
+  - Per-instance subscriber tracking (no more global state)
+
+  ### Core
+
+  - Admin token config with auto-generation
+  - Sync Rust validation rules with TypeScript implementation
+
+  ### Testing
+
+  - 100% line/function coverage across all packages
+  - E2E test infrastructure with Playwright
+  - Integration tests for Redis, CLI, server-sdk, client SSE, webhooks, auth, concurrency
+  - `startTestServer` helper exported from `@taskcast/server`
+
+### Patch Changes
+
+- Updated dependencies [af1d289]
+  - @taskcast/core@1.0.0
+  - @taskcast/client@1.0.0
+
 ## 0.3.1
 
 ### Patch Changes

@@ -14,7 +14,7 @@ use taskcast_core::{
     BroadcastProvider, ConnectionMode, MemoryBroadcastProvider, MemoryShortTermStore,
     ShortTermStore, TaskEngine, TaskEngineOptions, WorkerMatchRule,
 };
-use taskcast_server::{create_app, AuthMode, JwtConfig};
+use taskcast_server::{create_app, AuthMode, CorsConfig, JwtConfig};
 
 // ─── Test Helpers ────────────────────────────────────────────────────────────
 
@@ -41,6 +41,7 @@ fn make_worker_server() -> (Arc<TaskEngine>, Arc<WorkerManager>, TestServer) {
         AuthMode::None,
         Some(Arc::clone(&manager)),
         None,
+        CorsConfig::default(),
     );
     let server = TestServer::new(router);
     (engine, manager, server)
@@ -70,6 +71,7 @@ fn make_worker_ws_server() -> (Arc<TaskEngine>, Arc<WorkerManager>, TestServer) 
         AuthMode::None,
         Some(Arc::clone(&manager)),
         None,
+        CorsConfig::default(),
     );
     let server = TestServer::builder().http_transport().build(router);
     (engine, manager, server)
@@ -101,7 +103,7 @@ fn make_jwt_worker_server() -> (Arc<TaskEngine>, Arc<WorkerManager>, TestServer)
         issuer: None,
         audience: None,
     });
-    let (router, _ws_registry) = create_app(Arc::clone(&engine), auth_mode, Some(Arc::clone(&manager)), None);
+    let (router, _ws_registry) = create_app(Arc::clone(&engine), auth_mode, Some(Arc::clone(&manager)), None, CorsConfig::default());
     let server = TestServer::new(router);
     (engine, manager, server)
 }
@@ -178,7 +180,7 @@ async fn create_task(
 
 #[tokio::test]
 async fn ws_offer_complete_flow_register_dispatch_accept_assigned() {
-    let (engine, manager, server) = make_worker_ws_server();
+    let (engine, _manager, server) = make_worker_ws_server();
 
     let mut ws = server
         .get_websocket("/workers/ws")
