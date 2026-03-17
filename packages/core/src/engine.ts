@@ -298,7 +298,12 @@ export class TaskEngine {
   }
 
   async getEvents(taskId: string, opts?: EventQueryOptions): Promise<TaskEvent[]> {
-    return this.shortTermStore.getEvents(taskId, opts)
+    const fromShort = await this.shortTermStore.getEvents(taskId, opts)
+    if (fromShort.length > 0) return fromShort
+    if (this.longTermStore) {
+      return this.longTermStore.getEvents(taskId, opts)
+    }
+    return []
   }
 
   subscribe(taskId: string, handler: (event: TaskEvent) => void): () => void {
