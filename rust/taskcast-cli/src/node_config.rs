@@ -27,19 +27,10 @@ pub struct NodeListEntry {
     pub current: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 struct NodeConfigData {
     current: Option<String>,
     nodes: HashMap<String, NodeEntry>,
-}
-
-impl Default for NodeConfigData {
-    fn default() -> Self {
-        Self {
-            current: None,
-            nodes: HashMap::new(),
-        }
-    }
 }
 
 pub struct NodeConfigManager {

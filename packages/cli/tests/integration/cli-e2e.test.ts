@@ -294,7 +294,7 @@ describe('full lifecycle', () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ status: 'running' }),
     })
-    expect(res.status).toBe(400)
+    expect(res.status).toBe(409)
   })
 
   it('create -> running -> fail', async () => {
@@ -549,7 +549,7 @@ describe('error cases', () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ status: 'completed' }),
     })
-    expect(res.status).toBe(400)
+    expect(res.status).toBe(409)
   })
 
   it('rejects transition of non-existent task', async () => {

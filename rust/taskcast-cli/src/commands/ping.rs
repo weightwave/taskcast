@@ -22,7 +22,7 @@ pub async fn ping_server(url: &str) -> PingResult {
         .connect_timeout(std::time::Duration::from_secs(5))
         .build()
         .unwrap();
-    match client.get(&format!("{}/health", url)).send().await {
+    match client.get(format!("{}/health", url)).send().await {
         Ok(res) if res.status().is_success() => PingResult {
             ok: true,
             latency_ms: Some(start.elapsed().as_millis() as u64),

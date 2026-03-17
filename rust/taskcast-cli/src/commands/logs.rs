@@ -98,33 +98,29 @@ pub async fn consume_sse(
         buffer.push_str(&String::from_utf8_lossy(&chunk));
 
         // Parse SSE format
-        loop {
-            if let Some(newline_pos) = buffer.find('\n') {
-                let line = buffer[..newline_pos].to_string();
-                buffer = buffer[newline_pos + 1..].to_string();
+        while let Some(newline_pos) = buffer.find('\n') {
+            let line = buffer[..newline_pos].to_string();
+            buffer = buffer[newline_pos + 1..].to_string();
 
-                if line.starts_with("event:") {
-                    current_event = line[6..].trim().to_string();
-                } else if line.starts_with("data:") {
-                    current_data = line[5..].trim().to_string();
-                } else if line.is_empty() {
-                    // Empty line = end of event
-                    if !current_data.is_empty() {
-                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&current_data)
-                        {
-                            on_event(parsed, &current_event);
-                            if current_event == "taskcast.done" {
-                                if let Some(ref mut done_fn) = on_done {
-                                    done_fn();
-                                }
+            if let Some(stripped) = line.strip_prefix("event:") {
+                current_event = stripped.trim().to_string();
+            } else if let Some(stripped) = line.strip_prefix("data:") {
+                current_data = stripped.trim().to_string();
+            } else if line.is_empty() {
+                // Empty line = end of event
+                if !current_data.is_empty() {
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&current_data)
+                    {
+                        on_event(parsed, &current_event);
+                        if current_event == "taskcast.done" {
+                            if let Some(ref mut done_fn) = on_done {
+                                done_fn();
                             }
                         }
                     }
-                    current_event.clear();
-                    current_data.clear();
                 }
-            } else {
-                break;
+                current_event.clear();
+                current_data.clear();
             }
         }
     }

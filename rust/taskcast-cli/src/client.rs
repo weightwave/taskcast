@@ -29,6 +29,7 @@ struct AdminTokenResponse {
     expires_at: Option<u64>,
 }
 
+#[allow(dead_code)]
 impl TaskcastClient {
     /// Create a client directly with optional token.
     pub fn new(base_url: String, token: Option<String>) -> Self {

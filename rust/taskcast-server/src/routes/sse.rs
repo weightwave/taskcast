@@ -425,7 +425,8 @@ pub async fn global_sse_events(
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(256);
 
     // Collect all per-task unsubscribe functions for cleanup on disconnect.
-    let unsubscribes: Arc<std::sync::Mutex<Vec<Box<dyn Fn() + Send + Sync>>>> =
+    type UnsubList = Vec<Box<dyn Fn() + Send + Sync>>;
+    let unsubscribes: Arc<std::sync::Mutex<UnsubList>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
 
     let tx_for_listener = tx.clone();

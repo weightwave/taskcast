@@ -4,7 +4,7 @@ use axum_test::TestServer;
 use taskcast_core::{
     MemoryBroadcastProvider, MemoryShortTermStore, TaskEngine, TaskEngineOptions,
 };
-use taskcast_server::{create_app, AuthMode, JwtConfig};
+use taskcast_server::{create_app, AuthMode, CorsConfig, JwtConfig};
 
 fn make_server() -> TestServer {
     let engine = Arc::new(TaskEngine::new(TaskEngineOptions {
@@ -13,7 +13,7 @@ fn make_server() -> TestServer {
         long_term_store: None,
         hooks: None,
     }));
-    let (app, _) = create_app(engine, AuthMode::None, None, None);
+    let (app, _) = create_app(engine, AuthMode::None, None, None, CorsConfig::default());
     TestServer::new(app)
 }
 
@@ -62,7 +62,7 @@ fn make_jwt_server() -> TestServer {
         issuer: None,
         audience: None,
     });
-    let (app, _) = create_app(engine, auth, None, None);
+    let (app, _) = create_app(engine, auth, None, None, CorsConfig::default());
     TestServer::new(app)
 }
 

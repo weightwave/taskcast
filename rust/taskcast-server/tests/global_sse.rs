@@ -12,7 +12,7 @@ use taskcast_core::{
     Level, MemoryBroadcastProvider, MemoryShortTermStore, TaskEngine, TaskEngineOptions,
     TaskStatus,
 };
-use taskcast_server::{create_app, AuthMode, JwtConfig};
+use taskcast_server::{create_app, AuthMode, CorsConfig, JwtConfig};
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -26,7 +26,7 @@ fn make_engine() -> Arc<TaskEngine> {
 }
 
 fn make_app(engine: Arc<TaskEngine>) -> axum::Router {
-    let (app, _) = create_app(engine, AuthMode::None, None, None);
+    let (app, _) = create_app(engine, AuthMode::None, None, None, CorsConfig::default());
     app
 }
 
@@ -85,7 +85,7 @@ fn make_jwt_engine_and_app() -> (Arc<TaskEngine>, axum::Router) {
         issuer: None,
         audience: None,
     });
-    let (app, _) = create_app(Arc::clone(&engine), auth_mode, None, None);
+    let (app, _) = create_app(Arc::clone(&engine), auth_mode, None, None, CorsConfig::default());
     (engine, app)
 }
 

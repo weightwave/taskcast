@@ -6,7 +6,7 @@ use taskcast_core::{
     CreateTaskInput, MemoryBroadcastProvider, MemoryShortTermStore, TaskEngine, TaskEngineOptions,
     TaskStatus,
 };
-use taskcast_server::{create_app, AuthMode};
+use taskcast_server::{create_app, AuthMode, CorsConfig};
 
 use taskcast_cli::commands::doctor::{
     format_doctor_result, AdapterStatus, AuthStatus, DoctorResult, ServerStatus,
@@ -25,7 +25,7 @@ fn make_server() -> (Arc<TaskEngine>, TestServer) {
         long_term_store: None,
         hooks: None,
     }));
-    let (app, _) = create_app(Arc::clone(&engine), AuthMode::None, None, None);
+    let (app, _) = create_app(Arc::clone(&engine), AuthMode::None, None, None, CorsConfig::default());
     (engine, TestServer::new(app))
 }
 

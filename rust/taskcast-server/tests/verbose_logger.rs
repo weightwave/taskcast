@@ -8,7 +8,7 @@ use taskcast_core::{
     TaskStatus,
 };
 use taskcast_server::{
-    create_app, verbose_logger_middleware, AuthMode, CollectingLogger, VerboseLogger,
+    create_app, verbose_logger_middleware, AuthMode, CollectingLogger, CorsConfig, VerboseLogger,
 };
 
 fn make_verbose_server() -> (Arc<TaskEngine>, TestServer, CollectingLogger) {
@@ -18,7 +18,7 @@ fn make_verbose_server() -> (Arc<TaskEngine>, TestServer, CollectingLogger) {
         long_term_store: None,
         hooks: None,
     }));
-    let (app, _) = create_app(Arc::clone(&engine), AuthMode::None, None, None);
+    let (app, _) = create_app(Arc::clone(&engine), AuthMode::None, None, None, CorsConfig::default());
 
     let logger = CollectingLogger::default();
     let logger_arc: Arc<dyn VerboseLogger> = Arc::new(logger.clone());
