@@ -170,9 +170,10 @@ export function createSSERouter(engine: TaskEngine, subscriberCounts: Subscriber
         })
       }
 
-      // Parse limit parameter
+      // Parse limit parameter (ignore NaN / non-positive values)
       const limitStr = c.req.query('limit')
-      const limit = limitStr !== undefined ? Number(limitStr) : undefined
+      const limitRaw = limitStr !== undefined ? parseInt(limitStr, 10) : undefined
+      const limit = limitRaw !== undefined && Number.isFinite(limitRaw) && limitRaw > 0 ? limitRaw : undefined
 
       // Build storage-level query options (since cursor + limit)
       const storageSince = filter.since?.id || filter.since?.timestamp

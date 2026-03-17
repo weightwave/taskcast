@@ -309,7 +309,8 @@ export function createTasksRouter(engine: TaskEngine, subscriberCounts: Subscrib
       if (sinceTimestamp !== undefined) since.timestamp = Number(sinceTimestamp)
     }
 
-    const limit = limitStr !== undefined ? Number(limitStr) : undefined
+    const limitRaw = limitStr !== undefined ? parseInt(limitStr, 10) : undefined
+    const limit = limitRaw !== undefined && Number.isFinite(limitRaw) && limitRaw > 0 ? limitRaw : undefined
     const opts: EventQueryOptions | undefined =
       since !== undefined || limit !== undefined
         ? { ...(since !== undefined && { since }), ...(limit !== undefined && { limit }) }

@@ -453,7 +453,7 @@ pub async fn get_event_history(
             },
         )
         .await
-        .map_err(|e| AppError::BadRequest(format!("Series collapse error: {e}")))?;
+        .unwrap_or(events);
     }
 
     Ok(axum::Json(events))
