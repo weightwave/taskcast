@@ -142,15 +142,13 @@ describe('engine.publishEvent — seriesMode: latest', () => {
       seriesMode: 'latest',
     })
 
-    // Wait for async longTermStore writes
-    await new Promise(r => setTimeout(r, 50))
-
-    const saveEventCalls = (longTermStore.saveEvent as ReturnType<typeof vi.fn>).mock.calls
-    // latest mode events should be forwarded to longTermStore
-    const latestCalls = saveEventCalls.filter(
-      (c: unknown[]) => (c[0] as TaskEvent).seriesId === 's1',
-    )
-    expect(latestCalls.length).toBe(2)
+    await vi.waitFor(() => {
+      const saveEventCalls = (longTermStore.saveEvent as ReturnType<typeof vi.fn>).mock.calls
+      const latestCalls = saveEventCalls.filter(
+        (c: unknown[]) => (c[0] as TaskEvent).seriesId === 's1',
+      )
+      expect(latestCalls.length).toBe(2)
+    })
   })
 
   it('getSeriesLatest returns the latest value for latest-mode series', async () => {
