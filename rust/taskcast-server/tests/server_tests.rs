@@ -3700,7 +3700,7 @@ async fn health_endpoint_is_accessible_without_auth_in_jwt_mode() {
     detail_response.assert_status(axum_test::http::StatusCode::OK);
     let detail_body: serde_json::Value = detail_response.json();
     assert_eq!(detail_body["ok"], true);
-    assert_eq!(detail_body["authMode"], "jwt");
+    assert_eq!(detail_body["auth"]["mode"], "jwt");
 }
 
 #[tokio::test]
