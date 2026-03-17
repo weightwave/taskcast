@@ -241,48 +241,21 @@ pub async fn sse_events(
 
         let has_since_cursor = filter.since.is_some();
 
-        // Collect accumulate series IDs
-        let mut accumulate_series_ids = std::collections::HashSet::new();
-        for e in &history {
-            if e.series_mode.as_ref() == Some(&taskcast_core::SeriesMode::Accumulate) {
-                if let Some(ref sid) = e.series_id {
-                    accumulate_series_ids.insert(sid.clone());
-                }
-            }
-        }
-
         // Build replay events with late-join snapshot collapse
-        let replay_events = if !accumulate_series_ids.is_empty() && !has_since_cursor {
-            // Collapse accumulate series into snapshots
-            let mut snapshots = std::collections::HashMap::new();
-            for sid in &accumulate_series_ids {
-                if let Ok(Some(latest)) = engine.get_series_latest(&task_id_clone, sid).await {
-                    let mut snapshot = latest;
-                    snapshot.series_snapshot = Some(true);
-                    snapshots.insert(sid.clone(), snapshot);
-                }
-            }
-
-            let mut emitted_snapshots = std::collections::HashSet::new();
-            let mut replay = Vec::new();
-            for event in &history {
-                if event.series_mode.as_ref() == Some(&taskcast_core::SeriesMode::Accumulate) {
-                    if let Some(ref sid) = event.series_id {
-                        if accumulate_series_ids.contains(sid) {
-                            if !emitted_snapshots.contains(sid) {
-                                if let Some(snapshot) = snapshots.get(sid) {
-                                    replay.push(snapshot.clone());
-                                    emitted_snapshots.insert(sid.clone());
-                                }
-                            }
-                            // Skip remaining events in this accumulate series
-                            continue;
-                        }
+        let replay_events = if !has_since_cursor {
+            let engine_ref = Arc::clone(&engine);
+            taskcast_core::series::collapse_accumulate_series(
+                &history,
+                |tid: &str, sid: &str| {
+                    let eng = Arc::clone(&engine_ref);
+                    let tid = tid.to_string();
+                    let sid = sid.to_string();
+                    async move {
+                        eng.get_series_latest(&tid, &sid).await
+                            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
                     }
-                }
-                replay.push(event.clone());
-            }
-            replay
+                },
+            ).await.unwrap_or(history)
         } else {
             history
         };
