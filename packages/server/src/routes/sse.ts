@@ -2,7 +2,7 @@ import type { Hono } from 'hono'
 import { OpenAPIHono, createRoute, z } from '@hono/zod-openapi'
 import type { Context } from 'hono'
 import { streamSSE } from 'hono/streaming'
-import { applyFilteredIndex, matchesFilter, TERMINAL_STATUSES } from '@taskcast/core'
+import { applyFilteredIndex, matchesFilter, TERMINAL_STATUSES, collapseAccumulateSeries } from '@taskcast/core'
 import { checkScope } from '../auth.js'
 import { ErrorSchema } from '../schemas.js'
 import type { TaskEngine, TaskEvent, SubscribeFilter, SSEEnvelope, Level } from '@taskcast/core'
@@ -179,41 +179,14 @@ export function createSSERouter(engine: TaskEngine, subscriberCounts: Subscriber
       }
 
       const hasSinceCursor = !!filter.since
-      const accumulateSeriesIds = new Set<string>()
-      for (const e of history) {
-        if (e.seriesMode === 'accumulate' && e.seriesId) {
-          accumulateSeriesIds.add(e.seriesId)
-        }
-      }
 
       let replayEvents: TaskEvent[]
 
-      if (accumulateSeriesIds.size > 0 && !hasSinceCursor) {
-        // Collapse accumulate series into snapshots
-        const snapshots = new Map<string, TaskEvent>()
-        for (const sid of accumulateSeriesIds) {
-          const latest = await engine.getSeriesLatest(taskId, sid)
-          if (latest) {
-            snapshots.set(sid, { ...latest, seriesSnapshot: true })
-          }
-        }
-
-        const emittedSnapshots = new Set<string>()
-        replayEvents = []
-        for (const event of history) {
-          if (event.seriesMode === 'accumulate' && event.seriesId && accumulateSeriesIds.has(event.seriesId)) {
-            if (!emittedSnapshots.has(event.seriesId)) {
-              const snapshot = snapshots.get(event.seriesId)
-              if (snapshot) {
-                replayEvents.push(snapshot)
-                emittedSnapshots.add(event.seriesId)
-              }
-            }
-            // Skip remaining events in this accumulate series
-          } else {
-            replayEvents.push(event)
-          }
-        }
+      if (!hasSinceCursor) {
+        replayEvents = await collapseAccumulateSeries(
+          history,
+          (tid, sid) => engine.getSeriesLatest(tid, sid),
+        )
       } else {
         replayEvents = history
       }
