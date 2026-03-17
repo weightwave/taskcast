@@ -11,8 +11,8 @@ use tokio::sync::Mutex;
 use tokio_stream::wrappers::ReceiverStream;
 
 use taskcast_core::{
-    apply_filtered_index, matches_filter, Level, SSEEnvelope, SeriesFormat, SinceCursor,
-    SubscribeFilter, TaskEngine, TaskEvent, TaskStatus,
+    apply_filtered_index, matches_filter, EventQueryOptions, Level, SSEEnvelope, SeriesFormat,
+    SinceCursor, SubscribeFilter, TaskEngine, TaskEvent, TaskStatus,
 };
 
 use crate::auth::{check_scope, AuthContext};
@@ -64,6 +64,7 @@ pub struct SseQuery {
     pub since_index: Option<String>,
     #[serde(rename = "since.timestamp")]
     pub since_timestamp: Option<String>,
+    pub limit: Option<String>,
 }
 
 // ─── Filter Parsing ─────────────────────────────────────────────────────────
@@ -230,8 +231,27 @@ pub async fn sse_events(
                 let _ = tx.try_send(Ok(sse_event));
             };
 
+        // Build storage-level query options (since cursor + limit)
+        let limit = query.limit.as_ref().and_then(|s| s.parse::<u64>().ok());
+        let since = filter.since.as_ref().and_then(|s| {
+            if s.id.is_some() || s.timestamp.is_some() {
+                Some(SinceCursor {
+                    id: s.id.clone(),
+                    index: None,
+                    timestamp: s.timestamp,
+                })
+            } else {
+                None
+            }
+        });
+        let history_opts = if since.is_some() || limit.is_some() {
+            Some(EventQueryOptions { since, limit })
+        } else {
+            None
+        };
+
         // Replay history
-        let history = match engine.get_events(&task_id_clone, None).await {
+        let history = match engine.get_events(&task_id_clone, history_opts).await {
             Ok(events) => events,
             Err(_) => {
                 decrement_subscriber_count(&sub_counts, &task_id_clone).await;
@@ -354,6 +374,7 @@ mod tests {
             since_id: None,
             since_index: None,
             since_timestamp: None,
+            limit: None,
         };
         let filter = parse_filter(&query);
         assert_eq!(filter.series_format, Some(SeriesFormat::Delta));
@@ -370,6 +391,7 @@ mod tests {
             since_id: None,
             since_index: None,
             since_timestamp: None,
+            limit: None,
         };
         let filter = parse_filter(&query);
         assert_eq!(filter.series_format, Some(SeriesFormat::Accumulated));
@@ -386,6 +408,7 @@ mod tests {
             since_id: None,
             since_index: None,
             since_timestamp: None,
+            limit: None,
         };
         let filter = parse_filter(&query);
         assert_eq!(filter.series_format, None);
@@ -402,6 +425,7 @@ mod tests {
             since_id: None,
             since_index: None,
             since_timestamp: None,
+            limit: None,
         };
         let filter = parse_filter(&query);
         assert_eq!(filter.series_format, None);
