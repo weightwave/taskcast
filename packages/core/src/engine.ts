@@ -329,8 +329,10 @@ export class TaskEngine {
       ...(input.seriesAccField !== undefined && { seriesAccField: input.seriesAccField }),
     }
 
-    const { event, accumulatedEvent } = await processSeries(raw, this.shortTermStore)
-    await this.shortTermStore.appendEvent(taskId, event)
+    const { event, accumulatedEvent, stored } = await processSeries(raw, this.shortTermStore)
+    if (!stored) {
+      await this.shortTermStore.appendEvent(taskId, event)
+    }
 
     // Attach accumulated data to broadcast for SSE accumulated subscribers
     const broadcastEvent = accumulatedEvent

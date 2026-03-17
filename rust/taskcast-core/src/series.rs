@@ -36,7 +36,7 @@ pub async fn process_series(
             store
                 .replace_last_series_event(&event.task_id, &series_id, event.clone())
                 .await?;
-            Ok(SeriesResult { event, accumulated_event: None, stored: false })
+            Ok(SeriesResult { event, accumulated_event: None, stored: true })
         }
     }
 }

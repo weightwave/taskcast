@@ -22,7 +22,7 @@ export async function processSeries(
 
   // 'latest' is the only remaining case; 'keep-all' and 'accumulate' return early above
   await store.replaceLastSeriesEvent(taskId, seriesId, event)
-  return { event }
+  return { event, stored: true }
 }
 
 /**
