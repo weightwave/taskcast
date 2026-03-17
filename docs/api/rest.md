@@ -187,13 +187,19 @@ GET /tasks/:taskId/events/history
 
 **Query parameters:**
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `since.id` | string | After the specified event ID |
-| `since.index` | number | After the Nth filtered event |
-| `since.timestamp` | number | After the specified timestamp (ms) |
-| `types` | string | Comma-separated type filter (supports wildcards) |
-| `levels` | string | Comma-separated level filter |
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `since.id` | string | — | After the specified event ID |
+| `since.index` | number | — | After the Nth filtered event |
+| `since.timestamp` | number | — | After the specified timestamp (ms) |
+| `types` | string | — | Comma-separated type filter (supports wildcards) |
+| `levels` | string | — | Comma-separated level filter |
+| `limit` | number | — | Maximum number of events to return |
+| `seriesFormat` | string | `delta` | Format for `accumulate` series: `delta` (as-stored) or `accumulated` (collapsed snapshots) |
+
+**About `seriesFormat`:** When `accumulated` is requested, all events belonging to the same `accumulate` series are collapsed into a single snapshot event with `seriesSnapshot: true`. For hot tasks (data in short-term store), the snapshot reflects the latest accumulated value. For cold tasks (data in long-term store), events are already stored in accumulated form, so `delta` and `accumulated` return the same result.
+
+**About `limit`:** The limit is applied at the storage layer before series collapse. When combined with `seriesFormat=accumulated`, the final result may contain fewer events than the limit because multiple series events are collapsed into one.
 
 **Response:** `200 OK`
 

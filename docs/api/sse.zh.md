@@ -32,6 +32,8 @@ SSE 连接的行为取决于任务当前状态：
 | `levels` | string | — | 逗号分隔的级别过滤。如 `info,warn,error` |
 | `includeStatus` | boolean | `true` | 是否包含 `taskcast:status` 内置状态事件 |
 | `wrap` | boolean | `true` | 是否将事件包裹在 SSEEnvelope 中 |
+| `seriesFormat` | string | `delta` | `accumulate` 序列事件的格式：`delta`（原始增量数据）或 `accumulated`（累积总量）。详见[序列格式](#序列格式)。 |
+| `limit` | number | — | 连接时重放的历史事件最大数量。不影响重放后推送的实时事件。 |
 
 ### 示例
 
@@ -47,6 +49,12 @@ GET /tasks/01HXXX/events?since.index=5&levels=info,warn,error
 
 # 不需要状态事件，不包裹 envelope
 GET /tasks/01HXXX/events?includeStatus=false&wrap=false
+
+# 接收累积值而非增量
+GET /tasks/01HXXX/events?seriesFormat=accumulated
+
+# 只重放最近 50 条历史事件，然后推送实时事件
+GET /tasks/01HXXX/events?limit=50
 ```
 
 ## 事件流格式
@@ -105,6 +113,7 @@ interface SSEEnvelope {
   data: unknown          // 事件数据
   seriesId?: string
   seriesMode?: string
+  seriesSnapshot?: boolean  // 为 true 时表示此事件是迟到加入的快照（非增量 delta）
 }
 ```
 
@@ -150,6 +159,38 @@ client.subscribe(taskId, {
   },
 })
 ```
+
+## 序列格式
+
+`seriesFormat` 查询参数控制 `accumulate` 序列事件的交付格式。
+
+### `seriesFormat=delta`（默认）
+
+每条事件携带原始增量数据。这是流式 UI 的自然格式——逐个拼接到达的片段。
+
+### `seriesFormat=accumulated`
+
+每条事件携带累积总量——截至该时刻的完整累积值。适用于只需显示当前结果、无需跟踪各增量的简单展示场景。
+
+### 迟到加入行为
+
+当订阅者连接到已有 `accumulate` 序列事件的任务时（即"迟到加入"），服务器会将每个 accumulate 序列的所有历史事件**折叠**为单条快照事件。无论 `seriesFormat` 设置如何，此行为都会生效。
+
+快照事件在 envelope 中带有 `seriesSnapshot: true`，包含完整的累积值。
+
+| 场景 | 行为 |
+|------|------|
+| 从头订阅 | 按所选格式推送实时事件（delta 或 accumulated） |
+| 迟到加入（序列活跃） | 每个序列一条快照 + 后续事件按所选格式 |
+| 迟到加入（序列不活跃） | 每个序列一条快照 |
+| 终态任务重放 | 每个序列一条快照 |
+| 带 `since` 游标重连 | **不折叠** — 从断点开始按所选格式推送 |
+
+非序列事件不受 `seriesFormat` 影响，始终原样交付。
+
+### 存储语义
+
+在 `accumulate` 模式下，短期存储保存**增量事件**，长期存储保存**累积事件**。REST 历史端点（`GET /tasks/:taskId/events/history`）按存储原样返回数据。
 
 ## 认证
 
