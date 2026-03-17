@@ -45,11 +45,11 @@ export async function collapseAccumulateSeries(
     }
   }
 
-  if (accSeriesIds.size === 0) return events
+  if (accSeriesIds.size === 0 || events.length === 0) return events
 
   // Resolve snapshots for each accumulate series
   const snapshots = new Map<string, TaskEvent>()
-  const taskId = events[0].taskId
+  const taskId = events[0]!.taskId
   for (const sid of accSeriesIds) {
     const latest = await getSeriesLatest(taskId, sid)
     if (latest) {
@@ -57,8 +57,9 @@ export async function collapseAccumulateSeries(
     } else {
       // Cold path: derive from last event in this series
       for (let i = events.length - 1; i >= 0; i--) {
-        if (events[i].seriesId === sid) {
-          snapshots.set(sid, { ...events[i], seriesSnapshot: true })
+        const evt = events[i]!
+        if (evt.seriesId === sid) {
+          snapshots.set(sid, { ...evt, seriesSnapshot: true })
           break
         }
       }
