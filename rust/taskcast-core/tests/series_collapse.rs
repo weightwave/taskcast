@@ -204,3 +204,53 @@ async fn handles_empty_events() {
 
     assert!(result.is_empty());
 }
+
+// ─── propagates_error_from_get_series_latest ────────────────────────────
+
+#[tokio::test]
+async fn propagates_error_from_get_series_latest() {
+    let events = vec![
+        make_acc_event("e1", "task-1", 0, json!({ "delta": "A" }), "s1"),
+    ];
+
+    let result = collapse_accumulate_series(&events, |_task_id: &str, _series_id: &str| {
+        async {
+            Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "test error"))
+                as Box<dyn std::error::Error + Send + Sync>)
+        }
+    })
+    .await;
+
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("test error"));
+}
+
+// ─── accumulate_event_with_no_series_id_falls_through ───────────────────
+
+#[tokio::test]
+async fn accumulate_event_with_no_series_id_falls_through() {
+    // An event with series_mode=Accumulate but series_id=None should be
+    // treated as a regular event and passed through unchanged.
+    let orphan = TaskEvent {
+        series_mode: Some(SeriesMode::Accumulate),
+        series_id: None,
+        ..make_event("orphan", "task-1", 0, json!({ "text": "no series id" }))
+    };
+    let acc1 = make_acc_event("e1", "task-1", 1, json!({ "delta": "A" }), "s1");
+    let acc2 = make_acc_event("e2", "task-1", 2, json!({ "delta": "AB" }), "s1");
+
+    let events = vec![orphan.clone(), acc1, acc2];
+
+    let result = collapse_accumulate_series(&events, |_task_id: &str, _series_id: &str| {
+        async { Ok(None) }
+    })
+    .await
+    .unwrap();
+
+    // orphan falls through to result.push, s1 series collapsed to snapshot
+    assert_eq!(result.len(), 2);
+    assert_eq!(result[0].id, "orphan");
+    assert!(result[0].series_snapshot.is_none());
+    assert_eq!(result[1].series_snapshot, Some(true));
+    assert_eq!(result[1].id, "e2"); // cold fallback uses last event
+}
