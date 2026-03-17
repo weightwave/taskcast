@@ -187,13 +187,19 @@ GET /tasks/:taskId/events/history
 
 **查询参数：**
 
-| 参数 | 类型 | 说明 |
-|------|------|------|
-| `since.id` | string | 从指定事件 ID 之后 |
-| `since.index` | number | 从过滤后第 N 条之后 |
-| `since.timestamp` | number | 从指定时间戳（ms）之后 |
-| `types` | string | 逗号分隔的类型过滤（支持通配符） |
-| `levels` | string | 逗号分隔的级别过滤 |
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `since.id` | string | — | 从指定事件 ID 之后 |
+| `since.index` | number | — | 从过滤后第 N 条之后 |
+| `since.timestamp` | number | — | 从指定时间戳（ms）之后 |
+| `types` | string | — | 逗号分隔的类型过滤（支持通配符） |
+| `levels` | string | — | 逗号分隔的级别过滤 |
+| `limit` | number | — | 返回事件的最大数量 |
+| `seriesFormat` | string | `delta` | `accumulate` 序列的输出格式：`delta`（原样返回）或 `accumulated`（折叠为快照） |
+
+**关于 `seriesFormat`：** 当请求 `accumulated` 时，同一 `accumulate` 序列的所有事件会折叠为一条快照事件（`seriesSnapshot: true`）。对于热任务（数据在短期存储中），快照反映最新的累积值。对于冷任务（数据在长期存储中），事件已按累积形式存储，因此 `delta` 和 `accumulated` 返回相同结果。
+
+**关于 `limit`：** limit 在存储层生效，在序列折叠之前应用。当与 `seriesFormat=accumulated` 组合使用时，最终结果可能少于 limit 条，因为多条序列事件被折叠为一条。
 
 **响应：** `200 OK`
 

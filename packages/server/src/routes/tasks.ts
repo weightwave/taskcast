@@ -12,8 +12,8 @@ import {
   TaskEventSchema,
   ErrorSchema,
 } from '../schemas.js'
-import { TaskConflictError, InvalidTransitionError } from '@taskcast/core'
-import type { TaskEngine, CreateTaskInput, PublishEventInput, SinceCursor, TaskError, BlockedRequest, TaskFilter, TaskStatus } from '@taskcast/core'
+import { TaskConflictError, InvalidTransitionError, collapseAccumulateSeries } from '@taskcast/core'
+import type { TaskEngine, CreateTaskInput, PublishEventInput, SinceCursor, TaskError, BlockedRequest, TaskFilter, TaskStatus, EventQueryOptions } from '@taskcast/core'
 
 // ─── Route Definitions ─────────────────────────────────────────────────────
 
@@ -121,6 +121,8 @@ const eventHistoryRoute = createRoute({
       'since.timestamp': z.string().optional(),
       types: z.string().optional(),
       levels: z.string().optional(),
+      limit: z.string().optional().openapi({ description: 'Maximum number of events to return' }),
+      seriesFormat: z.string().optional().openapi({ description: 'Series format: delta (default) or accumulated' }),
     }),
   },
   responses: {
@@ -296,6 +298,8 @@ export function createTasksRouter(engine: TaskEngine, subscriberCounts: Subscrib
     const sinceIndex = c.req.query('since.index')
     const sinceTimestamp = c.req.query('since.timestamp')
     const sinceId = c.req.query('since.id')
+    const limitStr = c.req.query('limit')
+    const seriesFormat = c.req.query('seriesFormat') ?? 'delta'
 
     let since: SinceCursor | undefined
     if (sinceId !== undefined || sinceIndex !== undefined || sinceTimestamp !== undefined) {
@@ -305,7 +309,22 @@ export function createTasksRouter(engine: TaskEngine, subscriberCounts: Subscrib
       if (sinceTimestamp !== undefined) since.timestamp = Number(sinceTimestamp)
     }
 
-    const events = await engine.getEvents(taskId, since !== undefined ? { since } : undefined)
+    const limitRaw = limitStr !== undefined ? parseInt(limitStr, 10) : undefined
+    const limit = limitRaw !== undefined && Number.isFinite(limitRaw) && limitRaw > 0 ? limitRaw : undefined
+    const opts: EventQueryOptions | undefined =
+      since !== undefined || limit !== undefined
+        ? { ...(since !== undefined && { since }), ...(limit !== undefined && { limit }) }
+        : undefined
+
+    let events = await engine.getEvents(taskId, opts)
+
+    if (seriesFormat === 'accumulated') {
+      events = await collapseAccumulateSeries(
+        events,
+        (tid, sid) => engine.getSeriesLatest(tid, sid),
+      )
+    }
+
     return c.json(events)
   })
 

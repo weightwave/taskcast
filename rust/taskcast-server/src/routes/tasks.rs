@@ -82,6 +82,9 @@ pub struct HistoryQuery {
     pub since_timestamp: Option<f64>,
     #[serde(rename = "since.id")]
     pub since_id: Option<String>,
+    pub limit: Option<u64>,
+    #[serde(rename = "seriesFormat")]
+    pub series_format: Option<String>,
 }
 
 // ─── List Query ──────────────────────────────────────────────────────────────
@@ -409,23 +412,50 @@ pub async fn get_event_history(
         .await?
         .ok_or_else(|| AppError::NotFound("Task not found".to_string()))?;
 
-    let opts = if query.since_id.is_some()
+    let since = if query.since_id.is_some()
         || query.since_index.is_some()
         || query.since_timestamp.is_some()
     {
-        Some(EventQueryOptions {
-            since: Some(SinceCursor {
-                id: query.since_id,
-                index: query.since_index,
-                timestamp: query.since_timestamp,
-            }),
-            limit: None,
+        Some(SinceCursor {
+            id: query.since_id,
+            index: query.since_index,
+            timestamp: query.since_timestamp,
         })
     } else {
         None
     };
 
-    let events = engine.get_events(&task_id, opts).await?;
+    let opts = if since.is_some() || query.limit.is_some() {
+        Some(EventQueryOptions {
+            since,
+            limit: query.limit,
+        })
+    } else {
+        None
+    };
+
+    let mut events = engine.get_events(&task_id, opts).await?;
+
+    let series_format = query.series_format.as_deref().unwrap_or("delta");
+    if series_format == "accumulated" {
+        let engine_ref = Arc::clone(&engine);
+        events = taskcast_core::series::collapse_accumulate_series(
+            &events,
+            |tid: &str, sid: &str| {
+                let eng = Arc::clone(&engine_ref);
+                let tid = tid.to_string();
+                let sid = sid.to_string();
+                async move {
+                    eng.get_series_latest(&tid, &sid)
+                        .await
+                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+                }
+            },
+        )
+        .await
+        .unwrap_or(events);
+    }
+
     Ok(axum::Json(events))
 }
 

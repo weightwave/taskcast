@@ -417,3 +417,136 @@ describe('POST /tasks/:taskId/events - error handling', () => {
     expect(body.seriesMode).toBe('accumulate')
   })
 })
+
+describe('GET /tasks/:taskId/events/history — limit + seriesFormat', () => {
+  // NOTE: transitionTask('running') emits a taskcast:status event at index 0.
+  // All event counts below account for this extra event.
+
+  it('respects limit parameter', async () => {
+    const { app, engine } = makeApp()
+    const task = await engine.createTask({})
+    await engine.transitionTask(task.id, 'running')
+    for (let i = 0; i < 5; i++) {
+      await engine.publishEvent(task.id, { type: 'progress', level: 'info', data: { i } })
+    }
+
+    const res = await app.request(`/tasks/${task.id}/events/history?limit=3`)
+    expect(res.status).toBe(200)
+    const events = await res.json()
+    expect(events).toHaveLength(3)
+    expect(events[0].type).toBe('taskcast:status')
+    expect(events[1].data.i).toBe(0)
+    expect(events[2].data.i).toBe(1)
+  })
+
+  it('returns all events when limit is not specified', async () => {
+    const { app, engine } = makeApp()
+    const task = await engine.createTask({})
+    await engine.transitionTask(task.id, 'running')
+    for (let i = 0; i < 5; i++) {
+      await engine.publishEvent(task.id, { type: 'progress', level: 'info', data: { i } })
+    }
+
+    const res = await app.request(`/tasks/${task.id}/events/history`)
+    const events = await res.json()
+    expect(events).toHaveLength(6) // 1 status + 5 published
+  })
+
+  it('collapses accumulate series when seriesFormat=accumulated', async () => {
+    const { app, engine } = makeApp()
+    const task = await engine.createTask({})
+    await engine.transitionTask(task.id, 'running')
+
+    for (const delta of ['A', 'B', 'C']) {
+      await engine.publishEvent(task.id, {
+        type: 'llm.token', level: 'info',
+        data: { delta }, seriesId: 'tokens',
+        seriesMode: 'accumulate', seriesAccField: 'delta',
+      })
+    }
+
+    await engine.publishEvent(task.id, { type: 'log', level: 'info', data: { msg: 'done' } })
+
+    const res = await app.request(`/tasks/${task.id}/events/history?seriesFormat=accumulated`)
+    expect(res.status).toBe(200)
+    const events = await res.json()
+
+    // 1 status + 1 collapsed snapshot + 1 non-series = 3 events
+    expect(events).toHaveLength(3)
+    const snapshot = events.find((e: any) => e.seriesId === 'tokens')
+    expect(snapshot.seriesSnapshot).toBe(true)
+    expect(snapshot.data.delta).toBe('ABC')
+  })
+
+  it('returns raw deltas when seriesFormat=delta (default)', async () => {
+    const { app, engine } = makeApp()
+    const task = await engine.createTask({})
+    await engine.transitionTask(task.id, 'running')
+    for (const delta of ['A', 'B']) {
+      await engine.publishEvent(task.id, {
+        type: 'llm.token', level: 'info',
+        data: { delta }, seriesId: 'tokens',
+        seriesMode: 'accumulate', seriesAccField: 'delta',
+      })
+    }
+
+    const res = await app.request(`/tasks/${task.id}/events/history?seriesFormat=delta`)
+    const events = await res.json()
+    expect(events).toHaveLength(3) // 1 status + 2 deltas
+    const deltas = events.filter((e: any) => e.type === 'llm.token')
+    expect(deltas[0].data.delta).toBe('A')
+    expect(deltas[1].data.delta).toBe('B')
+  })
+
+  it('combines limit and seriesFormat=accumulated', async () => {
+    const { app, engine } = makeApp()
+    const task = await engine.createTask({})
+    await engine.transitionTask(task.id, 'running')
+    for (const delta of ['A', 'B', 'C']) {
+      await engine.publishEvent(task.id, {
+        type: 'llm.token', level: 'info',
+        data: { delta }, seriesId: 'tokens',
+        seriesMode: 'accumulate', seriesAccField: 'delta',
+      })
+    }
+    for (let i = 0; i < 2; i++) {
+      await engine.publishEvent(task.id, { type: 'log', level: 'info', data: { i } })
+    }
+
+    const res = await app.request(`/tasks/${task.id}/events/history?limit=5&seriesFormat=accumulated`)
+    const events = await res.json()
+    expect(events.length).toBeLessThanOrEqual(5)
+    const snapshot = events.find((e: any) => e.seriesSnapshot === true)
+    expect(snapshot).toBeDefined()
+  })
+
+  it('treats invalid seriesFormat as delta', async () => {
+    const { app, engine } = makeApp()
+    const task = await engine.createTask({})
+    await engine.transitionTask(task.id, 'running')
+    await engine.publishEvent(task.id, {
+      type: 'llm.token', level: 'info',
+      data: { delta: 'A' }, seriesId: 's1',
+      seriesMode: 'accumulate', seriesAccField: 'delta',
+    })
+
+    const res = await app.request(`/tasks/${task.id}/events/history?seriesFormat=invalid`)
+    const events = await res.json()
+    expect(events).toHaveLength(2) // 1 status + 1 delta, no collapse
+    expect(events.find((e: any) => e.seriesSnapshot)).toBeUndefined()
+  })
+
+  it('handles limit with since cursor', async () => {
+    const { app, engine } = makeApp()
+    const task = await engine.createTask({})
+    await engine.transitionTask(task.id, 'running')
+    const first = await engine.publishEvent(task.id, { type: 'a', level: 'info', data: null })
+    await engine.publishEvent(task.id, { type: 'b', level: 'info', data: null })
+    await engine.publishEvent(task.id, { type: 'c', level: 'info', data: null })
+
+    const res = await app.request(`/tasks/${task.id}/events/history?since.id=${first.id}&limit=1`)
+    const events = await res.json()
+    expect(events).toHaveLength(1)
+    expect(events[0].type).toBe('b')
+  })
+})

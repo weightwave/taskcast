@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest'
 import { TaskEngine, TaskConflictError, InvalidTransitionError } from '../../src/engine.js'
 import { MemoryBroadcastProvider, MemoryShortTermStore } from '../../src/memory-adapters.js'
-import type { LongTermStore } from '../../src/types.js'
+import type { LongTermStore, TaskEvent } from '../../src/types.js'
 
 function makeEngine() {
   const store = new MemoryShortTermStore()
@@ -396,6 +396,59 @@ describe('TaskEngine.getEvents', () => {
     await engine.publishEvent(task.id, { type: 'b', level: 'info', data: null })
     const events = await engine.getEvents(task.id, { limit: 1 })
     expect(events).toHaveLength(1)
+  })
+
+  it('falls back to longTermStore when shortTermStore returns empty', async () => {
+    const store = new MemoryShortTermStore()
+    const broadcast = new MemoryBroadcastProvider()
+    const longTermEvents: TaskEvent[] = [
+      {
+        id: 'lt-evt-1', taskId: 'cold-task', index: 0, timestamp: 1000,
+        type: 'test', level: 'info', data: { text: 'from long term' },
+      },
+    ]
+    const longTermStore = makeLongTermStore({
+      getEvents: vi.fn().mockResolvedValue(longTermEvents),
+    })
+    const engine = new TaskEngine({ shortTermStore: store, broadcast, longTermStore })
+
+    const events = await engine.getEvents('cold-task')
+    expect(events).toEqual(longTermEvents)
+    expect(longTermStore.getEvents).toHaveBeenCalledWith('cold-task', undefined)
+  })
+
+  it('returns shortTermStore events when available (does not call longTermStore)', async () => {
+    const store = new MemoryShortTermStore()
+    const broadcast = new MemoryBroadcastProvider()
+    const longTermStore = makeLongTermStore()
+    const engine = new TaskEngine({ shortTermStore: store, broadcast, longTermStore })
+
+    const task = await engine.createTask({})
+    await engine.transitionTask(task.id, 'running')
+    await engine.publishEvent(task.id, { type: 'test', level: 'info', data: {} })
+
+    const events = await engine.getEvents(task.id)
+    expect(events.length).toBeGreaterThan(0)
+    expect(longTermStore.getEvents).not.toHaveBeenCalled()
+  })
+
+  it('returns empty when both stores have no events and no longTermStore configured', async () => {
+    const { engine } = makeEngine()
+    const events = await engine.getEvents('nonexistent')
+    expect(events).toEqual([])
+  })
+
+  it('passes opts through to longTermStore fallback', async () => {
+    const store = new MemoryShortTermStore()
+    const broadcast = new MemoryBroadcastProvider()
+    const longTermStore = makeLongTermStore({
+      getEvents: vi.fn().mockResolvedValue([]),
+    })
+    const engine = new TaskEngine({ shortTermStore: store, broadcast, longTermStore })
+
+    const opts = { since: { id: 'some-id' }, limit: 10 }
+    await engine.getEvents('cold-task', opts)
+    expect(longTermStore.getEvents).toHaveBeenCalledWith('cold-task', opts)
   })
 })
 
