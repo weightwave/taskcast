@@ -1,5 +1,16 @@
 # @taskcast/playground
 
+## 0.3.3
+
+### Patch Changes
+
+- Updated dependencies [5e2ceb6]
+- Updated dependencies [13d321c]
+  - @taskcast/core@1.2.0
+  - @taskcast/server@1.2.0
+  - @taskcast/client@1.2.0
+  - @taskcast/react@1.2.0
+
 ## 0.3.2
 
 ### Patch Changes

@@ -1,5 +1,14 @@
 # @taskcast/react
 
+## 1.2.0
+
+### Patch Changes
+
+- Updated dependencies [5e2ceb6]
+- Updated dependencies [13d321c]
+  - @taskcast/core@1.2.0
+  - @taskcast/client@1.2.0
+
 ## 1.1.0
 
 ### Minor Changes
