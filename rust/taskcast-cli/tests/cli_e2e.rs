@@ -115,7 +115,7 @@ async fn transition_task_to_running() {
 }
 
 #[tokio::test]
-async fn invalid_transition_returns_400() {
+async fn invalid_transition_returns_409() {
     let (engine, server) = make_server();
     let task = engine
         .create_task(CreateTaskInput {
@@ -130,7 +130,7 @@ async fn invalid_transition_returns_400() {
         .patch(&format!("/tasks/{}/status", task.id))
         .json(&json!({ "status": "completed" }))
         .await;
-    res.assert_status(axum_test::http::StatusCode::BAD_REQUEST);
+    res.assert_status(axum_test::http::StatusCode::CONFLICT);
 }
 
 #[tokio::test]
@@ -156,7 +156,7 @@ async fn cannot_transition_terminal_task() {
         .patch(&format!("/tasks/{}/status", task.id))
         .json(&json!({ "status": "running" }))
         .await;
-    res.assert_status(axum_test::http::StatusCode::BAD_REQUEST);
+    res.assert_status(axum_test::http::StatusCode::CONFLICT);
 }
 
 #[tokio::test]
