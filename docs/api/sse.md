@@ -33,6 +33,7 @@ The behavior of an SSE connection depends on the current task state:
 | `includeStatus` | boolean | `true` | Whether to include the built-in `taskcast:status` status events. |
 | `wrap` | boolean | `true` | Whether to wrap each event in an SSEEnvelope. |
 | `seriesFormat` | string | `delta` | Format for `accumulate` series events: `delta` (original incremental data) or `accumulated` (running total). See [Series Format](#series-format) below. |
+| `limit` | number | — | Maximum number of historical events to replay on connect. Does not affect live events streamed after replay. |
 
 ### Examples
 
@@ -51,6 +52,9 @@ GET /tasks/01HXXX/events?includeStatus=false&wrap=false
 
 # Receive accumulated values instead of deltas for accumulate series
 GET /tasks/01HXXX/events?seriesFormat=accumulated
+
+# Only replay the last 50 historical events, then stream live
+GET /tasks/01HXXX/events?limit=50
 ```
 
 ## Event Stream Format

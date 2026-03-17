@@ -11,8 +11,8 @@ use tokio::sync::Mutex;
 use tokio_stream::wrappers::ReceiverStream;
 
 use taskcast_core::{
-    apply_filtered_index, matches_filter, matches_type, CreationListener, Level, SSEEnvelope,
-    SeriesFormat, SinceCursor, SubscribeFilter, TaskEngine, TaskEvent, TaskStatus,
+    apply_filtered_index, matches_filter, matches_type, CreationListener, EventQueryOptions, Level,
+    SSEEnvelope, SeriesFormat, SinceCursor, SubscribeFilter, TaskEngine, TaskEvent, TaskStatus,
 };
 
 use crate::auth::{check_scope, AuthContext};
@@ -64,6 +64,7 @@ pub struct SseQuery {
     pub since_index: Option<String>,
     #[serde(rename = "since.timestamp")]
     pub since_timestamp: Option<String>,
+    pub limit: Option<String>,
 }
 
 // ─── Filter Parsing ─────────────────────────────────────────────────────────
@@ -230,8 +231,27 @@ pub async fn sse_events(
                 let _ = tx.try_send(Ok(sse_event));
             };
 
+        // Build storage-level query options (since cursor + limit)
+        let limit = query.limit.as_ref().and_then(|s| s.parse::<u64>().ok());
+        let since = filter.since.as_ref().and_then(|s| {
+            if s.id.is_some() || s.timestamp.is_some() {
+                Some(SinceCursor {
+                    id: s.id.clone(),
+                    index: None,
+                    timestamp: s.timestamp,
+                })
+            } else {
+                None
+            }
+        });
+        let history_opts = if since.is_some() || limit.is_some() {
+            Some(EventQueryOptions { since, limit })
+        } else {
+            None
+        };
+
         // Replay history
-        let history = match engine.get_events(&task_id_clone, None).await {
+        let history = match engine.get_events(&task_id_clone, history_opts).await {
             Ok(events) => events,
             Err(_) => {
                 decrement_subscriber_count(&sub_counts, &task_id_clone).await;
@@ -241,48 +261,21 @@ pub async fn sse_events(
 
         let has_since_cursor = filter.since.is_some();
 
-        // Collect accumulate series IDs
-        let mut accumulate_series_ids = std::collections::HashSet::new();
-        for e in &history {
-            if e.series_mode.as_ref() == Some(&taskcast_core::SeriesMode::Accumulate) {
-                if let Some(ref sid) = e.series_id {
-                    accumulate_series_ids.insert(sid.clone());
-                }
-            }
-        }
-
         // Build replay events with late-join snapshot collapse
-        let replay_events = if !accumulate_series_ids.is_empty() && !has_since_cursor {
-            // Collapse accumulate series into snapshots
-            let mut snapshots = std::collections::HashMap::new();
-            for sid in &accumulate_series_ids {
-                if let Ok(Some(latest)) = engine.get_series_latest(&task_id_clone, sid).await {
-                    let mut snapshot = latest;
-                    snapshot.series_snapshot = Some(true);
-                    snapshots.insert(sid.clone(), snapshot);
-                }
-            }
-
-            let mut emitted_snapshots = std::collections::HashSet::new();
-            let mut replay = Vec::new();
-            for event in &history {
-                if event.series_mode.as_ref() == Some(&taskcast_core::SeriesMode::Accumulate) {
-                    if let Some(ref sid) = event.series_id {
-                        if accumulate_series_ids.contains(sid) {
-                            if !emitted_snapshots.contains(sid) {
-                                if let Some(snapshot) = snapshots.get(sid) {
-                                    replay.push(snapshot.clone());
-                                    emitted_snapshots.insert(sid.clone());
-                                }
-                            }
-                            // Skip remaining events in this accumulate series
-                            continue;
-                        }
+        let replay_events = if !has_since_cursor {
+            let engine_ref = Arc::clone(&engine);
+            taskcast_core::series::collapse_accumulate_series(
+                &history,
+                |tid: &str, sid: &str| {
+                    let eng = Arc::clone(&engine_ref);
+                    let tid = tid.to_string();
+                    let sid = sid.to_string();
+                    async move {
+                        eng.get_series_latest(&tid, &sid).await
+                            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
                     }
-                }
-                replay.push(event.clone());
-            }
-            replay
+                },
+            ).await.unwrap_or(history)
         } else {
             history
         };
@@ -523,6 +516,7 @@ mod tests {
             since_id: None,
             since_index: None,
             since_timestamp: None,
+            limit: None,
         };
         let filter = parse_filter(&query);
         assert_eq!(filter.series_format, Some(SeriesFormat::Delta));
@@ -539,6 +533,7 @@ mod tests {
             since_id: None,
             since_index: None,
             since_timestamp: None,
+            limit: None,
         };
         let filter = parse_filter(&query);
         assert_eq!(filter.series_format, Some(SeriesFormat::Accumulated));
@@ -555,6 +550,7 @@ mod tests {
             since_id: None,
             since_index: None,
             since_timestamp: None,
+            limit: None,
         };
         let filter = parse_filter(&query);
         assert_eq!(filter.series_format, None);
@@ -571,6 +567,7 @@ mod tests {
             since_id: None,
             since_index: None,
             since_timestamp: None,
+            limit: None,
         };
         let filter = parse_filter(&query);
         assert_eq!(filter.series_format, None);

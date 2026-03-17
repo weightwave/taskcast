@@ -303,7 +303,12 @@ export class TaskEngine {
   }
 
   async getEvents(taskId: string, opts?: EventQueryOptions): Promise<TaskEvent[]> {
-    return this.shortTermStore.getEvents(taskId, opts)
+    const fromShort = await this.shortTermStore.getEvents(taskId, opts)
+    if (fromShort.length > 0) return fromShort
+    if (this.longTermStore) {
+      return this.longTermStore.getEvents(taskId, opts)
+    }
+    return []
   }
 
   subscribe(taskId: string, handler: (event: TaskEvent) => void): () => void {
@@ -329,8 +334,10 @@ export class TaskEngine {
       ...(input.seriesAccField !== undefined && { seriesAccField: input.seriesAccField }),
     }
 
-    const { event, accumulatedEvent } = await processSeries(raw, this.shortTermStore)
-    await this.shortTermStore.appendEvent(taskId, event)
+    const { event, accumulatedEvent, stored } = await processSeries(raw, this.shortTermStore)
+    if (!stored) {
+      await this.shortTermStore.appendEvent(taskId, event)
+    }
 
     // Attach accumulated data to broadcast for SSE accumulated subscribers
     const broadcastEvent = accumulatedEvent

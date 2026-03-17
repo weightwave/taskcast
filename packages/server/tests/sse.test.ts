@@ -222,4 +222,38 @@ describe('GET /tasks/:taskId/events (SSE)', () => {
     const doneEvent = events.find((e) => e.event === 'taskcast.done')
     expect(JSON.parse(doneEvent!.data).reason).toBe('completed')
   }, 10000)
+
+  it('limits history replay events with limit query parameter', async () => {
+    const { app, engine } = makeApp()
+    const task = await engine.createTask({})
+    await engine.transitionTask(task.id, 'running')
+    // Publish 10 events
+    for (let i = 0; i < 10; i++) {
+      await engine.publishEvent(task.id, { type: 'progress', level: 'info', data: { i } })
+    }
+    await engine.transitionTask(task.id, 'completed')
+
+    // Connect with limit=3 — storage returns 3 events total (status:running + progress:0 + progress:1)
+    const res = await app.request(`/tasks/${task.id}/events?limit=3`)
+    expect(res.headers.get('content-type')).toContain('text/event-stream')
+
+    // Collect: 3 history events + taskcast.done
+    const events = await collectSSEEvents(res, 4)
+    const dataEvents = events.filter((e) => e.event === 'taskcast.event')
+    expect(dataEvents).toHaveLength(3)
+
+    // First event should be taskcast:status (running transition)
+    const firstType = JSON.parse(dataEvents[0]!.data).type
+    expect(firstType).toBe('taskcast:status')
+
+    // The remaining 2 should be progress events
+    const progressEvents = dataEvents.filter((e) => JSON.parse(e.data).type === 'progress')
+    expect(progressEvents).toHaveLength(2)
+    expect(JSON.parse(progressEvents[0]!.data).data.i).toBe(0)
+    expect(JSON.parse(progressEvents[1]!.data).data.i).toBe(1)
+
+    // Should still get taskcast.done
+    const doneEvent = events.find((e) => e.event === 'taskcast.done')
+    expect(doneEvent).toBeDefined()
+  })
 })

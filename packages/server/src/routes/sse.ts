@@ -2,7 +2,7 @@ import type { Hono } from 'hono'
 import { OpenAPIHono, createRoute, z } from '@hono/zod-openapi'
 import type { Context } from 'hono'
 import { streamSSE } from 'hono/streaming'
-import { applyFilteredIndex, matchesFilter, matchesType, TERMINAL_STATUSES } from '@taskcast/core'
+import { applyFilteredIndex, matchesFilter, matchesType, TERMINAL_STATUSES, collapseAccumulateSeries } from '@taskcast/core'
 import { checkScope } from '../auth.js'
 import { ErrorSchema } from '../schemas.js'
 import type { TaskEngine, TaskEvent, Task, SubscribeFilter, SSEEnvelope, Level } from '@taskcast/core'
@@ -52,6 +52,7 @@ const sseRoute = createRoute({
       'since.id': z.string().optional(),
       'since.index': z.string().optional(),
       'since.timestamp': z.string().optional(),
+      limit: z.string().optional().openapi({ description: 'Maximum number of history events to replay on connect' }),
     }),
   },
   responses: {
@@ -169,51 +170,40 @@ export function createSSERouter(engine: TaskEngine, subscriberCounts: Subscriber
         })
       }
 
+      // Parse limit parameter (ignore NaN / non-positive values)
+      const limitStr = c.req.query('limit')
+      const limitRaw = limitStr !== undefined ? parseInt(limitStr, 10) : undefined
+      const limit = limitRaw !== undefined && Number.isFinite(limitRaw) && limitRaw > 0 ? limitRaw : undefined
+
+      // Build storage-level query options (since cursor + limit)
+      const storageSince = filter.since?.id || filter.since?.timestamp
+        ? {
+          ...(filter.since.id && { id: filter.since.id }),
+          ...(filter.since.timestamp && { timestamp: filter.since.timestamp }),
+        }
+        : undefined
+      const historyOpts = storageSince || limit !== undefined
+        ? { ...(storageSince && { since: storageSince }), ...(limit !== undefined && { limit }) }
+        : undefined
+
       // Replay history
       let history: TaskEvent[]
       try {
-        history = await engine.getEvents(taskId)
+        history = await engine.getEvents(taskId, historyOpts)
       } catch {
         cleanup()
         return
       }
 
       const hasSinceCursor = !!filter.since
-      const accumulateSeriesIds = new Set<string>()
-      for (const e of history) {
-        if (e.seriesMode === 'accumulate' && e.seriesId) {
-          accumulateSeriesIds.add(e.seriesId)
-        }
-      }
 
       let replayEvents: TaskEvent[]
 
-      if (accumulateSeriesIds.size > 0 && !hasSinceCursor) {
-        // Collapse accumulate series into snapshots
-        const snapshots = new Map<string, TaskEvent>()
-        for (const sid of accumulateSeriesIds) {
-          const latest = await engine.getSeriesLatest(taskId, sid)
-          if (latest) {
-            snapshots.set(sid, { ...latest, seriesSnapshot: true })
-          }
-        }
-
-        const emittedSnapshots = new Set<string>()
-        replayEvents = []
-        for (const event of history) {
-          if (event.seriesMode === 'accumulate' && event.seriesId && accumulateSeriesIds.has(event.seriesId)) {
-            if (!emittedSnapshots.has(event.seriesId)) {
-              const snapshot = snapshots.get(event.seriesId)
-              if (snapshot) {
-                replayEvents.push(snapshot)
-                emittedSnapshots.add(event.seriesId)
-              }
-            }
-            // Skip remaining events in this accumulate series
-          } else {
-            replayEvents.push(event)
-          }
-        }
+      if (!hasSinceCursor) {
+        replayEvents = await collapseAccumulateSeries(
+          history,
+          (tid, sid) => engine.getSeriesLatest(tid, sid),
+        )
       } else {
         replayEvents = history
       }

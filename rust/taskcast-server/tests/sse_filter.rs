@@ -303,3 +303,228 @@ async fn sse_closes_on_terminal_status() {
     // which means the done_tx signal on line 264 fired and the select! on line 276
     // resolved, causing the stream to end.
 }
+
+// =============================================================================
+// 3. SSE limit parameter caps history replay events
+// =============================================================================
+
+#[tokio::test]
+async fn sse_limit_caps_history_replay() {
+    let (engine, app) = make_sse_app();
+    let addr = serve_app(app).await;
+    let client = reqwest::Client::new();
+
+    // Create a task and transition to running
+    engine
+        .create_task(CreateTaskInput {
+            id: Some("limit-test-1".to_string()),
+            r#type: Some("test".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    engine
+        .transition_task("limit-test-1", TaskStatus::Running, None)
+        .await
+        .unwrap();
+
+    // Publish 10 events
+    for i in 0..10 {
+        engine
+            .publish_event(
+                "limit-test-1",
+                PublishEventInput {
+                    r#type: "progress".to_string(),
+                    level: Level::Info,
+                    data: json!({ "i": i }),
+                    series_id: None,
+                    series_mode: None,
+                    series_acc_field: None,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    // Transition to completed so the stream will close after replay
+    engine
+        .transition_task("limit-test-1", TaskStatus::Completed, None)
+        .await
+        .unwrap();
+
+    // Connect SSE with limit=3 — storage returns 3 events total
+    // (status:running + progress:0 + progress:1)
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client
+            .get(format!("http://{addr}/tasks/limit-test-1/events?limit=3"))
+            .header("Accept", "text/event-stream")
+            .send(),
+    )
+    .await
+    .expect("SSE connect timed out")
+    .unwrap();
+    assert_eq!(response.status(), 200);
+
+    let body = tokio::time::timeout(std::time::Duration::from_secs(5), response.text())
+        .await
+        .expect("SSE stream timed out")
+        .unwrap();
+
+    let events = parse_sse_events(&body);
+
+    // Should have 3 taskcast.event entries + 1 taskcast.done
+    let data_events: Vec<_> = events
+        .iter()
+        .filter(|(name, _)| name == "taskcast.event")
+        .collect();
+    assert_eq!(
+        data_events.len(),
+        3,
+        "should have exactly 3 history events with limit=3, got {}. Events:\n{body}",
+        data_events.len()
+    );
+
+    // First event should be taskcast:status (running transition)
+    let first_type = data_events[0]
+        .1
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    assert_eq!(first_type, "taskcast:status");
+
+    // Remaining 2 should be progress events
+    let progress_events: Vec<_> = data_events
+        .iter()
+        .filter(|(_, data)| {
+            data.get("type")
+                .and_then(|v| v.as_str())
+                .map(|t| t == "progress")
+                .unwrap_or(false)
+        })
+        .collect();
+    assert_eq!(progress_events.len(), 2);
+
+    // Should have taskcast.done
+    assert!(
+        body.contains("taskcast.done"),
+        "should have taskcast.done event. Got:\n{body}"
+    );
+}
+
+// =============================================================================
+// 4. SSE since.id param constructs SinceCursor and filters history
+// =============================================================================
+
+#[tokio::test]
+async fn sse_since_id_constructs_cursor_and_filters_history() {
+    let (engine, app) = make_sse_app();
+    let addr = serve_app(app).await;
+    let client = reqwest::Client::new();
+
+    // Create a task and transition to running
+    engine
+        .create_task(CreateTaskInput {
+            id: Some("since-test-1".to_string()),
+            r#type: Some("test".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    engine
+        .transition_task("since-test-1", TaskStatus::Running, None)
+        .await
+        .unwrap();
+
+    // Publish 5 events and capture the 3rd event's ID for the since cursor
+    let mut event_ids = Vec::new();
+    for i in 0..5 {
+        let event = engine
+            .publish_event(
+                "since-test-1",
+                PublishEventInput {
+                    r#type: "progress".to_string(),
+                    level: Level::Info,
+                    data: json!({ "i": i }),
+                    series_id: None,
+                    series_mode: None,
+                    series_acc_field: None,
+                },
+            )
+            .await
+            .unwrap();
+        event_ids.push(event.id.clone());
+    }
+
+    // Transition to completed so the stream closes after replay
+    engine
+        .transition_task("since-test-1", TaskStatus::Completed, None)
+        .await
+        .unwrap();
+
+    // Connect SSE with since.id = 3rd event (index 2) — should skip events up to and
+    // including that one, returning only events after it
+    let since_id = &event_ids[2];
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client
+            .get(format!(
+                "http://{addr}/tasks/since-test-1/events?since.id={since_id}"
+            ))
+            .header("Accept", "text/event-stream")
+            .send(),
+    )
+    .await
+    .expect("SSE connect timed out")
+    .unwrap();
+    assert_eq!(response.status(), 200);
+
+    let body = tokio::time::timeout(std::time::Duration::from_secs(5), response.text())
+        .await
+        .expect("SSE stream timed out")
+        .unwrap();
+
+    let events = parse_sse_events(&body);
+
+    // Should have events AFTER since cursor: progress[3], progress[4],
+    // taskcast:status(completed) = 3 events + taskcast.done
+    let data_events: Vec<_> = events
+        .iter()
+        .filter(|(name, _)| name == "taskcast.event")
+        .collect();
+
+    // Events before and including since.id should be excluded
+    let progress_events: Vec<_> = data_events
+        .iter()
+        .filter(|(_, data)| {
+            data.get("type")
+                .and_then(|v| v.as_str())
+                .map(|t| t == "progress")
+                .unwrap_or(false)
+        })
+        .collect();
+
+    // We published 5 progress events, cursor is at index 2 (3rd),
+    // so we should get progress events 3 and 4 (2 events)
+    assert_eq!(
+        progress_events.len(),
+        2,
+        "should have 2 progress events after since cursor, got {}. Events:\n{body}",
+        progress_events.len()
+    );
+
+    // Verify none of the skipped event IDs are present
+    for skipped_id in &event_ids[..3] {
+        assert!(
+            !body.contains(skipped_id),
+            "event {} should have been filtered by since cursor. Got:\n{body}",
+            skipped_id
+        );
+    }
+
+    // Should still close properly
+    assert!(
+        body.contains("taskcast.done"),
+        "should have taskcast.done event. Got:\n{body}"
+    );
+}

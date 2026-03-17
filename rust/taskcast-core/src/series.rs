@@ -1,3 +1,6 @@
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
+
 use crate::types::{SeriesMode, SeriesResult, ShortTermStore, TaskEvent};
 
 /// Process a task event through its series mode logic.
@@ -12,11 +15,11 @@ pub async fn process_series(
 ) -> Result<SeriesResult, Box<dyn std::error::Error + Send + Sync>> {
     let (series_id, series_mode) = match (&event.series_id, &event.series_mode) {
         (Some(sid), Some(mode)) => (sid.clone(), mode.clone()),
-        _ => return Ok(SeriesResult { event, accumulated_event: None }),
+        _ => return Ok(SeriesResult { event, accumulated_event: None, stored: false }),
     };
 
     match series_mode {
-        SeriesMode::KeepAll => Ok(SeriesResult { event, accumulated_event: None }),
+        SeriesMode::KeepAll => Ok(SeriesResult { event, accumulated_event: None, stored: false }),
 
         SeriesMode::Accumulate => {
             let field = event
@@ -26,16 +29,91 @@ pub async fn process_series(
             let accumulated = store
                 .accumulate_series(&event.task_id, &series_id, event.clone(), field)
                 .await?;
-            Ok(SeriesResult { event, accumulated_event: Some(accumulated) })
+            Ok(SeriesResult { event, accumulated_event: Some(accumulated), stored: false })
         }
 
         SeriesMode::Latest => {
             store
                 .replace_last_series_event(&event.task_id, &series_id, event.clone())
                 .await?;
-            Ok(SeriesResult { event, accumulated_event: None })
+            Ok(SeriesResult { event, accumulated_event: None, stored: true })
         }
     }
+}
+
+/// Collapse accumulate-mode series events into single snapshot events.
+///
+/// For each accumulate series found in `events`:
+/// 1. Call `get_series_latest` to get the definitive accumulated value (hot task path)
+/// 2. If it returns None (cold task), use the last event in that series from the array
+/// 3. Replace all events in that series with a single snapshot (series_snapshot = true)
+///
+/// Non-accumulate events (keep-all, latest, no series) are passed through unchanged.
+pub async fn collapse_accumulate_series<F, Fut>(
+    events: &[TaskEvent],
+    get_series_latest: F,
+) -> Result<Vec<TaskEvent>, Box<dyn std::error::Error + Send + Sync>>
+where
+    F: Fn(&str, &str) -> Fut,
+    Fut: Future<Output = Result<Option<TaskEvent>, Box<dyn std::error::Error + Send + Sync>>>,
+{
+    if events.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let mut acc_series_ids = HashSet::new();
+    for e in events {
+        if e.series_mode.as_ref() == Some(&SeriesMode::Accumulate) {
+            if let Some(ref sid) = e.series_id {
+                acc_series_ids.insert(sid.clone());
+            }
+        }
+    }
+
+    if acc_series_ids.is_empty() {
+        return Ok(events.to_vec());
+    }
+
+    let task_id = &events[0].task_id;
+    let mut snapshots = HashMap::new();
+    for sid in &acc_series_ids {
+        let latest = get_series_latest(task_id, sid).await?;
+        if let Some(mut snap) = latest {
+            snap.series_snapshot = Some(true);
+            snapshots.insert(sid.clone(), snap);
+        } else {
+            // Cold path: derive from last event in this series
+            for e in events.iter().rev() {
+                if e.series_id.as_deref() == Some(sid) {
+                    let mut snap = e.clone();
+                    snap.series_snapshot = Some(true);
+                    snapshots.insert(sid.clone(), snap);
+                    break;
+                }
+            }
+        }
+    }
+
+    let mut emitted = HashSet::new();
+    let mut result = Vec::new();
+    for event in events {
+        if event.series_mode.as_ref() == Some(&SeriesMode::Accumulate) {
+            if let Some(ref sid) = event.series_id {
+                if acc_series_ids.contains(sid) {
+                    if !emitted.contains(sid) {
+                        if let Some(snapshot) = snapshots.get(sid) {
+                            result.push(snapshot.clone());
+                            emitted.insert(sid.clone());
+                        }
+                    }
+                    continue;
+                }
+            }
+        }
+        result.push(event.clone());
+    }
+
+    Ok(result)
 }
 
 #[cfg(test)]

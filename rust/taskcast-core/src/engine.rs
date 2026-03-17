@@ -446,7 +446,14 @@ impl TaskEngine {
         task_id: &str,
         opts: Option<EventQueryOptions>,
     ) -> Result<Vec<TaskEvent>, EngineError> {
-        Ok(self.short_term_store.get_events(task_id, opts).await?)
+        let from_short = self.short_term_store.get_events(task_id, opts.clone()).await?;
+        if !from_short.is_empty() {
+            return Ok(from_short);
+        }
+        if let Some(ref long_term_store) = self.long_term_store {
+            return Ok(long_term_store.get_events(task_id, opts).await?);
+        }
+        Ok(vec![])
     }
 
     pub async fn list_tasks(&self, filter: TaskFilter) -> Result<Vec<Task>, EngineError> {
@@ -511,10 +518,12 @@ impl TaskEngine {
         let series_result = process_series(raw, self.short_term_store.as_ref()).await?;
         let event = series_result.event;
 
-        // Store delta event in short-term store
-        self.short_term_store
-            .append_event(task_id, event.clone())
-            .await?;
+        // Store delta event in short-term store (skip if process_series already stored it)
+        if !series_result.stored {
+            self.short_term_store
+                .append_event(task_id, event.clone())
+                .await?;
+        }
 
         // Attach accumulated data to broadcast event for SSE accumulated subscribers
         let broadcast_event = if let Some(ref accumulated) = series_result.accumulated_event {
@@ -608,8 +617,9 @@ mod tests {
             Ok(())
         }
 
-        async fn get_events(&self, _task_id: &str, _opts: Option<EventQueryOptions>) -> Result<Vec<TaskEvent>, Box<dyn std::error::Error + Send + Sync>> {
-            Ok(self.events.read().await.clone())
+        async fn get_events(&self, task_id: &str, _opts: Option<EventQueryOptions>) -> Result<Vec<TaskEvent>, Box<dyn std::error::Error + Send + Sync>> {
+            let events = self.events.read().await;
+            Ok(events.iter().filter(|e| e.task_id == task_id).cloned().collect())
         }
 
         async fn save_worker_event(&self, _event: WorkerAuditEvent) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -1879,6 +1889,55 @@ mod tests {
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].data["delta"], "Hello ");
         assert_eq!(chunks[1].data["delta"], "Hello world");
+    }
+
+    #[tokio::test]
+    async fn get_events_falls_back_to_long_term_store() {
+        let long_term_store = Arc::new(MockLongTermStore::new());
+        let event = TaskEvent {
+            id: "lt-evt-1".to_string(),
+            task_id: "cold-task".to_string(),
+            index: 0,
+            timestamp: 1000.0,
+            r#type: "test".to_string(),
+            level: Level::Info,
+            data: serde_json::json!({"text": "from long term"}),
+            series_id: None,
+            series_mode: None,
+            series_acc_field: None,
+            series_snapshot: None,
+            _accumulated_data: None,
+        };
+        long_term_store.events.write().await.push(event.clone());
+
+        let engine = make_engine_with_long_term(Arc::clone(&long_term_store) as Arc<dyn LongTermStore>);
+
+        let events = engine.get_events("cold-task", None).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].id, "lt-evt-1");
+    }
+
+    #[tokio::test]
+    async fn get_events_prefers_short_term_store() {
+        let long_term_store = Arc::new(MockLongTermStore::new());
+        let engine = make_engine_with_long_term(Arc::clone(&long_term_store) as Arc<dyn LongTermStore>);
+
+        let task = engine.create_task(CreateTaskInput {
+            r#type: Some("test".to_string()),
+            ..Default::default()
+        }).await.unwrap();
+        engine.transition_task(&task.id, TaskStatus::Running, None).await.unwrap();
+        engine.publish_event(&task.id, PublishEventInput {
+            r#type: "test".to_string(),
+            level: Level::Info,
+            data: serde_json::json!({}),
+            series_id: None,
+            series_mode: None,
+            series_acc_field: None,
+        }).await.unwrap();
+
+        let events = engine.get_events(&task.id, None).await.unwrap();
+        assert!(!events.is_empty());
     }
 
     #[tokio::test]
