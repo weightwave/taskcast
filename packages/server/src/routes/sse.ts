@@ -52,6 +52,7 @@ const sseRoute = createRoute({
       'since.id': z.string().optional(),
       'since.index': z.string().optional(),
       'since.timestamp': z.string().optional(),
+      limit: z.string().optional().openapi({ description: 'Maximum number of history events to replay on connect' }),
     }),
   },
   responses: {
@@ -169,10 +170,25 @@ export function createSSERouter(engine: TaskEngine, subscriberCounts: Subscriber
         })
       }
 
+      // Parse limit parameter
+      const limitStr = c.req.query('limit')
+      const limit = limitStr !== undefined ? Number(limitStr) : undefined
+
+      // Build storage-level query options (since cursor + limit)
+      const storageSince = filter.since?.id || filter.since?.timestamp
+        ? {
+          ...(filter.since.id && { id: filter.since.id }),
+          ...(filter.since.timestamp && { timestamp: filter.since.timestamp }),
+        }
+        : undefined
+      const historyOpts = storageSince || limit !== undefined
+        ? { ...(storageSince && { since: storageSince }), ...(limit !== undefined && { limit }) }
+        : undefined
+
       // Replay history
       let history: TaskEvent[]
       try {
-        history = await engine.getEvents(taskId)
+        history = await engine.getEvents(taskId, historyOpts)
       } catch {
         cleanup()
         return
