@@ -64,11 +64,10 @@ pub async fn verbose_logger_middleware(
 
     let body_too_large = content_length.is_some_and(|len| len > MAX_BODY_SIZE);
 
-    // Only attempt body capture when Content-Length is present and within limit.
-    // If Content-Length is missing or exceeds MAX_BODY_SIZE, skip entirely and
-    // forward the original body unchanged so downstream handlers still work.
-    let should_capture_body = matches!(method.as_str(), "POST" | "PATCH" | "PUT")
-        && content_length.is_some_and(|len| len <= MAX_BODY_SIZE);
+    // Capture body for POST/PATCH/PUT unless Content-Length explicitly exceeds the limit.
+    // When Content-Length is missing (e.g. chunked transfer), we still attempt capture
+    // with to_bytes' built-in limit to avoid breaking body logging for normal requests.
+    let should_capture_body = matches!(method.as_str(), "POST" | "PATCH" | "PUT") && !body_too_large;
 
     let (request_body, req) = if should_capture_body {
         let (parts, body) = req.into_parts();
