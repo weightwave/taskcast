@@ -12,11 +12,11 @@ pub async fn process_series(
 ) -> Result<SeriesResult, Box<dyn std::error::Error + Send + Sync>> {
     let (series_id, series_mode) = match (&event.series_id, &event.series_mode) {
         (Some(sid), Some(mode)) => (sid.clone(), mode.clone()),
-        _ => return Ok(SeriesResult { event, accumulated_event: None }),
+        _ => return Ok(SeriesResult { event, accumulated_event: None, stored: false }),
     };
 
     match series_mode {
-        SeriesMode::KeepAll => Ok(SeriesResult { event, accumulated_event: None }),
+        SeriesMode::KeepAll => Ok(SeriesResult { event, accumulated_event: None, stored: false }),
 
         SeriesMode::Accumulate => {
             let field = event
@@ -26,14 +26,14 @@ pub async fn process_series(
             let accumulated = store
                 .accumulate_series(&event.task_id, &series_id, event.clone(), field)
                 .await?;
-            Ok(SeriesResult { event, accumulated_event: Some(accumulated) })
+            Ok(SeriesResult { event, accumulated_event: Some(accumulated), stored: false })
         }
 
         SeriesMode::Latest => {
             store
                 .replace_last_series_event(&event.task_id, &series_id, event.clone())
                 .await?;
-            Ok(SeriesResult { event, accumulated_event: None })
+            Ok(SeriesResult { event, accumulated_event: None, stored: true })
         }
     }
 }
