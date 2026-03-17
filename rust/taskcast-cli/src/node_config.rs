@@ -129,7 +129,15 @@ impl NodeConfigManager {
             let _ = std::fs::create_dir_all(parent);
         }
         let json = serde_json::to_string_pretty(data).expect("failed to serialize node config");
-        std::fs::write(&self.config_path, json).expect("failed to write node config");
+        std::fs::write(&self.config_path, &json).expect("failed to write node config");
+
+        // Restrict file permissions on Unix (nodes.json may contain tokens)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            let _ = std::fs::set_permissions(&self.config_path, perms);
+        }
     }
 }
 

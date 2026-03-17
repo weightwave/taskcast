@@ -27,7 +27,7 @@ export function createVerboseLogger(
     const bodyTooLarge = !isNaN(contentLength) && contentLength > MAX_BODY_SIZE
 
     // Capture request body for context extraction (clone to avoid consuming)
-    let requestBody: Record<string, unknown> | undefined
+    let requestBody: unknown
     if (method === 'POST' || method === 'PATCH' || method === 'PUT') {
       if (!bodyTooLarge) {
         try {
@@ -63,7 +63,7 @@ function extractContext(
   method: string,
   path: string,
   status: number,
-  requestBody: Record<string, unknown> | undefined,
+  requestBody: unknown,
   _res: Response,
   bodyTooLarge = false,
 ): string {
@@ -77,9 +77,15 @@ function extractContext(
     return 'task created'
   }
 
+  // Narrow to object for property access
+  const body =
+    requestBody != null && typeof requestBody === 'object' && !Array.isArray(requestBody)
+      ? (requestBody as Record<string, unknown>)
+      : undefined
+
   // PATCH /tasks/:id/status → show status transition
   if (method === 'PATCH' && path.match(/\/tasks\/[^/]+\/status$/)) {
-    const targetStatus = requestBody?.status
+    const targetStatus = body?.status
     if (targetStatus) {
       return `\u2192 ${targetStatus}`
     }
@@ -88,7 +94,7 @@ function extractContext(
 
   // POST /tasks/:id/events → show event type
   if (method === 'POST' && path.match(/\/tasks\/[^/]+\/events$/)) {
-    const eventType = requestBody?.type
+    const eventType = body?.type
     if (eventType) {
       return `type: ${eventType}`
     }

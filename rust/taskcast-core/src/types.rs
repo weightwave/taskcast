@@ -504,7 +504,10 @@ pub trait BroadcastProvider: Send + Sync {
         handler: Box<dyn Fn(TaskEvent) + Send + Sync>,
     ) -> Result<Box<dyn Fn() + Send + Sync>, Box<dyn std::error::Error + Send + Sync>> {
         let _ = (channel, handler);
-        Err("subscribe_sync is not supported by this BroadcastProvider".into())
+        Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "subscribe_sync is not supported by this broadcast provider",
+        )))
     }
 }
 

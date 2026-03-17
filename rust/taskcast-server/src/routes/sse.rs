@@ -381,6 +381,7 @@ pub struct GlobalSseQuery {
     responses(
         (status = 200, description = "SSE event stream (text/event-stream)"),
         (status = 403, description = "Forbidden"),
+        (status = 501, description = "Global SSE not supported with this broadcast provider"),
     )
 )]
 pub async fn global_sse_events(

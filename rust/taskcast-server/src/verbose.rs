@@ -64,26 +64,30 @@ pub async fn verbose_logger_middleware(
 
     let body_too_large = content_length.is_some_and(|len| len > MAX_BODY_SIZE);
 
-    let (request_body, req) =
-        if !body_too_large && matches!(method.as_str(), "POST" | "PATCH" | "PUT") {
-            let (parts, body) = req.into_parts();
-            match axum::body::to_bytes(body, MAX_BODY_SIZE).await {
-                Ok(bytes) => {
-                    let parsed: Option<serde_json::Value> =
-                        serde_json::from_slice(&bytes).ok();
-                    let req = Request::from_parts(parts, axum::body::Body::from(bytes));
-                    (parsed, req)
-                }
-                Err(_) => {
-                    // Body exceeded limit during read (no Content-Length or incorrect).
-                    // The body stream is consumed; reconstruct empty.
-                    let req = Request::from_parts(parts, axum::body::Body::empty());
-                    (None, req)
-                }
+    // Only attempt body capture when Content-Length is present and within limit.
+    // If Content-Length is missing or exceeds MAX_BODY_SIZE, skip entirely and
+    // forward the original body unchanged so downstream handlers still work.
+    let should_capture_body = matches!(method.as_str(), "POST" | "PATCH" | "PUT")
+        && content_length.is_some_and(|len| len <= MAX_BODY_SIZE);
+
+    let (request_body, req) = if should_capture_body {
+        let (parts, body) = req.into_parts();
+        match axum::body::to_bytes(body, MAX_BODY_SIZE).await {
+            Ok(bytes) => {
+                let parsed: Option<serde_json::Value> =
+                    serde_json::from_slice(&bytes).ok();
+                let req = Request::from_parts(parts, axum::body::Body::from(bytes));
+                (parsed, req)
             }
-        } else {
-            (None, req)
-        };
+            Err(_) => {
+                // Should not happen since we checked Content-Length, but be safe.
+                let req = Request::from_parts(parts, axum::body::Body::empty());
+                (None, req)
+            }
+        }
+    } else {
+        (None, req)
+    };
 
     let start = Instant::now();
     let response = next.run(req).await;

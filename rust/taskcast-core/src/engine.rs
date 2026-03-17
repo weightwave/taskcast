@@ -212,9 +212,12 @@ impl TaskEngine {
         }
 
         // Fire creation listeners
+        // Snapshot the Arc list, drop the lock, then invoke to prevent deadlock
+        // if a listener calls add_creation_listener / remove_creation_listener.
         {
-            let listeners = self.creation_listeners.lock().unwrap();
-            for listener in listeners.iter() {
+            let listeners: Vec<CreationListener> =
+                self.creation_listeners.lock().unwrap().clone();
+            for listener in &listeners {
                 listener(&task);
             }
         }
