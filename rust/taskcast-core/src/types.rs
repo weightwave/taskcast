@@ -420,6 +420,9 @@ pub enum SeriesFormat {
 pub struct SeriesResult {
     pub event: TaskEvent,
     pub accumulated_event: Option<TaskEvent>,
+    /// Whether process_series already stored the event (e.g. latest mode uses replace_last_series_event).
+    /// When true, emit skips append_event.
+    pub stored: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
@@ -1128,6 +1131,7 @@ mod tests {
         let result = SeriesResult {
             event: event.clone(),
             accumulated_event: Some(event.clone()),
+            stored: false,
         };
         assert_eq!(result.event.id, "e");
         assert!(result.accumulated_event.is_some());

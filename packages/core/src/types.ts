@@ -229,6 +229,8 @@ export interface SeriesResult {
   event: TaskEvent
   /** The event with accumulated data (for LongTermStore + broadcast). Undefined for non-accumulate modes. */
   accumulatedEvent?: TaskEvent
+  /** Whether processSeries already stored the event (e.g. latest mode uses replaceLastSeriesEvent). When true, _emit skips appendEvent. */
+  stored?: boolean
 }
 
 // ─── Storage Interfaces ──────────────────────────────────────────────────────
