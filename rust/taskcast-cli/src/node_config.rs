@@ -304,4 +304,85 @@ mod tests {
         let node = mgr2.get("staging").expect("node should exist");
         assert_eq!(node.url, "https://s.tc.io");
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_sets_restrictive_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let mgr = NodeConfigManager::new(dir.path().to_path_buf());
+        mgr.add(
+            "secret-node",
+            NodeEntry {
+                url: "https://secret.example.com".to_string(),
+                token: Some("super_secret_token".to_string()),
+                token_type: Some(TokenType::Admin),
+            },
+        );
+
+        let config_path = dir.path().join("nodes.json");
+        assert!(config_path.exists(), "nodes.json should exist after save");
+
+        let metadata = std::fs::metadata(&config_path).unwrap();
+        let mode = metadata.permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "nodes.json should have 0o600 permissions, got: {mode:#o}"
+        );
+    }
+
+    #[test]
+    fn save_and_reload_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().to_path_buf();
+
+        let entry1 = NodeEntry {
+            url: "https://alpha.example.com".to_string(),
+            token: Some("token_a".to_string()),
+            token_type: Some(TokenType::Jwt),
+        };
+        let entry2 = NodeEntry {
+            url: "https://beta.example.com".to_string(),
+            token: None,
+            token_type: None,
+        };
+        let entry3 = NodeEntry {
+            url: "https://gamma.example.com".to_string(),
+            token: Some("admin_key".to_string()),
+            token_type: Some(TokenType::Admin),
+        };
+
+        // Save with first manager instance
+        let mgr1 = NodeConfigManager::new(path.clone());
+        mgr1.add("alpha", entry1.clone());
+        mgr1.add("beta", entry2.clone());
+        mgr1.add("gamma", entry3.clone());
+        mgr1.set_current("beta").unwrap();
+
+        // Reload with a completely new manager instance
+        let mgr2 = NodeConfigManager::new(path);
+
+        // Verify all nodes survived the roundtrip
+        let alpha = mgr2.get("alpha").expect("alpha should exist");
+        assert_eq!(alpha, entry1);
+
+        let beta = mgr2.get("beta").expect("beta should exist");
+        assert_eq!(beta, entry2);
+
+        let gamma = mgr2.get("gamma").expect("gamma should exist");
+        assert_eq!(gamma, entry3);
+
+        // Verify current selection survived
+        let current = mgr2.get_current();
+        assert_eq!(current.url, "https://beta.example.com");
+        assert_eq!(current.token, None);
+        assert_eq!(current.token_type, None);
+
+        // Verify list count
+        let list = mgr2.list();
+        assert_eq!(list.len(), 3);
+        let beta_entry = list.iter().find(|n| n.name == "beta").unwrap();
+        assert!(beta_entry.current);
+    }
 }

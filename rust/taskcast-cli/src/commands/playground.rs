@@ -57,6 +57,121 @@ pub fn serve_playground_file(path: &str) -> axum::response::Response {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    #[test]
+    fn known_file_returns_correct_mime_type() {
+        let response = serve_playground_file("index.html");
+        let response = response.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .expect("should have content-type header")
+            .to_str()
+            .unwrap();
+        assert!(
+            content_type.contains("text/html"),
+            "Expected text/html, got: {content_type}"
+        );
+    }
+
+    #[test]
+    fn unknown_path_falls_back_to_index_html() {
+        // SPA fallback: any unknown path should serve index.html
+        let response = serve_playground_file("some/unknown/route");
+        let response = response.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .expect("should have content-type header")
+            .to_str()
+            .unwrap();
+        assert!(
+            content_type.contains("text/html"),
+            "SPA fallback should serve text/html, got: {content_type}"
+        );
+    }
+
+    #[test]
+    fn css_asset_returns_correct_mime_type() {
+        // Find a CSS asset from the embedded files
+        let css_file = PlaygroundAssets::iter().find(|f| f.ends_with(".css"));
+        if let Some(css_path) = css_file {
+            let response = serve_playground_file(&css_path);
+            let response = response.into_response();
+            assert_eq!(response.status(), StatusCode::OK);
+            let content_type = response
+                .headers()
+                .get("content-type")
+                .expect("should have content-type header")
+                .to_str()
+                .unwrap();
+            assert!(
+                content_type.contains("css"),
+                "Expected CSS mime type, got: {content_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn js_asset_returns_correct_mime_type() {
+        // Find a JS asset from the embedded files
+        let js_file = PlaygroundAssets::iter().find(|f| f.ends_with(".js"));
+        if let Some(js_path) = js_file {
+            let response = serve_playground_file(&js_path);
+            let response = response.into_response();
+            assert_eq!(response.status(), StatusCode::OK);
+            let content_type = response
+                .headers()
+                .get("content-type")
+                .expect("should have content-type header")
+                .to_str()
+                .unwrap();
+            assert!(
+                content_type.contains("javascript"),
+                "Expected javascript mime type, got: {content_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_embed_has_index_html() {
+        // Verify that the embedded assets include index.html
+        assert!(
+            PlaygroundAssets::get("index.html").is_some(),
+            "PlaygroundAssets should embed index.html"
+        );
+    }
+
+    #[test]
+    fn rust_embed_has_at_least_one_asset() {
+        // Verify that rust-embed actually embeds files
+        let count = PlaygroundAssets::iter().count();
+        assert!(
+            count > 0,
+            "PlaygroundAssets should contain at least one embedded file"
+        );
+    }
+
+    #[test]
+    fn known_file_body_is_not_empty() {
+        let _response = serve_playground_file("index.html");
+        // We can't easily read the body in a sync test, but we can verify
+        // the asset data from rust-embed directly
+        let asset = PlaygroundAssets::get("index.html").unwrap();
+        assert!(
+            !asset.data.is_empty(),
+            "index.html asset should have non-empty content"
+        );
+    }
+}
+
 pub async fn run(args: PlaygroundArgs) -> Result<(), Box<dyn std::error::Error>> {
     let PlaygroundArgs { port } = args;
 
