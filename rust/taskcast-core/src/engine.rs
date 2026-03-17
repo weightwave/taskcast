@@ -470,10 +470,12 @@ impl TaskEngine {
         let series_result = process_series(raw, self.short_term_store.as_ref()).await?;
         let event = series_result.event;
 
-        // Store delta event in short-term store
-        self.short_term_store
-            .append_event(task_id, event.clone())
-            .await?;
+        // Store delta event in short-term store (skip if process_series already stored it)
+        if !series_result.stored {
+            self.short_term_store
+                .append_event(task_id, event.clone())
+                .await?;
+        }
 
         // Attach accumulated data to broadcast event for SSE accumulated subscribers
         let broadcast_event = if let Some(ref accumulated) = series_result.accumulated_event {
