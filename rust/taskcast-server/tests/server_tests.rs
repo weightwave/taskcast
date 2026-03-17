@@ -3686,12 +3686,21 @@ async fn publish_event_to_completed_task_returns_error() {
 // ─── Health endpoint ────────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn health_endpoint_requires_auth_in_jwt_mode() {
+async fn health_endpoint_is_accessible_without_auth_in_jwt_mode() {
     let server = make_jwt_server().1;
 
-    // Health requires auth when JWT mode is enabled
+    // Health endpoints bypass auth — they must be accessible without a token
     let response = server.get("/health").await;
-    response.assert_status(axum_test::http::StatusCode::UNAUTHORIZED);
+    response.assert_status(axum_test::http::StatusCode::OK);
+    let body: serde_json::Value = response.json();
+    assert_eq!(body["ok"], true);
+
+    // /health/detail also bypasses auth and reports the auth mode
+    let detail_response = server.get("/health/detail").await;
+    detail_response.assert_status(axum_test::http::StatusCode::OK);
+    let detail_body: serde_json::Value = detail_response.json();
+    assert_eq!(detail_body["ok"], true);
+    assert_eq!(detail_body["authMode"], "jwt");
 }
 
 #[tokio::test]
