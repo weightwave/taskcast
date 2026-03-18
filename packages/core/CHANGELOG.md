@@ -1,5 +1,15 @@
 # @taskcast/core
 
+## 1.2.0
+
+### Minor Changes
+
+- 13d321c: Add `limit` and `seriesFormat` query parameters to the history endpoint, and `limit` to the SSE endpoint. History endpoint now supports hot/cold task routing (ShortTermStore → LongTermStore fallback) and series collapse via `seriesFormat=accumulated`. SSE handler refactored to use shared `collapseAccumulateSeries` function.
+
+### Patch Changes
+
+- 5e2ceb6: Fix seriesMode "latest" producing duplicate events in history. The engine now skips appendEvent when processSeries has already stored the event via replaceLastSeriesEvent.
+
 ## 1.1.0
 
 ### Minor Changes
