@@ -1225,6 +1225,15 @@ use taskcast_cli::node_config::{NodeConfigManager, NodeEntry};
 /// Mutex to serialize tests that modify HOME env var.
 static HOME_MUTEX: Mutex<()> = Mutex::new(());
 
+/// Helper: set up node config at an existing path.
+fn setup_temp_home_with_node_at(path: &std::path::Path, base_url: &str) {
+    let config_dir = path.join(".taskcast");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let mgr = NodeConfigManager::new(config_dir);
+    mgr.add("default", NodeEntry { url: base_url.to_string(), token: None, token_type: None });
+    mgr.set_current("default").unwrap();
+}
+
 /// Helper: create a temp HOME with a node config pointing to the given base_url.
 fn setup_temp_home_with_node(base_url: &str, node_name: &str) -> tempfile::TempDir {
     let temp_dir = tempfile::TempDir::new().unwrap();
@@ -1870,6 +1879,123 @@ async fn run_tail_node_not_found_returns_error() {
         err.contains("nonexistent"),
         "error should mention the node name, got: {err}"
     );
+
+    unsafe { std::env::remove_var("HOME"); }
+}
+
+// ─── Direct run_tail happy path (spawn_local + abort) ────────────────────────
+
+#[tokio::test]
+async fn run_tail_direct_call_receives_events() {
+    let _lock = HOME_MUTEX.lock().unwrap();
+    let engine = make_engine();
+    let base_url = start_server(engine.clone()).await;
+
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    setup_temp_home_with_node_at(temp_dir.path(), &base_url);
+    unsafe { std::env::set_var("HOME", temp_dir.path()); }
+
+    let local = tokio::task::LocalSet::new();
+    let engine_for_local = engine.clone();
+    local.run_until(async move {
+        // spawn_local for run_tail (its future is !Send due to FnMut callback)
+        let handle = tokio::task::spawn_local(async move {
+            let _ = run_tail(TailArgs {
+                types: None,
+                levels: None,
+                node: None,
+            })
+            .await;
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let task = engine_for_local
+            .create_task(CreateTaskInput {
+                r#type: Some("test".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        engine_for_local
+            .transition_task(&task.id, TaskStatus::Running, None)
+            .await
+            .unwrap();
+        engine_for_local
+            .publish_event(
+                &task.id,
+                PublishEventInput {
+                    r#type: "llm.delta".to_string(),
+                    level: Level::Info,
+                    data: json!({"text": "hello from tail"}),
+                    series_id: None,
+                    series_mode: None,
+                    series_acc_field: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        handle.abort();
+    }).await;
+
+    unsafe { std::env::remove_var("HOME"); }
+}
+
+#[tokio::test]
+async fn run_tail_direct_call_with_filters() {
+    let _lock = HOME_MUTEX.lock().unwrap();
+    let engine = make_engine();
+    let base_url = start_server(engine.clone()).await;
+
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    setup_temp_home_with_node_at(temp_dir.path(), &base_url);
+    unsafe { std::env::set_var("HOME", temp_dir.path()); }
+
+    let local = tokio::task::LocalSet::new();
+    let engine_for_local = engine.clone();
+    local.run_until(async move {
+        let handle = tokio::task::spawn_local(async move {
+            let _ = run_tail(TailArgs {
+                types: Some("llm.*".to_string()),
+                levels: Some("info,warn".to_string()),
+                node: None,
+            })
+            .await;
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let task = engine_for_local
+            .create_task(CreateTaskInput {
+                r#type: Some("test".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        engine_for_local
+            .transition_task(&task.id, TaskStatus::Running, None)
+            .await
+            .unwrap();
+        engine_for_local
+            .publish_event(
+                &task.id,
+                PublishEventInput {
+                    r#type: "llm.delta".to_string(),
+                    level: Level::Info,
+                    data: json!({"text": "filtered tail"}),
+                    series_id: None,
+                    series_mode: None,
+                    series_acc_field: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        handle.abort();
+    }).await;
 
     unsafe { std::env::remove_var("HOME"); }
 }
