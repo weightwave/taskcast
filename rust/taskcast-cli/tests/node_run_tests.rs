@@ -24,7 +24,8 @@ fn run_add_without_token() {
         url: "http://localhost:3721".to_string(),
         token: None,
         token_type: "jwt".to_string(),
-    });
+    })
+    .unwrap();
     // Verify via NodeConfigManager
     let mgr = NodeConfigManager::new(dir.path().join(".taskcast"));
     let node = mgr.get("local").unwrap();
@@ -44,7 +45,8 @@ fn run_add_with_jwt_token() {
         url: "https://prod.example.com".to_string(),
         token: Some("eyJ...".to_string()),
         token_type: "jwt".to_string(),
-    });
+    })
+    .unwrap();
     let mgr = NodeConfigManager::new(dir.path().join(".taskcast"));
     let node = mgr.get("prod").unwrap();
     assert_eq!(node.url, "https://prod.example.com");
@@ -63,7 +65,8 @@ fn run_add_with_admin_token() {
         url: "https://staging.example.com".to_string(),
         token: Some("admin_xxx".to_string()),
         token_type: "admin".to_string(),
-    });
+    })
+    .unwrap();
     let mgr = NodeConfigManager::new(dir.path().join(".taskcast"));
     let node = mgr.get("staging").unwrap();
     assert_eq!(node.url, "https://staging.example.com");
@@ -82,7 +85,8 @@ fn run_add_with_unknown_token_type_defaults_to_jwt() {
         url: "http://localhost:3721".to_string(),
         token: Some("tok".to_string()),
         token_type: "bearer".to_string(), // unknown type
-    });
+    })
+    .unwrap();
     let mgr = NodeConfigManager::new(dir.path().join(".taskcast"));
     let node = mgr.get("test").unwrap();
     assert_eq!(node.token_type, Some(TokenType::Jwt)); // defaults to JWT
@@ -95,7 +99,7 @@ fn run_list_empty() {
     let _lock = HOME_LOCK.lock().unwrap();
     let _dir = setup_home();
     // Should not panic, just prints "No nodes configured..."
-    run(NodeCommands::List);
+    run(NodeCommands::List).unwrap();
 }
 
 // ─── run(List) with nodes ──────────────────────────────────────────────────
@@ -109,9 +113,10 @@ fn run_list_with_nodes() {
         url: "http://localhost:3721".to_string(),
         token: None,
         token_type: "jwt".to_string(),
-    });
+    })
+    .unwrap();
     // Should not panic, prints the node list
-    run(NodeCommands::List);
+    run(NodeCommands::List).unwrap();
 }
 
 // ─── run(Use) existing node ────────────────────────────────────────────────
@@ -125,10 +130,12 @@ fn run_use_existing_node() {
         url: "http://localhost:3721".to_string(),
         token: None,
         token_type: "jwt".to_string(),
-    });
+    })
+    .unwrap();
     run(NodeCommands::Use {
         name: "test".to_string(),
-    });
+    })
+    .unwrap();
     // Verify current node was set
     let mgr = NodeConfigManager::new(dir.path().join(".taskcast"));
     let current = mgr.get_current();
@@ -146,16 +153,47 @@ fn run_remove_existing_node() {
         url: "http://localhost:3721".to_string(),
         token: None,
         token_type: "jwt".to_string(),
-    });
+    })
+    .unwrap();
     run(NodeCommands::Remove {
         name: "test".to_string(),
-    });
+    })
+    .unwrap();
     // Verify node was removed
     let mgr = NodeConfigManager::new(dir.path().join(".taskcast"));
     assert!(mgr.get("test").is_none());
 }
 
-// NOTE: run(Remove) for non-existent node and run(Use) for non-existent node
-// call std::process::exit(1) which would kill the test process.
-// Those error paths are tested indirectly through NodeConfigManager unit tests
-// in node_config.rs (error_on_remove_nonexistent, error_on_use_nonexistent).
+// ─── run(Remove) nonexistent node returns error ────────────────────────────
+
+#[test]
+fn run_remove_nonexistent_returns_error() {
+    let _lock = HOME_LOCK.lock().unwrap();
+    let _dir = setup_home();
+    let result = run(NodeCommands::Remove {
+        name: "ghost".to_string(),
+    });
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("ghost"),
+        "error should mention the node name, got: {err}"
+    );
+}
+
+// ─── run(Use) nonexistent node returns error ───────────────────────────────
+
+#[test]
+fn run_use_nonexistent_returns_error() {
+    let _lock = HOME_LOCK.lock().unwrap();
+    let _dir = setup_home();
+    let result = run(NodeCommands::Use {
+        name: "ghost".to_string(),
+    });
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("ghost"),
+        "error should mention the node name, got: {err}"
+    );
+}

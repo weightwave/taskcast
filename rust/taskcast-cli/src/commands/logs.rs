@@ -140,8 +140,7 @@ pub async fn run_logs(args: LogsArgs) -> Result<(), Box<dyn std::error::Error>> 
         Some(name) => match mgr.get(&name) {
             Some(entry) => entry,
             None => {
-                eprintln!("Node \"{name}\" not found");
-                std::process::exit(1);
+                return Err(format!("Node \"{name}\" not found").into());
             }
         },
         None => mgr.get_current(),
@@ -205,9 +204,7 @@ pub async fn run_logs(args: LogsArgs) -> Result<(), Box<dyn std::error::Error>> 
                 println!("{}", format_event(event_type, level, timestamp, &data, None));
             }
         },
-        Some(&mut || {
-            std::process::exit(0);
-        }),
+        None,
     )
     .await?;
 
@@ -224,8 +221,7 @@ pub async fn run_tail(args: TailArgs) -> Result<(), Box<dyn std::error::Error>> 
         Some(name) => match mgr.get(&name) {
             Some(entry) => entry,
             None => {
-                eprintln!("Node \"{name}\" not found");
-                std::process::exit(1);
+                return Err(format!("Node \"{name}\" not found").into());
             }
         },
         None => mgr.get_current(),

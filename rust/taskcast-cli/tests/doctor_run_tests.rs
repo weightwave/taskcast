@@ -101,8 +101,48 @@ async fn run_success_named_node() {
     assert!(result.is_ok());
 }
 
-// NOTE: run() with a non-existent named node calls std::process::exit(1),
-// and run() when server.ok is false also calls std::process::exit(1).
-// These error paths cannot be tested in-process without killing the test runner.
-// The underlying run_doctor() and format_doctor_result() functions are already
-// fully tested in doctor_tests.rs and inline unit tests.
+// ─── run() with non-existent named node returns error ───────────────────────
+
+#[tokio::test]
+async fn run_node_not_found_returns_error() {
+    let _lock = HOME_LOCK.lock().unwrap();
+    let _dir = setup_home();
+
+    let result = run(DoctorArgs {
+        node: Some("nonexistent".to_string()),
+    })
+    .await;
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("nonexistent"),
+        "error should mention the node name, got: {err}"
+    );
+}
+
+// ─── run() with unreachable server returns error ────────────────────────────
+
+#[tokio::test]
+async fn run_server_unreachable_returns_error() {
+    let _lock = HOME_LOCK.lock().unwrap();
+
+    let dir = setup_home();
+    let mgr = NodeConfigManager::new(dir.path().join(".taskcast"));
+    mgr.add(
+        "dead-server",
+        NodeEntry {
+            url: "http://127.0.0.1:19999".to_string(),
+            token: None,
+            token_type: None,
+        },
+    );
+    mgr.set_current("dead-server").unwrap();
+
+    let result = run(DoctorArgs { node: None }).await;
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("Server check failed"),
+        "error should indicate server failure, got: {err}"
+    );
+}

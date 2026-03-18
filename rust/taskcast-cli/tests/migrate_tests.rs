@@ -321,3 +321,50 @@ async fn migrate_run_detects_dirty_migrations() {
     );
     pool2.close().await;
 }
+
+// ─── Direct run() error path tests ──────────────────────────────────────────
+
+#[tokio::test]
+async fn migrate_run_no_url_returns_error() {
+    // No URL, no env var, no config -> should return Err
+    // Clear the env var to ensure no fallback
+    let saved = std::env::var("TASKCAST_POSTGRES_URL").ok();
+    std::env::remove_var("TASKCAST_POSTGRES_URL");
+
+    let result = migrate::run(MigrateArgs {
+        url: None,
+        config: None,
+        yes: true,
+    })
+    .await;
+
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("No Postgres URL"),
+        "error should mention missing URL, got: {err}"
+    );
+
+    // Restore env var if it was set
+    if let Some(val) = saved {
+        std::env::set_var("TASKCAST_POSTGRES_URL", val);
+    }
+}
+
+#[tokio::test]
+async fn migrate_run_bad_config_returns_error() {
+    // Point to a nonexistent config file
+    let result = migrate::run(MigrateArgs {
+        url: None,
+        config: Some("/nonexistent/config.yaml".to_string()),
+        yes: true,
+    })
+    .await;
+
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("config") || err.contains("Failed to load"),
+        "error should mention config loading failure, got: {err}"
+    );
+}

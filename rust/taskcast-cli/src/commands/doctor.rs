@@ -221,8 +221,7 @@ pub async fn run(args: DoctorArgs) -> Result<(), Box<dyn std::error::Error>> {
         match mgr.get(name) {
             Some(n) => n,
             None => {
-                eprintln!("Node \"{name}\" not found");
-                std::process::exit(1);
+                return Err(format!("Node \"{name}\" not found").into());
             }
         }
     } else {
@@ -233,7 +232,7 @@ pub async fn run(args: DoctorArgs) -> Result<(), Box<dyn std::error::Error>> {
     println!("{}", format_doctor_result(&result));
 
     if !result.server.ok {
-        std::process::exit(1);
+        return Err(format!("Server check failed: {}", result.server.error.as_deref().unwrap_or("unknown error")).into());
     }
 
     Ok(())

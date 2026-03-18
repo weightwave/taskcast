@@ -1709,3 +1709,167 @@ async fn run_tail_no_query_params() {
 
     assert_eq!(url, format!("{}/events", base_url), "URL should have no query string");
 }
+
+// ─── Direct run_logs / run_tail calls ────────────────────────────────────────
+
+use taskcast_cli::commands::logs::{run_logs, run_tail, LogsArgs, TailArgs};
+
+#[tokio::test]
+async fn run_logs_direct_call_completed_task() {
+    let _lock = HOME_MUTEX.lock().unwrap();
+    let engine = make_engine();
+    let base_url = start_server(engine.clone()).await;
+
+    let temp_dir = setup_temp_home_with_node(&base_url, "default");
+    unsafe { std::env::set_var("HOME", temp_dir.path()); }
+
+    // Create a task, publish an event, then complete it so the SSE stream ends
+    let task = engine
+        .create_task(CreateTaskInput {
+            r#type: Some("test".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    engine
+        .transition_task(&task.id, TaskStatus::Running, None)
+        .await
+        .unwrap();
+    engine
+        .publish_event(
+            &task.id,
+            PublishEventInput {
+                r#type: "test.event".to_string(),
+                level: Level::Info,
+                data: json!({"msg": "hello"}),
+                series_id: None,
+                series_mode: None,
+                series_acc_field: None,
+            },
+        )
+        .await
+        .unwrap();
+    engine
+        .transition_task(&task.id, TaskStatus::Completed, None)
+        .await
+        .unwrap();
+
+    let result = run_logs(LogsArgs {
+        task_id: task.id.clone(),
+        types: None,
+        levels: None,
+        node: None,
+    })
+    .await;
+
+    assert!(result.is_ok(), "run_logs should succeed for completed task: {:?}", result.err());
+
+    unsafe { std::env::remove_var("HOME"); }
+}
+
+#[tokio::test]
+async fn run_logs_node_not_found_returns_error() {
+    let _lock = HOME_MUTEX.lock().unwrap();
+
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let config_dir = temp_dir.path().join(".taskcast");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let _mgr = NodeConfigManager::new(config_dir);
+    unsafe { std::env::set_var("HOME", temp_dir.path()); }
+
+    let result = run_logs(LogsArgs {
+        task_id: "some-task".to_string(),
+        types: None,
+        levels: None,
+        node: Some("nonexistent".to_string()),
+    })
+    .await;
+
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("nonexistent"),
+        "error should mention the node name, got: {err}"
+    );
+
+    unsafe { std::env::remove_var("HOME"); }
+}
+
+#[tokio::test]
+async fn run_logs_with_filters() {
+    let _lock = HOME_MUTEX.lock().unwrap();
+    let engine = make_engine();
+    let base_url = start_server(engine.clone()).await;
+
+    let temp_dir = setup_temp_home_with_node(&base_url, "default");
+    unsafe { std::env::set_var("HOME", temp_dir.path()); }
+
+    let task = engine
+        .create_task(CreateTaskInput {
+            r#type: Some("test".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    engine
+        .transition_task(&task.id, TaskStatus::Running, None)
+        .await
+        .unwrap();
+    engine
+        .publish_event(
+            &task.id,
+            PublishEventInput {
+                r#type: "llm.delta".to_string(),
+                level: Level::Info,
+                data: json!({"text": "hi"}),
+                series_id: None,
+                series_mode: None,
+                series_acc_field: None,
+            },
+        )
+        .await
+        .unwrap();
+    engine
+        .transition_task(&task.id, TaskStatus::Completed, None)
+        .await
+        .unwrap();
+
+    let result = run_logs(LogsArgs {
+        task_id: task.id.clone(),
+        types: Some("llm.*".to_string()),
+        levels: Some("info".to_string()),
+        node: None,
+    })
+    .await;
+
+    assert!(result.is_ok(), "run_logs with filters should succeed: {:?}", result.err());
+
+    unsafe { std::env::remove_var("HOME"); }
+}
+
+#[tokio::test]
+async fn run_tail_node_not_found_returns_error() {
+    let _lock = HOME_MUTEX.lock().unwrap();
+
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let config_dir = temp_dir.path().join(".taskcast");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let _mgr = NodeConfigManager::new(config_dir);
+    unsafe { std::env::set_var("HOME", temp_dir.path()); }
+
+    let result = run_tail(TailArgs {
+        types: None,
+        levels: None,
+        node: Some("nonexistent".to_string()),
+    })
+    .await;
+
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("nonexistent"),
+        "error should mention the node name, got: {err}"
+    );
+
+    unsafe { std::env::remove_var("HOME"); }
+}

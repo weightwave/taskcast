@@ -65,13 +65,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             commands::playground::run(args).await?;
         }
         Some(Commands::Node { command }) => {
-            commands::node::run(command);
+            if let Err(e) = commands::node::run(command) {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
         }
         Some(Commands::Doctor(args)) => {
             commands::doctor::run(args).await?;
         }
         Some(Commands::Ping(args)) => {
-            commands::ping::run(args).await;
+            if let Err(e) = commands::ping::run(args).await {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
         }
         Some(Commands::Logs(args)) => {
             commands::logs::run_logs(args).await?;

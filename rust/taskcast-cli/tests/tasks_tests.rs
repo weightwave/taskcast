@@ -1478,3 +1478,133 @@ async fn run_inspect_http_error_path() {
 
     unsafe { std::env::remove_var("HOME"); }
 }
+
+// ─── Direct run() error path tests ──────────────────────────────────────────
+
+#[tokio::test]
+async fn run_list_node_not_found_returns_error() {
+    let _lock = HOME_MUTEX.lock().unwrap();
+
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let config_dir = temp_dir.path().join(".taskcast");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let _mgr = NodeConfigManager::new(config_dir);
+    unsafe { std::env::set_var("HOME", temp_dir.path()); }
+
+    let result = run(TasksArgs {
+        command: TasksCommands::List {
+            status: None,
+            task_type: None,
+            limit: 20,
+            node: Some("ghost".to_string()),
+        },
+    })
+    .await;
+
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("ghost"),
+        "error should mention the node name, got: {err}"
+    );
+
+    unsafe { std::env::remove_var("HOME"); }
+}
+
+#[tokio::test]
+async fn run_inspect_node_not_found_returns_error() {
+    let _lock = HOME_MUTEX.lock().unwrap();
+
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let config_dir = temp_dir.path().join(".taskcast");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let _mgr = NodeConfigManager::new(config_dir);
+    unsafe { std::env::set_var("HOME", temp_dir.path()); }
+
+    let result = run(TasksArgs {
+        command: TasksCommands::Inspect {
+            task_id: "some-task".to_string(),
+            node: Some("ghost".to_string()),
+        },
+    })
+    .await;
+
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("ghost"),
+        "error should mention the node name, got: {err}"
+    );
+
+    unsafe { std::env::remove_var("HOME"); }
+}
+
+#[tokio::test]
+async fn run_list_http_error_returns_error() {
+    let _lock = HOME_MUTEX.lock().unwrap();
+
+    // Start a mock server that returns 500 for /tasks
+    let app = axum::Router::new().route(
+        "/tasks",
+        axum::routing::get(|| async {
+            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr: std::net::SocketAddr = listener.local_addr().unwrap();
+    let mock_url = format!("http://127.0.0.1:{}", addr.port());
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let temp_dir = setup_temp_home_with_node(&mock_url, "mock-500");
+    unsafe { std::env::set_var("HOME", temp_dir.path()); }
+
+    let result = run(TasksArgs {
+        command: TasksCommands::List {
+            status: None,
+            task_type: None,
+            limit: 20,
+            node: None,
+        },
+    })
+    .await;
+
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("500"),
+        "error should contain HTTP status code 500, got: {err}"
+    );
+
+    unsafe { std::env::remove_var("HOME"); }
+}
+
+#[tokio::test]
+async fn run_inspect_http_error_returns_error() {
+    let _lock = HOME_MUTEX.lock().unwrap();
+
+    let engine = make_engine();
+    let base_url = start_server(engine.clone()).await;
+
+    let temp_dir = setup_temp_home_with_node(&base_url, "default");
+    unsafe { std::env::set_var("HOME", temp_dir.path()); }
+
+    // Inspect a nonexistent task — server returns 404
+    let result = run(TasksArgs {
+        command: TasksCommands::Inspect {
+            task_id: "nonexistent-task-id".to_string(),
+            node: None,
+        },
+    })
+    .await;
+
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("404"),
+        "error should contain HTTP status code 404, got: {err}"
+    );
+
+    unsafe { std::env::remove_var("HOME"); }
+}

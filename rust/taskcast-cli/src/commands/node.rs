@@ -51,7 +51,7 @@ fn get_config_manager() -> NodeConfigManager {
     NodeConfigManager::new(config_dir)
 }
 
-pub fn run(command: NodeCommands) {
+pub fn run(command: NodeCommands) -> Result<(), Box<dyn std::error::Error>> {
     let mgr = get_config_manager();
 
     match command {
@@ -78,24 +78,30 @@ pub fn run(command: NodeCommands) {
                 },
             );
             println!("Added node \"{name}\" -> {url}");
+            Ok(())
         }
         NodeCommands::Remove { name } => match mgr.remove(&name) {
-            Ok(()) => println!("Removed node \"{name}\""),
+            Ok(()) => {
+                println!("Removed node \"{name}\"");
+                Ok(())
+            }
             Err(e) => {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
+                Err(format!("Error: {e}").into())
             }
         },
         NodeCommands::Use { name } => match mgr.set_current(&name) {
-            Ok(()) => println!("Switched to node \"{name}\""),
+            Ok(()) => {
+                println!("Switched to node \"{name}\"");
+                Ok(())
+            }
             Err(e) => {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
+                Err(format!("Error: {e}").into())
             }
         },
         NodeCommands::List => {
             let nodes = mgr.list();
             println!("{}", format_node_list(&nodes));
+            Ok(())
         }
     }
 }

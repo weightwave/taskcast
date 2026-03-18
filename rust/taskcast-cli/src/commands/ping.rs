@@ -41,7 +41,7 @@ pub async fn ping_server(url: &str) -> PingResult {
     }
 }
 
-pub async fn run(args: PingArgs) {
+pub async fn run(args: PingArgs) -> Result<(), Box<dyn std::error::Error>> {
     let config_dir = dirs::home_dir()
         .expect("could not determine home directory")
         .join(".taskcast");
@@ -51,8 +51,7 @@ pub async fn run(args: PingArgs) {
         Some(name) => match mgr.get(&name) {
             Some(entry) => entry,
             None => {
-                eprintln!("Node \"{name}\" not found");
-                std::process::exit(1);
+                return Err(format!("Node \"{name}\" not found").into());
             }
         },
         None => mgr.get_current(),
@@ -65,13 +64,13 @@ pub async fn run(args: PingArgs) {
             node.url,
             result.latency_ms.unwrap()
         );
+        Ok(())
     } else {
-        eprintln!(
+        Err(format!(
             "FAIL — cannot reach {}: {}",
             node.url,
             result.error.unwrap()
-        );
-        std::process::exit(1);
+        ).into())
     }
 }
 

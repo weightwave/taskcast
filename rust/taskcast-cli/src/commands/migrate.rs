@@ -24,8 +24,7 @@ pub async fn run(args: MigrateArgs) -> Result<(), Box<dyn std::error::Error>> {
     let file_config = match taskcast_core::config::load_config_file(config.as_deref()) {
         Ok(cfg) => cfg,
         Err(e) => {
-            eprintln!("[taskcast] Failed to load config file: {e}");
-            std::process::exit(1);
+            return Err(format!("[taskcast] Failed to load config file: {e}").into());
         }
     };
 
@@ -44,10 +43,7 @@ pub async fn run(args: MigrateArgs) -> Result<(), Box<dyn std::error::Error>> {
     let postgres_url = match postgres_url {
         Some(u) => u,
         None => {
-            eprintln!(
-                "[taskcast] No Postgres URL found. Provide one via --url, TASKCAST_POSTGRES_URL, or config file."
-            );
-            std::process::exit(1);
+            return Err("[taskcast] No Postgres URL found. Provide one via --url, TASKCAST_POSTGRES_URL, or config file.".into());
         }
     };
 
@@ -88,12 +84,11 @@ pub async fn run(args: MigrateArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     if !dirty.is_empty() {
         let versions: Vec<String> = dirty.iter().map(|r| r.0.to_string()).collect();
-        eprintln!(
+        pool.close().await;
+        return Err(format!(
             "[taskcast] Dirty (failed) migrations found: versions {}. Fix manually before running migrations.",
             versions.join(", ")
-        );
-        pool.close().await;
-        std::process::exit(1);
+        ).into());
     }
 
     let applied: Vec<(i64,)> = sqlx::query_as(
@@ -131,11 +126,8 @@ pub async fn run(args: MigrateArgs) -> Result<(), Box<dyn std::error::Error>> {
         use std::io::IsTerminal;
         use std::io::Write;
         if !std::io::stdin().is_terminal() {
-            eprintln!(
-                "[taskcast] No TTY detected. Re-run with --yes (-y) to skip confirmation."
-            );
             pool.close().await;
-            std::process::exit(1);
+            return Err("[taskcast] No TTY detected. Re-run with --yes (-y) to skip confirmation.".into());
         }
         eprint!(
             "Apply {} migration(s) to {}? (Y/n) ",

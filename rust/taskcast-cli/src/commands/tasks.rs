@@ -182,8 +182,7 @@ async fn run_list(
         match mgr.get(name) {
             Some(n) => n,
             None => {
-                eprintln!("Node \"{name}\" not found");
-                std::process::exit(1);
+                return Err(format!("Node \"{name}\" not found").into());
             }
         }
     } else {
@@ -211,8 +210,7 @@ async fn run_list(
     if !res.status().is_success() {
         let status_code = res.status();
         let body = res.text().await.unwrap_or_default();
-        eprintln!("Error: HTTP {} — {}", status_code.as_u16(), body);
-        std::process::exit(1);
+        return Err(format!("HTTP {} — {}", status_code.as_u16(), body).into());
     }
 
     let body: ListTasksResponse = res.json().await?;
@@ -244,8 +242,7 @@ async fn run_inspect(
         match mgr.get(name) {
             Some(n) => n,
             None => {
-                eprintln!("Node \"{name}\" not found");
-                std::process::exit(1);
+                return Err(format!("Node \"{name}\" not found").into());
             }
         }
     } else {
@@ -259,8 +256,7 @@ async fn run_inspect(
     if !task_res.status().is_success() {
         let status_code = task_res.status();
         let body = task_res.text().await.unwrap_or_default();
-        eprintln!("Error: HTTP {} — {}", status_code.as_u16(), body);
-        std::process::exit(1);
+        return Err(format!("HTTP {} — {}", status_code.as_u16(), body).into());
     }
     let task: TaskDetail = task_res.json().await?;
 

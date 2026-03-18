@@ -153,22 +153,23 @@ async fn global_sse_streams_events_from_newly_created_tasks() {
     let engine = make_engine();
     let app = make_app(Arc::clone(&engine));
     let addr = serve_app(app).await;
-    let client = reqwest::Client::new();
 
+    // Connect to /events from main task
+    let client = reqwest::Client::new();
+    let mut response = client.get(format!("http://{addr}/events")).send().await.unwrap();
+    assert_eq!(response.status(), 200);
+
+    // Spawn producer
     let engine_clone = Arc::clone(&engine);
     tokio::spawn(async move {
-        // Wait for SSE connection to establish
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // Create two tasks and publish events to both
         create_task(&engine_clone, "global-sse-1").await;
-
-        // Transition to running so we can publish
         engine_clone
             .transition_task("global-sse-1", TaskStatus::Running, None)
             .await
             .unwrap();
-
         publish_event(
             &engine_clone,
             "global-sse-1",
@@ -183,7 +184,6 @@ async fn global_sse_streams_events_from_newly_created_tasks() {
             .transition_task("global-sse-2", TaskStatus::Running, None)
             .await
             .unwrap();
-
         publish_event(
             &engine_clone,
             "global-sse-2",
@@ -192,50 +192,43 @@ async fn global_sse_streams_events_from_newly_created_tasks() {
             json!({ "task": 2, "msg": "world" }),
         )
         .await;
-
-        // Small delay then complete both tasks (global SSE doesn't close on terminal,
-        // but we need to give time for events to arrive)
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     });
 
-    // Connect to global SSE
-    let response = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        client.get(format!("http://{addr}/events")).send(),
-    )
-    .await
-    .expect("connect timed out")
-    .unwrap();
-
-    assert_eq!(response.status(), 200);
-
-    // Read with a timeout — global SSE never closes, so we just read for a bit
-    let text = tokio::time::timeout(
-        std::time::Duration::from_secs(3),
-        response.text(),
-    )
-    .await;
-
-    // The timeout will fire since global SSE never closes — that's expected.
-    // We check if we got events before the timeout.
-    let text = match text {
-        Ok(Ok(t)) => t,
-        Ok(Err(e)) => panic!("reqwest error: {e}"),
-        Err(_) => {
-            // This means the stream is still open (expected for global SSE).
-            // We can't easily get partial text from reqwest — so let's use a
-            // different approach: abort the connection after collecting enough.
-            String::new()
+    // Read chunks in main task body
+    let mut collected = String::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            response.chunk(),
+        )
+        .await
+        {
+            Ok(Ok(Some(chunk))) => {
+                collected.push_str(&String::from_utf8_lossy(&chunk));
+                // Wait until we see both events
+                if collected.contains("hello") && collected.contains("world") {
+                    break;
+                }
+            }
+            Ok(Ok(None)) => break,
+            Ok(Err(_)) => break,
+            Err(_) => continue,
         }
-    };
-
-    // If we got text, verify it has the expected events
-    if !text.is_empty() {
-        assert!(
-            text.contains("event: taskcast.event"),
-            "should contain SSE event lines. Got:\n{text}"
-        );
     }
+
+    assert!(
+        collected.contains("event: taskcast.event"),
+        "should contain SSE event lines. Got:\n{collected}"
+    );
+    assert!(
+        collected.contains("hello"),
+        "should contain event from task 1. Got:\n{collected}"
+    );
+    assert!(
+        collected.contains("world"),
+        "should contain event from task 2. Got:\n{collected}"
+    );
 }
 
 #[tokio::test]
@@ -244,13 +237,15 @@ async fn global_sse_streams_events_with_task_id_in_envelope() {
     let app = make_app(Arc::clone(&engine));
     let addr = serve_app(app).await;
 
-    // Use a channel to signal when we have enough data
-    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<String>();
+    // Connect to /events from main task
+    let client = reqwest::Client::new();
+    let mut response = client.get(format!("http://{addr}/events")).send().await.unwrap();
+    assert_eq!(response.status(), 200);
 
+    // Spawn producer
     let engine_clone = Arc::clone(&engine);
     tokio::spawn(async move {
-        // Wait for SSE connection to establish
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         create_task(&engine_clone, "global-sse-envelope-1").await;
         engine_clone
@@ -266,60 +261,38 @@ async fn global_sse_streams_events_with_task_id_in_envelope() {
             json!({ "value": 42 }),
         )
         .await;
-
-        // Give time for events to flow
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     });
 
-    // Spawn SSE reader that collects events
-    let addr_clone = addr;
-    tokio::spawn(async move {
-        let client = reqwest::Client::new();
-        let mut response = client
-            .get(format!("http://{addr_clone}/events"))
-            .send()
-            .await
-            .unwrap();
-
-        let mut collected = String::new();
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
-
-        while tokio::time::Instant::now() < deadline {
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(100),
-                response.chunk(),
-            )
-            .await
-            {
-                Ok(Ok(Some(chunk))) => {
-                    collected.push_str(&String::from_utf8_lossy(&chunk));
-                    // Check if we have the progress event
-                    if collected.contains("\"value\":42") || collected.contains("\"value\": 42") {
-                        let _ = done_tx.send(collected);
-                        return;
-                    }
-                }
-                Ok(Ok(None)) => break, // Stream ended
-                Ok(Err(_)) => break,
-                Err(_) => continue, // Timeout, keep trying
-            }
-        }
-        let _ = done_tx.send(collected);
-    });
-
-    let text = tokio::time::timeout(std::time::Duration::from_secs(5), done_rx)
+    // Read chunks in main task body
+    let mut collected = String::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            response.chunk(),
+        )
         .await
-        .expect("timed out waiting for events")
-        .expect("channel closed");
+        {
+            Ok(Ok(Some(chunk))) => {
+                collected.push_str(&String::from_utf8_lossy(&chunk));
+                if collected.contains("\"value\":42") || collected.contains("\"value\": 42") {
+                    break;
+                }
+            }
+            Ok(Ok(None)) => break,
+            Ok(Err(_)) => break,
+            Err(_) => continue,
+        }
+    }
 
     // Verify the envelope contains taskId
     assert!(
-        text.contains("global-sse-envelope-1"),
-        "envelope should contain taskId. Got:\n{text}"
+        collected.contains("global-sse-envelope-1"),
+        "envelope should contain taskId. Got:\n{collected}"
     );
     assert!(
-        text.contains("event: taskcast.event"),
-        "should have SSE event type. Got:\n{text}"
+        collected.contains("event: taskcast.event"),
+        "should have SSE event type. Got:\n{collected}"
     );
 }
 
@@ -329,11 +302,19 @@ async fn global_sse_type_filter_with_wildcard() {
     let app = make_app(Arc::clone(&engine));
     let addr = serve_app(app).await;
 
-    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<String>();
+    // Connect with type filter from main task
+    let client = reqwest::Client::new();
+    let mut response = client
+        .get(format!("http://{addr}/events?types=llm.*"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
 
+    // Spawn producer
     let engine_clone = Arc::clone(&engine);
     tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         create_task(&engine_clone, "global-sse-filter-1").await;
         engine_clone
@@ -370,75 +351,55 @@ async fn global_sse_type_filter_with_wildcard() {
             json!({ "also_filtered": true }),
         )
         .await;
-
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     });
 
-    // Connect with type filter
-    let addr_clone = addr;
-    tokio::spawn(async move {
-        let client = reqwest::Client::new();
-        let mut response = client
-            .get(format!("http://{addr_clone}/events?types=llm.*"))
-            .send()
-            .await
-            .unwrap();
-
-        let mut collected = String::new();
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
-
-        while tokio::time::Instant::now() < deadline {
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(100),
-                response.chunk(),
-            )
-            .await
-            {
-                Ok(Ok(Some(chunk))) => {
-                    collected.push_str(&String::from_utf8_lossy(&chunk));
-                    if collected.contains("hello") {
-                        // Wait a bit more to ensure no additional events sneak through
-                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                        // Collect any remaining chunks
-                        while let Ok(Ok(Some(chunk))) = tokio::time::timeout(
-                            std::time::Duration::from_millis(100),
-                            response.chunk(),
-                        )
-                        .await
-                        {
-                            collected.push_str(&String::from_utf8_lossy(&chunk));
-                        }
-                        let _ = done_tx.send(collected);
-                        return;
-                    }
-                }
-                Ok(Ok(None)) => break,
-                Ok(Err(_)) => break,
-                Err(_) => continue,
-            }
-        }
-        let _ = done_tx.send(collected);
-    });
-
-    let text = tokio::time::timeout(std::time::Duration::from_secs(5), done_rx)
+    // Read chunks in main task body
+    let mut collected = String::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            response.chunk(),
+        )
         .await
-        .expect("timed out waiting for events")
-        .expect("channel closed");
+        {
+            Ok(Ok(Some(chunk))) => {
+                collected.push_str(&String::from_utf8_lossy(&chunk));
+                if collected.contains("hello") {
+                    // Wait a bit more to ensure no additional events sneak through
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    // Collect any remaining chunks
+                    while let Ok(Ok(Some(chunk))) = tokio::time::timeout(
+                        std::time::Duration::from_millis(100),
+                        response.chunk(),
+                    )
+                    .await
+                    {
+                        collected.push_str(&String::from_utf8_lossy(&chunk));
+                    }
+                    break;
+                }
+            }
+            Ok(Ok(None)) => break,
+            Ok(Err(_)) => break,
+            Err(_) => continue,
+        }
+    }
 
     // Should contain the llm.delta event
     assert!(
-        text.contains("hello"),
-        "should contain the llm.delta event data. Got:\n{text}"
+        collected.contains("hello"),
+        "should contain the llm.delta event data. Got:\n{collected}"
     );
 
     // Should NOT contain filtered-out events
     assert!(
-        !text.contains("should_be_filtered"),
-        "should not contain progress event (filtered out). Got:\n{text}"
+        !collected.contains("should_be_filtered"),
+        "should not contain progress event (filtered out). Got:\n{collected}"
     );
     assert!(
-        !text.contains("also_filtered"),
-        "should not contain log event (filtered out). Got:\n{text}"
+        !collected.contains("also_filtered"),
+        "should not contain log event (filtered out). Got:\n{collected}"
     );
 }
 
@@ -448,11 +409,19 @@ async fn global_sse_level_filter() {
     let app = make_app(Arc::clone(&engine));
     let addr = serve_app(app).await;
 
-    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<String>();
+    // Connect with level filter from main task
+    let client = reqwest::Client::new();
+    let mut response = client
+        .get(format!("http://{addr}/events?levels=warn"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
 
+    // Spawn producer
     let engine_clone = Arc::clone(&engine);
     tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         create_task(&engine_clone, "global-sse-level-1").await;
         engine_clone
@@ -479,68 +448,51 @@ async fn global_sse_level_filter() {
             json!({ "warn_event": true }),
         )
         .await;
-
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     });
 
-    let addr_clone = addr;
-    tokio::spawn(async move {
-        let client = reqwest::Client::new();
-        let mut response = client
-            .get(format!("http://{addr_clone}/events?levels=warn"))
-            .send()
-            .await
-            .unwrap();
-
-        let mut collected = String::new();
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
-
-        while tokio::time::Instant::now() < deadline {
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(100),
-                response.chunk(),
-            )
-            .await
-            {
-                Ok(Ok(Some(chunk))) => {
-                    collected.push_str(&String::from_utf8_lossy(&chunk));
-                    if collected.contains("warn_event") {
-                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                        while let Ok(Ok(Some(chunk))) = tokio::time::timeout(
-                            std::time::Duration::from_millis(100),
-                            response.chunk(),
-                        )
-                        .await
-                        {
-                            collected.push_str(&String::from_utf8_lossy(&chunk));
-                        }
-                        let _ = done_tx.send(collected);
-                        return;
-                    }
-                }
-                Ok(Ok(None)) => break,
-                Ok(Err(_)) => break,
-                Err(_) => continue,
-            }
-        }
-        let _ = done_tx.send(collected);
-    });
-
-    let text = tokio::time::timeout(std::time::Duration::from_secs(5), done_rx)
+    // Read chunks in main task body
+    let mut collected = String::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            response.chunk(),
+        )
         .await
-        .expect("timed out waiting for events")
-        .expect("channel closed");
+        {
+            Ok(Ok(Some(chunk))) => {
+                collected.push_str(&String::from_utf8_lossy(&chunk));
+                if collected.contains("warn_event") {
+                    // Wait a bit more to ensure no additional events sneak through
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    // Collect any remaining chunks
+                    while let Ok(Ok(Some(chunk))) = tokio::time::timeout(
+                        std::time::Duration::from_millis(100),
+                        response.chunk(),
+                    )
+                    .await
+                    {
+                        collected.push_str(&String::from_utf8_lossy(&chunk));
+                    }
+                    break;
+                }
+            }
+            Ok(Ok(None)) => break,
+            Ok(Err(_)) => break,
+            Err(_) => continue,
+        }
+    }
 
     // Should contain the warn event
     assert!(
-        text.contains("warn_event"),
-        "should contain the warn-level event. Got:\n{text}"
+        collected.contains("warn_event"),
+        "should contain the warn-level event. Got:\n{collected}"
     );
 
     // Should NOT contain the info event
     assert!(
-        !text.contains("info_event"),
-        "should not contain the info-level event (filtered out). Got:\n{text}"
+        !collected.contains("info_event"),
+        "should not contain the info-level event (filtered out). Got:\n{collected}"
     );
 }
 
@@ -619,12 +571,15 @@ async fn global_sse_does_not_replay_existing_tasks() {
     let app = make_app(Arc::clone(&engine));
     let addr = serve_app(app).await;
 
-    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<String>();
+    // Connect to /events from main task
+    let client = reqwest::Client::new();
+    let mut response = client.get(format!("http://{addr}/events")).send().await.unwrap();
+    assert_eq!(response.status(), 200);
 
+    // Spawn producer
     let engine_clone = Arc::clone(&engine);
     tokio::spawn(async move {
-        // Wait for SSE to connect
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // Create a NEW task after SSE connection
         create_task(&engine_clone, "post-connect-task").await;
@@ -640,68 +595,51 @@ async fn global_sse_does_not_replay_existing_tasks() {
             json!({ "post_connect": true }),
         )
         .await;
-
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     });
 
-    let addr_clone = addr;
-    tokio::spawn(async move {
-        let client = reqwest::Client::new();
-        let mut response = client
-            .get(format!("http://{addr_clone}/events"))
-            .send()
-            .await
-            .unwrap();
-
-        let mut collected = String::new();
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
-
-        while tokio::time::Instant::now() < deadline {
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(100),
-                response.chunk(),
-            )
-            .await
-            {
-                Ok(Ok(Some(chunk))) => {
-                    collected.push_str(&String::from_utf8_lossy(&chunk));
-                    if collected.contains("post_connect") {
-                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                        while let Ok(Ok(Some(chunk))) = tokio::time::timeout(
-                            std::time::Duration::from_millis(100),
-                            response.chunk(),
-                        )
-                        .await
-                        {
-                            collected.push_str(&String::from_utf8_lossy(&chunk));
-                        }
-                        let _ = done_tx.send(collected);
-                        return;
-                    }
-                }
-                Ok(Ok(None)) => break,
-                Ok(Err(_)) => break,
-                Err(_) => continue,
-            }
-        }
-        let _ = done_tx.send(collected);
-    });
-
-    let text = tokio::time::timeout(std::time::Duration::from_secs(5), done_rx)
+    // Read chunks in main task body
+    let mut collected = String::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            response.chunk(),
+        )
         .await
-        .expect("timed out waiting for events")
-        .expect("channel closed");
+        {
+            Ok(Ok(Some(chunk))) => {
+                collected.push_str(&String::from_utf8_lossy(&chunk));
+                if collected.contains("post_connect") {
+                    // Wait a bit more to ensure no pre-existing events sneak through
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    // Collect any remaining chunks
+                    while let Ok(Ok(Some(chunk))) = tokio::time::timeout(
+                        std::time::Duration::from_millis(100),
+                        response.chunk(),
+                    )
+                    .await
+                    {
+                        collected.push_str(&String::from_utf8_lossy(&chunk));
+                    }
+                    break;
+                }
+            }
+            Ok(Ok(None)) => break,
+            Ok(Err(_)) => break,
+            Err(_) => continue,
+        }
+    }
 
     // Should contain events from the post-connect task
     assert!(
-        text.contains("post_connect"),
-        "should contain events from newly created task. Got:\n{text}"
+        collected.contains("post_connect"),
+        "should contain events from newly created task. Got:\n{collected}"
     );
 
     // Should NOT contain events from the pre-existing task
     assert!(
-        !text.contains("pre_existing"),
-        "should NOT contain events from pre-existing task. Got:\n{text}"
+        !collected.contains("pre_existing"),
+        "should NOT contain events from pre-existing task. Got:\n{collected}"
     );
 }
 
