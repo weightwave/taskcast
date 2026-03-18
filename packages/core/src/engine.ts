@@ -275,6 +275,13 @@ export class TaskEngine {
       })
     }
 
+    // Clean up per-task emit chain — no more events can be published
+    // to a terminal task (publishEvent rejects), so the chain is unused.
+    // A reopened task will lazily recreate the entry on next emit.
+    if (isTerminal(to)) {
+      this._emitChains.delete(taskId)
+    }
+
     if (to === 'failed' && updated.error) {
       this.hooks?.onTaskFailed?.(updated, updated.error)
     }

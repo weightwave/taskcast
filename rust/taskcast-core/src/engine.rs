@@ -415,6 +415,14 @@ impl TaskEngine {
             .await?;
         }
 
+        // Clean up per-task emit lock — no more events can be published
+        // to a terminal task (publish_event rejects), so the lock is unused.
+        // A reopened task will lazily recreate the entry on next emit.
+        if is_terminal(&to) {
+            let mut locks = self.emit_locks.lock().unwrap();
+            locks.remove(task_id);
+        }
+
         if let Some(ref hooks) = self.hooks {
             hooks.on_task_transitioned(&updated, &from, &updated.status);
         }
