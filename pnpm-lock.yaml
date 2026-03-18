@@ -51,6 +51,9 @@ importers:
       '@taskcast/server':
         specifier: workspace:*
         version: link:../server
+      '@taskcast/server-sdk':
+        specifier: workspace:*
+        version: link:../server-sdk
       '@taskcast/sqlite':
         specifier: workspace:*
         version: link:../sqlite

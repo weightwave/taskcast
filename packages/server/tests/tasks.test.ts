@@ -195,6 +195,102 @@ describe('GET /tasks/:taskId/events/history', () => {
   })
 })
 
+describe('POST /tasks - error handling in create', () => {
+  it('returns 409 when task with same id already exists', async () => {
+    const { app } = makeApp()
+    await app.request('/tasks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: 'dup-id', type: 'test' }),
+    })
+    const res = await app.request('/tasks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: 'dup-id', type: 'test' }),
+    })
+    expect(res.status).toBe(409)
+    const body = await res.json()
+    expect(body.error).toContain('already exists')
+  })
+
+  it('returns 400 when engine throws Invalid TTL', async () => {
+    const store = new MemoryShortTermStore()
+    const broadcast = new MemoryBroadcastProvider()
+    const engine = new TaskEngine({ shortTermStore: store, broadcast })
+    const app = new Hono()
+    app.use('*', async (c, next) => {
+      const auth: AuthContext = { taskIds: '*', scope: ['*'] }
+      c.set('auth', auth)
+      await next()
+    })
+    app.route('/tasks', createTasksRouter(engine, createSubscriberCounts()))
+
+    engine.createTask = async () => {
+      throw new Error('Invalid TTL: must be positive')
+    }
+
+    const res = await app.request('/tasks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'test' }),
+    })
+    expect(res.status).toBe(400)
+    const body = await res.json()
+    expect(body.error).toContain('Invalid TTL')
+  })
+
+  it('returns 400 when engine throws Invalid cost', async () => {
+    const store = new MemoryShortTermStore()
+    const broadcast = new MemoryBroadcastProvider()
+    const engine = new TaskEngine({ shortTermStore: store, broadcast })
+    const app = new Hono()
+    app.use('*', async (c, next) => {
+      const auth: AuthContext = { taskIds: '*', scope: ['*'] }
+      c.set('auth', auth)
+      await next()
+    })
+    app.route('/tasks', createTasksRouter(engine, createSubscriberCounts()))
+
+    engine.createTask = async () => {
+      throw new Error('Invalid cost: must be non-negative')
+    }
+
+    const res = await app.request('/tasks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'test' }),
+    })
+    expect(res.status).toBe(400)
+    const body = await res.json()
+    expect(body.error).toContain('Invalid cost')
+  })
+
+  it('rethrows unknown errors from engine.createTask', async () => {
+    const store = new MemoryShortTermStore()
+    const broadcast = new MemoryBroadcastProvider()
+    const engine = new TaskEngine({ shortTermStore: store, broadcast })
+    const app = new Hono()
+    app.use('*', async (c, next) => {
+      const auth: AuthContext = { taskIds: '*', scope: ['*'] }
+      c.set('auth', auth)
+      await next()
+    })
+    app.route('/tasks', createTasksRouter(engine, createSubscriberCounts()))
+
+    engine.createTask = async () => {
+      throw new Error('unexpected internal failure')
+    }
+
+    const res = await app.request('/tasks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'test' }),
+    })
+    // Unknown errors are rethrown, Hono returns 500
+    expect(res.status).toBe(500)
+  })
+})
+
 describe('POST /tasks - worker assignment fields', () => {
   it('accepts tags, assignMode, cost, disconnectPolicy', async () => {
     const { app } = makeApp()

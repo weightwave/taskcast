@@ -55,6 +55,14 @@ impl BroadcastProvider for MemoryBroadcastProvider {
         channel: &str,
         handler: Box<dyn Fn(TaskEvent) + Send + Sync>,
     ) -> Box<dyn Fn() + Send + Sync> {
+        self.subscribe_sync(channel, handler).expect("MemoryBroadcastProvider::subscribe_sync should never fail")
+    }
+
+    fn subscribe_sync(
+        &self,
+        channel: &str,
+        handler: Box<dyn Fn(TaskEvent) + Send + Sync>,
+    ) -> Result<Box<dyn Fn() + Send + Sync>, Box<dyn std::error::Error + Send + Sync>> {
         let handler: Handler = Arc::from(handler);
         {
             let mut listeners = self.listeners.write().unwrap();
@@ -70,12 +78,12 @@ impl BroadcastProvider for MemoryBroadcastProvider {
         // This is only used for identity comparison, never dereferenced.
         let handler_addr = Arc::as_ptr(&handler) as *const () as usize;
 
-        Box::new(move || {
+        Ok(Box::new(move || {
             let mut listeners = listeners.write().unwrap();
             if let Some(handlers) = listeners.get_mut(&channel) {
                 handlers.retain(|h| (Arc::as_ptr(h) as *const () as usize) != handler_addr);
             }
-        })
+        }))
     }
 }
 

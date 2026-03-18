@@ -88,12 +88,17 @@ pub struct TaskEngineOptions {
 /// Receives the task, the old status, and the new status.
 pub type TransitionListener = Box<dyn Fn(&Task, &TaskStatus, &TaskStatus) + Send + Sync>;
 
+/// Callback signature for creation listeners.
+/// Receives the newly created task.
+pub type CreationListener = Arc<dyn Fn(&Task) + Send + Sync>;
+
 pub struct TaskEngine {
     short_term_store: Arc<dyn ShortTermStore>,
     broadcast: Arc<dyn BroadcastProvider>,
     long_term_store: Option<Arc<dyn LongTermStore>>,
     hooks: Option<Arc<dyn TaskcastHooks>>,
     transition_listeners: Mutex<Vec<TransitionListener>>,
+    creation_listeners: Mutex<Vec<CreationListener>>,
 }
 
 impl TaskEngine {
@@ -104,6 +109,7 @@ impl TaskEngine {
             long_term_store: opts.long_term_store,
             hooks: opts.hooks,
             transition_listeners: Mutex::new(Vec::new()),
+            creation_listeners: Mutex::new(Vec::new()),
         }
     }
 
@@ -111,6 +117,18 @@ impl TaskEngine {
     /// Also fires when a task is created (with from = to = Pending).
     pub fn add_transition_listener(&self, listener: TransitionListener) {
         self.transition_listeners.lock().unwrap().push(listener);
+    }
+
+    /// Register a callback that fires whenever a new task is created.
+    /// Returns the listener Arc so it can be passed to `remove_creation_listener`.
+    pub fn add_creation_listener(&self, listener: CreationListener) {
+        self.creation_listeners.lock().unwrap().push(listener);
+    }
+
+    /// Remove a previously registered creation listener by Arc identity.
+    pub fn remove_creation_listener(&self, listener: &CreationListener) {
+        let mut listeners = self.creation_listeners.lock().unwrap();
+        listeners.retain(|l| !Arc::ptr_eq(l, listener));
     }
 
     pub async fn create_task(&self, input: CreateTaskInput) -> Result<Task, EngineError> {
@@ -190,6 +208,17 @@ impl TaskEngine {
             let listeners = self.transition_listeners.lock().unwrap();
             for listener in listeners.iter() {
                 listener(&task, &TaskStatus::Pending, &TaskStatus::Pending);
+            }
+        }
+
+        // Fire creation listeners
+        // Snapshot the Arc list, drop the lock, then invoke to prevent deadlock
+        // if a listener calls add_creation_listener / remove_creation_listener.
+        {
+            let listeners: Vec<CreationListener> =
+                self.creation_listeners.lock().unwrap().clone();
+            for listener in &listeners {
+                listener(&task);
             }
         }
 
@@ -437,6 +466,18 @@ impl TaskEngine {
         handler: Box<dyn Fn(TaskEvent) + Send + Sync>,
     ) -> Box<dyn Fn() + Send + Sync> {
         self.broadcast.subscribe(task_id, handler).await
+    }
+
+    /// Synchronous version of `subscribe` for use in contexts where async
+    /// is not available (e.g., inside creation listener callbacks).
+    ///
+    /// Not all broadcast providers support this — see `BroadcastProvider::subscribe_sync`.
+    pub fn subscribe_sync(
+        &self,
+        task_id: &str,
+        handler: Box<dyn Fn(TaskEvent) + Send + Sync>,
+    ) -> Result<Box<dyn Fn() + Send + Sync>, Box<dyn std::error::Error + Send + Sync>> {
+        self.broadcast.subscribe_sync(task_id, handler)
     }
 
     /// Get the latest accumulated event for a series.

@@ -157,6 +157,11 @@ export class TaskEngine {
     this.creationListeners.push(listener)
   }
 
+  removeCreationListener(listener: CreationListener): void {
+    const idx = this.creationListeners.indexOf(listener)
+    if (idx !== -1) this.creationListeners.splice(idx, 1)
+  }
+
   async getTask(taskId: string): Promise<Task | null> {
     const fromShort = await this.shortTermStore.getTask(taskId)
     if (fromShort) return fromShort
