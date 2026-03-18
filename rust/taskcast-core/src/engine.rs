@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use tokio::sync::Mutex as TokioMutex;
+
 use crate::series::process_series;
 use serde::{Deserialize, Serialize};
 
@@ -99,6 +101,9 @@ pub struct TaskEngine {
     hooks: Option<Arc<dyn TaskcastHooks>>,
     transition_listeners: Mutex<Vec<TransitionListener>>,
     creation_listeners: Mutex<Vec<CreationListener>>,
+    /// Per-task mutex to serialize `emit` calls, ensuring events are stored
+    /// in the same order as their atomically-assigned indices.
+    emit_locks: Mutex<HashMap<String, Arc<TokioMutex<()>>>>,
 }
 
 impl TaskEngine {
@@ -110,6 +115,7 @@ impl TaskEngine {
             hooks: opts.hooks,
             transition_listeners: Mutex::new(Vec::new()),
             creation_listeners: Mutex::new(Vec::new()),
+            emit_locks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -409,6 +415,14 @@ impl TaskEngine {
             .await?;
         }
 
+        // Clean up per-task emit lock — no more events can be published
+        // to a terminal task (publish_event rejects), so the lock is unused.
+        // A reopened task will lazily recreate the entry on next emit.
+        if is_terminal(&to) {
+            let mut locks = self.emit_locks.lock().unwrap();
+            locks.remove(task_id);
+        }
+
         if let Some(ref hooks) = self.hooks {
             hooks.on_task_transitioned(&updated, &from, &updated.status);
         }
@@ -499,6 +513,18 @@ impl TaskEngine {
         task_id: &str,
         input: PublishEventInput,
     ) -> Result<TaskEvent, EngineError> {
+        // Acquire per-task lock to serialize event storage + broadcast,
+        // preventing race conditions where concurrent publishes could
+        // store events in a different order than their assigned indices.
+        let emit_lock = {
+            let mut locks = self.emit_locks.lock().unwrap();
+            locks
+                .entry(task_id.to_string())
+                .or_insert_with(|| Arc::new(TokioMutex::new(())))
+                .clone()
+        };
+        let _guard = emit_lock.lock().await;
+
         let index = self.short_term_store.next_index(task_id).await?;
         let raw = TaskEvent {
             id: ulid::Ulid::new().to_string(),

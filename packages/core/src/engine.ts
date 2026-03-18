@@ -87,6 +87,9 @@ export class TaskEngine {
   private hooks: TaskcastHooks | undefined
   private transitionListeners: TransitionListener[] = []
   private creationListeners: CreationListener[] = []
+  /** Per-task promise chain to serialize `_emit` calls, preventing race
+   *  conditions where concurrent publishes store events out of index order. */
+  private _emitChains = new Map<string, Promise<void>>()
 
   constructor(opts: TaskEngineOptions) {
     if ('shortTerm' in opts && 'shortTermStore' in opts) {
@@ -272,6 +275,13 @@ export class TaskEngine {
       })
     }
 
+    // Clean up per-task emit chain — no more events can be published
+    // to a terminal task (publishEvent rejects), so the chain is unused.
+    // A reopened task will lazily recreate the entry on next emit.
+    if (isTerminal(to)) {
+      this._emitChains.delete(taskId)
+    }
+
     if (to === 'failed' && updated.error) {
       this.hooks?.onTaskFailed?.(updated, updated.error)
     }
@@ -320,6 +330,23 @@ export class TaskEngine {
   }
 
   private async _emit(taskId: string, input: PublishEventInput): Promise<TaskEvent> {
+    // Serialize emit calls per task to prevent race conditions where
+    // concurrent publishes store events in a different order than
+    // their atomically-assigned indices.
+    const prev = this._emitChains.get(taskId) ?? Promise.resolve()
+    let release!: () => void
+    const gate = new Promise<void>((r) => { release = r })
+    this._emitChains.set(taskId, gate)
+
+    await prev
+    try {
+      return await this._emitInner(taskId, input)
+    } finally {
+      release()
+    }
+  }
+
+  private async _emitInner(taskId: string, input: PublishEventInput): Promise<TaskEvent> {
     const index = await this.shortTermStore.nextIndex(taskId)
     const raw: TaskEvent = {
       id: ulid(),
