@@ -7,9 +7,15 @@ RUST_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 ROOT_DIR="$(cd "$RUST_DIR/.." && pwd)"
 BINARY="$RUST_DIR/target/release/taskcast"
 
-echo "=== Building Rust binary ==="
-cd "$RUST_DIR"
-cargo build --release -p taskcast-cli
+# TASKCAST_PREBUILT_BINARY=1: reuse pre-built binary (set in CI where build job provides it).
+# Otherwise: always build (cargo handles incremental compilation efficiently).
+if [ "${TASKCAST_PREBUILT_BINARY:-}" = "1" ] && [ -x "$BINARY" ]; then
+    echo "=== Reusing pre-built binary: $BINARY ==="
+else
+    echo "=== Building Rust binary ==="
+    cd "$RUST_DIR"
+    cargo build --release -p taskcast-cli
+fi
 
 echo "=== Starting Rust server on port $PORT ==="
 $BINARY start --port $PORT &

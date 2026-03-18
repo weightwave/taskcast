@@ -180,3 +180,5 @@ jobs:
         run: chmod +x rust/target/release/taskcast
       - name: Run integration tests
         run: bash rust/tests/integration.sh
+        env:
+          TASKCAST_PREBUILT_BINARY: '1'
