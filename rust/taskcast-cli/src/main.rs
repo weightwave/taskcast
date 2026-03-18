@@ -2,6 +2,7 @@ mod client;
 mod commands;
 mod helpers;
 mod node_config;
+mod tty;
 
 use clap::{Parser, Subcommand};
 

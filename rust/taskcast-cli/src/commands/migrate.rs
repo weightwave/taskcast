@@ -123,25 +123,22 @@ pub async fn run(args: MigrateArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     // 7. Prompt for confirmation unless -y
     if !yes {
-        use std::io::IsTerminal;
-        use std::io::Write;
-        if !std::io::stdin().is_terminal() {
-            pool.close().await;
-            return Err("[taskcast] No TTY detected. Re-run with --yes (-y) to skip confirmation.".into());
-        }
-        eprint!(
+        let prompt = format!(
             "Apply {} migration(s) to {}? (Y/n) ",
             pending.len(),
             display_url
         );
-        std::io::stderr().flush()?;
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
-        let trimmed = input.trim().to_lowercase();
-        if !(trimmed.is_empty() || trimmed == "y" || trimmed == "yes") {
-            eprintln!("[taskcast] Migration cancelled.");
-            pool.close().await;
-            return Ok(());
+        match crate::tty::confirm_prompt(&prompt) {
+            Ok(true) => { /* proceed */ }
+            Ok(false) => {
+                eprintln!("[taskcast] Migration cancelled.");
+                pool.close().await;
+                return Ok(());
+            }
+            Err(e) => {
+                pool.close().await;
+                return Err(e);
+            }
         }
     }
 

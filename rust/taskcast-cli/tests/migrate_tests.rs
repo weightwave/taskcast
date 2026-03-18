@@ -437,3 +437,23 @@ async fn migrate_run_returns_error_on_dirty_migrations() {
         "expected dirty migration error, got: {err}"
     );
 }
+
+#[tokio::test]
+async fn migrate_run_no_tty_without_yes_returns_error() {
+    let (url, _container) = start_postgres().await;
+
+    // Without --yes, and no TTY (test environment), should return error
+    let result = migrate::run(MigrateArgs {
+        url: Some(url),
+        config: None,
+        yes: false,
+    })
+    .await;
+
+    assert!(result.is_err(), "should fail without TTY and without --yes");
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("No TTY") || err.contains("TTY"),
+        "expected TTY error, got: {err}"
+    );
+}
