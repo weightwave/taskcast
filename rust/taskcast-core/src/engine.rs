@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use tokio::sync::Mutex as TokioMutex;
+
 use crate::series::process_series;
 use serde::{Deserialize, Serialize};
 
@@ -94,6 +96,9 @@ pub struct TaskEngine {
     long_term_store: Option<Arc<dyn LongTermStore>>,
     hooks: Option<Arc<dyn TaskcastHooks>>,
     transition_listeners: Mutex<Vec<TransitionListener>>,
+    /// Per-task mutex to serialize `emit` calls, ensuring events are stored
+    /// in the same order as their atomically-assigned indices.
+    emit_locks: Mutex<HashMap<String, Arc<TokioMutex<()>>>>,
 }
 
 impl TaskEngine {
@@ -104,6 +109,7 @@ impl TaskEngine {
             long_term_store: opts.long_term_store,
             hooks: opts.hooks,
             transition_listeners: Mutex::new(Vec::new()),
+            emit_locks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -458,6 +464,18 @@ impl TaskEngine {
         task_id: &str,
         input: PublishEventInput,
     ) -> Result<TaskEvent, EngineError> {
+        // Acquire per-task lock to serialize event storage + broadcast,
+        // preventing race conditions where concurrent publishes could
+        // store events in a different order than their assigned indices.
+        let emit_lock = {
+            let mut locks = self.emit_locks.lock().unwrap();
+            locks
+                .entry(task_id.to_string())
+                .or_insert_with(|| Arc::new(TokioMutex::new(())))
+                .clone()
+        };
+        let _guard = emit_lock.lock().await;
+
         let index = self.short_term_store.next_index(task_id).await?;
         let raw = TaskEvent {
             id: ulid::Ulid::new().to_string(),
