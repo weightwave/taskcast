@@ -575,6 +575,181 @@ mod tests {
 
     // ── to_envelope ─────────────────────────────────────────────────────────
 
+    // ── parse_filter: since cursor ──────────────────────────────────────
+
+    #[test]
+    fn parse_filter_since_id_constructs_cursor() {
+        let query = SseQuery {
+            types: None,
+            levels: None,
+            include_status: None,
+            wrap: None,
+            series_format: None,
+            since_id: Some("evt_123".to_string()),
+            since_index: None,
+            since_timestamp: None,
+            limit: None,
+        };
+        let filter = parse_filter(&query);
+        let since = filter.since.unwrap();
+        assert_eq!(since.id, Some("evt_123".to_string()));
+        assert!(since.index.is_none());
+        assert!(since.timestamp.is_none());
+    }
+
+    #[test]
+    fn parse_filter_since_timestamp_constructs_cursor() {
+        let query = SseQuery {
+            types: None,
+            levels: None,
+            include_status: None,
+            wrap: None,
+            series_format: None,
+            since_id: None,
+            since_index: None,
+            since_timestamp: Some("1700000000000".to_string()),
+            limit: None,
+        };
+        let filter = parse_filter(&query);
+        let since = filter.since.unwrap();
+        assert!(since.id.is_none());
+        assert_eq!(since.timestamp, Some(1700000000000.0));
+    }
+
+    #[test]
+    fn parse_filter_since_index_only_constructs_cursor_with_index() {
+        let query = SseQuery {
+            types: None,
+            levels: None,
+            include_status: None,
+            wrap: None,
+            series_format: None,
+            since_id: None,
+            since_index: Some("42".to_string()),
+            since_timestamp: None,
+            limit: None,
+        };
+        let filter = parse_filter(&query);
+        let since = filter.since.unwrap();
+        assert!(since.id.is_none());
+        assert_eq!(since.index, Some(42));
+        assert!(since.timestamp.is_none());
+    }
+
+    #[test]
+    fn parse_filter_no_since_returns_none() {
+        let query = SseQuery {
+            types: None,
+            levels: None,
+            include_status: None,
+            wrap: None,
+            series_format: None,
+            since_id: None,
+            since_index: None,
+            since_timestamp: None,
+            limit: None,
+        };
+        let filter = parse_filter(&query);
+        assert!(filter.since.is_none());
+    }
+
+    #[test]
+    fn parse_filter_since_id_and_timestamp_combined() {
+        let query = SseQuery {
+            types: None,
+            levels: None,
+            include_status: None,
+            wrap: None,
+            series_format: None,
+            since_id: Some("evt_abc".to_string()),
+            since_index: Some("5".to_string()),
+            since_timestamp: Some("999".to_string()),
+            limit: None,
+        };
+        let filter = parse_filter(&query);
+        let since = filter.since.unwrap();
+        assert_eq!(since.id, Some("evt_abc".to_string()));
+        assert_eq!(since.index, Some(5));
+        assert_eq!(since.timestamp, Some(999.0));
+    }
+
+    // ── parse_filter: types & levels ────────────────────────────────────
+
+    #[test]
+    fn parse_filter_types_parsed_from_csv() {
+        let query = SseQuery {
+            types: Some("llm.chunk,progress".to_string()),
+            levels: None,
+            include_status: None,
+            wrap: None,
+            series_format: None,
+            since_id: None,
+            since_index: None,
+            since_timestamp: None,
+            limit: None,
+        };
+        let filter = parse_filter(&query);
+        assert_eq!(
+            filter.types,
+            Some(vec!["llm.chunk".to_string(), "progress".to_string()])
+        );
+    }
+
+    #[test]
+    fn parse_filter_levels_parsed_from_csv() {
+        let query = SseQuery {
+            types: None,
+            levels: Some("info,warn".to_string()),
+            include_status: None,
+            wrap: None,
+            series_format: None,
+            since_id: None,
+            since_index: None,
+            since_timestamp: None,
+            limit: None,
+        };
+        let filter = parse_filter(&query);
+        assert_eq!(filter.levels, Some(vec![Level::Info, Level::Warn]));
+    }
+
+    #[test]
+    fn parse_filter_include_status_and_wrap() {
+        let query = SseQuery {
+            types: None,
+            levels: None,
+            include_status: Some("false".to_string()),
+            wrap: Some("false".to_string()),
+            series_format: None,
+            since_id: None,
+            since_index: None,
+            since_timestamp: None,
+            limit: None,
+        };
+        let filter = parse_filter(&query);
+        assert_eq!(filter.include_status, Some(false));
+        assert_eq!(filter.wrap, Some(false));
+    }
+
+    #[test]
+    fn parse_filter_include_status_true_when_not_false() {
+        let query = SseQuery {
+            types: None,
+            levels: None,
+            include_status: Some("true".to_string()),
+            wrap: Some("yes".to_string()),
+            series_format: None,
+            since_id: None,
+            since_index: None,
+            since_timestamp: None,
+            limit: None,
+        };
+        let filter = parse_filter(&query);
+        assert_eq!(filter.include_status, Some(true));
+        assert_eq!(filter.wrap, Some(true));
+    }
+
+    // ── to_envelope ─────────────────────────────────────────────────────────
+
     #[test]
     fn to_envelope_includes_series_snapshot_true() {
         let event = TaskEvent {

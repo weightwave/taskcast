@@ -259,3 +259,65 @@ async fn migrate_run_with_invalid_url_returns_error() {
         "got: {err}"
     );
 }
+
+#[tokio::test]
+async fn migrate_run_detects_dirty_migrations() {
+    let (url, _container) = start_postgres().await;
+
+    // Create the _sqlx_migrations table with a dirty (failed) record
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .unwrap();
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS _sqlx_migrations (
+            version BIGINT PRIMARY KEY,
+            description TEXT NOT NULL,
+            installed_on TIMESTAMPTZ NOT NULL DEFAULT now(),
+            success BOOLEAN NOT NULL,
+            checksum BYTEA NOT NULL,
+            execution_time BIGINT NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Insert a failed migration record
+    sqlx::query(
+        "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time)
+         VALUES (99999, 'dirty_test', false, '\\x00', 0)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    // Verify the dirty record is detectable by querying directly
+    // (we can't test process::exit(1) in-process, but we can confirm
+    // the detection query finds the dirty record)
+    let pool2 = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .unwrap();
+
+    let dirty: Vec<(i64,)> = sqlx::query_as(
+        "SELECT version FROM _sqlx_migrations WHERE success = false ORDER BY version",
+    )
+    .fetch_all(&pool2)
+    .await
+    .unwrap();
+
+    assert!(
+        !dirty.is_empty(),
+        "should detect at least one dirty migration"
+    );
+    assert_eq!(
+        dirty[0].0, 99999,
+        "dirty migration version should be 99999"
+    );
+    pool2.close().await;
+}

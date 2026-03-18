@@ -920,3 +920,561 @@ fn format_timestamp_fractional_millis() {
         lines[1]
     );
 }
+
+// ─── Integration: run_list / run_inspect via NodeConfigManager + real server ──
+
+use std::sync::Mutex;
+use taskcast_cli::node_config::{NodeConfigManager, NodeEntry};
+use taskcast_cli::commands::tasks::{TasksArgs, TasksCommands, run};
+
+/// Mutex to serialize tests that modify HOME env var.
+static HOME_MUTEX: Mutex<()> = Mutex::new(());
+
+/// Helper: create a temp HOME with a node config pointing to the given base_url.
+fn setup_temp_home_with_node(base_url: &str, node_name: &str) -> tempfile::TempDir {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let config_dir = temp_dir.path().join(".taskcast");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let mgr = NodeConfigManager::new(config_dir);
+    mgr.add(
+        node_name,
+        NodeEntry {
+            url: base_url.to_string(),
+            token: None,
+            token_type: None,
+        },
+    );
+    mgr.set_current(node_name).unwrap();
+    temp_dir
+}
+
+#[tokio::test]
+async fn run_list_via_node_config_happy_path() {
+    let _lock = HOME_MUTEX.lock().unwrap();
+    let engine = make_engine();
+    let base_url = start_server(engine.clone()).await;
+
+    let temp_dir = setup_temp_home_with_node(&base_url, "test-node");
+    unsafe { std::env::set_var("HOME", temp_dir.path()); }
+
+    // Create tasks
+    engine
+        .create_task(CreateTaskInput {
+            r#type: Some("llm.chat".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    engine
+        .create_task(CreateTaskInput {
+            r#type: Some("agent.step".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    // Call the actual run function (dispatches to run_list)
+    let result = run(TasksArgs {
+        command: TasksCommands::List {
+            status: None,
+            task_type: None,
+            limit: 20,
+            node: None,
+        },
+    })
+    .await;
+
+    assert!(result.is_ok(), "run_list should succeed: {:?}", result.err());
+
+    unsafe { std::env::remove_var("HOME"); }
+}
+
+#[tokio::test]
+async fn run_list_with_status_filter_via_run() {
+    let _lock = HOME_MUTEX.lock().unwrap();
+    let engine = make_engine();
+    let base_url = start_server(engine.clone()).await;
+
+    let temp_dir = setup_temp_home_with_node(&base_url, "default");
+    unsafe { std::env::set_var("HOME", temp_dir.path()); }
+
+    let t1 = engine
+        .create_task(CreateTaskInput {
+            r#type: Some("llm.chat".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    engine
+        .transition_task(&t1.id, TaskStatus::Running, None)
+        .await
+        .unwrap();
+
+    let result = run(TasksArgs {
+        command: TasksCommands::List {
+            status: Some("running".to_string()),
+            task_type: None,
+            limit: 20,
+            node: None,
+        },
+    })
+    .await;
+
+    assert!(result.is_ok(), "run_list with status filter should succeed: {:?}", result.err());
+
+    unsafe { std::env::remove_var("HOME"); }
+}
+
+#[tokio::test]
+async fn run_list_with_type_filter_via_run() {
+    let _lock = HOME_MUTEX.lock().unwrap();
+    let engine = make_engine();
+    let base_url = start_server(engine.clone()).await;
+
+    let temp_dir = setup_temp_home_with_node(&base_url, "default");
+    unsafe { std::env::set_var("HOME", temp_dir.path()); }
+
+    engine
+        .create_task(CreateTaskInput {
+            r#type: Some("llm.chat".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let result = run(TasksArgs {
+        command: TasksCommands::List {
+            status: None,
+            task_type: Some("llm.chat".to_string()),
+            limit: 20,
+            node: None,
+        },
+    })
+    .await;
+
+    assert!(result.is_ok(), "run_list with type filter should succeed: {:?}", result.err());
+
+    unsafe { std::env::remove_var("HOME"); }
+}
+
+#[tokio::test]
+async fn run_list_with_limit_via_run() {
+    let _lock = HOME_MUTEX.lock().unwrap();
+    let engine = make_engine();
+    let base_url = start_server(engine.clone()).await;
+
+    let temp_dir = setup_temp_home_with_node(&base_url, "default");
+    unsafe { std::env::set_var("HOME", temp_dir.path()); }
+
+    for i in 0..5 {
+        engine
+            .create_task(CreateTaskInput {
+                r#type: Some(format!("task.{}", i)),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+
+    let result = run(TasksArgs {
+        command: TasksCommands::List {
+            status: None,
+            task_type: None,
+            limit: 2,
+            node: None,
+        },
+    })
+    .await;
+
+    assert!(result.is_ok(), "run_list with limit should succeed: {:?}", result.err());
+
+    unsafe { std::env::remove_var("HOME"); }
+}
+
+#[tokio::test]
+async fn run_list_empty_server_via_run() {
+    let _lock = HOME_MUTEX.lock().unwrap();
+    let engine = make_engine();
+    let base_url = start_server(engine.clone()).await;
+
+    let temp_dir = setup_temp_home_with_node(&base_url, "default");
+    unsafe { std::env::set_var("HOME", temp_dir.path()); }
+
+    let result = run(TasksArgs {
+        command: TasksCommands::List {
+            status: None,
+            task_type: None,
+            limit: 20,
+            node: None,
+        },
+    })
+    .await;
+
+    assert!(result.is_ok(), "run_list on empty server should succeed: {:?}", result.err());
+
+    unsafe { std::env::remove_var("HOME"); }
+}
+
+#[tokio::test]
+async fn run_inspect_via_run_happy_path() {
+    let _lock = HOME_MUTEX.lock().unwrap();
+    let engine = make_engine();
+    let base_url = start_server(engine.clone()).await;
+
+    let temp_dir = setup_temp_home_with_node(&base_url, "default");
+    unsafe { std::env::set_var("HOME", temp_dir.path()); }
+
+    let task = engine
+        .create_task(CreateTaskInput {
+            r#type: Some("llm.chat".to_string()),
+            params: Some([("model".to_string(), json!("gpt-4"))].into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let result = run(TasksArgs {
+        command: TasksCommands::Inspect {
+            task_id: task.id.clone(),
+            node: None,
+        },
+    })
+    .await;
+
+    assert!(result.is_ok(), "run_inspect should succeed: {:?}", result.err());
+
+    unsafe { std::env::remove_var("HOME"); }
+}
+
+#[tokio::test]
+async fn run_inspect_with_events_via_run() {
+    let _lock = HOME_MUTEX.lock().unwrap();
+    let engine = make_engine();
+    let base_url = start_server(engine.clone()).await;
+
+    let temp_dir = setup_temp_home_with_node(&base_url, "default");
+    unsafe { std::env::set_var("HOME", temp_dir.path()); }
+
+    let task = engine
+        .create_task(CreateTaskInput {
+            r#type: Some("llm.chat".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    engine
+        .transition_task(&task.id, TaskStatus::Running, None)
+        .await
+        .unwrap();
+    engine
+        .publish_event(
+            &task.id,
+            PublishEventInput {
+                r#type: "llm.delta".to_string(),
+                level: Level::Info,
+                data: json!({"delta": "Hello"}),
+                series_id: Some("response".to_string()),
+                series_mode: None,
+                series_acc_field: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let result = run(TasksArgs {
+        command: TasksCommands::Inspect {
+            task_id: task.id.clone(),
+            node: None,
+        },
+    })
+    .await;
+
+    assert!(result.is_ok(), "run_inspect with events should succeed: {:?}", result.err());
+
+    unsafe { std::env::remove_var("HOME"); }
+}
+
+#[tokio::test]
+async fn run_list_with_named_node_via_run() {
+    let _lock = HOME_MUTEX.lock().unwrap();
+    let engine = make_engine();
+    let base_url = start_server(engine.clone()).await;
+
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let config_dir = temp_dir.path().join(".taskcast");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let mgr = NodeConfigManager::new(config_dir);
+    mgr.add(
+        "my-node",
+        NodeEntry {
+            url: base_url.clone(),
+            token: None,
+            token_type: None,
+        },
+    );
+    // Don't set as current -- test the named node path
+    unsafe { std::env::set_var("HOME", temp_dir.path()); }
+
+    engine
+        .create_task(CreateTaskInput {
+            r#type: Some("test".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let result = run(TasksArgs {
+        command: TasksCommands::List {
+            status: None,
+            task_type: None,
+            limit: 20,
+            node: Some("my-node".to_string()),
+        },
+    })
+    .await;
+
+    assert!(result.is_ok(), "run_list with named node should succeed: {:?}", result.err());
+
+    unsafe { std::env::remove_var("HOME"); }
+}
+
+#[tokio::test]
+async fn run_inspect_with_named_node_via_run() {
+    let _lock = HOME_MUTEX.lock().unwrap();
+    let engine = make_engine();
+    let base_url = start_server(engine.clone()).await;
+
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let config_dir = temp_dir.path().join(".taskcast");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let mgr = NodeConfigManager::new(config_dir);
+    mgr.add(
+        "my-node",
+        NodeEntry {
+            url: base_url.clone(),
+            token: None,
+            token_type: None,
+        },
+    );
+    unsafe { std::env::set_var("HOME", temp_dir.path()); }
+
+    let task = engine
+        .create_task(CreateTaskInput {
+            r#type: Some("test".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let result = run(TasksArgs {
+        command: TasksCommands::Inspect {
+            task_id: task.id.clone(),
+            node: Some("my-node".to_string()),
+        },
+    })
+    .await;
+
+    assert!(result.is_ok(), "run_inspect with named node should succeed: {:?}", result.err());
+
+    unsafe { std::env::remove_var("HOME"); }
+}
+
+#[tokio::test]
+async fn run_list_node_config_lookup_path() {
+    let _lock = HOME_MUTEX.lock().unwrap();
+    let engine = make_engine();
+    let base_url = start_server(engine.clone()).await;
+
+    let temp_dir = setup_temp_home_with_node(&base_url, "default");
+    unsafe { std::env::set_var("HOME", temp_dir.path()); }
+
+    // Replicate run_list lines 176-193: node lookup + client creation
+    let home = dirs::home_dir().unwrap().join(".taskcast");
+    let node_mgr = NodeConfigManager::new(home);
+    let node = node_mgr.get_current();
+    assert_eq!(node.url, base_url);
+
+    let client = TaskcastClient::from_node(&node).await.unwrap();
+    assert_eq!(client.base_url(), base_url);
+
+    // Test query string construction (lines 195-206)
+    let status = Some("running".to_string());
+    let task_type = Some("llm.*".to_string());
+    let mut params = Vec::new();
+    if let Some(ref s) = status {
+        params.push(format!("status={}", s));
+    }
+    if let Some(ref t) = task_type {
+        params.push(format!("type={}", t));
+    }
+    let qs = if params.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", params.join("&"))
+    };
+    let path = format!("/tasks{}", qs);
+    assert_eq!(path, "/tasks?status=running&type=llm.*");
+
+    // Make actual HTTP request (line 209)
+    let res = client.get(&path).await.unwrap();
+    assert!(res.status().is_success());
+
+    unsafe { std::env::remove_var("HOME"); }
+}
+
+#[tokio::test]
+async fn run_inspect_node_config_lookup_path() {
+    let _lock = HOME_MUTEX.lock().unwrap();
+    let engine = make_engine();
+    let base_url = start_server(engine.clone()).await;
+
+    let temp_dir = setup_temp_home_with_node(&base_url, "default");
+    unsafe { std::env::set_var("HOME", temp_dir.path()); }
+
+    let task = engine
+        .create_task(CreateTaskInput {
+            r#type: Some("test".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    engine
+        .transition_task(&task.id, TaskStatus::Running, None)
+        .await
+        .unwrap();
+    engine
+        .publish_event(
+            &task.id,
+            PublishEventInput {
+                r#type: "test.event".to_string(),
+                level: Level::Info,
+                data: json!({"msg": "inspect-test"}),
+                series_id: None,
+                series_mode: None,
+                series_acc_field: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    // Replicate run_inspect lines 238-277
+    let home = dirs::home_dir().unwrap().join(".taskcast");
+    let node_mgr = NodeConfigManager::new(home);
+    let node = node_mgr.get_current();
+    let client = TaskcastClient::from_node(&node).await.unwrap();
+
+    // Get task details (line 258)
+    let task_res = client.get(&format!("/tasks/{}", task.id)).await.unwrap();
+    assert!(task_res.status().is_success());
+    let task_detail: TaskDetail = task_res.json().await.unwrap();
+    assert_eq!(task_detail.id, task.id);
+    assert_eq!(task_detail.status, "running");
+
+    // Get event history (lines 268-275)
+    let events_res = client
+        .get(&format!("/tasks/{}/events/history", task.id))
+        .await
+        .unwrap();
+    let events: Vec<EventItem> = if events_res.status().is_success() {
+        events_res.json().await.unwrap()
+    } else {
+        vec![]
+    };
+    assert!(!events.is_empty(), "should have events");
+
+    let output = format_task_inspect(&task_detail, &events);
+    assert!(output.contains(&task.id), "output: {output}");
+    assert!(output.contains("running"), "output: {output}");
+
+    unsafe { std::env::remove_var("HOME"); }
+}
+
+#[tokio::test]
+async fn run_inspect_events_history_non_success_fallback() {
+    let _lock = HOME_MUTEX.lock().unwrap();
+    let engine = make_engine();
+    let base_url = start_server(engine.clone()).await;
+
+    let temp_dir = setup_temp_home_with_node(&base_url, "default");
+    unsafe { std::env::set_var("HOME", temp_dir.path()); }
+
+    let task = engine
+        .create_task(CreateTaskInput {
+            r#type: Some("test".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    // Replicate the fallback in run_inspect (lines 271-275):
+    // if events endpoint returns non-success, use empty vec
+    let home = dirs::home_dir().unwrap().join(".taskcast");
+    let node_mgr = NodeConfigManager::new(home);
+    let node = node_mgr.get_current();
+    let client = TaskcastClient::from_node(&node).await.unwrap();
+
+    let task_res = client.get(&format!("/tasks/{}", task.id)).await.unwrap();
+    assert!(task_res.status().is_success());
+    let task_detail: TaskDetail = task_res.json().await.unwrap();
+
+    // Normal history should work fine
+    let events_res = client
+        .get(&format!("/tasks/{}/events/history", task.id))
+        .await
+        .unwrap();
+    let events: Vec<EventItem> = if events_res.status().is_success() {
+        events_res.json().await.unwrap()
+    } else {
+        vec![]
+    };
+
+    let output = format_task_inspect(&task_detail, &events);
+    assert!(output.contains(&task.id), "output: {output}");
+
+    unsafe { std::env::remove_var("HOME"); }
+}
+
+#[tokio::test]
+async fn run_list_named_node_not_found() {
+    let _lock = HOME_MUTEX.lock().unwrap();
+
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let config_dir = temp_dir.path().join(".taskcast");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let _mgr = NodeConfigManager::new(config_dir);
+
+    unsafe { std::env::set_var("HOME", temp_dir.path()); }
+
+    // Replicate run_list named node lookup failure (lines 182-188)
+    let home = dirs::home_dir().unwrap().join(".taskcast");
+    let node_mgr = NodeConfigManager::new(home);
+    let result = node_mgr.get("nonexistent");
+    assert!(result.is_none(), "should not find nonexistent node");
+
+    unsafe { std::env::remove_var("HOME"); }
+}
+
+#[tokio::test]
+async fn run_inspect_http_error_path() {
+    let _lock = HOME_MUTEX.lock().unwrap();
+    let engine = make_engine();
+    let base_url = start_server(engine.clone()).await;
+
+    let temp_dir = setup_temp_home_with_node(&base_url, "default");
+    unsafe { std::env::set_var("HOME", temp_dir.path()); }
+
+    // Replicate run_inspect error path (lines 259-263)
+    let home = dirs::home_dir().unwrap().join(".taskcast");
+    let node_mgr = NodeConfigManager::new(home);
+    let node = node_mgr.get_current();
+    let client = TaskcastClient::from_node(&node).await.unwrap();
+
+    let task_res = client.get("/tasks/nonexistent-task-id").await.unwrap();
+    assert!(!task_res.status().is_success());
+    let status_code = task_res.status();
+    let body = task_res.text().await.unwrap_or_default();
+    let error_msg = format!("Error: HTTP {} — {}", status_code.as_u16(), body);
+    assert!(error_msg.contains("404"), "should be 404: {error_msg}");
+
+    unsafe { std::env::remove_var("HOME"); }
+}

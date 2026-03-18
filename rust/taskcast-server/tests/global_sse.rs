@@ -705,6 +705,62 @@ async fn global_sse_does_not_replay_existing_tasks() {
     );
 }
 
+// ─── Global SSE 501 when subscribe_sync is unsupported ───────────────────────
+
+/// A broadcast provider that does NOT implement subscribe_sync (uses the default
+/// trait method which returns Err), used to test the 501 error path.
+struct NoSyncBroadcastProvider;
+
+#[async_trait::async_trait]
+impl taskcast_core::BroadcastProvider for NoSyncBroadcastProvider {
+    async fn publish(
+        &self,
+        _channel: &str,
+        _event: taskcast_core::TaskEvent,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
+
+    async fn subscribe(
+        &self,
+        _channel: &str,
+        _handler: Box<dyn Fn(taskcast_core::TaskEvent) + Send + Sync>,
+    ) -> Box<dyn Fn() + Send + Sync> {
+        Box::new(|| {})
+    }
+    // subscribe_sync intentionally NOT overridden — uses default Err
+}
+
+#[tokio::test]
+async fn global_sse_returns_501_when_subscribe_sync_unsupported() {
+    let engine = Arc::new(TaskEngine::new(TaskEngineOptions {
+        short_term_store: Arc::new(MemoryShortTermStore::new()),
+        broadcast: Arc::new(NoSyncBroadcastProvider),
+        long_term_store: None,
+        hooks: None,
+    }));
+    let app = make_app(Arc::clone(&engine));
+    let addr = serve_app(app).await;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .get(format!("http://{addr}/events"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        501,
+        "should return 501 when subscribe_sync is not supported"
+    );
+    let body = response.text().await.unwrap();
+    assert!(
+        body.contains("not supported"),
+        "response should mention unsupported. Got: {body}"
+    );
+}
+
 // ─── Engine-level creation listener tests ───────────────────────────────────
 
 #[tokio::test]
