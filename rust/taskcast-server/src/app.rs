@@ -1,5 +1,7 @@
 use std::sync::Arc;
+use std::time::Instant;
 
+use axum::extract::State as AxumState;
 use axum::middleware;
 use axum::response::IntoResponse;
 use axum::routing::{get, patch, post};
@@ -28,6 +30,8 @@ use crate::routes::{admin, sse, tasks};
 pub struct AppState {
     pub engine: Arc<TaskEngine>,
     pub auth_mode: Arc<AuthMode>,
+    pub start_time: Instant,
+    pub config: Option<Arc<TaskcastConfig>>,
 }
 
 /// Create the Axum router with all taskcast routes mounted.
@@ -56,6 +60,13 @@ pub fn create_app(
     let auth_mode = Arc::new(auth_mode);
     let subscriber_counts = create_subscriber_counts();
 
+    let app_state = AppState {
+        engine: Arc::clone(&engine),
+        auth_mode: Arc::clone(&auth_mode),
+        start_time: Instant::now(),
+        config: config.as_ref().map(|c| Arc::new(c.clone())),
+    };
+
     let task_routes = Router::new()
         .route("/", get(tasks::list_tasks).post(tasks::create_task))
         .route("/{task_id}", get(tasks::get_task))
@@ -70,9 +81,19 @@ pub fn create_app(
         .layer(Extension(subscriber_counts))
         .with_state(Arc::clone(&engine));
 
-    let mut app = Router::new()
+    let events_route = Router::new()
+        .route("/events", get(sse::global_sse_events))
+        .with_state(Arc::clone(&engine));
+
+    // Public routes bypass auth (health endpoints)
+    let public_routes = Router::new()
         .route("/health", get(health))
-        .nest("/tasks", task_routes);
+        .route("/health/detail", get(health_detail).with_state(app_state));
+
+    // Authenticated routes (tasks, events, workers, etc.)
+    let mut authenticated_routes = Router::new()
+        .nest("/tasks", task_routes)
+        .merge(events_route);
 
     // Conditionally mount worker routes if a WorkerManager is provided
     let mut ws_registry_out: Option<WsRegistry> = None;
@@ -132,7 +153,7 @@ pub fn create_app(
             .with_state(Arc::clone(&manager));
 
         // Mount WS route at top level for /workers/ws (with registry)
-        app = app
+        authenticated_routes = authenticated_routes
             .route(
                 "/workers/ws",
                 get(crate::routes::worker_ws::ws_handler)
@@ -145,7 +166,7 @@ pub fn create_app(
 
     // OpenAPI spec and Scalar UI
     let openapi_spec = ApiDoc::openapi();
-    app = app
+    authenticated_routes = authenticated_routes
         .route(
             "/openapi.json",
             get({
@@ -155,16 +176,19 @@ pub fn create_app(
         )
         .merge(Scalar::with_url("/docs", openapi_spec));
 
-    // Auth middleware must be applied AFTER routes are mounted but BEFORE
-    // admin routes are merged, so admin routes bypass auth.
-    let app_with_auth = app.layer(middleware::from_fn_with_state(
+    // Auth middleware is applied only to authenticated routes, so health
+    // endpoints (public_routes) bypass auth — matching the TS implementation.
+    let authenticated_with_auth = authenticated_routes.layer(middleware::from_fn_with_state(
         Arc::clone(&auth_mode),
         auth_middleware,
     ));
 
+    // Merge public (no auth) + authenticated (with auth)
+    let mut app = public_routes.merge(authenticated_with_auth);
+
     // Admin route is merged AFTER the auth layer so it bypasses JWT/custom auth.
     // It authenticates via admin token independently.
-    let final_app = if let Some(cfg) = config {
+    if let Some(cfg) = config {
         let admin_state = Arc::new(admin::AdminState {
             config: Arc::new(cfg),
             auth_mode: Arc::clone(&auth_mode),
@@ -172,29 +196,64 @@ pub fn create_app(
         let admin_routes = Router::new()
             .route("/admin/token", post(admin::admin_token))
             .with_state(admin_state);
-        app_with_auth.merge(admin_routes)
-    } else {
-        app_with_auth
-    };
+        app = app.merge(admin_routes);
+    }
 
     // Apply CORS layer
-    let final_app = match cors_config {
-        CorsConfig::Disabled => final_app,
-        CorsConfig::AllowAll => final_app.layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any)),
+    let app = match cors_config {
+        CorsConfig::Disabled => app,
+        CorsConfig::AllowAll => app.layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any)),
         CorsConfig::AllowOrigins(origins) => {
             let origins: Vec<_> = origins
                 .iter()
                 .filter_map(|o| o.parse().ok())
                 .collect();
-            final_app.layer(CorsLayer::new().allow_origin(origins).allow_methods(Any).allow_headers(Any))
+            app.layer(CorsLayer::new().allow_origin(origins).allow_methods(Any).allow_headers(Any))
         }
     };
 
-    (final_app, ws_registry_out)
+    (app, ws_registry_out)
 }
 
 async fn health() -> impl IntoResponse {
     axum::Json(serde_json::json!({ "ok": true }))
+}
+
+async fn health_detail(AxumState(state): AxumState<AppState>) -> impl IntoResponse {
+    let uptime = state.start_time.elapsed().as_secs();
+    let auth_mode_str = match state.auth_mode.as_ref() {
+        AuthMode::None => "none",
+        AuthMode::Jwt(_) => "jwt",
+    };
+
+    let mut adapters = serde_json::json!({
+        "broadcast": { "provider": "memory", "status": "ok" },
+        "shortTermStore": { "provider": "memory", "status": "ok" }
+    });
+
+    if let Some(ref config) = state.config {
+        if let Some(ref adp) = config.adapters {
+            if let Some(ref b) = adp.broadcast {
+                adapters["broadcast"]["provider"] = serde_json::json!(b.provider);
+            }
+            if let Some(ref s) = adp.short_term_store {
+                adapters["shortTermStore"]["provider"] = serde_json::json!(s.provider);
+            }
+            if let Some(ref l) = adp.long_term_store {
+                adapters["longTermStore"] = serde_json::json!({
+                    "provider": l.provider,
+                    "status": "ok"
+                });
+            }
+        }
+    }
+
+    axum::Json(serde_json::json!({
+        "ok": true,
+        "uptime": uptime,
+        "auth": { "mode": auth_mode_str },
+        "adapters": adapters
+    }))
 }
 
 // ─── Extracted dispatch helpers (testable without closures) ─────────────────

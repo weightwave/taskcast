@@ -11,8 +11,8 @@ use tokio::sync::Mutex;
 use tokio_stream::wrappers::ReceiverStream;
 
 use taskcast_core::{
-    apply_filtered_index, matches_filter, EventQueryOptions, Level, SSEEnvelope, SeriesFormat,
-    SinceCursor, SubscribeFilter, TaskEngine, TaskEvent, TaskStatus,
+    apply_filtered_index, matches_filter, matches_type, CreationListener, EventQueryOptions, Level,
+    SSEEnvelope, SeriesFormat, SinceCursor, SubscribeFilter, TaskEngine, TaskEvent, TaskStatus,
 };
 
 use crate::auth::{check_scope, AuthContext};
@@ -353,6 +353,148 @@ pub async fn sse_events(
     Ok(Sse::new(stream))
 }
 
+// ─── Global SSE Query Parameters ────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub struct GlobalSseQuery {
+    pub types: Option<String>,
+    pub levels: Option<String>,
+}
+
+// ─── Global SSE Handler ─────────────────────────────────────────────────────
+
+#[utoipa::path(
+    get,
+    path = "/events",
+    tag = "Events",
+    summary = "Subscribe to events from all tasks via SSE",
+    description = "Global SSE stream. Streams events from all tasks created after the connection is established. Runs indefinitely until client disconnects.",
+    security(("Bearer" = [])),
+    params(GlobalSseQuery),
+    responses(
+        (status = 200, description = "SSE event stream (text/event-stream)"),
+        (status = 403, description = "Forbidden"),
+        (status = 501, description = "Global SSE not supported with this broadcast provider"),
+    )
+)]
+pub async fn global_sse_events(
+    State(engine): State<Arc<TaskEngine>>,
+    Extension(auth): Extension<AuthContext>,
+    Query(query): Query<GlobalSseQuery>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
+    if !check_scope(
+        &auth,
+        taskcast_core::PermissionScope::EventSubscribe,
+        None,
+    ) {
+        return Err(AppError::Forbidden);
+    }
+
+    let types: Option<Vec<String>> = query
+        .types
+        .as_ref()
+        .map(|t| t.split(',').filter(|s| !s.is_empty()).map(String::from).collect());
+    let levels: Option<Vec<Level>> = query.levels.as_ref().map(|l| {
+        l.split(',')
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| serde_json::from_value(serde_json::Value::String(s.to_string())).ok())
+            .collect()
+    });
+
+    // Probe whether the broadcast provider supports subscribe_sync.
+    // If it doesn't, return 501 immediately instead of panicking later
+    // when a task is created and the creation listener fires.
+    {
+        let probe = engine.subscribe_sync("__probe__", Box::new(|_| {}));
+        match probe {
+            Ok(unsub) => unsub(), // clean up probe subscription
+            Err(_) => {
+                return Err(AppError::NotImplemented(
+                    "Global SSE not supported with this broadcast provider".to_string(),
+                ));
+            }
+        }
+    }
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(256);
+
+    // Collect all per-task unsubscribe functions for cleanup on disconnect.
+    type UnsubList = Vec<Box<dyn Fn() + Send + Sync>>;
+    let unsubscribes: Arc<std::sync::Mutex<UnsubList>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let tx_for_listener = tx.clone();
+    let types_for_listener = types;
+    let levels_for_listener = levels;
+    let engine_for_listener = Arc::clone(&engine);
+    let unsubs_for_listener = Arc::clone(&unsubscribes);
+
+    // The creation listener subscribes to each new task's events synchronously
+    // using `subscribe_sync`. This is critical: if we used the async `subscribe`
+    // (via tokio::spawn), there would be a race condition — events published
+    // right after task creation could be missed before the subscription is
+    // established, especially on single-threaded runtimes where the spawned
+    // task may not get scheduled in time.
+    let creation_listener: CreationListener = Arc::new(move |task| {
+        let tx_for_sub = tx_for_listener.clone();
+        let types_for_sub = types_for_listener.clone();
+        let levels_for_sub = levels_for_listener.clone();
+
+        let unsub = match engine_for_listener.subscribe_sync(
+            &task.id,
+            Box::new(move |event| {
+                // Apply type filter
+                if let Some(ref type_patterns) = types_for_sub {
+                    if !matches_type(&event.r#type, Some(type_patterns)) {
+                        return;
+                    }
+                }
+
+                // Apply level filter
+                if let Some(ref level_list) = levels_for_sub {
+                    if !level_list.contains(&event.level) {
+                        return;
+                    }
+                }
+
+                let envelope = to_envelope(&event, 0);
+                let payload = serde_json::to_value(envelope).unwrap();
+                let sse_event = Event::default()
+                    .event("taskcast.event")
+                    .data(serde_json::to_string(&payload).unwrap())
+                    .id(event.id.clone());
+                let _ = tx_for_sub.try_send(Ok(sse_event));
+            }),
+        ) {
+            Ok(unsub) => unsub,
+            Err(_) => return, // provider doesn't support subscribe_sync; skip
+        };
+
+        unsubs_for_listener.lock().unwrap().push(unsub);
+    });
+
+    engine.add_creation_listener(creation_listener.clone());
+
+    // Spawn a cleanup task that waits for client disconnect
+    tokio::spawn(async move {
+        // Wait for client disconnect (rx is dropped when the SSE stream ends)
+        tx.closed().await;
+
+        // Cleanup: remove creation listener and all per-task subscriptions
+        engine.remove_creation_listener(&creation_listener);
+        let unsubs = {
+            let mut guard = unsubscribes.lock().unwrap();
+            std::mem::take(&mut *guard)
+        };
+        for unsub in unsubs {
+            unsub();
+        }
+    });
+
+    let stream = ReceiverStream::new(rx);
+    Ok(Sse::new(stream))
+}
+
 // ─── Unit Tests ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -429,6 +571,181 @@ mod tests {
         };
         let filter = parse_filter(&query);
         assert_eq!(filter.series_format, None);
+    }
+
+    // ── to_envelope ─────────────────────────────────────────────────────────
+
+    // ── parse_filter: since cursor ──────────────────────────────────────
+
+    #[test]
+    fn parse_filter_since_id_constructs_cursor() {
+        let query = SseQuery {
+            types: None,
+            levels: None,
+            include_status: None,
+            wrap: None,
+            series_format: None,
+            since_id: Some("evt_123".to_string()),
+            since_index: None,
+            since_timestamp: None,
+            limit: None,
+        };
+        let filter = parse_filter(&query);
+        let since = filter.since.unwrap();
+        assert_eq!(since.id, Some("evt_123".to_string()));
+        assert!(since.index.is_none());
+        assert!(since.timestamp.is_none());
+    }
+
+    #[test]
+    fn parse_filter_since_timestamp_constructs_cursor() {
+        let query = SseQuery {
+            types: None,
+            levels: None,
+            include_status: None,
+            wrap: None,
+            series_format: None,
+            since_id: None,
+            since_index: None,
+            since_timestamp: Some("1700000000000".to_string()),
+            limit: None,
+        };
+        let filter = parse_filter(&query);
+        let since = filter.since.unwrap();
+        assert!(since.id.is_none());
+        assert_eq!(since.timestamp, Some(1700000000000.0));
+    }
+
+    #[test]
+    fn parse_filter_since_index_only_constructs_cursor_with_index() {
+        let query = SseQuery {
+            types: None,
+            levels: None,
+            include_status: None,
+            wrap: None,
+            series_format: None,
+            since_id: None,
+            since_index: Some("42".to_string()),
+            since_timestamp: None,
+            limit: None,
+        };
+        let filter = parse_filter(&query);
+        let since = filter.since.unwrap();
+        assert!(since.id.is_none());
+        assert_eq!(since.index, Some(42));
+        assert!(since.timestamp.is_none());
+    }
+
+    #[test]
+    fn parse_filter_no_since_returns_none() {
+        let query = SseQuery {
+            types: None,
+            levels: None,
+            include_status: None,
+            wrap: None,
+            series_format: None,
+            since_id: None,
+            since_index: None,
+            since_timestamp: None,
+            limit: None,
+        };
+        let filter = parse_filter(&query);
+        assert!(filter.since.is_none());
+    }
+
+    #[test]
+    fn parse_filter_since_id_and_timestamp_combined() {
+        let query = SseQuery {
+            types: None,
+            levels: None,
+            include_status: None,
+            wrap: None,
+            series_format: None,
+            since_id: Some("evt_abc".to_string()),
+            since_index: Some("5".to_string()),
+            since_timestamp: Some("999".to_string()),
+            limit: None,
+        };
+        let filter = parse_filter(&query);
+        let since = filter.since.unwrap();
+        assert_eq!(since.id, Some("evt_abc".to_string()));
+        assert_eq!(since.index, Some(5));
+        assert_eq!(since.timestamp, Some(999.0));
+    }
+
+    // ── parse_filter: types & levels ────────────────────────────────────
+
+    #[test]
+    fn parse_filter_types_parsed_from_csv() {
+        let query = SseQuery {
+            types: Some("llm.chunk,progress".to_string()),
+            levels: None,
+            include_status: None,
+            wrap: None,
+            series_format: None,
+            since_id: None,
+            since_index: None,
+            since_timestamp: None,
+            limit: None,
+        };
+        let filter = parse_filter(&query);
+        assert_eq!(
+            filter.types,
+            Some(vec!["llm.chunk".to_string(), "progress".to_string()])
+        );
+    }
+
+    #[test]
+    fn parse_filter_levels_parsed_from_csv() {
+        let query = SseQuery {
+            types: None,
+            levels: Some("info,warn".to_string()),
+            include_status: None,
+            wrap: None,
+            series_format: None,
+            since_id: None,
+            since_index: None,
+            since_timestamp: None,
+            limit: None,
+        };
+        let filter = parse_filter(&query);
+        assert_eq!(filter.levels, Some(vec![Level::Info, Level::Warn]));
+    }
+
+    #[test]
+    fn parse_filter_include_status_and_wrap() {
+        let query = SseQuery {
+            types: None,
+            levels: None,
+            include_status: Some("false".to_string()),
+            wrap: Some("false".to_string()),
+            series_format: None,
+            since_id: None,
+            since_index: None,
+            since_timestamp: None,
+            limit: None,
+        };
+        let filter = parse_filter(&query);
+        assert_eq!(filter.include_status, Some(false));
+        assert_eq!(filter.wrap, Some(false));
+    }
+
+    #[test]
+    fn parse_filter_include_status_true_when_not_false() {
+        let query = SseQuery {
+            types: None,
+            levels: None,
+            include_status: Some("true".to_string()),
+            wrap: Some("yes".to_string()),
+            series_format: None,
+            since_id: None,
+            since_index: None,
+            since_timestamp: None,
+            limit: None,
+        };
+        let filter = parse_filter(&query);
+        assert_eq!(filter.include_status, Some(true));
+        assert_eq!(filter.wrap, Some(true));
     }
 
     // ── to_envelope ─────────────────────────────────────────────────────────

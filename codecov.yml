@@ -6,3 +6,4 @@ coverage:
 
 ignore:
   - "rust/taskcast-cli/src/main.rs"
+  - "rust/taskcast-cli/src/tty.rs"

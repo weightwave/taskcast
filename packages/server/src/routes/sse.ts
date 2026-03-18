@@ -2,10 +2,10 @@ import type { Hono } from 'hono'
 import { OpenAPIHono, createRoute, z } from '@hono/zod-openapi'
 import type { Context } from 'hono'
 import { streamSSE } from 'hono/streaming'
-import { applyFilteredIndex, matchesFilter, TERMINAL_STATUSES, collapseAccumulateSeries } from '@taskcast/core'
+import { applyFilteredIndex, matchesFilter, matchesType, TERMINAL_STATUSES, collapseAccumulateSeries } from '@taskcast/core'
 import { checkScope } from '../auth.js'
 import { ErrorSchema } from '../schemas.js'
-import type { TaskEngine, TaskEvent, SubscribeFilter, SSEEnvelope, Level } from '@taskcast/core'
+import type { TaskEngine, TaskEvent, Task, SubscribeFilter, SSEEnvelope, Level } from '@taskcast/core'
 
 // ─── Subscriber Tracking ─────────────────────────────────────────────────────
 
@@ -247,6 +247,92 @@ export function createSSERouter(engine: TaskEngine, subscriberCounts: Subscriber
           resolve()
         })
       })
+    })
+  })
+
+  return router as unknown as Hono
+}
+
+// ─── Global SSE Route ─────────────────────────────────────────────────────
+
+const globalSSERoute = createRoute({
+  method: 'get',
+  path: '/',
+  tags: ['Events'],
+  summary: 'Subscribe to events from all tasks via SSE',
+  description: 'Global SSE stream. Streams events from all tasks created after the connection is established. Runs indefinitely until client disconnects.',
+  security: [{ Bearer: [] }],
+  request: {
+    query: z.object({
+      types: z.string().optional().openapi({ description: 'Comma-separated type filter with wildcard support' }),
+      levels: z.string().optional().openapi({ description: 'Comma-separated level filter' }),
+    }),
+  },
+  responses: {
+    200: { description: 'SSE event stream (text/event-stream)' },
+    403: { description: 'Forbidden', content: { 'application/json': { schema: ErrorSchema } } },
+  },
+})
+
+export function createGlobalSSERoute(engine: TaskEngine): Hono {
+  const router = new OpenAPIHono()
+  const register = router.openapi.bind(router) as OpenAPIRegister
+
+  register(globalSSERoute, async (c) => {
+    const auth = c.get('auth')
+    if (!checkScope(auth, 'event:subscribe')) return c.json({ error: 'Forbidden' }, 403)
+
+    const typesParam = c.req.query('types')
+    const levelsParam = c.req.query('levels')
+    const types = typesParam ? typesParam.split(',').filter(Boolean) : undefined
+    const levels = levelsParam ? levelsParam.split(',').filter(Boolean) as Level[] : undefined
+
+    return streamSSE(c, async (stream) => {
+      const unsubscribes: Array<() => void> = []
+      let closed = false
+
+      const creationListener = (task: Task) => {
+        const unsub = engine.subscribe(task.id, (event: TaskEvent) => {
+          if (closed) return
+          if (types && !matchesType(event.type, types)) return
+          if (levels && !levels.includes(event.level as Level)) return
+
+          const envelope: SSEEnvelope = {
+            filteredIndex: 0,
+            rawIndex: event.index,
+            eventId: event.id,
+            taskId: event.taskId,
+            type: event.type,
+            timestamp: event.timestamp,
+            level: event.level,
+            data: event.data,
+          }
+          if (event.seriesId !== undefined) envelope.seriesId = event.seriesId
+          if (event.seriesMode !== undefined) envelope.seriesMode = event.seriesMode
+          if (event.seriesAccField !== undefined) envelope.seriesAccField = event.seriesAccField
+
+          stream.writeSSE({
+            event: 'taskcast.event',
+            data: JSON.stringify(envelope),
+            id: event.id,
+          }).catch(() => { /* stream may have closed */ })
+        })
+        unsubscribes.push(unsub)
+      }
+
+      engine.addCreationListener(creationListener)
+
+      stream.onAbort(() => {
+        closed = true
+        for (const unsub of unsubscribes) unsub()
+        engine.removeCreationListener(creationListener)
+      })
+
+      // Keep alive — send comment periodically to detect client disconnection
+      while (!closed) {
+        await stream.write(':keepalive\n\n')
+        await new Promise((r) => setTimeout(r, 30000))
+      }
     })
   })
 

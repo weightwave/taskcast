@@ -1,7 +1,8 @@
 export { createAuthMiddleware, checkScope } from './auth.js'
+export { createVerboseLogger } from './middleware/verbose-logger.js'
 export type { AuthConfig, AuthContext, JWTConfig } from './auth.js'
 export { createTasksRouter } from './routes/tasks.js'
-export { createSSERouter, createSubscriberCounts, getSubscriberCount } from './routes/sse.js'
+export { createSSERouter, createGlobalSSERoute, createSubscriberCounts, getSubscriberCount } from './routes/sse.js'
 export type { SubscriberCounts } from './routes/sse.js'
 export { createWorkersRouter, WorkerWSHandler, WorkerWSRegistry } from './routes/workers.js'
 export type { WSLike, TaskSummary } from './routes/workers.js'
@@ -19,10 +20,11 @@ import { cors } from 'hono/cors'
 import { apiReference } from '@scalar/hono-api-reference'
 import { createAuthMiddleware } from './auth.js'
 import { createTasksRouter } from './routes/tasks.js'
-import { createSSERouter, createSubscriberCounts } from './routes/sse.js'
+import { createSSERouter, createGlobalSSERoute, createSubscriberCounts } from './routes/sse.js'
 import { createWorkersRouter } from './routes/workers.js'
 import { WorkerWSRegistry } from './routes/worker-ws.js'
 import { createAdminRouter } from './routes/admin.js'
+import { createVerboseLogger } from './middleware/verbose-logger.js'
 import type { AuthConfig } from './auth.js'
 import { isTerminal, matchesWorkerRule } from '@taskcast/core'
 import type {
@@ -42,6 +44,10 @@ export interface TaskcastServerOptions {
   shortTermStore?: ShortTermStore
   auth?: AuthConfig
   config?: TaskcastConfig
+  /** Enable verbose HTTP request logging to stdout. */
+  verbose?: boolean
+  /** Custom logger function for verbose mode (defaults to console.log). Useful for testing. */
+  verboseLogger?: (line: string) => void
   cors?: boolean | { origin: string | string[] }
   scheduler?: {
     enabled?: boolean
@@ -72,7 +78,13 @@ export interface TaskcastApp {
  * clean up scheduler/heartbeat timers.
  */
 export function createTaskcastApp(opts: TaskcastServerOptions): TaskcastApp {
+  const startTime = Date.now()
   const app = new OpenAPIHono()
+
+  // Apply verbose logger before all routes when enabled
+  if (opts.verbose) {
+    app.use('*', createVerboseLogger(opts.verboseLogger))
+  }
 
   // CORS middleware
   if (opts.cors) {
@@ -81,6 +93,30 @@ export function createTaskcastApp(opts: TaskcastServerOptions): TaskcastApp {
   }
 
   app.get('/health', (c) => c.json({ ok: true }))
+
+  app.get('/health/detail', (c) => {
+    const uptime = Math.floor((Date.now() - startTime) / 1000)
+    const authMode = opts.auth?.mode ?? 'none'
+    const broadcastProvider = opts.config?.adapters?.broadcast?.provider ?? 'memory'
+    const shortTermProvider = opts.config?.adapters?.shortTermStore?.provider ?? 'memory'
+    const longTermProvider = opts.config?.adapters?.longTermStore?.provider
+
+    const adapters: Record<string, { provider: string; status: string }> = {
+      broadcast: { provider: broadcastProvider, status: 'ok' },
+      shortTermStore: { provider: shortTermProvider, status: 'ok' },
+    }
+
+    if (longTermProvider) {
+      adapters.longTermStore = { provider: longTermProvider, status: 'ok' }
+    }
+
+    return c.json({
+      ok: true,
+      uptime,
+      auth: { mode: authMode },
+      adapters,
+    })
+  })
 
   // Admin route is mounted BEFORE auth middleware so it bypasses JWT/custom auth.
   // It authenticates via admin token independently.
@@ -93,6 +129,7 @@ export function createTaskcastApp(opts: TaskcastServerOptions): TaskcastApp {
   app.use('*', createAuthMiddleware(opts.auth ?? { mode: 'none' }))
   app.route('/tasks', createTasksRouter(opts.engine, subscriberCounts))
   app.route('/tasks', createSSERouter(opts.engine, subscriberCounts))
+  app.route('/events', createGlobalSSERoute(opts.engine))
 
   const cleanups: Array<() => void> = []
 

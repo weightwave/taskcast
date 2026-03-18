@@ -23,3 +23,19 @@ redis = { version = "0.27", features = ["tokio-comp", "aio"] }
 jsonwebtoken = "9"
 rust-embed = "8"
 mime_guess = "2"
+serde = { workspace = true }
+dirs = "6"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+chrono = "0.4"
+futures-util = "0.3"
+
+[lib]
+name = "taskcast_cli"
+path = "src/lib.rs"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+axum-test = "19"
+testcontainers = "0.23"
+testcontainers-modules = { version = "0.11", features = ["postgres", "redis"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres"] }

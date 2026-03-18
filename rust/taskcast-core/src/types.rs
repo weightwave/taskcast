@@ -494,6 +494,23 @@ pub trait BroadcastProvider: Send + Sync {
         channel: &str,
         handler: Box<dyn Fn(TaskEvent) + Send + Sync>,
     ) -> Box<dyn Fn() + Send + Sync>;
+
+    /// Synchronous version of `subscribe` for use in contexts where async is not
+    /// available (e.g., inside creation listener callbacks).
+    ///
+    /// The default implementation returns an error. Providers that support
+    /// synchronous subscription should override this.
+    fn subscribe_sync(
+        &self,
+        channel: &str,
+        handler: Box<dyn Fn(TaskEvent) + Send + Sync>,
+    ) -> Result<Box<dyn Fn() + Send + Sync>, Box<dyn std::error::Error + Send + Sync>> {
+        let _ = (channel, handler);
+        Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "subscribe_sync is not supported by this broadcast provider",
+        )))
+    }
 }
 
 #[async_trait]
@@ -1652,5 +1669,67 @@ mod tests {
         assert!(store.remove_assignment("x").await.is_ok());
         assert!(store.get_worker_assignments("w").await.unwrap().is_empty());
         assert!(store.get_task_assignment("x").await.unwrap().is_none());
+    }
+
+    // ─── BroadcastProvider::subscribe_sync default impl ─────────────────
+
+    /// A minimal broadcast provider that relies on the default `subscribe_sync` impl.
+    struct StubBroadcast;
+
+    #[async_trait]
+    impl BroadcastProvider for StubBroadcast {
+        async fn publish(
+            &self,
+            _channel: &str,
+            _event: TaskEvent,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+
+        async fn subscribe(
+            &self,
+            _channel: &str,
+            _handler: Box<dyn Fn(TaskEvent) + Send + Sync>,
+        ) -> Box<dyn Fn() + Send + Sync> {
+            Box::new(|| {})
+        }
+        // subscribe_sync intentionally NOT overridden — uses the default
+    }
+
+    #[test]
+    fn subscribe_sync_default_returns_unsupported_error() {
+        let provider = StubBroadcast;
+        let result = provider.subscribe_sync("test-channel", Box::new(|_| {}));
+        assert!(result.is_err(), "default subscribe_sync should return Err");
+        let msg = result.err().unwrap().to_string();
+        assert!(
+            msg.contains("subscribe_sync is not supported"),
+            "expected 'not supported' message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn series_result_stored_field_true() {
+        let event = TaskEvent {
+            id: "e".to_string(),
+            task_id: "t".to_string(),
+            index: 0,
+            timestamp: 0.0,
+            r#type: "x".to_string(),
+            level: Level::Info,
+            data: json!(null),
+            series_id: None,
+            series_mode: None,
+            series_acc_field: None,
+            series_snapshot: None,
+            _accumulated_data: None,
+        };
+        let result = SeriesResult {
+            event,
+            accumulated_event: None,
+            stored: true,
+        };
+        assert!(result.stored);
+        assert!(result.accumulated_event.is_none());
     }
 }
