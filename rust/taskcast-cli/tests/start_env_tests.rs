@@ -4,6 +4,9 @@
 
 use std::sync::{Mutex, MutexGuard};
 use taskcast_cli::commands::start::StartArgs;
+use testcontainers::runners::AsyncRunner;
+use testcontainers_modules::postgres::Postgres;
+use testcontainers_modules::redis::Redis;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -228,4 +231,71 @@ async fn run_env_storage_sqlite_overrides_default_memory() {
     assert_eq!(body["ok"], true);
 
     handle.abort();
+}
+
+// ─── Redis backend (testcontainer) ──────────────────────────────────────────
+
+#[tokio::test]
+async fn run_redis_backend_serves_health() {
+    let container = Redis::default().start().await.unwrap();
+    let host_port = container.get_host_port_ipv4(6379).await.unwrap();
+    let redis_url = format!("redis://127.0.0.1:{}", host_port);
+
+    // EnvGuard sets the env var immediately; the borrow only needs to live through new()
+    let _env = EnvGuard::new(&[("TASKCAST_REDIS_URL", &redis_url)]);
+
+    let port = find_available_port().await;
+    let handle = tokio::spawn(async move {
+        let _ = taskcast_cli::commands::start::run(StartArgs {
+            port,
+            storage: "redis".to_string(),
+            ..Default::default()
+        })
+        .await;
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let res = reqwest::get(&format!("http://127.0.0.1:{port}/health"))
+        .await
+        .unwrap();
+    assert!(res.status().is_success());
+
+    handle.abort();
+    drop(_env);
+    drop(container);
+}
+
+// ─── Memory backend with Postgres long-term store (testcontainer) ───────────
+
+#[tokio::test]
+async fn run_memory_backend_with_postgres_long_term_store() {
+    let container = Postgres::default().start().await.unwrap();
+    let host_port = container.get_host_port_ipv4(5432).await.unwrap();
+    let pg_url = format!(
+        "postgres://postgres:postgres@127.0.0.1:{}/postgres?sslmode=disable",
+        host_port
+    );
+
+    let _env = EnvGuard::new(&[("TASKCAST_POSTGRES_URL", &pg_url)]);
+
+    let port = find_available_port().await;
+    let handle = tokio::spawn(async move {
+        let _ = taskcast_cli::commands::start::run(StartArgs {
+            port,
+            ..Default::default()
+        })
+        .await;
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let res = reqwest::get(&format!("http://127.0.0.1:{port}/health"))
+        .await
+        .unwrap();
+    assert!(res.status().is_success());
+
+    handle.abort();
+    drop(_env);
+    drop(container);
 }

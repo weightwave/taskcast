@@ -364,7 +364,76 @@ async fn migrate_run_bad_config_returns_error() {
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
     assert!(
-        err.contains("config") || err.contains("Failed to load"),
+        err.contains("config") || err.contains("Failed to load") || err.contains("No Postgres URL"),
         "error should mention config loading failure, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn migrate_run_invalid_config_file_returns_error() {
+    // An existing file with invalid YAML triggers the config load error path (lines 26-27)
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(tmp.path(), "{{invalid yaml content!!!").unwrap();
+    let result = migrate::run(MigrateArgs {
+        url: None,
+        config: Some(tmp.path().to_str().unwrap().to_string()),
+        yes: true,
+    })
+    .await;
+
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("Failed to load") || err.contains("config"),
+        "error should mention config loading failure, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn migrate_run_returns_error_on_dirty_migrations() {
+    let (url, _container) = start_postgres().await;
+
+    // Create the _sqlx_migrations table with a dirty (failed) record
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .unwrap();
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS _sqlx_migrations (
+            version BIGINT PRIMARY KEY,
+            description TEXT NOT NULL,
+            installed_on TIMESTAMPTZ NOT NULL DEFAULT now(),
+            success BOOLEAN NOT NULL,
+            checksum BYTEA NOT NULL,
+            execution_time BIGINT NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time)
+         VALUES (99999, 'dirty_test', false, '\\x00', 0)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    // Now call run() which should detect dirty migrations and return Err (lines 86-91)
+    let result = migrate::run(MigrateArgs {
+        url: Some(url),
+        config: None,
+        yes: true,
+    })
+    .await;
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("Dirty") || err.contains("dirty"),
+        "expected dirty migration error, got: {err}"
     );
 }
