@@ -656,3 +656,563 @@ async fn consume_sse_multiple_events_in_sequence() {
         assert_eq!(name, "taskcast.event");
     }
 }
+
+// ─── Integration: consume_sse with real taskcast server ───────────────────────
+
+#[tokio::test]
+async fn consume_sse_from_real_server_task_events() {
+    let engine = make_engine();
+    let base_url = start_server(engine.clone()).await;
+
+    let task = engine
+        .create_task(CreateTaskInput {
+            r#type: Some("llm.chat".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    engine
+        .transition_task(&task.id, TaskStatus::Running, None)
+        .await
+        .unwrap();
+
+    engine
+        .publish_event(
+            &task.id,
+            PublishEventInput {
+                r#type: "llm.delta".to_string(),
+                level: Level::Info,
+                data: json!({"text": "hello"}),
+                series_id: None,
+                series_mode: None,
+                series_acc_field: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    engine
+        .transition_task(&task.id, TaskStatus::Completed, None)
+        .await
+        .unwrap();
+
+    // Stream from real SSE endpoint
+    let url = format!("{base_url}/tasks/{}/events", task.id);
+    let mut events: Vec<(serde_json::Value, String)> = Vec::new();
+    let mut done = false;
+
+    consume_sse(
+        &url,
+        None,
+        |ev, name| {
+            events.push((ev, name.to_string()));
+        },
+        Some(&mut || {
+            done = true;
+        }),
+    )
+    .await
+    .unwrap();
+
+    assert!(!events.is_empty(), "should receive events from real SSE");
+    assert!(done, "should receive done signal for completed task");
+
+    // Verify we received the llm.delta event
+    let has_delta = events
+        .iter()
+        .any(|(ev, name)| name == "taskcast.event" && ev.get("type").and_then(|t| t.as_str()) == Some("llm.delta"));
+    assert!(has_delta, "should receive llm.delta event, got: {events:?}");
+
+    // Verify we received the done event
+    let has_done = events
+        .iter()
+        .any(|(_, name)| name == "taskcast.done");
+    assert!(has_done, "should receive taskcast.done event");
+}
+
+#[tokio::test]
+async fn consume_sse_from_real_server_formats_events_correctly() {
+    let engine = make_engine();
+    let base_url = start_server(engine.clone()).await;
+
+    let task = engine
+        .create_task(CreateTaskInput {
+            r#type: Some("agent.step".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    engine
+        .transition_task(&task.id, TaskStatus::Running, None)
+        .await
+        .unwrap();
+
+    engine
+        .publish_event(
+            &task.id,
+            PublishEventInput {
+                r#type: "agent.step".to_string(),
+                level: Level::Info,
+                data: json!({"step": 1, "output": "planning"}),
+                series_id: None,
+                series_mode: None,
+                series_acc_field: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    engine
+        .publish_event(
+            &task.id,
+            PublishEventInput {
+                r#type: "agent.step".to_string(),
+                level: Level::Warn,
+                data: json!({"step": 2, "output": "retrying"}),
+                series_id: None,
+                series_mode: None,
+                series_acc_field: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    engine
+        .transition_task(&task.id, TaskStatus::Completed, None)
+        .await
+        .unwrap();
+
+    let url = format!("{base_url}/tasks/{}/events", task.id);
+    let mut formatted_outputs: Vec<String> = Vec::new();
+
+    consume_sse(
+        &url,
+        None,
+        |event, sse_event_name| {
+            // Apply same formatting as run_logs callback
+            if sse_event_name == "taskcast.done" {
+                let reason = event
+                    .as_object()
+                    .and_then(|obj| obj.get("reason"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                formatted_outputs.push(format_event(
+                    "taskcast.done",
+                    "info",
+                    0,
+                    &json!({ "reason": reason }),
+                    None,
+                ));
+            } else if sse_event_name == "taskcast.event" {
+                let event_type = event
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let level = event
+                    .get("level")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("info");
+                let timestamp = event
+                    .get("timestamp")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                let data = event.get("data").cloned().unwrap_or(serde_json::Value::Null);
+                formatted_outputs.push(format_event(event_type, level, timestamp, &data, None));
+            }
+        },
+        Some(&mut || {}),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        !formatted_outputs.is_empty(),
+        "should have formatted outputs"
+    );
+
+    // Should have at least one agent.step formatted line
+    let has_step = formatted_outputs.iter().any(|s| s.contains("agent.step"));
+    assert!(has_step, "should format agent.step events, got: {formatted_outputs:?}");
+
+    // Should have a done line
+    let has_done = formatted_outputs.iter().any(|s| s.contains("[DONE]"));
+    assert!(has_done, "should format done event, got: {formatted_outputs:?}");
+}
+
+#[tokio::test]
+async fn consume_sse_from_real_server_tail_format() {
+    // Test the run_tail formatting path: global /events with task_id prefix
+    let engine = make_engine();
+    let base_url = start_server(engine.clone()).await;
+
+    let task = engine
+        .create_task(CreateTaskInput {
+            r#type: Some("llm.chat".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    engine
+        .transition_task(&task.id, TaskStatus::Running, None)
+        .await
+        .unwrap();
+
+    // Publish an event, then complete
+    engine
+        .publish_event(
+            &task.id,
+            PublishEventInput {
+                r#type: "llm.delta".to_string(),
+                level: Level::Info,
+                data: json!({"text": "world"}),
+                series_id: None,
+                series_mode: None,
+                series_acc_field: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    engine
+        .transition_task(&task.id, TaskStatus::Completed, None)
+        .await
+        .unwrap();
+
+    // Use per-task SSE to test tail-like formatting (with task_id in output)
+    let url = format!("{base_url}/tasks/{}/events", task.id);
+    let mut formatted_with_task_id: Vec<String> = Vec::new();
+
+    consume_sse(
+        &url,
+        None,
+        |event, sse_event_name| {
+            // Apply same formatting as run_tail callback
+            if sse_event_name == "taskcast.event" {
+                let event_type = event
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let level = event
+                    .get("level")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("info");
+                let timestamp = event
+                    .get("timestamp")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                let data = event.get("data").cloned().unwrap_or(serde_json::Value::Null);
+                let task_id = event.get("taskId").and_then(|v| v.as_str());
+                formatted_with_task_id.push(format_event(
+                    event_type, level, timestamp, &data, task_id,
+                ));
+            }
+        },
+        Some(&mut || {}),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        !formatted_with_task_id.is_empty(),
+        "should have formatted outputs from tail-like consumption"
+    );
+}
+
+#[tokio::test]
+async fn consume_sse_query_string_construction() {
+    // Test that the URL construction with query params works correctly
+    // by verifying filter params are passed through to the real server
+    let engine = make_engine();
+    let base_url = start_server(engine.clone()).await;
+
+    let task = engine
+        .create_task(CreateTaskInput {
+            r#type: Some("llm.chat".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    engine
+        .transition_task(&task.id, TaskStatus::Running, None)
+        .await
+        .unwrap();
+
+    engine
+        .publish_event(
+            &task.id,
+            PublishEventInput {
+                r#type: "llm.delta".to_string(),
+                level: Level::Info,
+                data: json!({"text": "hello"}),
+                series_id: None,
+                series_mode: None,
+                series_acc_field: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    engine
+        .publish_event(
+            &task.id,
+            PublishEventInput {
+                r#type: "agent.step".to_string(),
+                level: Level::Warn,
+                data: json!({"step": 1}),
+                series_id: None,
+                series_mode: None,
+                series_acc_field: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    engine
+        .transition_task(&task.id, TaskStatus::Completed, None)
+        .await
+        .unwrap();
+
+    // Build query string the same way run_logs does
+    let mut params = Vec::new();
+    let types = Some("llm.*".to_string());
+    let levels: Option<String> = None;
+    if let Some(ref t) = types {
+        params.push(format!("types={t}"));
+    }
+    if let Some(ref l) = levels {
+        params.push(format!("levels={l}"));
+    }
+    let qs = if params.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", params.join("&"))
+    };
+    let url = format!("{base_url}/tasks/{}/events{qs}", task.id);
+
+    // The URL should contain the filter param
+    assert!(url.contains("types=llm.*"), "URL should contain types filter: {url}");
+
+    let mut events: Vec<(serde_json::Value, String)> = Vec::new();
+
+    consume_sse(
+        &url,
+        None,
+        |ev, name| {
+            events.push((ev, name.to_string()));
+        },
+        Some(&mut || {}),
+    )
+    .await
+    .unwrap();
+
+    // When types=llm.* filter is applied, we should only get llm.delta events,
+    // not agent.step events (plus status transitions and done)
+    let has_agent_step = events
+        .iter()
+        .any(|(ev, name)| name == "taskcast.event" && ev.get("type").and_then(|t| t.as_str()) == Some("agent.step"));
+    assert!(
+        !has_agent_step,
+        "filtered SSE should not include agent.step events"
+    );
+}
+
+#[tokio::test]
+async fn consume_sse_query_string_with_both_params() {
+    // Test query string construction with both types and levels params
+    let mut params = Vec::new();
+    let types = Some("llm.*".to_string());
+    let levels = Some("info,warn".to_string());
+
+    if let Some(ref t) = types {
+        params.push(format!("types={t}"));
+    }
+    if let Some(ref l) = levels {
+        params.push(format!("levels={l}"));
+    }
+    let qs = if params.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", params.join("&"))
+    };
+
+    assert_eq!(qs, "?types=llm.*&levels=info,warn");
+}
+
+#[tokio::test]
+async fn consume_sse_query_string_empty_when_no_params() {
+    let params: Vec<String> = Vec::new();
+    let qs = if params.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", params.join("&"))
+    };
+
+    assert_eq!(qs, "");
+}
+
+#[tokio::test]
+async fn consume_sse_done_event_reason_extraction() {
+    // Test the done callback reason extraction logic used in run_logs
+    let app = Router::new().route(
+        "/sse",
+        get(|| async {
+            let events = vec![
+                Ok::<_, Infallible>(
+                    Event::default()
+                        .event("taskcast.done")
+                        .data(r#"{"reason":"timeout"}"#),
+                ),
+            ];
+            Sse::new(stream::iter(events))
+        }),
+    );
+    let base_url = start_mock_sse_server(app).await;
+
+    let mut formatted = String::new();
+
+    consume_sse(
+        &format!("{base_url}/sse"),
+        None,
+        |event, sse_event_name| {
+            if sse_event_name == "taskcast.done" {
+                let reason = event
+                    .as_object()
+                    .and_then(|obj| obj.get("reason"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                formatted = format_event(
+                    "taskcast.done",
+                    "info",
+                    0,
+                    &json!({ "reason": reason }),
+                    None,
+                );
+            }
+        },
+        Some(&mut || {}),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        formatted.contains("[DONE] timeout"),
+        "should format done with reason timeout, got: {formatted}"
+    );
+}
+
+#[tokio::test]
+async fn consume_sse_event_field_extraction_defaults() {
+    // Test the field extraction logic used in run_logs/run_tail callbacks
+    // when optional fields are missing
+    let app = Router::new().route(
+        "/sse",
+        get(|| async {
+            let events = vec![
+                Ok::<_, Infallible>(
+                    Event::default()
+                        .event("taskcast.event")
+                        .data(r#"{}"#), // no type, level, timestamp, or data fields
+                ),
+            ];
+            Sse::new(stream::iter(events))
+        }),
+    );
+    let base_url = start_mock_sse_server(app).await;
+
+    let mut formatted = String::new();
+
+    consume_sse(
+        &format!("{base_url}/sse"),
+        None,
+        |event, sse_event_name| {
+            if sse_event_name == "taskcast.event" {
+                let event_type = event
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let level = event
+                    .get("level")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("info");
+                let timestamp = event
+                    .get("timestamp")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                let data = event.get("data").cloned().unwrap_or(serde_json::Value::Null);
+                formatted = format_event(event_type, level, timestamp, &data, None);
+            }
+        },
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert!(formatted.contains("unknown"), "missing type should default to 'unknown', got: {formatted}");
+    assert!(formatted.contains("info"), "missing level should default to 'info', got: {formatted}");
+    assert!(formatted.contains("null"), "missing data should default to null, got: {formatted}");
+}
+
+#[tokio::test]
+async fn consume_sse_ignores_non_taskcast_events() {
+    // The run_logs/run_tail callbacks only handle taskcast.event and taskcast.done.
+    // Other SSE event names should be ignored.
+    let app = Router::new().route(
+        "/sse",
+        get(|| async {
+            let events = vec![
+                Ok::<_, Infallible>(
+                    Event::default()
+                        .event("other.event")
+                        .data(r#"{"type":"ignored"}"#),
+                ),
+                Ok(
+                    Event::default()
+                        .event("taskcast.event")
+                        .data(r#"{"type":"included","level":"info","timestamp":0,"data":{}}"#),
+                ),
+            ];
+            Sse::new(stream::iter(events))
+        }),
+    );
+    let base_url = start_mock_sse_server(app).await;
+
+    let mut formatted: Vec<String> = Vec::new();
+
+    consume_sse(
+        &format!("{base_url}/sse"),
+        None,
+        |event, sse_event_name| {
+            // Same filter as run_logs: only process taskcast.event and taskcast.done
+            if sse_event_name == "taskcast.event" {
+                let event_type = event
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let level = event
+                    .get("level")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("info");
+                let timestamp = event
+                    .get("timestamp")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                let data = event.get("data").cloned().unwrap_or(serde_json::Value::Null);
+                formatted.push(format_event(event_type, level, timestamp, &data, None));
+            }
+        },
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        formatted.len(),
+        1,
+        "should only format the taskcast.event, not other.event"
+    );
+    assert!(formatted[0].contains("included"), "got: {}", formatted[0]);
+}

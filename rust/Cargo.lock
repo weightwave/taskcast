@@ -3087,6 +3087,8 @@ dependencies = [
  "taskcast-server",
  "taskcast-sqlite",
  "tempfile",
+ "testcontainers",
+ "testcontainers-modules",
  "tokio",
  "url",
 ]

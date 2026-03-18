@@ -310,6 +310,106 @@ async fn logs_global_sse_endpoint() {
 }
 
 #[tokio::test]
+async fn logs_post_events_array_body() {
+    let (engine, server, logger) = make_verbose_server();
+    let task = engine
+        .create_task(CreateTaskInput {
+            r#type: Some("test".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    engine
+        .transition_task(&task.id, TaskStatus::Running, None)
+        .await
+        .unwrap();
+
+    logger.lines.lock().unwrap().clear();
+
+    // POST a batch (array) of events
+    let res = server
+        .post(&format!("/tasks/{}/events", task.id))
+        .json(&serde_json::json!([
+            { "type": "llm.delta", "level": "info", "data": { "text": "a" } },
+            { "type": "llm.delta", "level": "info", "data": { "text": "b" } },
+            { "type": "llm.done", "level": "info", "data": {} }
+        ]))
+        .await;
+    res.assert_status(axum_test::http::StatusCode::CREATED);
+
+    let lines = logger.lines.lock().unwrap();
+    assert_eq!(lines.len(), 1);
+    assert!(
+        lines[0].contains("3 events"),
+        "Expected '3 events' in: {}",
+        &lines[0]
+    );
+}
+
+#[tokio::test]
+async fn logs_post_events_without_type_field() {
+    let (engine, server, logger) = make_verbose_server();
+    let task = engine
+        .create_task(CreateTaskInput {
+            r#type: Some("test".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    engine
+        .transition_task(&task.id, TaskStatus::Running, None)
+        .await
+        .unwrap();
+
+    logger.lines.lock().unwrap().clear();
+
+    // POST an event body that is an object but without a "type" key.
+    // The server will return 400 (missing required field) but the
+    // verbose middleware still logs the request with "event published" context.
+    let _res = server
+        .post(&format!("/tasks/{}/events", task.id))
+        .json(&serde_json::json!({ "level": "info", "data": {} }))
+        .await;
+
+    let lines = logger.lines.lock().unwrap();
+    assert_eq!(lines.len(), 1);
+    assert!(
+        lines[0].contains("event published"),
+        "Expected 'event published' fallback in: {}",
+        &lines[0]
+    );
+}
+
+#[tokio::test]
+async fn logs_patch_status_without_status_field() {
+    let (engine, server, logger) = make_verbose_server();
+    let task = engine
+        .create_task(CreateTaskInput {
+            r#type: Some("test".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    logger.lines.lock().unwrap().clear();
+
+    // PATCH status with a body that doesn't have "status" — the handler
+    // will fail, but the verbose middleware still logs with "status transition".
+    let _res = server
+        .patch(&format!("/tasks/{}/status", task.id))
+        .json(&serde_json::json!({ "reason": "test" }))
+        .await;
+
+    let lines = logger.lines.lock().unwrap();
+    assert_eq!(lines.len(), 1);
+    assert!(
+        lines[0].contains("status transition"),
+        "Expected 'status transition' fallback in: {}",
+        &lines[0]
+    );
+}
+
+#[tokio::test]
 async fn logs_post_resolve_with_context() {
     let (engine, server, logger) = make_verbose_server();
     let task = engine
@@ -354,5 +454,75 @@ async fn logs_post_resolve_with_context() {
         lines[0].contains("resolve"),
         "Expected 'resolve' context in: {}",
         &lines[0]
+    );
+}
+
+#[tokio::test]
+async fn logs_task_sse_subscriber_connected() {
+    let (engine, server, logger) = make_verbose_server();
+    let task = engine
+        .create_task(CreateTaskInput {
+            r#type: Some("test".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    engine
+        .transition_task(&task.id, TaskStatus::Running, None)
+        .await
+        .unwrap();
+
+    logger.lines.lock().unwrap().clear();
+
+    // GET /tasks/:id/events is a per-task SSE endpoint
+    let server = std::sync::Arc::new(server);
+    let s = std::sync::Arc::clone(&server);
+    let task_id = task.id.clone();
+    let handle = tokio::spawn(async move {
+        let _res = s.get(&format!("/tasks/{}/events", task_id)).await;
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let lines = logger.lines.lock().unwrap();
+    assert!(
+        !lines.is_empty(),
+        "Expected at least one log line from task SSE endpoint"
+    );
+    assert!(
+        lines[0].contains("SSE"),
+        "Expected 'SSE' status for task events endpoint in: {}",
+        &lines[0]
+    );
+    assert!(
+        lines[0].contains("subscriber connected"),
+        "Expected 'subscriber connected' in: {}",
+        &lines[0]
+    );
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn logs_get_request_without_special_context() {
+    let (_engine, server, logger) = make_verbose_server();
+
+    // GET /health/detail has no special context extraction
+    let res = server.get("/health/detail").await;
+    res.assert_status_ok();
+
+    let lines = logger.lines.lock().unwrap();
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].contains("GET"));
+    assert!(lines[0].contains("/health/detail"));
+    assert!(lines[0].contains("200"));
+    // Should NOT contain any special context like "task created" or "subscriber connected"
+    assert!(
+        !lines[0].contains("task created"),
+        "health/detail should not have task context"
+    );
+    assert!(
+        !lines[0].contains("subscriber"),
+        "health/detail should not have subscriber context"
     );
 }

@@ -431,4 +431,139 @@ mod tests {
         assert!(output.contains("Server:    OK  taskcast at http://localhost:3721"));
         assert!(!output.contains("uptime"));
     }
+
+    #[test]
+    fn format_adapter_fail_status() {
+        let result = DoctorResult {
+            server: ServerStatus {
+                ok: true,
+                url: "http://localhost:3721".to_string(),
+                uptime: Some(10),
+                error: None,
+            },
+            auth: AuthStatus {
+                status: "ok".to_string(),
+                mode: Some("none".to_string()),
+                message: None,
+            },
+            adapters: vec![
+                AdapterStatus {
+                    name: "broadcast".to_string(),
+                    provider: "redis".to_string(),
+                    status: "fail".to_string(),
+                },
+                AdapterStatus {
+                    name: "shortTermStore".to_string(),
+                    provider: "redis".to_string(),
+                    status: "ok".to_string(),
+                },
+            ],
+        };
+        let output = format_doctor_result(&result);
+        assert!(
+            output.contains("Broadcast: FAIL  redis"),
+            "got: {output}"
+        );
+        assert!(output.contains("ShortTerm: OK  redis"));
+    }
+
+    #[test]
+    fn format_auth_warn_no_message_with_mode() {
+        // When auth status is warn, message is None, but mode is Some
+        let result = DoctorResult {
+            server: ServerStatus {
+                ok: true,
+                url: "http://localhost:3721".to_string(),
+                uptime: Some(10),
+                error: None,
+            },
+            auth: AuthStatus {
+                status: "warn".to_string(),
+                mode: Some("jwt".to_string()),
+                message: None,
+            },
+            adapters: vec![],
+        };
+        let output = format_doctor_result(&result);
+        assert!(
+            output.contains("Auth:      WARN  jwt"),
+            "got: {output}"
+        );
+    }
+
+    #[test]
+    fn format_server_fail_no_error() {
+        // When server.ok is false and error is None → should show "unknown error"
+        let result = DoctorResult {
+            server: ServerStatus {
+                ok: false,
+                url: "http://localhost:3721".to_string(),
+                uptime: None,
+                error: None,
+            },
+            auth: AuthStatus {
+                status: "warn".to_string(),
+                mode: None,
+                message: None,
+            },
+            adapters: vec![],
+        };
+        let output = format_doctor_result(&result);
+        assert!(
+            output.contains("FAIL  cannot reach"),
+            "got: {output}"
+        );
+        assert!(
+            output.contains("unknown error"),
+            "got: {output}"
+        );
+    }
+
+    #[test]
+    fn format_auth_warn_no_message_no_mode() {
+        // When auth status is warn, message is None, mode is None → should show "unknown"
+        let result = DoctorResult {
+            server: ServerStatus {
+                ok: true,
+                url: "http://localhost:3721".to_string(),
+                uptime: Some(5),
+                error: None,
+            },
+            auth: AuthStatus {
+                status: "warn".to_string(),
+                mode: None,
+                message: None,
+            },
+            adapters: vec![],
+        };
+        let output = format_doctor_result(&result);
+        assert!(
+            output.contains("Auth:      WARN  unknown"),
+            "got: {output}"
+        );
+    }
+
+    #[test]
+    fn format_auth_ok_no_mode() {
+        // When auth status is ok but mode is None → should show "unknown"
+        let result = DoctorResult {
+            server: ServerStatus {
+                ok: true,
+                url: "http://localhost:3721".to_string(),
+                uptime: Some(5),
+                error: None,
+            },
+            auth: AuthStatus {
+                status: "ok".to_string(),
+                mode: None,
+                message: None,
+            },
+            adapters: vec![],
+        };
+        let output = format_doctor_result(&result);
+        assert!(
+            output.contains("Auth:      OK  unknown"),
+            "got: {output}"
+        );
+    }
 }
