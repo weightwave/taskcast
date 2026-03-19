@@ -1,6 +1,6 @@
 {
   "name": "@taskcast/client",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Browser SSE subscription client for Taskcast.",
   "repository": {
     "type": "git",
