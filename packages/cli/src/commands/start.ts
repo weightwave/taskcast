@@ -30,7 +30,7 @@ export function registerStartCommand(program: Command): void {
     .option('--playground', 'serve the interactive playground UI at /_playground/')
     .option('-v, --verbose', 'enable verbose logging')
     .action(async (options: { config?: string; port: string; storage?: string; dbPath?: string; playground?: boolean; verbose?: boolean }) => {
-      let { config: fileConfig, source } = await loadConfigFile(options.config)
+      let { config: fileConfig, source, path: configPath } = await loadConfigFile(options.config)
 
       if (source === 'none') {
         const shouldCreate = await promptCreateGlobalConfig()
@@ -39,6 +39,8 @@ export function registerStartCommand(program: Command): void {
           if (createdPath) {
             const created = await loadConfigFile(createdPath)
             fileConfig = created.config
+            source = created.source
+            configPath = created.path
           }
         }
       }
@@ -53,13 +55,18 @@ export function registerStartCommand(program: Command): void {
 
       const storage = options.storage ?? process.env['TASKCAST_STORAGE'] ?? (redisUrl ? 'redis' : 'memory')
 
+      let shortTermLabel: string
+      let longTermLabel: string
+
       if (storage === 'sqlite') {
+        const dbPath = options.dbPath ?? './taskcast.db'
         const sqliteOpts = options.dbPath ? { path: options.dbPath } : {}
         const adapters = createSqliteAdapters(sqliteOpts)
         broadcast = new MemoryBroadcastProvider()
         shortTermStore = adapters.shortTermStore
         longTermStore = adapters.longTermStore
-        console.log(`[taskcast] Using SQLite storage at ${options.dbPath ?? './taskcast.db'}`)
+        shortTermLabel = `sqlite @ ${dbPath}`
+        longTermLabel = `sqlite @ ${dbPath}`
       } else if (storage === 'redis' || redisUrl) {
         const pubClient = new Redis(redisUrl!)
         const subClient = new Redis(redisUrl!)
@@ -67,16 +74,25 @@ export function registerStartCommand(program: Command): void {
         const adapters = createRedisAdapters(pubClient, subClient, storeClient)
         broadcast = adapters.broadcast
         shortTermStore = adapters.shortTermStore
+        shortTermLabel = `redis @ ${redisUrl}`
+        longTermLabel = '(none)'
       } else {
-        console.warn('[taskcast] No TASKCAST_REDIS_URL configured — using in-memory adapters')
         broadcast = new MemoryBroadcastProvider()
         shortTermStore = new MemoryShortTermStore()
+        shortTermLabel = 'memory'
+        longTermLabel = '(none)'
       }
 
       if (storage !== 'sqlite' && postgresUrl) {
         const sql = postgres(postgresUrl)
         longTermStore = new PostgresLongTermStore(sql)
+        longTermLabel = `postgres @ ${postgresUrl}`
       }
+
+      // Print startup configuration summary
+      console.log(`[taskcast] Config: ${configPath ?? '(none)'}`)
+      console.log(`[taskcast] Short-term store: ${shortTermLabel}`)
+      console.log(`[taskcast] Long-term store:  ${longTermLabel}`)
 
       const engineOpts: ConstructorParameters<typeof TaskEngine>[0] = { shortTermStore, broadcast }
       if (longTermStore !== undefined) engineOpts.longTermStore = longTermStore

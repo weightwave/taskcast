@@ -98,6 +98,8 @@ export function parseConfig(content: string, format: 'json' | 'yaml'): TaskcastC
 export interface ConfigLoadResult {
   config: TaskcastConfig
   source: 'explicit' | 'local' | 'global' | 'none'
+  /** Resolved absolute path to the config file that was loaded. Undefined when source is 'none'. */
+  path?: string
 }
 
 export async function loadConfigFile(
@@ -111,18 +113,18 @@ export async function loadConfigFile(
   // 1. Explicit path
   if (configPath) {
     const fullPath = resolve(configPath)
-    if (!existsSync(fullPath)) return { config: {}, source: 'explicit' }
+    if (!existsSync(fullPath)) return { config: {}, source: 'explicit', path: fullPath }
 
     const ext = extname(fullPath).toLowerCase()
     /* v8 ignore next 4 -- dynamic import of .ts/.js/.mjs config files */
     if (ext === '.ts' || ext === '.js' || ext === '.mjs') {
       const mod = await import(fullPath) as { default?: TaskcastConfig }
-      return { config: mod.default ?? {}, source: 'explicit' }
+      return { config: mod.default ?? {}, source: 'explicit', path: fullPath }
     }
 
     const content = readFileSync(fullPath, 'utf8')
     const format = ext === '.json' ? 'json' : 'yaml'
-    return { config: parseConfig(content, format), source: 'explicit' }
+    return { config: parseConfig(content, format), source: 'explicit', path: fullPath }
   }
 
   // 2. Local directory
@@ -143,12 +145,12 @@ export async function loadConfigFile(
     const ext = extname(fullPath).toLowerCase()
     if (ext === '.ts' || ext === '.js' || ext === '.mjs') {
       const mod = await import(fullPath) as { default?: TaskcastConfig }
-      return { config: mod.default ?? {}, source: 'local' }
+      return { config: mod.default ?? {}, source: 'local', path: fullPath }
     }
 
     const content = readFileSync(fullPath, 'utf8')
     const format = ext === '.json' ? 'json' : 'yaml'
-    return { config: parseConfig(content, format), source: 'local' }
+    return { config: parseConfig(content, format), source: 'local', path: fullPath }
     /* v8 ignore stop */
   }
 
@@ -167,7 +169,7 @@ export async function loadConfigFile(
     const content = readFileSync(fullPath, 'utf8')
     const ext = extname(fullPath).toLowerCase()
     const format = ext === '.json' ? 'json' : 'yaml'
-    return { config: parseConfig(content, format), source: 'global' }
+    return { config: parseConfig(content, format), source: 'global', path: fullPath }
   }
 
   return { config: {}, source: 'none' }
