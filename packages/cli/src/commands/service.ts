@@ -234,7 +234,9 @@ export async function pollHealth(port: number, timeoutMs = 5000): Promise<boolea
     } catch {
       // Not ready yet
     }
-    await new Promise(r => setTimeout(r, 500))
+    const remaining = timeoutMs - (Date.now() - start)
+    if (remaining <= 0) break
+    await new Promise(r => setTimeout(r, Math.min(500, remaining)))
   }
   return false
 }
