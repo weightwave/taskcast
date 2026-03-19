@@ -9,6 +9,7 @@ import { registerPingCommand } from './commands/ping.js'
 import { registerDoctorCommand } from './commands/doctor.js'
 import { registerLogsCommand, registerTailCommand } from './commands/logs.js'
 import { registerTasksCommand } from './commands/tasks.js'
+import { registerServiceCommand } from './commands/service.js'
 
 const program = new Command()
 
@@ -27,13 +28,23 @@ registerDoctorCommand(program)
 registerLogsCommand(program)
 registerTailCommand(program)
 registerTasksCommand(program)
+registerServiceCommand(program)
 
-// Placeholders for unimplemented commands
-program.command('daemon').description('Start as background service (not yet implemented)')
-  .action(() => { console.error('[taskcast] daemon mode is not yet implemented'); process.exit(1) })
-program.command('stop').description('Stop background service (not yet implemented)')
-  .action(() => { console.error('[taskcast] stop is not yet implemented'); process.exit(1) })
-program.command('status').description('Show server status (not yet implemented)')
-  .action(() => { console.error('[taskcast] status is not yet implemented'); process.exit(1) })
+// Backward-compat aliases for old daemon/stop/status placeholder commands
+program.command('daemon').description('Alias for `taskcast service start`')
+  .action(async () => {
+    const { runServiceStart } = await import('./commands/service.js')
+    await runServiceStart()
+  })
+program.command('stop').description('Alias for `taskcast service stop`')
+  .action(async () => {
+    const { runServiceStop } = await import('./commands/service.js')
+    await runServiceStop()
+  })
+program.command('status').description('Alias for `taskcast service status`')
+  .action(async () => {
+    const { runServiceStatus } = await import('./commands/service.js')
+    await runServiceStatus()
+  })
 
 program.parse()
