@@ -89,14 +89,13 @@ jobs:
             exit 0
           fi
 
-          # Check if changeset files remain in the *committed* tree — if yes,
-          # a versioning PR was created and no publish happened.
-          # Use git ls-tree instead of find because changesets/action may
-          # modify the working tree when creating the Release PR.
-          CHANGESET_COUNT=$(git ls-tree --name-only HEAD .changeset/ 2>/dev/null | grep -v '^README.md$' | wc -l | tr -d ' ')
-          if [ "$CHANGESET_COUNT" -gt 0 ]; then
+          # If the action reported hasChangesets=true, it created a versioning
+          # PR rather than publishing. (We check the action's output rather
+          # than the filesystem — new changesets may have landed on main
+          # after the Release PR was created, so file presence is unreliable.)
+          if [ "${{ steps.changesets.outputs.hasChangesets }}" = "true" ]; then
             echo "published=false" >> "$GITHUB_OUTPUT"
-            echo "Changesets found ($CHANGESET_COUNT) — versioning PR created, not published"
+            echo "changesets/action created a versioning PR, not published"
             exit 0
           fi
 
