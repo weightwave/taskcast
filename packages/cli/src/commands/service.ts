@@ -154,10 +154,10 @@ export function registerServiceCommand(program: Command): void {
       const installOpts: ServiceInstallOptions = {
         port: Number(opts.port),
         config: configPath,
-        storage: opts.storage,
-        dbPath: opts.dbPath,
         nodePath: resolveNodePath(),
         entryPoint: resolveEntryPoint(),
+        ...(opts.storage !== undefined ? { storage: opts.storage } : {}),
+        ...(opts.dbPath !== undefined ? { dbPath: opts.dbPath } : {}),
       }
 
       await mgr.install(installOpts)
