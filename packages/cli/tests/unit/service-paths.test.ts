@@ -24,6 +24,7 @@ describe('getServicePaths', () => {
     expect(paths.stderrLog).toBe(join(home, 'Library/Application Support/taskcast/taskcast.err.log'))
     expect(paths.defaultConfigPath).toBe(join(home, '.taskcast/taskcast.config.yaml'))
     expect(paths.defaultDbPath).toBe(join(home, '.taskcast/taskcast.db'))
+    expect(paths.serviceStatePath).toBe(join(home, '.taskcast/service.state.json'))
   })
 
   it('returns Linux paths on linux', async () => {
@@ -35,6 +36,7 @@ describe('getServicePaths', () => {
     expect(paths.plistOrUnitPath).toBe(join(home, '.config/systemd/user/taskcast.service'))
     expect(paths.defaultConfigPath).toBe(join(home, '.taskcast/taskcast.config.yaml'))
     expect(paths.defaultDbPath).toBe(join(home, '.taskcast/taskcast.db'))
+    expect(paths.serviceStatePath).toBe(join(home, '.taskcast/service.state.json'))
     expect(paths.logDir).toBe('')
     expect(paths.stdoutLog).toBe('')
     expect(paths.stderrLog).toBe('')

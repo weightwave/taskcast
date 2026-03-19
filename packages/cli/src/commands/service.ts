@@ -161,6 +161,12 @@ export function registerServiceCommand(program: Command): void {
       }
 
       await mgr.install(installOpts)
+
+      // Write state file with the installed port so start/restart poll the right port
+      const statePath = paths.serviceStatePath
+      mkdirSync(dirname(statePath), { recursive: true })
+      writeFileSync(statePath, JSON.stringify({ port: Number(opts.port) }))
+
       console.log('[taskcast] Service installed successfully.')
       console.log('[taskcast] Run `taskcast service start` to start the service.')
     })
@@ -203,6 +209,13 @@ export function registerServiceCommand(program: Command): void {
 async function getPortFromConfig(): Promise<number> {
   try {
     const paths = getServicePaths()
+    // Try state file first (written by install, has the exact installed port)
+    try {
+      const state = JSON.parse(readFileSync(paths.serviceStatePath, 'utf8')) as { port?: number }
+      if (typeof state.port === 'number') return state.port
+    } catch {
+      // State file not present — fall through to config file
+    }
     const text = readFileSync(paths.defaultConfigPath, 'utf8')
     const match = text.match(/^port:\s*(\d+)/m)
     if (match) return Number(match[1])

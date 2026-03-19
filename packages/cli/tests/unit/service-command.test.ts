@@ -29,6 +29,7 @@ vi.mock('../../src/service/paths.js', () => ({
     logDir: '/tmp/logs',
     stdoutLog: '/tmp/logs/taskcast.log',
     stderrLog: '/tmp/logs/taskcast.err.log',
+    serviceStatePath: '/home/test/.taskcast/service.state.json',
   })),
   LAUNCHD_LABEL: 'com.taskcast.daemon',
 }))
@@ -37,7 +38,10 @@ vi.mock('fs', () => ({
   existsSync: vi.fn().mockReturnValue(true),
   mkdirSync: vi.fn(),
   writeFileSync: vi.fn(),
-  readFileSync: vi.fn().mockReturnValue('port: 3721\n'),
+  readFileSync: vi.fn((path: string) => {
+    if (String(path).endsWith('service.state.json')) return JSON.stringify({ port: 3721 })
+    return 'port: 3721\n'
+  }),
 }))
 
 import { registerServiceCommand, runServiceStart, runServiceRestart } from '../../src/commands/service.js'
@@ -115,7 +119,15 @@ describe('registerServiceCommand', () => {
       await makeProgram().parseAsync(['node', 'test', 'service', 'install'])
 
       const { writeFileSync } = await import('fs')
-      expect(writeFileSync).not.toHaveBeenCalled()
+      // Config file should not be written (it already exists), but state file should be
+      expect(writeFileSync).not.toHaveBeenCalledWith(
+        '/home/test/.taskcast/taskcast.config.yaml',
+        expect.anything(),
+      )
+      expect(writeFileSync).toHaveBeenCalledWith(
+        '/home/test/.taskcast/service.state.json',
+        expect.any(String),
+      )
     })
 
     it('passes --port option to ServiceManager.install', async () => {
@@ -125,6 +137,18 @@ describe('registerServiceCommand', () => {
 
       expect(mockInstall).toHaveBeenCalledWith(
         expect.objectContaining({ port: 8080 }),
+      )
+    })
+
+    it('writes service state file during install', async () => {
+      mockInstall.mockResolvedValue(undefined)
+
+      await makeProgram().parseAsync(['node', 'test', 'service', 'install', '--port', '9000'])
+
+      const { writeFileSync } = await import('fs')
+      expect(writeFileSync).toHaveBeenCalledWith(
+        '/home/test/.taskcast/service.state.json',
+        JSON.stringify({ port: 9000 }),
       )
     })
   })

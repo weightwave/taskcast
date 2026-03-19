@@ -8,6 +8,7 @@ export interface ServicePaths {
   stderrLog: string
   defaultConfigPath: string
   defaultDbPath: string
+  serviceStatePath: string
 }
 
 export const LAUNCHD_LABEL = 'com.taskcast.daemon'
@@ -18,6 +19,7 @@ export function getServicePaths(): ServicePaths {
 
   const defaultConfigPath = join(home, '.taskcast', 'taskcast.config.yaml')
   const defaultDbPath = join(home, '.taskcast', 'taskcast.db')
+  const serviceStatePath = join(home, '.taskcast', 'service.state.json')
 
   if (platform === 'darwin') {
     const logDir = join(home, 'Library/Application Support/taskcast')
@@ -28,6 +30,7 @@ export function getServicePaths(): ServicePaths {
       stderrLog: join(logDir, 'taskcast.err.log'),
       defaultConfigPath,
       defaultDbPath,
+      serviceStatePath,
     }
   }
 
@@ -39,6 +42,7 @@ export function getServicePaths(): ServicePaths {
       stderrLog: '', // journalctl --user -u taskcast
       defaultConfigPath,
       defaultDbPath,
+      serviceStatePath,
     }
   }
 
