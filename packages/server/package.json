@@ -1,6 +1,6 @@
 {
   "name": "@taskcast/server",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Hono HTTP server — REST + SSE + auth + webhooks for Taskcast.",
   "repository": {
     "type": "git",
