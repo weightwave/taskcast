@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { createRequire } from 'module'
 import { Command } from 'commander'
 import { registerStartCommand } from './commands/start.js'
 import { registerMigrateCommand } from './commands/migrate.js'
@@ -11,12 +12,15 @@ import { registerLogsCommand, registerTailCommand } from './commands/logs.js'
 import { registerTasksCommand } from './commands/tasks.js'
 import { registerServiceCommand } from './commands/service.js'
 
+const _require = createRequire(import.meta.url)
+const { version } = _require('../package.json') as { version: string }
+
 const program = new Command()
 
 program
   .name('taskcast')
   .description('Taskcast — unified task tracking and streaming service')
-  .version('0.3.1')
+  .version(version)
 
 registerStartCommand(program)
 registerMigrateCommand(program)
