@@ -89,9 +89,11 @@ jobs:
             exit 0
           fi
 
-          # Check if changeset files remain — if yes, a versioning PR was
-          # created and no publish happened (correct to skip downstream)
-          CHANGESET_COUNT=$(find .changeset -name '*.md' ! -name 'README.md' 2>/dev/null | wc -l | tr -d ' ')
+          # Check if changeset files remain in the *committed* tree — if yes,
+          # a versioning PR was created and no publish happened.
+          # Use git ls-tree instead of find because changesets/action may
+          # modify the working tree when creating the Release PR.
+          CHANGESET_COUNT=$(git ls-tree --name-only HEAD .changeset/ 2>/dev/null | grep -v '^README.md$' | wc -l | tr -d ' ')
           if [ "$CHANGESET_COUNT" -gt 0 ]; then
             echo "published=false" >> "$GITHUB_OUTPUT"
             echo "Changesets found ($CHANGESET_COUNT) — versioning PR created, not published"
