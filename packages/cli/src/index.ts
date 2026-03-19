@@ -36,16 +36,19 @@ registerServiceCommand(program)
 
 // Backward-compat aliases for old daemon/stop/status placeholder commands
 program.command('daemon').description('Alias for `taskcast service start`')
+  /* v8 ignore next 4 */
   .action(async () => {
     const { runServiceStart } = await import('./commands/service.js')
     await runServiceStart()
   })
 program.command('stop').description('Alias for `taskcast service stop`')
+  /* v8 ignore next 4 */
   .action(async () => {
     const { runServiceStop } = await import('./commands/service.js')
     await runServiceStop()
   })
 program.command('status').description('Alias for `taskcast service status`')
+  /* v8 ignore next 4 */
   .action(async () => {
     const { runServiceStatus } = await import('./commands/service.js')
     await runServiceStatus()

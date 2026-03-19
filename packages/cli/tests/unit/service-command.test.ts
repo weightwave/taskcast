@@ -44,7 +44,26 @@ vi.mock('fs', () => ({
   }),
 }))
 
-import { registerServiceCommand, runServiceStart, runServiceRestart } from '../../src/commands/service.js'
+import { registerServiceCommand, runServiceStart, runServiceRestart, runServiceStatus } from '../../src/commands/service.js'
+import { getServicePaths } from '../../src/service/paths.js'
+
+const DEFAULT_PATHS = {
+  defaultConfigPath: '/home/test/.taskcast/taskcast.config.yaml',
+  defaultDbPath: '/home/test/.taskcast/taskcast.db',
+  serviceStatePath: '/home/test/.taskcast/service.state.json',
+  plistOrUnitPath: '/tmp/test.plist',
+  logDir: '/tmp/logs',
+  stdoutLog: '/tmp/logs/taskcast.log',
+  stderrLog: '/tmp/logs/taskcast.err.log',
+}
+
+const LINUX_PATHS = {
+  ...DEFAULT_PATHS,
+  plistOrUnitPath: '/home/test/.config/systemd/user/taskcast.service',
+  logDir: '',
+  stdoutLog: '',
+  stderrLog: '',
+}
 
 // Mock fetch for health polling
 const mockFetch = vi.fn()
@@ -63,6 +82,8 @@ describe('registerServiceCommand', () => {
 
   beforeEach(() => {
     vi.clearAllMocks()
+    // Reset paths mock to default (macOS-like) paths after any Linux override
+    vi.mocked(getServicePaths).mockReturnValue(DEFAULT_PATHS)
     logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
     errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
     mockStatus.mockResolvedValue({ state: 'not-installed' })
@@ -185,6 +206,17 @@ describe('registerServiceCommand', () => {
       expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('failed to start'))
       expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('/tmp/logs/taskcast.log'))
     })
+
+    it('prints journalctl hint when health check times out (Linux, no log file)', async () => {
+      vi.mocked(getServicePaths).mockReturnValue(LINUX_PATHS)
+      mockStatus.mockResolvedValue({ state: 'stopped' })
+      mockStart.mockResolvedValue(undefined)
+      mockFetch.mockRejectedValue(new Error('ECONNREFUSED'))
+
+      await runServiceStart(100)
+
+      expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('journalctl'))
+    })
   })
 
   describe('stop', () => {
@@ -228,6 +260,16 @@ describe('registerServiceCommand', () => {
 
       expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('failed to restart'))
       expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('/tmp/logs/taskcast.log'))
+    })
+
+    it('prints journalctl hint when health check times out after restart (Linux)', async () => {
+      vi.mocked(getServicePaths).mockReturnValue(LINUX_PATHS)
+      mockRestart.mockResolvedValue(undefined)
+      mockFetch.mockRejectedValue(new Error('ECONNREFUSED'))
+
+      await runServiceRestart(100)
+
+      expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('journalctl'))
     })
   })
 
@@ -294,6 +336,35 @@ describe('registerServiceCommand', () => {
 
       expect(mockUninstall).toHaveBeenCalledOnce()
       expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('uninstalled successfully'))
+    })
+  })
+
+  describe('getPortFromConfig fallback paths', () => {
+    it('falls back to config file port when state file is missing', async () => {
+      const { readFileSync } = await import('fs')
+      vi.mocked(readFileSync).mockImplementation((path: unknown) => {
+        if (String(path).endsWith('service.state.json')) throw new Error('ENOENT')
+        return 'port: 9999\n'
+      })
+      mockStatus.mockResolvedValue({ state: 'stopped' })
+      mockStart.mockResolvedValue(undefined)
+      mockFetch.mockResolvedValue({ ok: true })
+
+      await runServiceStart(100)
+
+      expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('9999'))
+    })
+
+    it('returns default port 3721 when both state file and config file are unreadable', async () => {
+      const { readFileSync } = await import('fs')
+      vi.mocked(readFileSync).mockImplementation(() => { throw new Error('ENOENT') })
+      mockStatus.mockResolvedValue({ state: 'running', pid: 1 })
+      mockFetch.mockRejectedValue(new Error('ECONNREFUSED'))
+
+      await runServiceStatus()
+
+      // Should not throw; health check fetches http://localhost:3721/...
+      expect(mockFetch).toHaveBeenCalledWith(expect.stringContaining('3721'))
     })
   })
 })
