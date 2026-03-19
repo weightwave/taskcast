@@ -35,6 +35,9 @@ describe('getServicePaths', () => {
     expect(paths.plistOrUnitPath).toBe(join(home, '.config/systemd/user/taskcast.service'))
     expect(paths.defaultConfigPath).toBe(join(home, '.taskcast/taskcast.config.yaml'))
     expect(paths.defaultDbPath).toBe(join(home, '.taskcast/taskcast.db'))
+    expect(paths.logDir).toBe('')
+    expect(paths.stdoutLog).toBe('')
+    expect(paths.stderrLog).toBe('')
   })
 
   it('throws on unsupported platform', async () => {
