@@ -181,6 +181,8 @@ export interface TaskEvent {
   seriesMode?: SeriesMode
   seriesAccField?: string
   seriesSnapshot?: boolean
+  clientId?: string
+  clientSeq?: number
   /** Transient: accumulated data attached during broadcast, not persisted in ShortTermStore */
   _accumulatedData?: unknown
 }
@@ -277,7 +279,22 @@ export interface ShortTermStore {
 
   // Task query by status
   listByStatus(statuses: TaskStatus[]): Promise<Task[]>
+
+  // Seq ordering
+  processSeq(taskId: string, clientId: string, seq: number, ttl: number): Promise<ProcessSeqResult>
+  advanceAfterEmit(taskId: string, clientId: string, completedSeq: number, ttl: number): Promise<{ triggerNext?: number }>
+  cancelSlot(taskId: string, clientId: string, seq: number): Promise<'cancelled' | 'already_triggered'>
+  getExpectedSeq(taskId: string, clientId: string): Promise<number | null>
+  cleanupSeq(taskId: string, clientId?: string): Promise<void>
 }
+
+// ─── Seq Ordering ─────────────────────────────────────────────────────────
+
+export type ProcessSeqResult =
+  | { action: 'accept'; triggerNext?: number }
+  | { action: 'wait' }
+  | { action: 'reject_stale'; expected: number }
+  | { action: 'reject_duplicate' }
 
 export interface LongTermStore {
   saveTask(task: Task): Promise<void>
