@@ -146,18 +146,30 @@ export function registerServiceCommand(program: Command): void {
     .option('-s, --storage <type>', 'storage backend: memory | redis | sqlite')
     .option('--db-path <path>', 'SQLite database file path')
     .action(async (opts: { config?: string; port: string; storage?: string; dbPath?: string }) => {
+      const port = Number(opts.port)
+      if (!Number.isFinite(port) || port < 1 || port > 65535 || port !== Math.floor(port)) {
+        console.error(`[taskcast] Invalid port: ${opts.port}`)
+        process.exit(1)
+      }
+
       const mgr = createServiceManager()
       const paths = getServicePaths()
 
       const configPath = ensureConfigFile(paths, opts.config)
 
+      // When using auto-generated config (SQLite default) and user didn't
+      // explicitly set --storage, ensure the service starts with sqlite.
+      const autoSqlite = !opts.config && !opts.storage
+      const storage = opts.storage ?? (autoSqlite ? 'sqlite' : undefined)
+      const dbPath = opts.dbPath ?? (autoSqlite ? paths.defaultDbPath : undefined)
+
       const installOpts: ServiceInstallOptions = {
-        port: Number(opts.port),
+        port,
         config: configPath,
         nodePath: resolveNodePath(),
         entryPoint: resolveEntryPoint(),
-        ...(opts.storage !== undefined ? { storage: opts.storage } : {}),
-        ...(opts.dbPath !== undefined ? { dbPath: opts.dbPath } : {}),
+        ...(storage !== undefined ? { storage } : {}),
+        ...(dbPath !== undefined ? { dbPath } : {}),
       }
 
       await mgr.install(installOpts)
@@ -165,7 +177,7 @@ export function registerServiceCommand(program: Command): void {
       // Write state file with the installed port so start/restart poll the right port
       const statePath = paths.serviceStatePath
       mkdirSync(dirname(statePath), { recursive: true })
-      writeFileSync(statePath, JSON.stringify({ port: Number(opts.port) }))
+      writeFileSync(statePath, JSON.stringify({ port }))
 
       console.log('[taskcast] Service installed successfully.')
       console.log('[taskcast] Run `taskcast service start` to start the service.')

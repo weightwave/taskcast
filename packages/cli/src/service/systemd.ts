@@ -13,7 +13,9 @@ function generateUnitFile(opts: ServiceInstallOptions): string {
   if (opts.storage) args.push('--storage', opts.storage)
   if (opts.dbPath) args.push('--db-path', opts.dbPath)
 
-  const execStart = [opts.nodePath, ...args].join(' ')
+  // Quote any argument containing spaces so systemd parses them correctly
+  const quote = (s: string) => (s.includes(' ') ? `"${s}"` : s)
+  const execStart = [opts.nodePath, ...args].map(quote).join(' ')
 
   return `[Unit]
 Description=Taskcast — unified task tracking and streaming service

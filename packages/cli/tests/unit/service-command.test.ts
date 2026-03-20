@@ -120,6 +120,26 @@ describe('registerServiceCommand', () => {
       expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('installed successfully'))
     })
 
+    it('rejects invalid port', async () => {
+      const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => { throw new Error('exit') }) as never)
+      try {
+        await makeProgram().parseAsync(['node', 'test', 'service', 'install', '--port', 'abc']).catch(() => {})
+        expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('Invalid port'))
+      } finally {
+        exitSpy.mockRestore()
+      }
+    })
+
+    it('rejects out-of-range port', async () => {
+      const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => { throw new Error('exit') }) as never)
+      try {
+        await makeProgram().parseAsync(['node', 'test', 'service', 'install', '--port', '99999']).catch(() => {})
+        expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('Invalid port'))
+      } finally {
+        exitSpy.mockRestore()
+      }
+    })
+
     it('creates default config when none exists', async () => {
       const { existsSync } = await import('fs')
       vi.mocked(existsSync).mockReturnValue(false)
@@ -158,6 +178,35 @@ describe('registerServiceCommand', () => {
 
       expect(mockInstall).toHaveBeenCalledWith(
         expect.objectContaining({ port: 8080 }),
+      )
+    })
+
+    it('auto-adds --storage sqlite and --db-path when using default config', async () => {
+      mockInstall.mockResolvedValue(undefined)
+      await makeProgram().parseAsync(['node', 'test', 'service', 'install'])
+
+      expect(mockInstall).toHaveBeenCalledWith(
+        expect.objectContaining({
+          storage: 'sqlite',
+          dbPath: '/home/test/.taskcast/taskcast.db',
+        }),
+      )
+    })
+
+    it('does not auto-add sqlite when --config is provided', async () => {
+      mockInstall.mockResolvedValue(undefined)
+      await makeProgram().parseAsync(['node', 'test', 'service', 'install', '--config', '/some/config.yaml'])
+
+      const call = mockInstall.mock.calls[0][0]
+      expect(call.storage).toBeUndefined()
+    })
+
+    it('does not override explicit --storage', async () => {
+      mockInstall.mockResolvedValue(undefined)
+      await makeProgram().parseAsync(['node', 'test', 'service', 'install', '--storage', 'memory'])
+
+      expect(mockInstall).toHaveBeenCalledWith(
+        expect.objectContaining({ storage: 'memory' }),
       )
     })
 

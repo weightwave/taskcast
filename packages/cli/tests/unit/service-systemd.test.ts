@@ -80,6 +80,23 @@ describe('SystemdServiceManager', () => {
       )
     })
 
+    it('quotes arguments containing spaces in ExecStart', async () => {
+      vi.mocked(existsSync).mockReturnValue(false)
+      vi.mocked(execFileSync).mockReturnValue(Buffer.from(''))
+
+      await mgr.install({
+        port: 3721,
+        config: '/path with spaces/taskcast.config.yaml',
+        nodePath: '/usr/bin/node',
+        entryPoint: '/usr/lib/node_modules/@taskcast/cli/dist/index.js',
+      })
+
+      const [, content] = vi.mocked(writeFileSync).mock.calls[0] as [string, string]
+      expect(content).toContain('"/path with spaces/taskcast.config.yaml"')
+      // Non-space paths should not be quoted
+      expect(content).not.toContain('"/usr/bin/node"')
+    })
+
     it('throws if already installed', async () => {
       vi.mocked(existsSync).mockReturnValue(true)
 
