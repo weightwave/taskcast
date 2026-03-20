@@ -14,7 +14,7 @@ class ExitError extends Error {
 vi.mock('@taskcast/core', () => ({
   TaskEngine: vi.fn().mockImplementation(() => ({})),
   WorkerManager: vi.fn().mockImplementation(() => ({})),
-  loadConfigFile: vi.fn().mockResolvedValue({ config: { port: 3721 }, source: 'none' }),
+  loadConfigFile: vi.fn().mockResolvedValue({ config: { port: 3721 }, source: 'none', path: undefined }),
   resolveAdminToken: vi.fn(),
   MemoryBroadcastProvider: vi.fn(),
   MemoryShortTermStore: vi.fn(),
@@ -136,6 +136,77 @@ describe('registerStartCommand', () => {
     expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('Server started'))
   })
 
+  it('prints config path and storage info on startup', async () => {
+    const { loadConfigFile } = await import('@taskcast/core')
+    ;(loadConfigFile as ReturnType<typeof vi.fn>).mockResolvedValue({
+      config: { port: 3721 },
+      source: 'global',
+      path: '/home/user/.taskcast/taskcast.config.yaml',
+    })
+
+    const origRedis = process.env['TASKCAST_REDIS_URL']
+    delete process.env['TASKCAST_REDIS_URL']
+
+    const program = new Command()
+    program.exitOverride()
+    registerStartCommand(program)
+
+    try {
+      await program.parseAsync(['node', 'test', 'start'])
+    } finally {
+      if (origRedis !== undefined) process.env['TASKCAST_REDIS_URL'] = origRedis
+    }
+
+    expect(logSpy).toHaveBeenCalledWith('[taskcast] Config: /home/user/.taskcast/taskcast.config.yaml')
+    expect(logSpy).toHaveBeenCalledWith('[taskcast] Short-term store: memory')
+    expect(logSpy).toHaveBeenCalledWith('[taskcast] Long-term store:  (none)')
+
+    // Reset
+    ;(loadConfigFile as ReturnType<typeof vi.fn>).mockResolvedValue({
+      config: { port: 3721 },
+      source: 'none',
+      path: undefined,
+    })
+  })
+
+  it('prints (none) for config path when no config file found', async () => {
+    const origRedis = process.env['TASKCAST_REDIS_URL']
+    delete process.env['TASKCAST_REDIS_URL']
+
+    const program = new Command()
+    program.exitOverride()
+    registerStartCommand(program)
+
+    try {
+      await program.parseAsync(['node', 'test', 'start'])
+    } finally {
+      if (origRedis !== undefined) process.env['TASKCAST_REDIS_URL'] = origRedis
+    }
+
+    expect(logSpy).toHaveBeenCalledWith('[taskcast] Config: (none)')
+  })
+
+  it('prints postgres long-term store info when configured', async () => {
+    const origPg = process.env['TASKCAST_POSTGRES_URL']
+    const origRedis = process.env['TASKCAST_REDIS_URL']
+    process.env['TASKCAST_POSTGRES_URL'] = 'postgres://localhost/taskcast'
+    delete process.env['TASKCAST_REDIS_URL']
+
+    const program = new Command()
+    program.exitOverride()
+    registerStartCommand(program)
+
+    try {
+      await program.parseAsync(['node', 'test', 'start'])
+    } finally {
+      if (origPg !== undefined) process.env['TASKCAST_POSTGRES_URL'] = origPg
+      else delete process.env['TASKCAST_POSTGRES_URL']
+      if (origRedis !== undefined) process.env['TASKCAST_REDIS_URL'] = origRedis
+    }
+
+    expect(logSpy).toHaveBeenCalledWith('[taskcast] Long-term store:  postgres @ postgres://localhost/taskcast')
+  })
+
   it('starts server with custom port', async () => {
     const program = new Command()
     program.exitOverride()
@@ -155,7 +226,7 @@ describe('registerStartCommand', () => {
 
     await program.parseAsync(['node', 'test', 'start', '-s', 'sqlite'])
 
-    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('SQLite'))
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('Short-term store: sqlite'))
   })
 
   it('starts server with redis storage', async () => {
@@ -215,7 +286,7 @@ describe('registerStartCommand', () => {
       if (origEnv !== undefined) process.env['TASKCAST_REDIS_URL'] = origEnv
     }
 
-    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('in-memory adapters'))
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('Short-term store: memory'))
   })
 
   it('passes verbose flag to server', async () => {
@@ -258,6 +329,7 @@ describe('registerStartCommand', () => {
     ;(loadConfigFile as ReturnType<typeof vi.fn>).mockResolvedValue({
       config: { port: 3721, workers: { enabled: true, defaults: { maxRetries: 3 } } },
       source: 'file',
+      path: '/fake/taskcast.config.yaml',
     })
 
     const origRedis = process.env['TASKCAST_REDIS_URL']
@@ -281,6 +353,7 @@ describe('registerStartCommand', () => {
     ;(loadConfigFile as ReturnType<typeof vi.fn>).mockResolvedValue({
       config: { port: 3721 },
       source: 'none',
+      path: undefined,
     })
   })
 
@@ -335,8 +408,8 @@ describe('registerStartCommand', () => {
 
     // loadConfigFile will be called again with the created path
     ;(loadConfigFile as ReturnType<typeof vi.fn>)
-      .mockResolvedValueOnce({ config: { port: 3721 }, source: 'none' })
-      .mockResolvedValueOnce({ config: { port: 4000 }, source: 'file' })
+      .mockResolvedValueOnce({ config: { port: 3721 }, source: 'none', path: undefined })
+      .mockResolvedValueOnce({ config: { port: 4000 }, source: 'file', path: '/fake/config.yaml' })
 
     const origRedis = process.env['TASKCAST_REDIS_URL']
     delete process.env['TASKCAST_REDIS_URL']
@@ -359,6 +432,7 @@ describe('registerStartCommand', () => {
     ;(loadConfigFile as ReturnType<typeof vi.fn>).mockResolvedValue({
       config: { port: 3721 },
       source: 'none',
+      path: undefined,
     })
   })
 
@@ -369,6 +443,6 @@ describe('registerStartCommand', () => {
 
     await program.parseAsync(['node', 'test', 'start', '-s', 'sqlite', '--db-path', '/tmp/my.db'])
 
-    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('/tmp/my.db'))
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('sqlite @ /tmp/my.db'))
   })
 })

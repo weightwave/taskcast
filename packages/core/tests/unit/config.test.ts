@@ -132,6 +132,7 @@ describe('loadConfigFile', () => {
       const result = await loadConfigFile(tmpPath)
       expect(result.config.port).toBe(9999)
       expect(result.source).toBe('explicit')
+      expect(result.path).toBe(tmpPath)
     } finally {
       unlinkSync(tmpPath)
     }
@@ -145,24 +146,27 @@ describe('loadConfigFile', () => {
       expect(result.config.port).toBe(7777)
       expect(result.config.logLevel).toBe('debug')
       expect(result.source).toBe('explicit')
+      expect(result.path).toBe(tmpPath)
     } finally {
       unlinkSync(tmpPath)
     }
   })
 
-  it('returns source "explicit" with empty config when explicit path does not exist', async () => {
+  it('returns source "explicit" with path when explicit path does not exist', async () => {
     const result = await loadConfigFile('/tmp/taskcast-nonexistent-xyz-12345.yaml')
     expect(result.config).toEqual({})
     expect(result.source).toBe('explicit')
+    expect(result.path).toBe('/tmp/taskcast-nonexistent-xyz-12345.yaml')
   })
 
-  it('returns source "none" when no config files exist anywhere', async () => {
+  it('returns source "none" with no path when no config files exist anywhere', async () => {
     const emptyDir = join(tmpdir(), `taskcast-empty-${Date.now()}`)
     mkdirSync(emptyDir, { recursive: true })
     try {
       const result = await loadConfigFile(undefined, emptyDir)
       expect(result.source).toBe('none')
       expect(result.config).toEqual({})
+      expect(result.path).toBeUndefined()
     } finally {
       rmSync(emptyDir, { recursive: true, force: true })
     }
@@ -186,6 +190,7 @@ describe('loadConfigFile - global fallback', () => {
     const result = await loadConfigFile(undefined, globalDir)
     expect(result.config.port).toBe(5555)
     expect(result.source).toBe('global')
+    expect(result.path).toBe(globalConfigPath)
   })
 
   it('does not search global for ts/js/mjs files', async () => {

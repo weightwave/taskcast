@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { createRequire } from 'module'
 import { Command } from 'commander'
 import { registerStartCommand } from './commands/start.js'
 import { registerMigrateCommand } from './commands/migrate.js'
@@ -9,13 +10,17 @@ import { registerPingCommand } from './commands/ping.js'
 import { registerDoctorCommand } from './commands/doctor.js'
 import { registerLogsCommand, registerTailCommand } from './commands/logs.js'
 import { registerTasksCommand } from './commands/tasks.js'
+import { registerServiceCommand } from './commands/service.js'
+
+const _require = createRequire(import.meta.url)
+const { version } = _require('../package.json') as { version: string }
 
 const program = new Command()
 
 program
   .name('taskcast')
   .description('Taskcast — unified task tracking and streaming service')
-  .version('0.3.1')
+  .version(version)
 
 registerStartCommand(program)
 registerMigrateCommand(program)
@@ -27,13 +32,26 @@ registerDoctorCommand(program)
 registerLogsCommand(program)
 registerTailCommand(program)
 registerTasksCommand(program)
+registerServiceCommand(program)
 
-// Placeholders for unimplemented commands
-program.command('daemon').description('Start as background service (not yet implemented)')
-  .action(() => { console.error('[taskcast] daemon mode is not yet implemented'); process.exit(1) })
-program.command('stop').description('Stop background service (not yet implemented)')
-  .action(() => { console.error('[taskcast] stop is not yet implemented'); process.exit(1) })
-program.command('status').description('Show server status (not yet implemented)')
-  .action(() => { console.error('[taskcast] status is not yet implemented'); process.exit(1) })
+// Backward-compat aliases for old daemon/stop/status placeholder commands
+program.command('daemon').description('Alias for `taskcast service start`')
+  /* v8 ignore next 4 */
+  .action(async () => {
+    const { runServiceStart } = await import('./commands/service.js')
+    await runServiceStart()
+  })
+program.command('stop').description('Alias for `taskcast service stop`')
+  /* v8 ignore next 4 */
+  .action(async () => {
+    const { runServiceStop } = await import('./commands/service.js')
+    await runServiceStop()
+  })
+program.command('status').description('Alias for `taskcast service status`')
+  /* v8 ignore next 4 */
+  .action(async () => {
+    const { runServiceStatus } = await import('./commands/service.js')
+    await runServiceStatus()
+  })
 
 program.parse()

@@ -32,6 +32,12 @@ vi.mock('../../src/commands/logs.js', () => ({
 vi.mock('../../src/commands/tasks.js', () => ({
   registerTasksCommand: vi.fn(),
 }))
+vi.mock('../../src/commands/service.js', () => ({
+  registerServiceCommand: vi.fn(),
+  runServiceStart: vi.fn().mockResolvedValue(undefined),
+  runServiceStop: vi.fn().mockResolvedValue(undefined),
+  runServiceStatus: vi.fn().mockResolvedValue(undefined),
+}))
 
 // Mock commander to capture the program
 const mockParse = vi.fn()
@@ -79,6 +85,7 @@ describe('index.ts', () => {
     const { registerDoctorCommand } = await import('../../src/commands/doctor.js')
     const { registerLogsCommand, registerTailCommand } = await import('../../src/commands/logs.js')
     const { registerTasksCommand } = await import('../../src/commands/tasks.js')
+    const { registerServiceCommand } = await import('../../src/commands/service.js')
 
     expect(registerStartCommand).toHaveBeenCalledWith(mockProgram)
     expect(registerMigrateCommand).toHaveBeenCalledWith(mockProgram)
@@ -90,8 +97,9 @@ describe('index.ts', () => {
     expect(registerLogsCommand).toHaveBeenCalledWith(mockProgram)
     expect(registerTailCommand).toHaveBeenCalledWith(mockProgram)
     expect(registerTasksCommand).toHaveBeenCalledWith(mockProgram)
+    expect(registerServiceCommand).toHaveBeenCalledWith(mockProgram)
 
-    // Placeholder commands: daemon, stop, status
+    // Backward-compat alias commands: daemon, stop, status
     expect(mockCommand).toHaveBeenCalledWith('daemon')
     expect(mockCommand).toHaveBeenCalledWith('stop')
     expect(mockCommand).toHaveBeenCalledWith('status')
