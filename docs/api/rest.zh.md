@@ -168,12 +168,43 @@ POST /tasks/:taskId/events
 | `seriesId` | string | 否 | 序列 ID，用于分组 |
 | `seriesMode` | string | 否 | `keep-all`/`accumulate`/`latest` |
 | `seriesAccField` | string | 否 | `accumulate` 模式下拼接的字段名（默认为 `delta`） |
+| `clientId` | string | 否 | 客户端标识，用于序号排序。必须与 `clientSeq` 同时提供 |
+| `clientSeq` | integer | 否 | 单调递增的客户端序号（≥ 0）。必须与 `clientId` 同时提供 |
+| `seqMode` | string | 否 | `hold`（默认）或 `fast-fail`。控制乱序事件的处理方式 |
 
-**响应：** `201 Created` — 返回创建的事件（单条）或事件数组（批量）
+> **序号排序：** 当提供 `clientId` 和 `clientSeq` 时，服务器保证在同一 `(taskId, clientId)` 内按 `clientSeq` 顺序写入事件。乱序请求会被 hold 等待间隙填补（默认超时 30 秒），或在 `fast-fail` 模式下立即拒绝。不同 `clientId` 之间相互独立。两个字段都不传时完全跳过排序（向后兼容）。
+
+**响应：** `201 Created` — 返回创建的事件（单条）或事件数组（批量）。提供 `clientId`/`clientSeq` 时会包含在响应中。
 
 **错误：**
-- `400` — 任务不在 `running` 状态时不能发布事件
+- `400` — 参数无效（任务不在 `running` 状态、`clientId`/`clientSeq` 未同时提供、`clientSeq` 为负数）
 - `404` — 任务不存在
+- `408` — 序号等待超时，间隙未在超时时间内填补
+- `409` — 序号冲突：`seq_stale`（序号已消费）、`seq_duplicate`（重复序号）、`seq_gap`（fast-fail 模式，存在间隙）
+
+**所需权限：** `event:publish`
+
+---
+
+### 查询序号状态
+
+```
+GET /tasks/:taskId/seq/:clientId
+```
+
+返回指定客户端的当前期望序号。
+
+**响应：** `200 OK`
+
+```json
+{
+  "clientId": "worker-1",
+  "expectedSeq": 5
+}
+```
+
+**错误：**
+- `404` — 该客户端无序号状态（从未使用此 `clientId` 发布过事件，或任务已到达终态）
 
 **所需权限：** `event:publish`
 

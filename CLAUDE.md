@@ -136,6 +136,10 @@ Task lifecycle: pending → running → completed|failed|timeout|cancelled
   - TTL triggers automatic timeout
 
 Event filtering: wildcard type matching (e.g. "llm.*"), level filtering, since cursor
+Client seq ordering: clientId + clientSeq for write-time ordering, seqMode=hold|fast-fail
+  - Server holds out-of-order requests until gaps fill (default 30s timeout)
+  - Per (taskId, clientId) — different clients are independent
+  - Omitting clientId/clientSeq bypasses ordering (backward-compatible)
 Series modes: keep-all | accumulate (text concat) | latest (replace)
 Series format (SSE): seriesFormat=delta (default) | accumulated
   - Late-join: accumulate series collapsed to single snapshot (seriesSnapshot: true)
