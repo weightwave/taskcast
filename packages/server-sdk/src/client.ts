@@ -74,20 +74,20 @@ export class TaskcastServerClient {
    * Connects to the server's SSE endpoint and calls the handler for each event.
    * Returns a synchronous unsubscribe function that closes the connection.
    *
-   * Uses `wrap=false` by default so the handler receives raw `TaskEvent` objects.
+   * Always uses `wrap=false` so the handler receives raw `TaskEvent` objects.
    * The connection starts asynchronously; events begin flowing once established.
    * The stream closes automatically when the task reaches a terminal status.
    */
   subscribe(
     taskId: string,
     handler: (event: TaskEvent) => void,
-    filter?: SubscribeFilter,
+    filter?: Omit<SubscribeFilter, 'wrap'>,
   ): () => void {
     const controller = new AbortController()
 
     const params = new URLSearchParams()
-    // Default to unwrapped TaskEvent format
-    params.set('wrap', String(filter?.wrap ?? false))
+    // Force unwrapped TaskEvent format to match the handler type
+    params.set('wrap', 'false')
     if (filter?.types?.length) params.set('types', filter.types.join(','))
     if (filter?.levels?.length) params.set('levels', filter.levels.join(','))
     if (filter?.includeStatus !== undefined) params.set('includeStatus', String(filter.includeStatus))
@@ -145,17 +145,25 @@ export class TaskcastServerClient {
           } else if (line === '') {
             // Empty line = end of SSE message
             if (currentEvent === 'taskcast.done') {
-              // Terminal event — stream will close
+              // Terminal event — proactively close the stream
               currentEvent = ''
               currentData = ''
+              await reader.cancel().catch(() => {})
               return
             }
             if (currentData) {
+              let parsed: TaskEvent | null = null
               try {
-                const parsed = JSON.parse(currentData) as TaskEvent
-                handler(parsed)
+                parsed = JSON.parse(currentData) as TaskEvent
               } catch {
                 // Skip malformed events
+              }
+              if (parsed) {
+                try {
+                  handler(parsed)
+                } catch {
+                  // Don't let handler errors break the stream
+                }
               }
             }
             currentEvent = ''
@@ -163,8 +171,12 @@ export class TaskcastServerClient {
           }
         }
       }
-    } catch {
-      // AbortError or read failure — clean exit
+    } catch (err) {
+      // AbortError — clean exit; let other errors propagate
+      const isAbort =
+        (err instanceof DOMException && err.name === 'AbortError') ||
+        (err instanceof Error && err.name === 'AbortError')
+      if (!isAbort) throw err
     }
   }
 

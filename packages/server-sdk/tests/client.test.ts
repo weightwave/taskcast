@@ -424,6 +424,29 @@ describe('TaskcastServerClient.subscribe', () => {
     expect(received).toHaveLength(0)
   })
 
+  it('continues streaming when handler throws', async () => {
+    const event1 = { id: 'e1', taskId: 't1', index: 0, timestamp: 1000, type: 'log', level: 'info', data: null }
+    const event2 = { id: 'e2', taskId: 't1', index: 1, timestamp: 1001, type: 'log', level: 'info', data: null }
+    const fetch = makeSSEFetch([
+      `event: taskcast.event\ndata: ${JSON.stringify(event1)}\n\n`,
+      `event: taskcast.event\ndata: ${JSON.stringify(event2)}\n\n`,
+    ])
+    const client = new TaskcastServerClient({ baseUrl: 'http://taskcast', fetch })
+    const received: unknown[] = []
+    let callCount = 0
+
+    client.subscribe('t1', (e) => {
+      callCount++
+      if (callCount === 1) throw new Error('handler error')
+      received.push(e)
+    })
+    await new Promise((r) => setTimeout(r, 50))
+
+    // Second event should still be delivered despite first handler throwing
+    expect(received).toHaveLength(1)
+    expect(received[0]).toEqual(event2)
+  })
+
   it('handles fetch failure gracefully', async () => {
     const fetch = vi.fn().mockRejectedValue(new TypeError('fetch failed'))
     const client = new TaskcastServerClient({ baseUrl: 'http://taskcast', fetch })
