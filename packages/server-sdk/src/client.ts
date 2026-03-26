@@ -1,4 +1,4 @@
-import type { Task, TaskEvent, TaskStatus, TaskAuthConfig, WebhookConfig, CleanupRule, SeriesMode, SinceCursor, TaskError } from '@taskcast/core'
+import type { Task, TaskEvent, TaskStatus, TaskAuthConfig, WebhookConfig, CleanupRule, SeriesMode, SinceCursor, TaskError, SubscribeFilter } from '@taskcast/core'
 
 export type CreateTaskInput = Pick<Partial<Task>, 'type' | 'params' | 'result' | 'metadata' | 'ttl' | 'authConfig' | 'webhooks' | 'cleanup'>
 
@@ -67,6 +67,105 @@ export class TaskcastServerClient {
       params.set('since.timestamp', String(opts.since.timestamp))
     const qs = params.toString()
     return this._request<TaskEvent[]>('GET', `/tasks/${taskId}/events/history${qs ? `?${qs}` : ''}`)
+  }
+
+  /**
+   * Subscribe to real-time events for a task via SSE.
+   * Connects to the server's SSE endpoint and calls the handler for each event.
+   * Returns a synchronous unsubscribe function that closes the connection.
+   *
+   * Uses `wrap=false` by default so the handler receives raw `TaskEvent` objects.
+   * The connection starts asynchronously; events begin flowing once established.
+   * The stream closes automatically when the task reaches a terminal status.
+   */
+  subscribe(
+    taskId: string,
+    handler: (event: TaskEvent) => void,
+    filter?: SubscribeFilter,
+  ): () => void {
+    const controller = new AbortController()
+
+    const params = new URLSearchParams()
+    // Default to unwrapped TaskEvent format
+    params.set('wrap', String(filter?.wrap ?? false))
+    if (filter?.types?.length) params.set('types', filter.types.join(','))
+    if (filter?.levels?.length) params.set('levels', filter.levels.join(','))
+    if (filter?.includeStatus !== undefined) params.set('includeStatus', String(filter.includeStatus))
+    if (filter?.seriesFormat) params.set('seriesFormat', filter.seriesFormat)
+    if (filter?.since?.id) params.set('since.id', filter.since.id)
+    if (filter?.since?.index !== undefined) params.set('since.index', String(filter.since.index))
+    if (filter?.since?.timestamp !== undefined) params.set('since.timestamp', String(filter.since.timestamp))
+
+    const qs = params.toString()
+    const url = `${this.baseUrl}/tasks/${taskId}/events${qs ? `?${qs}` : ''}`
+    const headers: Record<string, string> = { Accept: 'text/event-stream' }
+    if (this.token) headers['Authorization'] = `Bearer ${this.token}`
+
+    // Start SSE connection asynchronously
+    void this._consumeSSE(url, headers, controller.signal, handler)
+
+    return () => controller.abort()
+  }
+
+  private async _consumeSSE(
+    url: string,
+    headers: Record<string, string>,
+    signal: AbortSignal,
+    handler: (event: TaskEvent) => void,
+  ): Promise<void> {
+    let res: Response
+    try {
+      res = await this.fetch(url, { method: 'GET', headers, signal })
+    } catch {
+      return // Aborted or network error
+    }
+    if (!res.ok || !res.body) return
+
+    const reader = res.body.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ''
+    let currentEvent = ''
+    let currentData = ''
+
+    try {
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+        // Keep incomplete last line in buffer
+        buffer = lines.pop() ?? ''
+
+        for (const line of lines) {
+          if (line.startsWith('event: ')) {
+            currentEvent = line.slice(7).trim()
+          } else if (line.startsWith('data: ')) {
+            currentData += (currentData ? '\n' : '') + line.slice(6)
+          } else if (line === '') {
+            // Empty line = end of SSE message
+            if (currentEvent === 'taskcast.done') {
+              // Terminal event — stream will close
+              currentEvent = ''
+              currentData = ''
+              return
+            }
+            if (currentData) {
+              try {
+                const parsed = JSON.parse(currentData) as TaskEvent
+                handler(parsed)
+              } catch {
+                // Skip malformed events
+              }
+            }
+            currentEvent = ''
+            currentData = ''
+          }
+        }
+      }
+    } catch {
+      // AbortError or read failure — clean exit
+    }
   }
 
   private async _request<T>(

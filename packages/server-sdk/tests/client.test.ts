@@ -262,6 +262,181 @@ describe('Network failures and error responses', () => {
   })
 })
 
+// --- SSE subscribe tests ---
+
+/** Create a ReadableStream that emits SSE-formatted text chunks. */
+function makeSSEStream(chunks: string[]): ReadableStream<Uint8Array> {
+  const encoder = new TextEncoder()
+  let i = 0
+  return new ReadableStream({
+    pull(controller) {
+      if (i < chunks.length) {
+        controller.enqueue(encoder.encode(chunks[i++]))
+      } else {
+        controller.close()
+      }
+    },
+  })
+}
+
+function makeSSEFetch(sseChunks: string[]) {
+  return vi.fn().mockImplementation((url: string) => {
+    if (url.includes('/events') && !url.includes('/history')) {
+      return Promise.resolve(
+        new Response(makeSSEStream(sseChunks), {
+          status: 200,
+          headers: { 'Content-Type': 'text/event-stream' },
+        }),
+      )
+    }
+    return Promise.resolve(new Response(JSON.stringify({}), { status: 200 }))
+  })
+}
+
+describe('TaskcastServerClient.subscribe', () => {
+  it('connects to SSE endpoint and delivers events to handler', async () => {
+    const event1 = { id: 'e1', taskId: 't1', index: 0, timestamp: 1000, type: 'log', level: 'info', data: { msg: 'hello' } }
+    const event2 = { id: 'e2', taskId: 't1', index: 1, timestamp: 1001, type: 'log', level: 'info', data: { msg: 'world' } }
+
+    const fetch = makeSSEFetch([
+      `event: taskcast.event\ndata: ${JSON.stringify(event1)}\n\n`,
+      `event: taskcast.event\ndata: ${JSON.stringify(event2)}\n\n`,
+    ])
+    const client = new TaskcastServerClient({ baseUrl: 'http://taskcast', fetch })
+    const received: unknown[] = []
+
+    client.subscribe('t1', (e) => received.push(e))
+
+    // Wait for async SSE consumption
+    await new Promise((r) => setTimeout(r, 50))
+
+    expect(received).toHaveLength(2)
+    expect(received[0]).toEqual(event1)
+    expect(received[1]).toEqual(event2)
+  })
+
+  it('builds correct URL with default wrap=false', async () => {
+    const fetch = makeSSEFetch([])
+    const client = new TaskcastServerClient({ baseUrl: 'http://taskcast', fetch })
+
+    client.subscribe('task-1', () => {})
+    await new Promise((r) => setTimeout(r, 10))
+
+    const url = fetch.mock.calls[0]![0] as string
+    expect(url).toContain('/tasks/task-1/events')
+    expect(url).toContain('wrap=false')
+  })
+
+  it('includes filter query params', async () => {
+    const fetch = makeSSEFetch([])
+    const client = new TaskcastServerClient({ baseUrl: 'http://taskcast', fetch })
+
+    client.subscribe('task-1', () => {}, {
+      types: ['llm.*', 'progress'],
+      levels: ['info', 'warn'],
+      since: { index: 5 },
+      seriesFormat: 'accumulated',
+    })
+    await new Promise((r) => setTimeout(r, 10))
+
+    const url = fetch.mock.calls[0]![0] as string
+    expect(url).toContain('types=llm.*%2Cprogress')
+    expect(url).toContain('levels=info%2Cwarn')
+    expect(url).toContain('since.index=5')
+    expect(url).toContain('seriesFormat=accumulated')
+  })
+
+  it('sends Authorization header when token is set', async () => {
+    const fetch = makeSSEFetch([])
+    const client = new TaskcastServerClient({
+      baseUrl: 'http://taskcast',
+      token: 'my-token',
+      fetch,
+    })
+
+    client.subscribe('t1', () => {})
+    await new Promise((r) => setTimeout(r, 10))
+
+    const headers = fetch.mock.calls[0]![1].headers
+    expect(headers['Authorization']).toBe('Bearer my-token')
+  })
+
+  it('returns unsubscribe function that aborts the connection', async () => {
+    // Stream that never ends
+    const stream = new ReadableStream<Uint8Array>({
+      start() { /* hang forever */ },
+    })
+    const fetch = vi.fn().mockResolvedValue(
+      new Response(stream, { status: 200, headers: { 'Content-Type': 'text/event-stream' } }),
+    )
+    const client = new TaskcastServerClient({ baseUrl: 'http://taskcast', fetch })
+
+    const unsubscribe = client.subscribe('t1', () => {})
+
+    // Should not throw
+    unsubscribe()
+  })
+
+  it('stops on taskcast.done event', async () => {
+    const event1 = { id: 'e1', taskId: 't1', index: 0, timestamp: 1000, type: 'log', level: 'info', data: null }
+    const fetch = makeSSEFetch([
+      `event: taskcast.event\ndata: ${JSON.stringify(event1)}\n\n`,
+      `event: taskcast.done\ndata: {"reason":"completed"}\n\n`,
+      // This event should NOT be delivered
+      `event: taskcast.event\ndata: ${JSON.stringify({ ...event1, id: 'e2' })}\n\n`,
+    ])
+    const client = new TaskcastServerClient({ baseUrl: 'http://taskcast', fetch })
+    const received: unknown[] = []
+
+    client.subscribe('t1', (e) => received.push(e))
+    await new Promise((r) => setTimeout(r, 50))
+
+    expect(received).toHaveLength(1)
+  })
+
+  it('skips malformed JSON data gracefully', async () => {
+    const event1 = { id: 'e1', taskId: 't1', index: 0, timestamp: 1000, type: 'log', level: 'info', data: null }
+    const fetch = makeSSEFetch([
+      `event: taskcast.event\ndata: not-json\n\n`,
+      `event: taskcast.event\ndata: ${JSON.stringify(event1)}\n\n`,
+    ])
+    const client = new TaskcastServerClient({ baseUrl: 'http://taskcast', fetch })
+    const received: unknown[] = []
+
+    client.subscribe('t1', (e) => received.push(e))
+    await new Promise((r) => setTimeout(r, 50))
+
+    expect(received).toHaveLength(1)
+    expect(received[0]).toEqual(event1)
+  })
+
+  it('handles non-200 response gracefully', async () => {
+    const fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ error: 'Not found' }), { status: 404 }),
+    )
+    const client = new TaskcastServerClient({ baseUrl: 'http://taskcast', fetch })
+    const received: unknown[] = []
+
+    // Should not throw
+    client.subscribe('t1', (e) => received.push(e))
+    await new Promise((r) => setTimeout(r, 50))
+
+    expect(received).toHaveLength(0)
+  })
+
+  it('handles fetch failure gracefully', async () => {
+    const fetch = vi.fn().mockRejectedValue(new TypeError('fetch failed'))
+    const client = new TaskcastServerClient({ baseUrl: 'http://taskcast', fetch })
+    const received: unknown[] = []
+
+    // Should not throw
+    client.subscribe('t1', (e) => received.push(e))
+    await new Promise((r) => setTimeout(r, 50))
+
+    expect(received).toHaveLength(0)
+  })
+})
+
 describe('TaskcastServerClient re-exported from index', () => {
   it('is the same class exported from index', async () => {
     const fetch = vi.fn().mockResolvedValue(
