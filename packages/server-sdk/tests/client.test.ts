@@ -447,6 +447,37 @@ describe('TaskcastServerClient.subscribe', () => {
     expect(received[0]).toEqual(event2)
   })
 
+  it('rethrows non-AbortError from reader', async () => {
+    let readCount = 0
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        readCount++
+        if (readCount === 1) {
+          const encoder = new TextEncoder()
+          controller.enqueue(encoder.encode('event: taskcast.event\ndata: {"id":"e1"}\n\n'))
+        } else {
+          throw new Error('unexpected read error')
+        }
+      },
+    })
+    const fetch = vi.fn().mockResolvedValue(
+      new Response(stream, { status: 200, headers: { 'Content-Type': 'text/event-stream' } }),
+    )
+    const client = new TaskcastServerClient({ baseUrl: 'http://taskcast', fetch })
+
+    // _consumeSSE is fire-and-forget, so the rethrown error becomes an unhandled rejection.
+    const errors: Error[] = []
+    const onReject = (reason: unknown) => { errors.push(reason as Error) }
+    process.on('unhandledRejection', onReject)
+
+    client.subscribe('t1', () => {})
+    await new Promise((r) => setTimeout(r, 100))
+
+    process.removeListener('unhandledRejection', onReject)
+    expect(errors).toHaveLength(1)
+    expect(errors[0]!.message).toBe('unexpected read error')
+  })
+
   it('handles fetch failure gracefully', async () => {
     const fetch = vi.fn().mockRejectedValue(new TypeError('fetch failed'))
     const client = new TaskcastServerClient({ baseUrl: 'http://taskcast', fetch })
