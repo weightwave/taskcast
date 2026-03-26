@@ -1,5 +1,15 @@
 # @taskcast/server-sdk
 
+## 1.3.0
+
+### Minor Changes
+
+- 5738886: Add `subscribe` method to `TaskcastServerClient` for real-time SSE event streaming. Connects to the server's SSE endpoint and delivers `TaskEvent` objects to a callback handler. Returns a synchronous unsubscribe function.
+
+### Patch Changes
+
+- @taskcast/core@1.3.0
+
 ## 1.2.1
 
 ### Patch Changes
