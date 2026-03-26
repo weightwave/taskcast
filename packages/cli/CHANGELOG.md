@@ -1,5 +1,19 @@
 # @taskcast/cli
 
+## 1.3.0
+
+### Patch Changes
+
+- Updated dependencies [5738886]
+  - @taskcast/server-sdk@1.3.0
+  - @taskcast/dashboard-web@0.3.5
+  - @taskcast/core@1.3.0
+  - @taskcast/server@1.3.0
+  - @taskcast/redis@1.3.0
+  - @taskcast/postgres@1.3.0
+  - @taskcast/sqlite@1.3.0
+  - @taskcast/playground@0.3.5
+
 ## 1.2.1
 
 ### Patch Changes
