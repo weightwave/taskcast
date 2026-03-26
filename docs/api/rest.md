@@ -168,12 +168,43 @@ POST /tasks/:taskId/events
 | `seriesId` | string | No | Series ID for grouping |
 | `seriesMode` | string | No | `keep-all`/`accumulate`/`latest` |
 | `seriesAccField` | string | No | Field name to concatenate in `accumulate` mode (defaults to `delta`) |
+| `clientId` | string | No | Client identifier for sequence ordering. Must be paired with `clientSeq` |
+| `clientSeq` | integer | No | Monotonically increasing sequence number (≥ 0). Must be paired with `clientId` |
+| `seqMode` | string | No | `hold` (default) or `fast-fail`. Controls behavior when events arrive out of order |
 
-**Response:** `201 Created` — returns the created event (single) or event array (batch). For `accumulate` series, the returned event contains the original delta data (not the accumulated value).
+> **Sequence ordering:** When `clientId` and `clientSeq` are provided, the server guarantees events are written in `clientSeq` order within each `(taskId, clientId)` pair. Out-of-order requests are held until the gap is filled (up to the configured timeout, default 30s) or rejected immediately in `fast-fail` mode. Different `clientId` values are independent. Omitting both fields bypasses ordering entirely (backward-compatible).
+
+**Response:** `201 Created` — returns the created event (single) or event array (batch). For `accumulate` series, the returned event contains the original delta data (not the accumulated value). When `clientId`/`clientSeq` are provided, they are included in the response.
 
 **Errors:**
-- `400` — Cannot publish events when the task is not in `running` status
+- `400` — Invalid input (task not in `running` status, or `clientId`/`clientSeq` not both present/absent, or negative `clientSeq`)
 - `404` — Task not found
+- `408` — Sequence hold timeout — the gap was not filled within the configured timeout
+- `409` — Sequence conflict: `seq_stale` (already consumed), `seq_duplicate` (duplicate seq), or `seq_gap` (fast-fail mode, gap detected)
+
+**Required permission:** `event:publish`
+
+---
+
+### Query Sequence State
+
+```
+GET /tasks/:taskId/seq/:clientId
+```
+
+Returns the current expected sequence number for a given client.
+
+**Response:** `200 OK`
+
+```json
+{
+  "clientId": "worker-1",
+  "expectedSeq": 5
+}
+```
+
+**Errors:**
+- `404` — Client has no sequence state (never published with this `clientId`, or task reached terminal state)
 
 **Required permission:** `event:publish`
 
