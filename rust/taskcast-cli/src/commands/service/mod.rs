@@ -162,9 +162,16 @@ pub fn run_stop() -> Result<(), Box<dyn std::error::Error>> {
     let mgr = create_service_manager()?;
 
     let status = mgr.status()?;
-    if !matches!(status, ServiceStatus::Running { .. }) {
-        eprintln!("[taskcast] Service is not running.");
-        return Ok(());
+    match status {
+        ServiceStatus::NotInstalled => {
+            eprintln!("[taskcast] Service is not installed.");
+            return Ok(());
+        }
+        ServiceStatus::Stopped => {
+            eprintln!("[taskcast] Service is not running.");
+            return Ok(());
+        }
+        _ => {}
     }
 
     mgr.stop()?;

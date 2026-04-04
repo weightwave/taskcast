@@ -8,9 +8,16 @@ const LAUNCHD_LABEL: &str = "com.taskcast.daemon";
 
 pub struct LaunchdServiceManager;
 
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
 pub fn generate_plist(opts: &ServiceInstallOptions, stdout_log: &str, stderr_log: &str) -> String {
     let mut args = vec![
-        format!("        <string>{}</string>", opts.exec_path),
+        format!("        <string>{}</string>", xml_escape(&opts.exec_path)),
         "        <string>start</string>".to_string(),
         "        <string>--port</string>".to_string(),
         format!("        <string>{}</string>", opts.port),
@@ -18,18 +25,20 @@ pub fn generate_plist(opts: &ServiceInstallOptions, stdout_log: &str, stderr_log
 
     if let Some(ref config) = opts.config {
         args.push("        <string>--config</string>".to_string());
-        args.push(format!("        <string>{config}</string>"));
+        args.push(format!("        <string>{}</string>", xml_escape(config)));
     }
     if let Some(ref storage) = opts.storage {
         args.push("        <string>--storage</string>".to_string());
-        args.push(format!("        <string>{storage}</string>"));
+        args.push(format!("        <string>{}</string>", xml_escape(storage)));
     }
     if let Some(ref db_path) = opts.db_path {
         args.push("        <string>--db-path</string>".to_string());
-        args.push(format!("        <string>{db_path}</string>"));
+        args.push(format!("        <string>{}</string>", xml_escape(db_path)));
     }
 
     let args_xml = args.join("\n");
+    let stdout_log = xml_escape(stdout_log);
+    let stderr_log = xml_escape(stderr_log);
 
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -174,8 +183,8 @@ impl ServiceManager for LaunchdServiceManager {
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         match parse_launchctl_pid(&stdout) {
-            Some(pid) => Ok(ServiceStatus::Running { pid }),
-            None => Ok(ServiceStatus::Stopped),
+            Some(pid) if pid > 0 => Ok(ServiceStatus::Running { pid }),
+            _ => Ok(ServiceStatus::Stopped),
         }
     }
 }
@@ -262,5 +271,29 @@ mod tests {
     fn parse_pid_handles_zero() {
         let output = "{\n\t\"PID\" = 0;\n};";
         assert_eq!(parse_launchctl_pid(output), Some(0));
+    }
+
+    #[test]
+    fn plist_escapes_xml_special_chars() {
+        let opts = ServiceInstallOptions {
+            port: 3721,
+            config: Some("/path/with&special<chars>".into()),
+            storage: None,
+            db_path: None,
+            exec_path: "/usr/bin/taskcast".into(),
+        };
+        let plist = generate_plist(&opts, "/tmp/out", "/tmp/err");
+        assert!(plist.contains("&amp;special&lt;chars&gt;"));
+        assert!(!plist.contains("&special<chars>"));
+    }
+
+    #[test]
+    fn xml_escape_handles_all_entities() {
+        assert_eq!(xml_escape("a&b<c>d\"e"), "a&amp;b&lt;c&gt;d&quot;e");
+    }
+
+    #[test]
+    fn xml_escape_noop_for_normal_strings() {
+        assert_eq!(xml_escape("/usr/local/bin/taskcast"), "/usr/local/bin/taskcast");
     }
 }

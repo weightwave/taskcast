@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const DEFAULT_PORT: u16 = 3721;
 
@@ -58,6 +58,9 @@ impl ServicePaths {
 
 pub fn ensure_config(paths: &ServicePaths, config_opt: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
     if let Some(config) = config_opt {
+        if !Path::new(config).exists() {
+            return Err(format!("Config file not found: {config}").into());
+        }
         return Ok(config.to_string());
     }
 
@@ -171,8 +174,19 @@ mod tests {
     fn ensure_config_returns_explicit_path() {
         let tmp = TempDir::new().unwrap();
         let paths = test_paths(tmp.path());
-        let result = ensure_config(&paths, Some("/custom/config.yaml")).unwrap();
-        assert_eq!(result, "/custom/config.yaml");
+        let config_file = tmp.path().join("custom.yaml");
+        fs::write(&config_file, "port: 3721\n").unwrap();
+        let result = ensure_config(&paths, Some(config_file.to_str().unwrap())).unwrap();
+        assert_eq!(result, config_file.to_string_lossy());
+    }
+
+    #[test]
+    fn ensure_config_rejects_nonexistent_explicit_path() {
+        let tmp = TempDir::new().unwrap();
+        let paths = test_paths(tmp.path());
+        let result = ensure_config(&paths, Some("/nonexistent/config.yaml"));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not found"));
     }
 
     #[test]
