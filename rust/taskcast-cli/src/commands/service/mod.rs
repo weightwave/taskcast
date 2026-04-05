@@ -98,10 +98,11 @@ fn run_install(
     let config_path = ensure_config(&paths, config.as_deref())?;
 
     // Default to sqlite if no explicit config or storage specified
-    let storage = if config.is_none() && storage.is_none() {
-        Some("sqlite".to_string())
+    let (storage, db_path) = if config.is_none() && storage.is_none() {
+        let db = db_path.unwrap_or_else(|| paths.default_db.to_string_lossy().into_owned());
+        (Some("sqlite".to_string()), Some(db))
     } else {
-        storage
+        (storage, db_path)
     };
 
     let exec_path = std::env::current_exe()?
