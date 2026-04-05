@@ -1,5 +1,13 @@
 # @taskcast/dashboard-web
 
+## 0.3.6
+
+### Patch Changes
+
+- @taskcast/core@1.4.0
+- @taskcast/server-sdk@1.4.0
+- @taskcast/client@1.4.0
+
 ## 0.3.5
 
 ### Patch Changes

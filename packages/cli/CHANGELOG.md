@@ -1,5 +1,31 @@
 # @taskcast/cli
 
+## 1.4.0
+
+### Minor Changes
+
+- d6b0067: feat(rust-cli): add daemon/service management for Rust CLI
+
+  - Add `taskcast service` subcommand group (install/uninstall/start/stop/restart/reload/status)
+  - Add graceful shutdown (SIGTERM/SIGINT) handling for `taskcast start`
+  - macOS: launchd plist generation + launchctl commands
+  - Linux: systemd unit file generation + systemctl --user commands
+  - `daemon`/`stop`/`status` top-level aliases for backward compatibility
+  - Health check polling after start/restart
+  - Auto-config creation with SQLite defaults on `service install`
+  - Windows: trait reserved, returns unsupported error at runtime
+
+### Patch Changes
+
+- @taskcast/core@1.4.0
+- @taskcast/server@1.4.0
+- @taskcast/server-sdk@1.4.0
+- @taskcast/redis@1.4.0
+- @taskcast/postgres@1.4.0
+- @taskcast/sqlite@1.4.0
+- @taskcast/dashboard-web@0.3.6
+- @taskcast/playground@0.3.6
+
 ## 1.3.0
 
 ### Patch Changes
