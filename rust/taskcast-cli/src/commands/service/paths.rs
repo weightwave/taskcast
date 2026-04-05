@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 const DEFAULT_PORT: u16 = 3721;
 
+#[allow(dead_code)]
 pub struct ServicePaths {
     pub service_file: PathBuf,
     pub log_dir: Option<PathBuf>,
