@@ -34,6 +34,7 @@ pub trait ServiceManager {
     fn status(&self) -> Result<ServiceStatus, Box<dyn std::error::Error>>;
 }
 
+#[allow(clippy::needless_return)]
 pub fn create_service_manager() -> Result<Box<dyn ServiceManager>, Box<dyn std::error::Error>> {
     #[cfg(target_os = "macos")]
     {
