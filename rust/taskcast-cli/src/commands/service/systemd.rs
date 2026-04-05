@@ -93,8 +93,17 @@ impl ServiceManager for SystemdServiceManager {
         let unit = generate_unit_file(opts);
         fs::write(&paths.service_file, unit)?;
 
-        systemctl(&["daemon-reload"])?;
-        systemctl(&["enable", "taskcast"])?;
+        let output = systemctl(&["daemon-reload"])?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("systemctl daemon-reload failed: {stderr}").into());
+        }
+
+        let output = systemctl(&["enable", "taskcast"])?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("systemctl enable failed: {stderr}").into());
+        }
 
         Ok(())
     }
