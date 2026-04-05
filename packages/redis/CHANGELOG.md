@@ -1,5 +1,11 @@
 # @taskcast/redis
 
+## 1.4.1
+
+### Patch Changes
+
+- @taskcast/core@1.4.1
+
 ## 1.4.0
 
 ### Patch Changes

@@ -1,5 +1,25 @@
 # @taskcast/cli
 
+## 1.4.1
+
+### Patch Changes
+
+- 11cf78a: fix(rust-cli): include --db-path in service config when defaulting to sqlite
+
+  When `taskcast service install` auto-selected SQLite storage, the generated
+  launchd plist / systemd unit file did not include `--db-path`, causing the
+  server to use the relative default `./taskcast.db`. Since launchd starts
+  processes with cwd=/, SQLite failed with "unable to open database file".
+
+  - @taskcast/core@1.4.1
+  - @taskcast/server@1.4.1
+  - @taskcast/server-sdk@1.4.1
+  - @taskcast/redis@1.4.1
+  - @taskcast/postgres@1.4.1
+  - @taskcast/sqlite@1.4.1
+  - @taskcast/dashboard-web@0.3.7
+  - @taskcast/playground@0.3.7
+
 ## 1.4.0
 
 ### Minor Changes
