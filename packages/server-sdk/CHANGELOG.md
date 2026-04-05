@@ -1,5 +1,11 @@
 # @taskcast/server-sdk
 
+## 1.4.0
+
+### Patch Changes
+
+- @taskcast/core@1.4.0
+
 ## 1.3.0
 
 ### Minor Changes

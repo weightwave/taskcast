@@ -1,6 +1,6 @@
 {
   "name": "@taskcast/redis",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "Redis broadcast + short-term store adapters for Taskcast.",
   "repository": {
     "type": "git",
