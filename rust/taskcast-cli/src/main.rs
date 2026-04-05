@@ -40,11 +40,13 @@ enum Commands {
     Tail(commands::logs::TailArgs),
     /// Manage tasks on a Taskcast server
     Tasks(commands::tasks::TasksArgs),
-    /// Start the server as a background service (not yet implemented)
+    /// Manage Taskcast as a background system service
+    Service(commands::service::ServiceArgs),
+    /// Alias for `taskcast service start`
     Daemon,
-    /// Stop the background service (not yet implemented)
+    /// Alias for `taskcast service stop`
     Stop,
-    /// Show server status (not yet implemented)
+    /// Alias for `taskcast service status`
     Status,
 }
 
@@ -89,17 +91,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Commands::Tasks(args)) => {
             commands::tasks::run(args).await?;
         }
+        Some(Commands::Service(args)) => {
+            commands::service::run(args).await?;
+        }
         Some(Commands::Daemon) => {
-            eprintln!("[taskcast] daemon mode is not yet implemented, use `taskcast start` for foreground mode");
-            std::process::exit(1);
+            commands::service::run_start().await?;
         }
         Some(Commands::Stop) => {
-            eprintln!("[taskcast] stop is not yet implemented");
-            std::process::exit(1);
+            commands::service::run_stop()?;
         }
         Some(Commands::Status) => {
-            eprintln!("[taskcast] status is not yet implemented");
-            std::process::exit(1);
+            commands::service::run_status().await?;
         }
     }
 
@@ -615,6 +617,54 @@ mod tests {
     fn cli_status_subcommand_parses() {
         let cli = Cli::parse_from(["taskcast", "status"]);
         assert!(matches!(cli.command.unwrap(), Commands::Status));
+    }
+
+    #[test]
+    fn cli_service_install_defaults() {
+        let cli = Cli::parse_from(["taskcast", "service", "install"]);
+        match cli.command.unwrap() {
+            Commands::Service(args) => match args.command {
+                commands::service::ServiceCommands::Install { port, config, storage, db_path } => {
+                    assert_eq!(port, 3721);
+                    assert!(config.is_none());
+                    assert!(storage.is_none());
+                    assert!(db_path.is_none());
+                }
+                _ => panic!("expected Install"),
+            },
+            _ => panic!("expected Service"),
+        }
+    }
+
+    #[test]
+    fn cli_service_install_with_all_flags() {
+        let cli = Cli::parse_from([
+            "taskcast", "service", "install",
+            "-c", "/etc/tc.yaml",
+            "-p", "8080",
+            "-s", "sqlite",
+            "--db-path", "/data/tc.db",
+        ]);
+        match cli.command.unwrap() {
+            Commands::Service(args) => match args.command {
+                commands::service::ServiceCommands::Install { config, port, storage, db_path } => {
+                    assert_eq!(config, Some("/etc/tc.yaml".to_string()));
+                    assert_eq!(port, 8080);
+                    assert_eq!(storage, Some("sqlite".to_string()));
+                    assert_eq!(db_path, Some("/data/tc.db".to_string()));
+                }
+                _ => panic!("expected Install"),
+            },
+            _ => panic!("expected Service"),
+        }
+    }
+
+    #[test]
+    fn cli_service_all_subcommands_parse() {
+        for cmd in ["uninstall", "start", "stop", "restart", "reload", "status"] {
+            let cli = Cli::parse_from(["taskcast", "service", cmd]);
+            assert!(matches!(cli.command.unwrap(), Commands::Service(_)), "failed to parse service {cmd}");
+        }
     }
 
     // ─── resolve_postgres_url ────────────────────────────────────────────

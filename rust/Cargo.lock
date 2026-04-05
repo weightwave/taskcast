@@ -3074,6 +3074,7 @@ dependencies = [
  "dirs",
  "futures-util",
  "jsonwebtoken",
+ "libc",
  "mime_guess",
  "redis",
  "reqwest",

@@ -4,5 +4,6 @@ pub mod migrate;
 pub mod node;
 pub mod ping;
 pub mod playground;
+pub mod service;
 pub mod start;
 pub mod tasks;
