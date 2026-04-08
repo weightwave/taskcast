@@ -29,6 +29,10 @@
     "./helpers": {
       "types": "./dist/helpers.d.ts",
       "import": "./dist/helpers.js"
+    },
+    "./auto-migrate": {
+      "types": "./dist/auto-migrate.d.ts",
+      "import": "./dist/auto-migrate.js"
     }
   },
   "publishConfig": {
