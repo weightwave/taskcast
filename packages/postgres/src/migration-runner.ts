@@ -16,6 +16,11 @@ export interface MigrationResult {
   skipped: string[]
 }
 
+export interface EmbeddedMigration {
+  filename: string
+  sql: string
+}
+
 /**
  * Parse a migration filename into version and description.
  *
@@ -77,6 +82,30 @@ export function loadMigrationFiles(migrationsDir: string): MigrationFile[] {
   return files
 }
 
+/**
+ * Convert embedded migrations (code-generated SQL strings) to MigrationFile[] array.
+ * Parses filenames, computes checksums, and sorts by version.
+ */
+export function buildMigrationFiles(embedded: readonly EmbeddedMigration[]): MigrationFile[] {
+  const files: MigrationFile[] = []
+
+  for (const m of embedded) {
+    const parsed = parseMigrationFilename(m.filename)
+    if (!parsed) continue
+
+    files.push({
+      version: parsed.version,
+      description: parsed.description,
+      sql: m.sql,
+      checksum: computeChecksum(m.sql),
+      filename: m.filename,
+    })
+  }
+
+  files.sort((a, b) => a.version - b.version)
+  return files
+}
+
 const CREATE_MIGRATIONS_TABLE = `
 CREATE TABLE IF NOT EXISTS _sqlx_migrations (
     version BIGINT PRIMARY KEY,
@@ -94,10 +123,13 @@ CREATE TABLE IF NOT EXISTS _sqlx_migrations (
  * This is fully compatible with sqlx's _sqlx_migrations table — the Rust
  * server and the TS server can share the same database and track migrations
  * in the same table.
+ *
+ * @param sql - Postgres connection instance
+ * @param migrationsOrFiles - Either a directory path (string) or array of MigrationFile objects
  */
 export async function runMigrations(
   sql: ReturnType<typeof postgres>,
-  migrationsDir: string,
+  migrationsOrFiles: string | MigrationFile[],
 ): Promise<MigrationResult> {
   // 1. Ensure the migrations table exists
   await sql.unsafe(CREATE_MIGRATIONS_TABLE)
@@ -115,7 +147,9 @@ export async function runMigrations(
   }
 
   // 3. Load local files and query applied migrations
-  const localFiles = loadMigrationFiles(migrationsDir)
+  const localFiles = typeof migrationsOrFiles === 'string'
+    ? loadMigrationFiles(migrationsOrFiles)
+    : migrationsOrFiles
   const appliedRows = await sql.unsafe('SELECT version, checksum FROM _sqlx_migrations ORDER BY version')
   const appliedMap = new Map<number, Buffer>()
   for (const row of appliedRows) {

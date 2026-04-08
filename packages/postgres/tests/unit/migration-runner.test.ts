@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest'
 import { mkdtempSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { parseMigrationFilename, computeChecksum, loadMigrationFiles } from '../../src/migration-runner.js'
+import { parseMigrationFilename, computeChecksum, loadMigrationFiles, buildMigrationFiles } from '../../src/migration-runner.js'
 
 describe('parseMigrationFilename', () => {
   it('parses a standard filename', () => {
@@ -109,5 +109,106 @@ describe('loadMigrationFiles', () => {
     const files = loadMigrationFiles(dir)
     expect(files).toHaveLength(1)
     expect(files[0]!.filename).toBe('001_valid.sql')
+  })
+})
+
+describe('buildMigrationFiles', () => {
+  it('builds MigrationFile[] from EmbeddedMigration[]', () => {
+    const embedded = [
+      { filename: '001_initial.sql', sql: 'CREATE TABLE foo (id INT)' },
+      { filename: '002_add_column.sql', sql: 'ALTER TABLE foo ADD COLUMN name VARCHAR(255)' },
+    ]
+
+    const result = buildMigrationFiles(embedded)
+
+    expect(result).toHaveLength(2)
+    expect(result[0]).toMatchObject({
+      version: 1,
+      description: 'initial',
+      sql: 'CREATE TABLE foo (id INT)',
+      filename: '001_initial.sql',
+    })
+    expect(result[0]!.checksum).toBeInstanceOf(Buffer)
+    expect(result[0]!.checksum.length).toBe(48)
+
+    expect(result[1]).toMatchObject({
+      version: 2,
+      description: 'add column',
+      sql: 'ALTER TABLE foo ADD COLUMN name VARCHAR(255)',
+      filename: '002_add_column.sql',
+    })
+    expect(result[1]!.checksum).toBeInstanceOf(Buffer)
+  })
+
+  it('sorts by version numerically', () => {
+    const embedded = [
+      { filename: '010_third.sql', sql: 'SQL3' },
+      { filename: '001_first.sql', sql: 'SQL1' },
+      { filename: '100_fourth.sql', sql: 'SQL4' },
+      { filename: '002_second.sql', sql: 'SQL2' },
+    ]
+
+    const result = buildMigrationFiles(embedded)
+
+    expect(result.map((m) => m.version)).toEqual([1, 2, 10, 100])
+  })
+
+  it('handles empty array', () => {
+    const result = buildMigrationFiles([])
+    expect(result).toEqual([])
+  })
+
+  it('skips malformed filenames', () => {
+    const embedded = [
+      { filename: '001_valid.sql', sql: 'SQL1' },
+      { filename: 'invalid.sql', sql: 'SQL2' },
+      { filename: '002_.sql', sql: 'SQL3' },
+      { filename: '002_valid.txt', sql: 'SQL4' },
+    ]
+
+    const result = buildMigrationFiles(embedded)
+
+    expect(result).toHaveLength(1)
+    expect(result[0]!.version).toBe(1)
+    expect(result[0]!.description).toBe('valid')
+  })
+
+  it('handles readonly array input', () => {
+    const embedded: readonly { filename: string; sql: string }[] = [
+      { filename: '001_initial.sql', sql: 'SQL1' },
+      { filename: '002_second.sql', sql: 'SQL2' },
+    ]
+
+    const result = buildMigrationFiles(embedded)
+
+    expect(result).toHaveLength(2)
+    expect(result[0]!.version).toBe(1)
+    expect(result[1]!.version).toBe(2)
+  })
+
+  it('computes correct checksums for each migration', () => {
+    const sql1 = 'CREATE TABLE foo (id INT)'
+    const sql2 = 'CREATE TABLE bar (id INT)'
+    const embedded = [
+      { filename: '001_first.sql', sql: sql1 },
+      { filename: '002_second.sql', sql: sql2 },
+    ]
+
+    const result = buildMigrationFiles(embedded)
+
+    expect(result[0]!.checksum).toEqual(computeChecksum(sql1))
+    expect(result[1]!.checksum).toEqual(computeChecksum(sql2))
+  })
+
+  it('handles migrations with multi-word descriptions', () => {
+    const embedded = [
+      { filename: '001_create_users_table.sql', sql: 'SQL' },
+      { filename: '002_add_email_column.sql', sql: 'SQL' },
+    ]
+
+    const result = buildMigrationFiles(embedded)
+
+    expect(result[0]!.description).toBe('create users table')
+    expect(result[1]!.description).toBe('add email column')
   })
 })
