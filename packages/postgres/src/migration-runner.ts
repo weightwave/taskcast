@@ -149,7 +149,7 @@ export async function runMigrations(
   // 3. Load local files and query applied migrations
   const localFiles = typeof migrationsOrFiles === 'string'
     ? loadMigrationFiles(migrationsOrFiles)
-    : migrationsOrFiles
+    : [...migrationsOrFiles].sort((a, b) => a.version - b.version)
   const appliedRows = await sql.unsafe('SELECT version, checksum FROM _sqlx_migrations ORDER BY version')
   const appliedMap = new Map<number, Buffer>()
   for (const row of appliedRows) {
