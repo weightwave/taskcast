@@ -96,7 +96,13 @@ vi.mock('fs', async (importOriginal) => {
   }
 })
 
-import { registerStartCommand } from '../../src/commands/start.js'
+// Mock auto-migrate
+vi.mock('../../src/auto-migrate.js', () => ({
+  performAutoMigrateIfEnabled: vi.fn(),
+}))
+
+import { registerStartCommand, runStart } from '../../src/commands/start.js'
+import type { RunStartOptions } from '../../src/commands/start.js'
 
 describe('registerStartCommand', () => {
   let exitSpy: ReturnType<typeof vi.spyOn>
@@ -444,5 +450,268 @@ describe('registerStartCommand', () => {
     await program.parseAsync(['node', 'test', 'start', '-s', 'sqlite', '--db-path', '/tmp/my.db'])
 
     expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('sqlite @ /tmp/my.db'))
+  })
+})
+
+describe('runStart', () => {
+  let exitSpy: ReturnType<typeof vi.spyOn>
+  let logSpy: ReturnType<typeof vi.spyOn>
+  let onSpy: ReturnType<typeof vi.spyOn>
+
+  beforeEach(() => {
+    exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => {
+      throw new ExitError(0)
+    }) as never)
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+    onSpy = vi.spyOn(process, 'on').mockImplementation((() => process) as never)
+    vi.clearAllMocks()
+  })
+
+  afterEach(() => {
+    exitSpy.mockRestore()
+    logSpy.mockRestore()
+    onSpy.mockRestore()
+  })
+
+  it('calls performAutoMigrateIfEnabled when postgres is configured', async () => {
+    const { performAutoMigrateIfEnabled } = await import('../../src/auto-migrate.js')
+    const mockPostgres = {} as ReturnType<typeof import('postgres').default>
+
+    const options: RunStartOptions = {
+      postgres: mockPostgres,
+      broadcast: {},
+      shortTermStore: {},
+      port: 3721,
+      config: {},
+      verbose: false,
+      playground: false,
+      env: { TASKCAST_AUTO_MIGRATE: 'true' },
+    }
+
+    await runStart(options)
+
+    expect(performAutoMigrateIfEnabled).toHaveBeenCalledWith(
+      mockPostgres,
+      expect.objectContaining({ TASKCAST_AUTO_MIGRATE: 'true' }),
+    )
+  })
+
+  it('skips performAutoMigrateIfEnabled when postgres is not configured', async () => {
+    const { performAutoMigrateIfEnabled } = await import('../../src/auto-migrate.js')
+
+    const options: RunStartOptions = {
+      broadcast: {},
+      shortTermStore: {},
+      port: 3721,
+      config: {},
+      verbose: false,
+      playground: false,
+    }
+
+    await runStart(options)
+
+    expect(performAutoMigrateIfEnabled).not.toHaveBeenCalled()
+  })
+
+  it('blocks server startup if auto-migrate fails', async () => {
+    const { performAutoMigrateIfEnabled } = await import('../../src/auto-migrate.js')
+    ;(performAutoMigrateIfEnabled as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+      new Error('Auto-migration failed: Checksum mismatch'),
+    )
+
+    const mockPostgres = {} as ReturnType<typeof import('postgres').default>
+
+    const options: RunStartOptions = {
+      postgres: mockPostgres,
+      broadcast: {},
+      shortTermStore: {},
+      port: 3721,
+      config: {},
+      verbose: false,
+      playground: false,
+    }
+
+    await expect(runStart(options)).rejects.toThrow('Auto-migration failed: Checksum mismatch')
+
+    const { serve } = await import('@hono/node-server')
+    expect(serve).not.toHaveBeenCalled()
+  })
+
+  it('starts server normally when auto-migrate succeeds', async () => {
+    const { performAutoMigrateIfEnabled } = await import('../../src/auto-migrate.js')
+    ;(performAutoMigrateIfEnabled as ReturnType<typeof vi.fn>).mockResolvedValueOnce(undefined)
+
+    const mockPostgres = {} as ReturnType<typeof import('postgres').default>
+
+    const options: RunStartOptions = {
+      postgres: mockPostgres,
+      broadcast: {},
+      shortTermStore: {},
+      port: 3721,
+      config: {},
+      verbose: false,
+      playground: false,
+    }
+
+    await runStart(options)
+
+    const { serve } = await import('@hono/node-server')
+    expect(serve).toHaveBeenCalled()
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('Server started'))
+  })
+
+  it('starts server successfully without postgres', async () => {
+    const { performAutoMigrateIfEnabled } = await import('../../src/auto-migrate.js')
+
+    const options: RunStartOptions = {
+      broadcast: {},
+      shortTermStore: {},
+      port: 3721,
+      config: {},
+      verbose: false,
+      playground: false,
+    }
+
+    await runStart(options)
+
+    const { serve } = await import('@hono/node-server')
+    expect(serve).toHaveBeenCalled()
+    expect(performAutoMigrateIfEnabled).not.toHaveBeenCalled()
+  })
+
+  it('passes verbose flag to createTaskcastApp', async () => {
+    const options: RunStartOptions = {
+      broadcast: {},
+      shortTermStore: {},
+      port: 3721,
+      config: {},
+      verbose: true,
+      playground: false,
+    }
+
+    await runStart(options)
+
+    const { createTaskcastApp } = await import('@taskcast/server')
+    expect(createTaskcastApp).toHaveBeenCalledWith(
+      expect.objectContaining({ verbose: true }),
+    )
+  })
+
+  it('sets up long-term store when provided', async () => {
+    const { TaskEngine } = await import('@taskcast/core')
+
+    const mockLongTermStore = {}
+
+    const options: RunStartOptions = {
+      broadcast: {},
+      shortTermStore: {},
+      longTermStore: mockLongTermStore as any,
+      port: 3721,
+      config: {},
+      verbose: false,
+      playground: false,
+    }
+
+    await runStart(options)
+
+    // longTermStore is passed to TaskEngine, not createTaskcastApp
+    expect(TaskEngine).toHaveBeenCalledWith(
+      expect.objectContaining({
+        longTermStore: mockLongTermStore,
+      }),
+    )
+  })
+
+  it('registers SIGTERM and SIGINT handlers', async () => {
+    const options: RunStartOptions = {
+      broadcast: {},
+      shortTermStore: {},
+      port: 3721,
+      config: {},
+      verbose: false,
+      playground: false,
+    }
+
+    await runStart(options)
+
+    expect(onSpy).toHaveBeenCalledWith('SIGTERM', expect.any(Function))
+    expect(onSpy).toHaveBeenCalledWith('SIGINT', expect.any(Function))
+  })
+
+  it('uses correct port from options', async () => {
+    const options: RunStartOptions = {
+      broadcast: {},
+      shortTermStore: {},
+      port: 4000,
+      config: {},
+      verbose: false,
+      playground: false,
+    }
+
+    await runStart(options)
+
+    const { serve } = await import('@hono/node-server')
+    const serveCall = (serve as ReturnType<typeof vi.fn>).mock.calls[0]
+    expect(serveCall[0].port).toBe(4000)
+  })
+
+  it('serves playground when playground flag is true and dist exists', async () => {
+    const options: RunStartOptions = {
+      broadcast: {},
+      shortTermStore: {},
+      port: 3721,
+      config: {},
+      verbose: false,
+      playground: true,
+    }
+
+    await runStart(options)
+
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('Playground UI'))
+  })
+
+  it('creates engine with broadcast and shortTermStore', async () => {
+    const { TaskEngine } = await import('@taskcast/core')
+
+    const options: RunStartOptions = {
+      broadcast: { mock: 'broadcast' } as any,
+      shortTermStore: { mock: 'store' } as any,
+      port: 3721,
+      config: {},
+      verbose: false,
+      playground: false,
+    }
+
+    await runStart(options)
+
+    expect(TaskEngine).toHaveBeenCalledWith(
+      expect.objectContaining({
+        broadcast: { mock: 'broadcast' },
+        shortTermStore: { mock: 'store' },
+      }),
+    )
+  })
+
+  it('auto-migrate receives correct env variables', async () => {
+    const { performAutoMigrateIfEnabled } = await import('../../src/auto-migrate.js')
+    ;(performAutoMigrateIfEnabled as ReturnType<typeof vi.fn>).mockResolvedValueOnce(undefined)
+
+    const mockPostgres = {} as ReturnType<typeof import('postgres').default>
+    const customEnv = { TASKCAST_AUTO_MIGRATE: 'true', CUSTOM_VAR: 'value' }
+
+    const options: RunStartOptions = {
+      postgres: mockPostgres,
+      broadcast: {},
+      shortTermStore: {},
+      port: 3721,
+      config: {},
+      verbose: false,
+      playground: false,
+      env: customEnv,
+    }
+
+    await runStart(options)
+
+    expect(performAutoMigrateIfEnabled).toHaveBeenCalledWith(mockPostgres, customEnv)
   })
 })

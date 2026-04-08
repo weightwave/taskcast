@@ -12,12 +12,129 @@ import {
   MemoryBroadcastProvider,
   MemoryShortTermStore,
 } from '@taskcast/core'
-import type { BroadcastProvider, ShortTermStore, LongTermStore } from '@taskcast/core'
+import type { BroadcastProvider, ShortTermStore, LongTermStore, TaskcastConfig } from '@taskcast/core'
 import { createTaskcastApp } from '@taskcast/server'
 import { createRedisAdapters } from '@taskcast/redis'
 import { PostgresLongTermStore } from '@taskcast/postgres'
 import { createSqliteAdapters } from '@taskcast/sqlite'
 import { promptCreateGlobalConfig, createDefaultGlobalConfig } from '../utils.js'
+import { performAutoMigrateIfEnabled } from '../auto-migrate.js'
+
+/**
+ * Options for runStart function.
+ * Captures all server startup configuration.
+ */
+export interface RunStartOptions {
+  /** Postgres connection instance (optional) */
+  postgres?: ReturnType<typeof postgres>
+  /** Broadcast provider instance */
+  broadcast: BroadcastProvider
+  /** Short-term store instance */
+  shortTermStore: ShortTermStore
+  /** Long-term store instance (optional) */
+  longTermStore?: LongTermStore
+  /** Port to listen on */
+  port: number
+  /** Server configuration options */
+  config: TaskcastConfig
+  /** Verbose logging flag */
+  verbose: boolean
+  /** Playground flag */
+  playground: boolean
+  /** File config path for display */
+  configPath?: string
+  /** Environment variables for auto-migrate */
+  env?: Record<string, string | undefined>
+}
+
+/**
+ * Runs the taskcast server with auto-migrate support.
+ *
+ * This function:
+ * 1. Calls performAutoMigrateIfEnabled() if Postgres is configured
+ * 2. Creates and starts the server
+ * 3. Sets up SIGTERM/SIGINT handlers
+ * 4. Serves playground UI if enabled
+ *
+ * If auto-migrate fails, the error is re-thrown and server startup is blocked.
+ *
+ * @param options - Server startup options
+ * @throws Error if auto-migrate fails
+ */
+export async function runStart(options: RunStartOptions): Promise<void> {
+  // Call auto-migrate if Postgres is configured
+  if (options.postgres) {
+    await performAutoMigrateIfEnabled(options.postgres, options.env)
+  }
+
+  const engineOpts: ConstructorParameters<typeof TaskEngine>[0] = {
+    shortTermStore: options.shortTermStore,
+    broadcast: options.broadcast,
+  }
+  if (options.longTermStore !== undefined) engineOpts.longTermStore = options.longTermStore
+  const engine = new TaskEngine(engineOpts)
+
+  const authMode = (process.env['TASKCAST_AUTH_MODE'] ?? options.config.auth?.mode ?? 'none') as 'none' | 'jwt'
+
+  // Worker assignment system
+  const workersEnabled = options.config.workers?.enabled ?? false
+  let workerManager: WorkerManager | undefined
+  if (workersEnabled) {
+    console.log('[taskcast] Worker assignment system enabled')
+    const wmOpts: ConstructorParameters<typeof WorkerManager>[0] = {
+      engine,
+      shortTermStore: options.shortTermStore,
+      broadcast: options.broadcast,
+    }
+    if (options.longTermStore !== undefined) wmOpts.longTermStore = options.longTermStore
+    if (options.config.workers?.defaults) wmOpts.defaults = options.config.workers.defaults
+    workerManager = new WorkerManager(wmOpts)
+  }
+
+  // Resolve admin token (auto-generate + print if adminApi is enabled)
+  resolveAdminToken(options.config)
+
+  const serverOpts: Parameters<typeof createTaskcastApp>[0] = {
+    engine,
+    shortTermStore: options.shortTermStore,
+    auth: { mode: authMode },
+    config: options.config,
+    verbose: options.verbose,
+  }
+  if (workerManager !== undefined) serverOpts.workerManager = workerManager
+  const { app, stop } = createTaskcastApp(serverOpts)
+
+  // Serve playground static files if enabled and dist exists
+  if (options.playground) {
+    try {
+      const require = createRequire(import.meta.url)
+      const pkgPath = require.resolve('@taskcast/playground/package.json')
+      const distDir = join(dirname(pkgPath), 'dist')
+      if (existsSync(distDir)) {
+        const { serveStatic } = await import('@hono/node-server/serve-static')
+        app.use('/_playground/*', serveStatic({ root: distDir, rewriteRequestPath: (p) => p.replace(/^\/_playground/, '') }))
+        // SPA fallback: serve index.html for non-asset paths
+        app.get('/_playground/*', serveStatic({ root: distDir, rewriteRequestPath: () => '/index.html' }))
+      } else {
+        console.warn('[taskcast] Playground dist not found. Run `pnpm --filter @taskcast/playground build` first.')
+      }
+    } catch {
+      console.warn('[taskcast] @taskcast/playground not available, skipping playground UI.')
+    }
+  }
+
+  const { serve } = await import('@hono/node-server')
+  const server = serve({ fetch: app.fetch, port: options.port }, () => {
+    console.log(`[taskcast] Server started on http://localhost:${options.port}`)
+    if (options.playground) {
+      console.log(`[taskcast] Playground UI at http://localhost:${options.port}/_playground/`)
+    }
+  })
+
+  // Clean up scheduler/heartbeat on shutdown
+  process.on('SIGTERM', () => { stop(); (server as { close?: () => void }).close?.() })
+  process.on('SIGINT', () => { stop(); (server as { close?: () => void }).close?.() })
+}
 
 export function registerStartCommand(program: Command): void {
   program
@@ -52,6 +169,7 @@ export function registerStartCommand(program: Command): void {
       let shortTermStore: ShortTermStore
       let broadcast: BroadcastProvider
       let longTermStore: LongTermStore | undefined
+      let postgres_: ReturnType<typeof postgres> | undefined
 
       const storage = options.storage ?? process.env['TASKCAST_STORAGE'] ?? (redisUrl ? 'redis' : 'memory')
 
@@ -84,8 +202,8 @@ export function registerStartCommand(program: Command): void {
       }
 
       if (storage !== 'sqlite' && postgresUrl) {
-        const sql = postgres(postgresUrl)
-        longTermStore = new PostgresLongTermStore(sql)
+        postgres_ = postgres(postgresUrl)
+        longTermStore = new PostgresLongTermStore(postgres_)
         longTermLabel = `postgres @ ${postgresUrl}`
       }
 
@@ -94,69 +212,25 @@ export function registerStartCommand(program: Command): void {
       console.log(`[taskcast] Short-term store: ${shortTermLabel}`)
       console.log(`[taskcast] Long-term store:  ${longTermLabel}`)
 
-      const engineOpts: ConstructorParameters<typeof TaskEngine>[0] = { shortTermStore, broadcast }
-      if (longTermStore !== undefined) engineOpts.longTermStore = longTermStore
-      const engine = new TaskEngine(engineOpts)
-
-      const authMode = (process.env['TASKCAST_AUTH_MODE'] ?? fileConfig.auth?.mode ?? 'none') as 'none' | 'jwt'
-
-      // Worker assignment system
-      const workersEnabled = fileConfig.workers?.enabled ?? false
-      let workerManager: WorkerManager | undefined
-      if (workersEnabled) {
-        console.log('[taskcast] Worker assignment system enabled')
-        const wmOpts: ConstructorParameters<typeof WorkerManager>[0] = {
-          engine,
-          shortTermStore,
-          broadcast,
-        }
-        if (longTermStore !== undefined) wmOpts.longTermStore = longTermStore
-        if (fileConfig.workers?.defaults) wmOpts.defaults = fileConfig.workers.defaults
-        workerManager = new WorkerManager(wmOpts)
-      }
-
-      // Resolve admin token (auto-generate + print if adminApi is enabled)
-      resolveAdminToken(fileConfig)
-
-      const serverOpts: Parameters<typeof createTaskcastApp>[0] = {
-        engine,
+      // Call runStart with resolved options
+      const runStartOptions: Omit<RunStartOptions, 'postgres' | 'longTermStore' | 'configPath' | 'env'> & {
+        postgres?: ReturnType<typeof postgres>
+        longTermStore?: LongTermStore
+        configPath?: string
+        env?: Record<string, string | undefined>
+      } = {
+        broadcast,
         shortTermStore,
-        auth: { mode: authMode },
+        port,
         config: fileConfig,
         verbose: options.verbose ?? false,
+        playground: options.playground ?? false,
       }
-      if (workerManager !== undefined) serverOpts.workerManager = workerManager
-      const { app, stop } = createTaskcastApp(serverOpts)
+      if (postgres_ !== undefined) runStartOptions.postgres = postgres_
+      if (longTermStore !== undefined) runStartOptions.longTermStore = longTermStore
+      if (configPath !== undefined) runStartOptions.configPath = configPath
+      runStartOptions.env = process.env as Record<string, string | undefined>
 
-      // Serve playground static files if --playground and dist exists
-      if (options.playground) {
-        try {
-          const require = createRequire(import.meta.url)
-          const pkgPath = require.resolve('@taskcast/playground/package.json')
-          const distDir = join(dirname(pkgPath), 'dist')
-          if (existsSync(distDir)) {
-            const { serveStatic } = await import('@hono/node-server/serve-static')
-            app.use('/_playground/*', serveStatic({ root: distDir, rewriteRequestPath: (p) => p.replace(/^\/_playground/, '') }))
-            // SPA fallback: serve index.html for non-asset paths
-            app.get('/_playground/*', serveStatic({ root: distDir, rewriteRequestPath: () => '/index.html' }))
-          } else {
-            console.warn('[taskcast] Playground dist not found. Run `pnpm --filter @taskcast/playground build` first.')
-          }
-        } catch {
-          console.warn('[taskcast] @taskcast/playground not available, skipping playground UI.')
-        }
-      }
-
-      const { serve } = await import('@hono/node-server')
-      const server = serve({ fetch: app.fetch, port }, () => {
-        console.log(`[taskcast] Server started on http://localhost:${port}`)
-        if (options.playground) {
-          console.log(`[taskcast] Playground UI at http://localhost:${port}/_playground/`)
-        }
-      })
-
-      // Clean up scheduler/heartbeat on shutdown
-      process.on('SIGTERM', () => { stop(); (server as { close?: () => void }).close?.() })
-      process.on('SIGINT', () => { stop(); (server as { close?: () => void }).close?.() })
+      await runStart(runStartOptions as RunStartOptions)
     })
 }
