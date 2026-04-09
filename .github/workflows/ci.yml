@@ -47,3 +47,39 @@ jobs:
 
       - name: Test
         run: pnpm test
+
+  migrations-staleness:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate migrations
+        run: cd packages/cli && pnpm generate-migrations
+
+      - name: Check if generated file is stale
+        run: |
+          if git diff --quiet packages/cli/src/generated-migrations.ts; then
+            echo "✓ Generated migrations file is up to date"
+            exit 0
+          else
+            echo "✗ Generated migrations file is stale"
+            echo ""
+            echo "Changes detected in packages/cli/src/generated-migrations.ts:"
+            git diff packages/cli/src/generated-migrations.ts
+            echo ""
+            echo "Fix: Run 'pnpm generate-migrations' in the packages/cli directory and commit the changes"
+            exit 1
+          fi
