@@ -299,3 +299,167 @@ async fn run_memory_backend_with_postgres_long_term_store() {
     drop(_env);
     drop(container);
 }
+
+// ─── Auto-migrate integration tests ────────────────────────────────────────
+
+#[tokio::test]
+async fn auto_migrate_disabled_when_env_var_not_set() {
+    let container = Postgres::default().start().await.unwrap();
+    let host_port = container.get_host_port_ipv4(5432).await.unwrap();
+    let pg_url = format!(
+        "postgres://postgres:postgres@127.0.0.1:{}/postgres?sslmode=disable",
+        host_port
+    );
+
+    // Don't set TASKCAST_AUTO_MIGRATE; it should default to disabled
+    let _env = EnvGuard::new(&[("TASKCAST_POSTGRES_URL", &pg_url)]);
+
+    let port = find_available_port().await;
+    let handle = tokio::spawn(async move {
+        let _ = taskcast_cli::commands::start::run(StartArgs {
+            port,
+            ..Default::default()
+        })
+        .await;
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let res = reqwest::get(&format!("http://127.0.0.1:{port}/health"))
+        .await
+        .unwrap();
+    assert!(res.status().is_success());
+
+    handle.abort();
+    drop(_env);
+    drop(container);
+}
+
+#[tokio::test]
+async fn auto_migrate_enabled_runs_migrations_on_startup() {
+    let container = Postgres::default().start().await.unwrap();
+    let host_port = container.get_host_port_ipv4(5432).await.unwrap();
+    let pg_url = format!(
+        "postgres://postgres:postgres@127.0.0.1:{}/postgres?sslmode=disable",
+        host_port
+    );
+
+    // Enable auto-migrate
+    let _env = EnvGuard::new(&[
+        ("TASKCAST_AUTO_MIGRATE", "true"),
+        ("TASKCAST_POSTGRES_URL", &pg_url),
+    ]);
+
+    let port = find_available_port().await;
+    let handle = tokio::spawn(async move {
+        let _ = taskcast_cli::commands::start::run(StartArgs {
+            port,
+            ..Default::default()
+        })
+        .await;
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Verify server started successfully
+    let res = reqwest::get(&format!("http://127.0.0.1:{port}/health"))
+        .await
+        .unwrap();
+    assert!(res.status().is_success());
+
+    // Verify that migrations were applied by checking that we can create a task
+    let client = reqwest::Client::new();
+    let task_payload = serde_json::json!({
+        "type": "test:task",
+        "params": {"foo": "bar"}
+    });
+    let res = client
+        .post(&format!("http://127.0.0.1:{port}/tasks"))
+        .json(&task_payload)
+        .send()
+        .await
+        .unwrap();
+
+    // Should succeed (200 or 201)
+    assert!(
+        res.status().is_success(),
+        "Expected success response from /tasks, got {}",
+        res.status()
+    );
+
+    handle.abort();
+    drop(_env);
+    drop(container);
+}
+
+#[tokio::test]
+async fn auto_migrate_disabled_when_env_var_is_false() {
+    let container = Postgres::default().start().await.unwrap();
+    let host_port = container.get_host_port_ipv4(5432).await.unwrap();
+    let pg_url = format!(
+        "postgres://postgres:postgres@127.0.0.1:{}/postgres?sslmode=disable",
+        host_port
+    );
+
+    // Explicitly set to false
+    let _env = EnvGuard::new(&[
+        ("TASKCAST_AUTO_MIGRATE", "false"),
+        ("TASKCAST_POSTGRES_URL", &pg_url),
+    ]);
+
+    let port = find_available_port().await;
+    let handle = tokio::spawn(async move {
+        let _ = taskcast_cli::commands::start::run(StartArgs {
+            port,
+            ..Default::default()
+        })
+        .await;
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let res = reqwest::get(&format!("http://127.0.0.1:{port}/health"))
+        .await
+        .unwrap();
+    assert!(res.status().is_success());
+
+    handle.abort();
+    drop(_env);
+    drop(container);
+}
+
+#[tokio::test]
+async fn auto_migrate_enabled_with_case_insensitive_env_var() {
+    let container = Postgres::default().start().await.unwrap();
+    let host_port = container.get_host_port_ipv4(5432).await.unwrap();
+    let pg_url = format!(
+        "postgres://postgres:postgres@127.0.0.1:{}/postgres?sslmode=disable",
+        host_port
+    );
+
+    // Test case-insensitive parsing
+    let _env = EnvGuard::new(&[
+        ("TASKCAST_AUTO_MIGRATE", "TRUE"),
+        ("TASKCAST_POSTGRES_URL", &pg_url),
+    ]);
+
+    let port = find_available_port().await;
+    let handle = tokio::spawn(async move {
+        let _ = taskcast_cli::commands::start::run(StartArgs {
+            port,
+            ..Default::default()
+        })
+        .await;
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let res = reqwest::get(&format!("http://127.0.0.1:{port}/health"))
+        .await
+        .unwrap();
+    assert!(res.status().is_success());
+
+    handle.abort();
+    drop(_env);
+    drop(container);
+}

@@ -1,3 +1,4 @@
+mod auto_migrate;
 mod client;
 mod commands;
 mod helpers;
