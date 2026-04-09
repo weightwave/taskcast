@@ -2,6 +2,7 @@ import type postgres from 'postgres'
 import { buildMigrationFiles, runMigrations } from '@taskcast/postgres'
 import { parseBooleanEnv } from './helpers.js'
 import { EMBEDDED_MIGRATIONS } from './generated-migrations.js'
+import { formatDisplayUrl } from './migrate-helpers.js'
 
 /**
  * Automatically run database migrations if enabled.
@@ -46,8 +47,10 @@ export async function performAutoMigrateIfEnabled(
     return
   }
 
-  // Log banner with URL (if available)
-  const urlDisplay = postgresUrl ?? '<postgres>'
+  // Log banner with display URL (credentials stripped).
+  // The raw postgresUrl may contain a password (e.g. postgres://user:pass@host/db)
+  // which must not be emitted to stderr where it could leak into log aggregators.
+  const urlDisplay = postgresUrl ? formatDisplayUrl(postgresUrl) : '<postgres>'
   console.error(`[taskcast] TASKCAST_AUTO_MIGRATE enabled — running Postgres migrations on ${urlDisplay}`)
 
   // Run migrations

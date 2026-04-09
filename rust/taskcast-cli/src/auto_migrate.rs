@@ -1,6 +1,6 @@
 use sqlx::PgPool;
 
-use crate::helpers::parse_boolean_env;
+use crate::helpers::{format_display_url, parse_boolean_env};
 
 /// Automatically run database migrations if TASKCAST_AUTO_MIGRATE is enabled.
 ///
@@ -54,8 +54,12 @@ pub async fn run_auto_migrate(
         }
     };
 
-    // Log banner with URL (if available)
-    let url_display = postgres_url.unwrap_or("<postgres>");
+    // Log banner with display URL (credentials stripped).
+    // The raw postgres_url may contain a password which must not leak into
+    // stderr / log aggregators.
+    let url_display = postgres_url
+        .map(format_display_url)
+        .unwrap_or_else(|| "<postgres>".to_string());
     eprintln!(
         "[taskcast] TASKCAST_AUTO_MIGRATE enabled — running Postgres migrations on {}",
         url_display

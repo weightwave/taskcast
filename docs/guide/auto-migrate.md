@@ -126,14 +126,33 @@ npx @taskcast/cli migrate --url postgresql://localhost/taskcast_dev
 
 ### Multi-Host Deployments
 
-If multiple Taskcast instances start simultaneously against the same database, migrations are serialized via database-level locking. The first instance to acquire the lock runs the migrations; subsequent instances wait and then verify the schema is up-to-date.
+**Coordinated startup is not safe with auto-migrate enabled.** If multiple
+Taskcast instances start simultaneously against the same database with
+`TASKCAST_AUTO_MIGRATE=true`, only one instance can win the race to insert
+a given migration row into `_sqlx_migrations`; the others will fail with a
+primary-key conflict wrapped as `Auto-migration failed: duplicate key ...`
+and exit non-zero.
+
+The Rust CLI benefits from sqlx's built-in advisory locking (migrations run
+under a Postgres advisory lock), so concurrent Rust startups serialize
+correctly. The Node.js CLI does **not** take an advisory lock and is unsafe
+under concurrent startup.
+
+**Recommended patterns:**
 
 ```bash
-# Multiple instances can safely start together
-TASKCAST_AUTO_MIGRATE=true npx @taskcast/cli start &
-TASKCAST_AUTO_MIGRATE=true npx @taskcast/cli start &
-TASKCAST_AUTO_MIGRATE=true npx @taskcast/cli start &
-wait
+# Option A — run migrations as a pre-deploy step, then start instances with
+# auto-migrate disabled (safe for any number of replicas, both CLIs):
+TASKCAST_POSTGRES_URL=postgres://... npx @taskcast/cli migrate --yes
+TASKCAST_AUTO_MIGRATE=false npx @taskcast/cli start &
+TASKCAST_AUTO_MIGRATE=false npx @taskcast/cli start &
+
+# Option B — gate startup through a Kubernetes initContainer or a
+# docker-compose "depends_on: condition: service_completed_successfully"
+# so only the first pod runs migrations.
+
+# Option C — use the Rust CLI (taskcast-rs), whose advisory-lock protocol
+# tolerates concurrent auto-migrate across replicas.
 ```
 
 ## Manual Migration

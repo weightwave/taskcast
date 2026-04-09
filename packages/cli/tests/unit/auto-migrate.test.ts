@@ -104,16 +104,31 @@ describe('performAutoMigrateIfEnabled', () => {
 
   // ─── Banner log (before running) ───────────────────────────────────────
 
-  it('logs banner with resolved Postgres URL before running migrations', async () => {
+  it('logs banner with display URL (credentials stripped) before running migrations', async () => {
+    // Regression test: the banner must not print raw credentials. A URL with
+    // user:password must be formatted into host:port/db form via
+    // formatDisplayUrl() to avoid leaking secrets into stderr/log aggregators.
     const env = { TASKCAST_AUTO_MIGRATE: 'true' }
     const mockError = vi.spyOn(console, 'error').mockImplementation(() => {})
     vi.mocked(runMigrations).mockResolvedValueOnce({ applied: [], skipped: [] })
 
-    await performAutoMigrateIfEnabled(mockSql, 'postgres://db.example.com/taskcast', env)
-
-    expect(mockError).toHaveBeenCalledWith(
-      '[taskcast] TASKCAST_AUTO_MIGRATE enabled — running Postgres migrations on postgres://db.example.com/taskcast',
+    await performAutoMigrateIfEnabled(
+      mockSql,
+      'postgres://user:secretpass@db.example.com:5432/taskcast',
+      env,
     )
+
+    // Assert the banner line was emitted and the password does NOT appear
+    const bannerCalls = mockError.mock.calls.filter((call) =>
+      String(call[0]).includes('TASKCAST_AUTO_MIGRATE enabled'),
+    )
+    expect(bannerCalls).toHaveLength(1)
+    const bannerLine = String(bannerCalls[0]?.[0])
+    expect(bannerLine).toBe(
+      '[taskcast] TASKCAST_AUTO_MIGRATE enabled — running Postgres migrations on db.example.com:5432/taskcast',
+    )
+    expect(bannerLine).not.toContain('secretpass')
+    expect(bannerLine).not.toContain('user:')
 
     mockError.mockRestore()
   })

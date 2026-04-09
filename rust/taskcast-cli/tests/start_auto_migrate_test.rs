@@ -172,6 +172,11 @@ async fn start_auto_migrate_twice_is_idempotent() {
         host_port
     );
 
+    // Capture the first-run count in the outer scope so the second-run
+    // assertion can compare against it. (Earlier version compared two
+    // post-second-run queries, making the assertion tautological.)
+    let count_after_first_run: i64;
+
     // First run: apply migrations
     {
         let _env = EnvGuard::new(&[
@@ -193,8 +198,11 @@ async fn start_auto_migrate_twice_is_idempotent() {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
         let pool = get_postgres_pool(&database_url).await;
-        let count_after_first_run = get_applied_migration_count(&pool).await;
-        assert!(count_after_first_run > 0, "First run should apply migrations");
+        count_after_first_run = get_applied_migration_count(&pool).await;
+        assert!(
+            count_after_first_run > 0,
+            "First run should apply migrations"
+        );
 
         handle.abort();
         drop(_env);
@@ -223,10 +231,12 @@ async fn start_auto_migrate_twice_is_idempotent() {
         let pool = get_postgres_pool(&database_url).await;
         let count_after_second_run = get_applied_migration_count(&pool).await;
 
-        // Count should remain the same (no new migrations applied)
-        let pool_first = get_postgres_pool(&database_url).await;
-        let count_first = get_applied_migration_count(&pool_first).await;
-        assert_eq!(count_after_second_run, count_first, "Second run should not apply new migrations (idempotent)");
+        assert_eq!(
+            count_after_second_run, count_after_first_run,
+            "Second run should not apply new migrations (idempotent): \
+             first run count = {}, second run count = {}",
+            count_after_first_run, count_after_second_run
+        );
 
         handle.abort();
     }
