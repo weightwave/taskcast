@@ -1,9 +1,8 @@
 import { Command } from 'commander'
 import postgres from 'postgres'
-import { join, dirname } from 'path'
-import { fileURLToPath } from 'url'
 import { loadConfigFile } from '@taskcast/core'
-import { loadMigrationFiles, runMigrations } from '@taskcast/postgres'
+import { buildMigrationFiles, runMigrations } from '@taskcast/postgres'
+import { EMBEDDED_MIGRATIONS } from '../generated-migrations.js'
 import { resolvePostgresUrl, formatDisplayUrl } from '../migrate-helpers.js'
 import { promptConfirm } from '../utils.js'
 
@@ -30,14 +29,10 @@ export function registerMigrateCommand(program: Command): void {
 
       const target = formatDisplayUrl(pgUrl)
 
-      // TODO: This path works in the monorepo only. For npm publishing,
-      // migrations would need to be bundled with the package.
-      const migrationsDir = join(dirname(fileURLToPath(import.meta.url)), '../../../../migrations/postgres')
-
       const sql = postgres(pgUrl)
       try {
-        // Load migration files and check what's pending
-        const allFiles = loadMigrationFiles(migrationsDir)
+        // Build migration files from embedded migrations
+        const allFiles = buildMigrationFiles(EMBEDDED_MIGRATIONS)
 
         // Ensure the migrations table exists so we can query applied versions
         await sql.unsafe(`
@@ -77,7 +72,7 @@ export function registerMigrateCommand(program: Command): void {
           }
         }
 
-        const result = await runMigrations(sql, migrationsDir)
+        const result = await runMigrations(sql, allFiles)
 
         for (const filename of result.applied) {
           console.log(`  Applied ${filename}`)

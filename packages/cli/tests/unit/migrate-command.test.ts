@@ -34,11 +34,17 @@ vi.mock('@taskcast/core', () => ({
   loadConfigFile: (...args: unknown[]) => mockLoadConfigFile(...args),
 }))
 
-const mockLoadMigrationFiles = vi.fn()
+const mockBuildMigrationFiles = vi.fn()
 const mockRunMigrations = vi.fn()
 vi.mock('@taskcast/postgres', () => ({
-  loadMigrationFiles: (...args: unknown[]) => mockLoadMigrationFiles(...args),
+  buildMigrationFiles: (...args: unknown[]) => mockBuildMigrationFiles(...args),
   runMigrations: (...args: unknown[]) => mockRunMigrations(...args),
+}))
+
+vi.mock('../../src/generated-migrations.js', () => ({
+  EMBEDDED_MIGRATIONS: [
+    { filename: '001_initial.sql', sql: 'CREATE TABLE ...' },
+  ],
 }))
 
 const mockPromptConfirm = vi.fn()
@@ -98,7 +104,7 @@ describe('registerMigrateCommand', () => {
     mockLoadConfigFile.mockResolvedValue({ config: {}, source: 'none' })
     mockSqlUnsafe.mockResolvedValueOnce(undefined) // CREATE TABLE
     mockSqlUnsafe.mockResolvedValueOnce([{ version: 1 }]) // SELECT applied
-    mockLoadMigrationFiles.mockReturnValue([{ version: 1, filename: '001_init.sql' }])
+    mockBuildMigrationFiles.mockReturnValue([{ version: 1, filename: '001_init.sql' }])
 
     const program = new Command()
     program.exitOverride()
@@ -114,7 +120,7 @@ describe('registerMigrateCommand', () => {
     mockLoadConfigFile.mockResolvedValue({ config: {}, source: 'none' })
     mockSqlUnsafe.mockResolvedValueOnce(undefined) // CREATE TABLE
     mockSqlUnsafe.mockResolvedValueOnce([]) // no applied
-    mockLoadMigrationFiles.mockReturnValue([
+    mockBuildMigrationFiles.mockReturnValue([
       { version: 1, filename: '001_init.sql' },
       { version: 2, filename: '002_add_index.sql' },
     ])
@@ -136,7 +142,7 @@ describe('registerMigrateCommand', () => {
     mockLoadConfigFile.mockResolvedValue({ config: {}, source: 'none' })
     mockSqlUnsafe.mockResolvedValueOnce(undefined) // CREATE TABLE
     mockSqlUnsafe.mockResolvedValueOnce([]) // no applied
-    mockLoadMigrationFiles.mockReturnValue([
+    mockBuildMigrationFiles.mockReturnValue([
       { version: 1, filename: '001_init.sql' },
     ])
     mockPromptConfirm.mockResolvedValue(false)
@@ -163,7 +169,7 @@ describe('registerMigrateCommand', () => {
     mockLoadConfigFile.mockResolvedValue({ config: {}, source: 'none' })
     mockSqlUnsafe.mockResolvedValueOnce(undefined) // CREATE TABLE
     mockSqlUnsafe.mockResolvedValueOnce([]) // no applied
-    mockLoadMigrationFiles.mockReturnValue([
+    mockBuildMigrationFiles.mockReturnValue([
       { version: 1, filename: '001_init.sql' },
     ])
 
@@ -189,7 +195,7 @@ describe('registerMigrateCommand', () => {
   it('exits with 1 on migration error', async () => {
     mockLoadConfigFile.mockResolvedValue({ config: {}, source: 'none' })
     mockSqlUnsafe.mockRejectedValue(new Error('connection refused'))
-    mockLoadMigrationFiles.mockReturnValue([])
+    mockBuildMigrationFiles.mockReturnValue([])
 
     const program = new Command()
     program.exitOverride()
@@ -214,7 +220,7 @@ describe('registerMigrateCommand', () => {
     })
     mockSqlUnsafe.mockResolvedValueOnce(undefined)
     mockSqlUnsafe.mockResolvedValueOnce([{ version: 1 }])
-    mockLoadMigrationFiles.mockReturnValue([{ version: 1, filename: '001_init.sql' }])
+    mockBuildMigrationFiles.mockReturnValue([{ version: 1, filename: '001_init.sql' }])
 
     const origEnv = process.env['TASKCAST_POSTGRES_URL']
     delete process.env['TASKCAST_POSTGRES_URL']
@@ -236,7 +242,7 @@ describe('registerMigrateCommand', () => {
     mockLoadConfigFile.mockResolvedValue({ config: {}, source: 'none' })
     mockSqlUnsafe.mockResolvedValueOnce(undefined)
     mockSqlUnsafe.mockResolvedValueOnce([])
-    mockLoadMigrationFiles.mockReturnValue([
+    mockBuildMigrationFiles.mockReturnValue([
       { version: 1, filename: '001_init.sql' },
     ])
     mockPromptConfirm.mockResolvedValue(true)
