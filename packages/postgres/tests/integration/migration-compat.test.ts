@@ -63,7 +63,7 @@ describe('cross-compatibility: TS runner with sqlx-style pre-applied migrations'
     const result = await runMigrations(sql, MIGRATIONS_DIR)
 
     expect(result.skipped).toEqual(['001_initial.sql'])
-    expect(result.applied).toEqual(['002_workers.sql'])
+    expect(result.applied).toEqual(['002_workers.sql', '003_client_seq.sql'])
   })
 
   it('TS-written records have correct sqlx field format', async () => {
