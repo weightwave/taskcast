@@ -200,6 +200,8 @@ export interface SSEEnvelope {
   seriesMode?: SeriesMode
   seriesAccField?: string
   seriesSnapshot?: boolean
+  clientId?: string
+  clientSeq?: number
 }
 
 // ─── Subscription ────────────────────────────────────────────────────────────

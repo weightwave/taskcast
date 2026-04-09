@@ -80,6 +80,8 @@ X-Taskcast-Signature: sha256=abc123...
 
 The **request body** is the JSON representation of the event (wrapped in an SSEEnvelope if `wrap=true`).
 
+If the publisher used [client sequence ordering](./rest.md#publish-events), the `clientId` and `clientSeq` fields are preserved end-to-end and included in the webhook payload (both in the wrapped envelope and — where present — in the event record itself). This lets downstream systems deduplicate or re-order on their side without re-querying the server.
+
 ## Request Headers
 
 | Header | Description |

@@ -144,6 +144,8 @@ interface SSEEnvelope {
   data: unknown
   seriesId?: string
   seriesMode?: string
+  clientId?: string        // 生产者客户端 ID（仅当发布方启用了 client seq 排序时出现）
+  clientSeq?: number       // 生产者序列号（仅当发布方启用了 client seq 排序时出现）
 }
 ```
 
