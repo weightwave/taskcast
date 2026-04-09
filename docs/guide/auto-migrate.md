@@ -346,9 +346,11 @@ If auto-migrate seems to skip:
 **Checklist:**
 1. Is `TASKCAST_AUTO_MIGRATE` set to a truthy value? (Check: `echo $TASKCAST_AUTO_MIGRATE`)
 2. Is `TASKCAST_POSTGRES_URL` configured? (Check: `echo $TASKCAST_POSTGRES_URL`)
-3. Check the server logs — Taskcast should log migration status:
+3. Check the server logs — Taskcast should log migration status. The banner
+   uses a display-formatted URL (host:port/dbname) — credentials are stripped
+   so it is safe to include the log line in bug reports or shared dashboards:
    ```
-   [taskcast] TASKCAST_AUTO_MIGRATE enabled — running Postgres migrations on postgres://host:5432/db
+   [taskcast] TASKCAST_AUTO_MIGRATE enabled — running Postgres migrations on host:5432/db
    [taskcast] Applied 3 new migration(s): 001_initial.sql, 002_workers.sql, 003_indexes.sql
    [taskcast] Database schema up to date (5 migration(s) already applied)
    [taskcast] TASKCAST_AUTO_MIGRATE is set but no Postgres configured — skipping

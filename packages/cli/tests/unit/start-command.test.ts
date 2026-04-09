@@ -192,10 +192,11 @@ describe('registerStartCommand', () => {
     expect(logSpy).toHaveBeenCalledWith('[taskcast] Config: (none)')
   })
 
-  it('prints postgres long-term store info when configured', async () => {
+  it('prints postgres long-term store info when configured (display URL, credentials stripped)', async () => {
     const origPg = process.env['TASKCAST_POSTGRES_URL']
     const origRedis = process.env['TASKCAST_REDIS_URL']
-    process.env['TASKCAST_POSTGRES_URL'] = 'postgres://localhost/taskcast'
+    // Use a URL with credentials to verify they're stripped from the log.
+    process.env['TASKCAST_POSTGRES_URL'] = 'postgres://user:secretpass@localhost:5432/taskcast'
     delete process.env['TASKCAST_REDIS_URL']
 
     const program = new Command()
@@ -210,7 +211,46 @@ describe('registerStartCommand', () => {
       if (origRedis !== undefined) process.env['TASKCAST_REDIS_URL'] = origRedis
     }
 
-    expect(logSpy).toHaveBeenCalledWith('[taskcast] Long-term store:  postgres @ postgres://localhost/taskcast')
+    // The log line must contain host:port/db (display format), not the raw URL
+    // with credentials.
+    expect(logSpy).toHaveBeenCalledWith('[taskcast] Long-term store:  postgres @ localhost:5432/taskcast')
+
+    // Belt-and-suspenders: assert no log call includes the password
+    const allCalls = logSpy.mock.calls.map((c) => String(c[0]))
+    for (const call of allCalls) {
+      expect(call).not.toContain('secretpass')
+      expect(call).not.toContain('user:')
+    }
+  })
+
+  it('prints redis short-term store info with credentials stripped from URL', async () => {
+    const origPg = process.env['TASKCAST_POSTGRES_URL']
+    const origRedis = process.env['TASKCAST_REDIS_URL']
+    delete process.env['TASKCAST_POSTGRES_URL']
+    process.env['TASKCAST_REDIS_URL'] = 'redis://admin:supersecret@redis.example.com:6379/0'
+
+    const program = new Command()
+    program.exitOverride()
+    registerStartCommand(program)
+
+    try {
+      await program.parseAsync(['node', 'test', 'start'])
+    } finally {
+      if (origPg !== undefined) process.env['TASKCAST_POSTGRES_URL'] = origPg
+      if (origRedis !== undefined) process.env['TASKCAST_REDIS_URL'] = origRedis
+      else delete process.env['TASKCAST_REDIS_URL']
+    }
+
+    // The redis label must include the host but NOT the password.
+    const allCalls = logSpy.mock.calls.map((c) => String(c[0]))
+    for (const call of allCalls) {
+      expect(call).not.toContain('supersecret')
+      expect(call).not.toContain('admin:')
+    }
+    // Confirm a redis line was actually emitted (otherwise assertions above
+    // would pass vacuously).
+    const redisLines = allCalls.filter((c) => c.includes('redis @'))
+    expect(redisLines.length).toBeGreaterThan(0)
   })
 
   it('starts server with custom port', async () => {

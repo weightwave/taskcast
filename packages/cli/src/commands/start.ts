@@ -19,6 +19,26 @@ import { PostgresLongTermStore } from '@taskcast/postgres'
 import { createSqliteAdapters } from '@taskcast/sqlite'
 import { promptCreateGlobalConfig, createDefaultGlobalConfig } from '../utils.js'
 import { performAutoMigrateIfEnabled } from '../auto-migrate.js'
+import { formatDisplayUrl } from '../migrate-helpers.js'
+
+/**
+ * Strip credentials from a connection URL (Redis/Postgres/etc.) for logging.
+ * Returns `scheme://host:port/path` with no userinfo. Falls back to the raw
+ * string only when parsing fails AND the fallback does not contain an `@`
+ * (which would indicate embedded credentials). When credentials are present
+ * and parsing fails, returns '<redacted>' to avoid leaking secrets.
+ */
+function formatConnectionUrlForLog(url: string): string {
+  try {
+    const parsed = new URL(url)
+    parsed.username = ''
+    parsed.password = ''
+    return parsed.toString()
+  } catch {
+    // Parse failed. Only return the raw string if it clearly contains no creds.
+    return url.includes('@') ? '<redacted>' : url
+  }
+}
 
 /**
  * Options for runStart function.
@@ -194,7 +214,9 @@ export function registerStartCommand(program: Command): void {
         const adapters = createRedisAdapters(pubClient, subClient, storeClient)
         broadcast = adapters.broadcast
         shortTermStore = adapters.shortTermStore
-        shortTermLabel = `redis @ ${redisUrl}`
+        // Strip any userinfo from the displayed URL so credentials don't land
+        // in stdout / log aggregators.
+        shortTermLabel = `redis @ ${formatConnectionUrlForLog(redisUrl!)}`
         longTermLabel = '(none)'
       } else {
         broadcast = new MemoryBroadcastProvider()
@@ -206,7 +228,8 @@ export function registerStartCommand(program: Command): void {
       if (storage !== 'sqlite' && postgresUrl) {
         postgres_ = postgres(postgresUrl)
         longTermStore = new PostgresLongTermStore(postgres_)
-        longTermLabel = `postgres @ ${postgresUrl}`
+        // formatDisplayUrl returns host:port/dbname — credentials stripped.
+        longTermLabel = `postgres @ ${formatDisplayUrl(postgresUrl)}`
       }
 
       // Print startup configuration summary
