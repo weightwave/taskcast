@@ -27,6 +27,8 @@ import { performAutoMigrateIfEnabled } from '../auto-migrate.js'
 export interface RunStartOptions {
   /** Postgres connection instance (optional) */
   postgres?: ReturnType<typeof postgres>
+  /** Resolved Postgres URL (for auto-migrate banner log), required if postgres is set */
+  postgresUrl?: string
   /** Broadcast provider instance */
   broadcast: BroadcastProvider
   /** Short-term store instance */
@@ -62,10 +64,10 @@ export interface RunStartOptions {
  * @throws Error if auto-migrate fails
  */
 export async function runStart(options: RunStartOptions): Promise<void> {
-  // Call auto-migrate if Postgres is configured
-  if (options.postgres) {
-    await performAutoMigrateIfEnabled(options.postgres, options.env)
-  }
+  // Call auto-migrate (no-op if not enabled or no Postgres).
+  // Pass the actual sql connection so the helper can detect "configured via
+  // config file" scenarios where TASKCAST_POSTGRES_URL env var is not set.
+  await performAutoMigrateIfEnabled(options.postgres, options.postgresUrl, options.env)
 
   const engineOpts: ConstructorParameters<typeof TaskEngine>[0] = {
     shortTermStore: options.shortTermStore,
@@ -213,8 +215,12 @@ export function registerStartCommand(program: Command): void {
       console.log(`[taskcast] Long-term store:  ${longTermLabel}`)
 
       // Call runStart with resolved options
-      const runStartOptions: Omit<RunStartOptions, 'postgres' | 'longTermStore' | 'configPath' | 'env'> & {
+      const runStartOptions: Omit<
+        RunStartOptions,
+        'postgres' | 'postgresUrl' | 'longTermStore' | 'configPath' | 'env'
+      > & {
         postgres?: ReturnType<typeof postgres>
+        postgresUrl?: string
         longTermStore?: LongTermStore
         configPath?: string
         env?: Record<string, string | undefined>
@@ -227,10 +233,20 @@ export function registerStartCommand(program: Command): void {
         playground: options.playground ?? false,
       }
       if (postgres_ !== undefined) runStartOptions.postgres = postgres_
+      if (postgresUrl !== undefined) runStartOptions.postgresUrl = postgresUrl
       if (longTermStore !== undefined) runStartOptions.longTermStore = longTermStore
       if (configPath !== undefined) runStartOptions.configPath = configPath
       runStartOptions.env = process.env as Record<string, string | undefined>
 
-      await runStart(runStartOptions as RunStartOptions)
+      // Fail-fast: auto-migrate errors (and any other runStart errors) should
+      // produce a clean user-facing message and non-zero exit, not an unhandled
+      // rejection from Commander.
+      try {
+        await runStart(runStartOptions as RunStartOptions)
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        console.error(`[taskcast] ${msg}`)
+        process.exit(1)
+      }
     })
 }

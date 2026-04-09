@@ -44,16 +44,19 @@ impl Default for StartArgs {
 ///
 /// This helper encapsulates the pool creation + auto-migrate flow.
 /// It's called from the main `run()` function in multiple places.
+///
+/// The pool itself (not the env var) is passed to `run_auto_migrate` as
+/// proof that Postgres is configured, so the helper works correctly
+/// regardless of whether the URL came from an env var or the config file.
 async fn create_postgres_pool_with_auto_migrate(
     postgres_url: &str,
 ) -> Result<sqlx::PgPool, Box<dyn std::error::Error>> {
     let pool = sqlx::PgPool::connect(postgres_url).await?;
 
-    // Run auto-migrate if enabled
     run_auto_migrate(
-        &pool,
+        Some(&pool),
+        Some(postgres_url),
         std::env::var("TASKCAST_AUTO_MIGRATE").ok().as_deref(),
-        std::env::var("TASKCAST_POSTGRES_URL").ok().as_deref(),
     )
     .await?;
 

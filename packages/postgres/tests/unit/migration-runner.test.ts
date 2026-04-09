@@ -211,4 +211,21 @@ describe('buildMigrationFiles', () => {
     expect(result[0]!.description).toBe('create users table')
     expect(result[1]!.description).toBe('add email column')
   })
+
+  it('does not mutate the input array (defensive copy)', () => {
+    // Plan acceptance criterion: array input is defensively re-sorted without
+    // in-place mutation, so callers can pass a frozen/shared array safely.
+    const embedded = [
+      { filename: '002_second.sql', sql: 'SQL2' },
+      { filename: '001_first.sql', sql: 'SQL1' },
+    ]
+    const snapshot = JSON.parse(JSON.stringify(embedded)) as typeof embedded
+
+    const result = buildMigrationFiles(embedded)
+
+    // Result is sorted
+    expect(result.map((f) => f.version)).toEqual([1, 2])
+    // Input is unchanged
+    expect(embedded).toEqual(snapshot)
+  })
 })

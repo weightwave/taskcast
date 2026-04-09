@@ -17,27 +17,32 @@ fn lock_env() -> MutexGuard<'static, ()> {
 }
 
 struct EnvGuard {
-    vars: Vec<&'static str>,
+    /// Saved original values: (key, previous value if any).
+    /// On Drop we restore previous values rather than blindly removing keys,
+    /// so pre-existing environment state is preserved across tests.
+    saved: Vec<(&'static str, Option<String>)>,
     _lock: MutexGuard<'static, ()>,
 }
 
 impl EnvGuard {
     fn new(vars: &[(&'static str, &str)]) -> Self {
         let lock = lock_env();
+        let mut saved = Vec::with_capacity(vars.len());
         for (key, value) in vars {
+            saved.push((*key, std::env::var(key).ok()));
             std::env::set_var(key, value);
         }
-        Self {
-            vars: vars.iter().map(|(k, _)| *k).collect(),
-            _lock: lock,
-        }
+        Self { saved, _lock: lock }
     }
 }
 
 impl Drop for EnvGuard {
     fn drop(&mut self) {
-        for var in &self.vars {
-            std::env::remove_var(var);
+        for (key, prev) in &self.saved {
+            match prev {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
         }
     }
 }

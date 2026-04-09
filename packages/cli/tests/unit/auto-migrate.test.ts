@@ -19,6 +19,7 @@ import { runMigrations, buildMigrationFiles } from '@taskcast/postgres'
 
 describe('performAutoMigrateIfEnabled', () => {
   const mockSql = {} as ReturnType<typeof postgres>
+  const testUrl = 'postgres://localhost/taskcast'
 
   beforeEach(() => {
     vi.clearAllMocks()
@@ -26,209 +27,268 @@ describe('performAutoMigrateIfEnabled', () => {
     vi.mocked(buildMigrationFiles).mockReturnValue([])
   })
 
-  // Test 1: Auto-migrate disabled (TASKCAST_AUTO_MIGRATE not set)
-  it('returns immediately when auto-migrate is disabled (TASKCAST_AUTO_MIGRATE not set)', async () => {
+  // ─── Disabled scenarios ────────────────────────────────────────────────
+
+  it('returns immediately when TASKCAST_AUTO_MIGRATE is not set', async () => {
     const env = {}
-    const mockLog = vi.spyOn(console, 'log').mockImplementation(() => {})
+    const mockError = vi.spyOn(console, 'error').mockImplementation(() => {})
 
-    await performAutoMigrateIfEnabled(mockSql, env)
+    await performAutoMigrateIfEnabled(mockSql, testUrl, env)
 
     expect(runMigrations).not.toHaveBeenCalled()
-    expect(mockLog).not.toHaveBeenCalled()
+    expect(mockError).not.toHaveBeenCalled()
 
-    mockLog.mockRestore()
+    mockError.mockRestore()
   })
 
-  // Test 2: Auto-migrate disabled (TASKCAST_AUTO_MIGRATE = 'false')
-  it('returns immediately when auto-migrate is explicitly disabled', async () => {
+  it('returns immediately when TASKCAST_AUTO_MIGRATE is explicitly false', async () => {
     const env = { TASKCAST_AUTO_MIGRATE: 'false' }
-    const mockLog = vi.spyOn(console, 'log').mockImplementation(() => {})
+    const mockError = vi.spyOn(console, 'error').mockImplementation(() => {})
 
-    await performAutoMigrateIfEnabled(mockSql, env)
+    await performAutoMigrateIfEnabled(mockSql, testUrl, env)
 
     expect(runMigrations).not.toHaveBeenCalled()
-    expect(mockLog).not.toHaveBeenCalled()
+    expect(mockError).not.toHaveBeenCalled()
 
-    mockLog.mockRestore()
+    mockError.mockRestore()
   })
 
-  // Test 3: Auto-migrate enabled, Postgres not configured
-  it('logs info and returns when Postgres is not configured', async () => {
+  // ─── Postgres not configured ───────────────────────────────────────────
+
+  it('logs skip message when sql is undefined (no Postgres configured)', async () => {
     const env = { TASKCAST_AUTO_MIGRATE: 'true' }
-    const mockLog = vi.spyOn(console, 'log').mockImplementation(() => {})
+    const mockError = vi.spyOn(console, 'error').mockImplementation(() => {})
 
-    await performAutoMigrateIfEnabled(mockSql, env)
+    await performAutoMigrateIfEnabled(undefined, undefined, env)
 
-    expect(mockLog).toHaveBeenCalledWith('[taskcast] Auto-migrate disabled: Postgres not configured')
+    expect(mockError).toHaveBeenCalledWith(
+      '[taskcast] TASKCAST_AUTO_MIGRATE is set but no Postgres configured — skipping',
+    )
     expect(runMigrations).not.toHaveBeenCalled()
 
-    mockLog.mockRestore()
+    mockError.mockRestore()
   })
 
-  // Test 4: Auto-migrate enabled, Postgres configured, no migrations needed
-  it('logs "Database schema up to date" when no migrations are applied', async () => {
+  it('logs skip message when sql is undefined even if URL env var is set', async () => {
+    // Even if the env var is set, if the caller did not pass a sql connection
+    // (e.g., because storage mode is sqlite), we still skip.
     const env = {
       TASKCAST_AUTO_MIGRATE: 'true',
       TASKCAST_POSTGRES_URL: 'postgres://localhost/taskcast',
     }
-    const mockLog = vi.spyOn(console, 'log').mockImplementation(() => {})
-    vi.mocked(runMigrations).mockResolvedValueOnce({ applied: [], skipped: ['001_initial.sql', '002_workers.sql'] })
+    const mockError = vi.spyOn(console, 'error').mockImplementation(() => {})
 
-    await performAutoMigrateIfEnabled(mockSql, env)
+    await performAutoMigrateIfEnabled(undefined, undefined, env)
 
-    expect(mockLog).toHaveBeenCalledWith('[taskcast] Database schema up to date')
+    expect(mockError).toHaveBeenCalledWith(
+      '[taskcast] TASKCAST_AUTO_MIGRATE is set but no Postgres configured — skipping',
+    )
+    expect(runMigrations).not.toHaveBeenCalled()
+
+    mockError.mockRestore()
+  })
+
+  it('proceeds when sql is provided even if URL env var is unset (config-file case)', async () => {
+    // Regression test for config-file silent bypass: auto-migrate must work
+    // when Postgres is configured only via the YAML config file.
+    const env = { TASKCAST_AUTO_MIGRATE: 'true' }
+    const mockError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    vi.mocked(runMigrations).mockResolvedValueOnce({ applied: [], skipped: [] })
+
+    await performAutoMigrateIfEnabled(mockSql, 'postgres://from-config-file', env)
+
     expect(runMigrations).toHaveBeenCalled()
 
-    mockLog.mockRestore()
+    mockError.mockRestore()
   })
 
-  // Test 5: Auto-migrate enabled, Postgres configured, 1 migration applied
-  it('logs "Applied 1 migrations" when one migration is applied', async () => {
-    const env = {
-      TASKCAST_AUTO_MIGRATE: 'true',
-      TASKCAST_POSTGRES_URL: 'postgres://localhost/taskcast',
-    }
-    const mockLog = vi.spyOn(console, 'log').mockImplementation(() => {})
-    vi.mocked(runMigrations).mockResolvedValueOnce({ applied: ['001_initial.sql'], skipped: ['002_workers.sql'] })
+  // ─── Banner log (before running) ───────────────────────────────────────
 
-    await performAutoMigrateIfEnabled(mockSql, env)
+  it('logs banner with resolved Postgres URL before running migrations', async () => {
+    const env = { TASKCAST_AUTO_MIGRATE: 'true' }
+    const mockError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    vi.mocked(runMigrations).mockResolvedValueOnce({ applied: [], skipped: [] })
 
-    expect(mockLog).toHaveBeenCalledWith('[taskcast] Applied 1 migrations')
+    await performAutoMigrateIfEnabled(mockSql, 'postgres://db.example.com/taskcast', env)
 
-    mockLog.mockRestore()
+    expect(mockError).toHaveBeenCalledWith(
+      '[taskcast] TASKCAST_AUTO_MIGRATE enabled — running Postgres migrations on postgres://db.example.com/taskcast',
+    )
+
+    mockError.mockRestore()
   })
 
-  // Test 6: Auto-migrate enabled, Postgres configured, 2+ migrations applied
-  it('logs "Applied N migrations" when multiple migrations are applied', async () => {
-    const env = {
-      TASKCAST_AUTO_MIGRATE: 'true',
-      TASKCAST_POSTGRES_URL: 'postgres://localhost/taskcast',
-    }
-    const mockLog = vi.spyOn(console, 'log').mockImplementation(() => {})
+  // ─── Success scenarios ─────────────────────────────────────────────────
+
+  it('logs "Database schema up to date (N migration(s) already applied)" when nothing new applied', async () => {
+    const env = { TASKCAST_AUTO_MIGRATE: 'true' }
+    const mockError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    vi.mocked(runMigrations).mockResolvedValueOnce({
+      applied: [],
+      skipped: ['001_initial.sql', '002_workers.sql'],
+    })
+
+    await performAutoMigrateIfEnabled(mockSql, testUrl, env)
+
+    expect(mockError).toHaveBeenCalledWith(
+      '[taskcast] Database schema up to date (2 migration(s) already applied)',
+    )
+    expect(runMigrations).toHaveBeenCalled()
+
+    mockError.mockRestore()
+  })
+
+  it('logs "Applied 1 new migration(s)" with filename when one migration applied', async () => {
+    const env = { TASKCAST_AUTO_MIGRATE: 'true' }
+    const mockError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    vi.mocked(runMigrations).mockResolvedValueOnce({
+      applied: ['003_add_index.sql'],
+      skipped: ['001_initial.sql', '002_workers.sql'],
+    })
+
+    await performAutoMigrateIfEnabled(mockSql, testUrl, env)
+
+    expect(mockError).toHaveBeenCalledWith(
+      '[taskcast] Applied 1 new migration(s): 003_add_index.sql',
+    )
+
+    mockError.mockRestore()
+  })
+
+  it('logs "Applied N new migration(s)" with comma-separated filenames when multiple applied', async () => {
+    const env = { TASKCAST_AUTO_MIGRATE: 'true' }
+    const mockError = vi.spyOn(console, 'error').mockImplementation(() => {})
     vi.mocked(runMigrations).mockResolvedValueOnce({
       applied: ['001_initial.sql', '002_workers.sql'],
       skipped: [],
     })
 
-    await performAutoMigrateIfEnabled(mockSql, env)
+    await performAutoMigrateIfEnabled(mockSql, testUrl, env)
 
-    expect(mockLog).toHaveBeenCalledWith('[taskcast] Applied 2 migrations')
+    expect(mockError).toHaveBeenCalledWith(
+      '[taskcast] Applied 2 new migration(s): 001_initial.sql, 002_workers.sql',
+    )
 
-    mockLog.mockRestore()
+    mockError.mockRestore()
   })
 
-  // Test 7: Auto-migrate enabled, Postgres configured, runMigrations throws
-  it('logs error and re-throws when migration fails', async () => {
-    const env = {
-      TASKCAST_AUTO_MIGRATE: 'true',
-      TASKCAST_POSTGRES_URL: 'postgres://localhost/taskcast',
-    }
-    const mockLog = vi.spyOn(console, 'log').mockImplementation(() => {})
+  // ─── Error handling ────────────────────────────────────────────────────
+
+  it('logs error to stderr and re-throws wrapped error when migration fails', async () => {
+    const env = { TASKCAST_AUTO_MIGRATE: 'true' }
+    const mockError = vi.spyOn(console, 'error').mockImplementation(() => {})
     const testError = new Error('Checksum mismatch detected')
     vi.mocked(runMigrations).mockRejectedValueOnce(testError)
 
-    await expect(performAutoMigrateIfEnabled(mockSql, env)).rejects.toThrow(
+    await expect(performAutoMigrateIfEnabled(mockSql, testUrl, env)).rejects.toThrow(
       'Auto-migration failed: Checksum mismatch detected',
     )
 
-    expect(mockLog).toHaveBeenCalledWith('[taskcast] Auto-migration failed: Checksum mismatch detected')
+    expect(mockError).toHaveBeenCalledWith(
+      '[taskcast] Auto-migration failed: Checksum mismatch detected',
+    )
 
-    mockLog.mockRestore()
+    mockError.mockRestore()
   })
 
-  // Test 8: Case-insensitive TASKCAST_AUTO_MIGRATE parsing
-  it('recognizes case-insensitive truthy values for TASKCAST_AUTO_MIGRATE', async () => {
-    const mockLog = vi.spyOn(console, 'log').mockImplementation(() => {})
-    vi.mocked(runMigrations).mockResolvedValue({ applied: [], skipped: [] })
-
-    // Test "TRUE"
-    await performAutoMigrateIfEnabled(mockSql, {
-      TASKCAST_AUTO_MIGRATE: 'TRUE',
-      TASKCAST_POSTGRES_URL: 'postgres://localhost/taskcast',
-    })
-
-    expect(runMigrations).toHaveBeenCalledTimes(1)
-
-    // Clear mocks and test "Yes"
-    vi.clearAllMocks()
-    vi.mocked(runMigrations).mockResolvedValue({ applied: [], skipped: [] })
-
-    await performAutoMigrateIfEnabled(mockSql, {
-      TASKCAST_AUTO_MIGRATE: 'Yes',
-      TASKCAST_POSTGRES_URL: 'postgres://localhost/taskcast',
-    })
-
-    expect(runMigrations).toHaveBeenCalledTimes(1)
-
-    mockLog.mockRestore()
-  })
-
-  // Test 9: Verify log messages don't have duplicate prefixes
-  it('includes [taskcast] prefix exactly once in log messages', async () => {
-    const env = {
-      TASKCAST_AUTO_MIGRATE: 'true',
-      TASKCAST_POSTGRES_URL: 'postgres://localhost/taskcast',
-    }
-    const mockLog = vi.spyOn(console, 'log').mockImplementation(() => {})
-    vi.mocked(runMigrations).mockResolvedValueOnce({ applied: ['001.sql'], skipped: [] })
-
-    await performAutoMigrateIfEnabled(mockSql, env)
-
-    const logCall = mockLog.mock.calls[0]?.[0] as string
-    const prefixCount = (logCall.match(/\[taskcast\]/g) ?? []).length
-    expect(prefixCount).toBe(1)
-
-    mockLog.mockRestore()
-  })
-
-  // Test 10: Verify buildMigrationFiles is called with EMBEDDED_MIGRATIONS
-  it('calls buildMigrationFiles with EMBEDDED_MIGRATIONS', async () => {
-    const env = {
-      TASKCAST_AUTO_MIGRATE: 'true',
-      TASKCAST_POSTGRES_URL: 'postgres://localhost/taskcast',
-    }
-    const mockLog = vi.spyOn(console, 'log').mockImplementation(() => {})
-    vi.mocked(runMigrations).mockResolvedValueOnce({ applied: [], skipped: [] })
-    vi.mocked(buildMigrationFiles).mockReturnValueOnce([])
-
-    await performAutoMigrateIfEnabled(mockSql, env)
-
-    expect(buildMigrationFiles).toHaveBeenCalled()
-
-    mockLog.mockRestore()
-  })
-
-  // Test 11: Verify sql connection is passed to runMigrations
-  it('passes sql connection to runMigrations', async () => {
-    const env = {
-      TASKCAST_AUTO_MIGRATE: 'true',
-      TASKCAST_POSTGRES_URL: 'postgres://localhost/taskcast',
-    }
-    const mockLog = vi.spyOn(console, 'log').mockImplementation(() => {})
-    vi.mocked(runMigrations).mockResolvedValueOnce({ applied: [], skipped: [] })
-
-    await performAutoMigrateIfEnabled(mockSql, env)
-
-    expect(runMigrations).toHaveBeenCalledWith(mockSql, expect.anything())
-
-    mockLog.mockRestore()
-  })
-
-  // Test 12: Non-Error objects are converted to string
   it('handles non-Error objects thrown by runMigrations', async () => {
-    const env = {
-      TASKCAST_AUTO_MIGRATE: 'true',
-      TASKCAST_POSTGRES_URL: 'postgres://localhost/taskcast',
-    }
-    const mockLog = vi.spyOn(console, 'log').mockImplementation(() => {})
+    const env = { TASKCAST_AUTO_MIGRATE: 'true' }
+    const mockError = vi.spyOn(console, 'error').mockImplementation(() => {})
     vi.mocked(runMigrations).mockRejectedValueOnce('String error')
 
-    await expect(performAutoMigrateIfEnabled(mockSql, env)).rejects.toThrow(
+    await expect(performAutoMigrateIfEnabled(mockSql, testUrl, env)).rejects.toThrow(
       'Auto-migration failed: String error',
     )
 
-    expect(mockLog).toHaveBeenCalledWith('[taskcast] Auto-migration failed: String error')
+    expect(mockError).toHaveBeenCalledWith(
+      '[taskcast] Auto-migration failed: String error',
+    )
 
-    mockLog.mockRestore()
+    mockError.mockRestore()
+  })
+
+  // ─── Parsing & dispatch ────────────────────────────────────────────────
+
+  it('recognizes case-insensitive truthy values for TASKCAST_AUTO_MIGRATE', async () => {
+    const mockError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    vi.mocked(runMigrations).mockResolvedValue({ applied: [], skipped: [] })
+
+    await performAutoMigrateIfEnabled(mockSql, testUrl, { TASKCAST_AUTO_MIGRATE: 'TRUE' })
+    expect(runMigrations).toHaveBeenCalledTimes(1)
+
+    vi.clearAllMocks()
+    vi.mocked(runMigrations).mockResolvedValue({ applied: [], skipped: [] })
+
+    await performAutoMigrateIfEnabled(mockSql, testUrl, { TASKCAST_AUTO_MIGRATE: 'Yes' })
+    expect(runMigrations).toHaveBeenCalledTimes(1)
+
+    vi.clearAllMocks()
+    vi.mocked(runMigrations).mockResolvedValue({ applied: [], skipped: [] })
+
+    await performAutoMigrateIfEnabled(mockSql, testUrl, { TASKCAST_AUTO_MIGRATE: '1' })
+    expect(runMigrations).toHaveBeenCalledTimes(1)
+
+    vi.clearAllMocks()
+    vi.mocked(runMigrations).mockResolvedValue({ applied: [], skipped: [] })
+
+    await performAutoMigrateIfEnabled(mockSql, testUrl, { TASKCAST_AUTO_MIGRATE: 'on' })
+    expect(runMigrations).toHaveBeenCalledTimes(1)
+
+    mockError.mockRestore()
+  })
+
+  it('calls buildMigrationFiles with EMBEDDED_MIGRATIONS', async () => {
+    const env = { TASKCAST_AUTO_MIGRATE: 'true' }
+    const mockError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    vi.mocked(runMigrations).mockResolvedValueOnce({ applied: [], skipped: [] })
+    vi.mocked(buildMigrationFiles).mockReturnValueOnce([])
+
+    await performAutoMigrateIfEnabled(mockSql, testUrl, env)
+
+    expect(buildMigrationFiles).toHaveBeenCalled()
+
+    mockError.mockRestore()
+  })
+
+  it('passes sql connection to runMigrations', async () => {
+    const env = { TASKCAST_AUTO_MIGRATE: 'true' }
+    const mockError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    vi.mocked(runMigrations).mockResolvedValueOnce({ applied: [], skipped: [] })
+
+    await performAutoMigrateIfEnabled(mockSql, testUrl, env)
+
+    expect(runMigrations).toHaveBeenCalledWith(mockSql, expect.anything())
+
+    mockError.mockRestore()
+  })
+
+  it('includes [taskcast] prefix exactly once in each log message', async () => {
+    const env = { TASKCAST_AUTO_MIGRATE: 'true' }
+    const mockError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    vi.mocked(runMigrations).mockResolvedValueOnce({ applied: ['001.sql'], skipped: [] })
+
+    await performAutoMigrateIfEnabled(mockSql, testUrl, env)
+
+    for (const call of mockError.mock.calls) {
+      const message = call[0] as string
+      const prefixCount = (message.match(/\[taskcast\]/g) ?? []).length
+      expect(prefixCount).toBe(1)
+    }
+
+    mockError.mockRestore()
+  })
+
+  it('uses <postgres> placeholder in banner if URL not provided', async () => {
+    const env = { TASKCAST_AUTO_MIGRATE: 'true' }
+    const mockError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    vi.mocked(runMigrations).mockResolvedValueOnce({ applied: [], skipped: [] })
+
+    await performAutoMigrateIfEnabled(mockSql, undefined, env)
+
+    expect(mockError).toHaveBeenCalledWith(
+      '[taskcast] TASKCAST_AUTO_MIGRATE enabled — running Postgres migrations on <postgres>',
+    )
+
+    mockError.mockRestore()
   })
 })

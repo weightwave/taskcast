@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from 'vitest'
 import postgres from 'postgres'
 import { GenericContainer, Wait, type StartedTestContainer } from 'testcontainers'
 import { MemoryBroadcastProvider, MemoryShortTermStore } from '@taskcast/core'
@@ -112,10 +112,9 @@ describe('CLI start command with auto-migrate', () => {
       let appliedVersions = await getAppliedMigrationVersions(pgSql!)
       expect(appliedVersions).toHaveLength(0)
 
-      // Run auto-migrate by calling performAutoMigrateIfEnabled indirectly via runStart
-      // We'll do this by capturing the behavior via the long-term store
+      const pgUrl = `postgres://test:test@localhost:${pgContainer!.getMappedPort(5432)}/testdb`
       const { performAutoMigrateIfEnabled } = await import('../../src/auto-migrate.js')
-      await performAutoMigrateIfEnabled(pgSql!, options.env)
+      await performAutoMigrateIfEnabled(pgSql!, pgUrl, options.env)
 
       // Verify migrations were applied
       appliedVersions = await getAppliedMigrationVersions(pgSql!)
@@ -147,18 +146,16 @@ describe('CLI start command with auto-migrate', () => {
 
     it('second run skips migrations and logs no-op', async () => {
       const { performAutoMigrateIfEnabled } = await import('../../src/auto-migrate.js')
-      const env = {
-        TASKCAST_AUTO_MIGRATE: 'true',
-        TASKCAST_POSTGRES_URL: `postgres://test:test@localhost:${pgContainer!.getMappedPort(5432)}/testdb`,
-      }
+      const pgUrl = `postgres://test:test@localhost:${pgContainer!.getMappedPort(5432)}/testdb`
+      const env = { TASKCAST_AUTO_MIGRATE: 'true' }
 
       // First run: apply migrations
-      await performAutoMigrateIfEnabled(pgSql!, env)
+      await performAutoMigrateIfEnabled(pgSql!, pgUrl, env)
       const firstVersions = await getAppliedMigrationVersions(pgSql!)
       expect(firstVersions).toEqual([1, 2])
 
       // Second run: should be no-op
-      await performAutoMigrateIfEnabled(pgSql!, env)
+      await performAutoMigrateIfEnabled(pgSql!, pgUrl, env)
       const secondVersions = await getAppliedMigrationVersions(pgSql!)
       expect(secondVersions).toEqual([1, 2]) // No additional migrations applied
     })
@@ -180,13 +177,11 @@ describe('CLI start command with auto-migrate', () => {
 
     it('skips migrations when TASKCAST_AUTO_MIGRATE=false', async () => {
       const { performAutoMigrateIfEnabled } = await import('../../src/auto-migrate.js')
-      const env = {
-        TASKCAST_AUTO_MIGRATE: 'false',
-        TASKCAST_POSTGRES_URL: `postgres://test:test@localhost:${pgContainer!.getMappedPort(5432)}/testdb`,
-      }
+      const pgUrl = `postgres://test:test@localhost:${pgContainer!.getMappedPort(5432)}/testdb`
+      const env = { TASKCAST_AUTO_MIGRATE: 'false' }
 
       // Call with auto-migrate disabled
-      await performAutoMigrateIfEnabled(pgSql!, env)
+      await performAutoMigrateIfEnabled(pgSql!, pgUrl, env)
 
       // Verify no migrations were applied
       const versions = await getAppliedMigrationVersions(pgSql!)
@@ -195,12 +190,10 @@ describe('CLI start command with auto-migrate', () => {
 
     it('skips migrations when TASKCAST_AUTO_MIGRATE=0', async () => {
       const { performAutoMigrateIfEnabled } = await import('../../src/auto-migrate.js')
-      const env = {
-        TASKCAST_AUTO_MIGRATE: '0',
-        TASKCAST_POSTGRES_URL: `postgres://test:test@localhost:${pgContainer!.getMappedPort(5432)}/testdb`,
-      }
+      const pgUrl = `postgres://test:test@localhost:${pgContainer!.getMappedPort(5432)}/testdb`
+      const env = { TASKCAST_AUTO_MIGRATE: '0' }
 
-      await performAutoMigrateIfEnabled(pgSql!, env)
+      await performAutoMigrateIfEnabled(pgSql!, pgUrl, env)
 
       const versions = await getAppliedMigrationVersions(pgSql!)
       expect(versions).toHaveLength(0)
@@ -208,12 +201,10 @@ describe('CLI start command with auto-migrate', () => {
 
     it('skips migrations when TASKCAST_AUTO_MIGRATE undefined', async () => {
       const { performAutoMigrateIfEnabled } = await import('../../src/auto-migrate.js')
-      const env = {
-        // TASKCAST_AUTO_MIGRATE not set
-        TASKCAST_POSTGRES_URL: `postgres://test:test@localhost:${pgContainer!.getMappedPort(5432)}/testdb`,
-      }
+      const pgUrl = `postgres://test:test@localhost:${pgContainer!.getMappedPort(5432)}/testdb`
+      const env: Record<string, string | undefined> = {}
 
-      await performAutoMigrateIfEnabled(pgSql!, env)
+      await performAutoMigrateIfEnabled(pgSql!, pgUrl, env)
 
       const versions = await getAppliedMigrationVersions(pgSql!)
       expect(versions).toHaveLength(0)
@@ -223,15 +214,14 @@ describe('CLI start command with auto-migrate', () => {
   // ─── Test 4: Postgres not configured ──────────────────────────────────
 
   describe('Scenario 4: Postgres not configured', () => {
-    it('gracefully skips auto-migrate when Postgres URL not set', async () => {
+    it('gracefully skips auto-migrate when sql connection is undefined', async () => {
       const { performAutoMigrateIfEnabled } = await import('../../src/auto-migrate.js')
-      const env = {
-        TASKCAST_AUTO_MIGRATE: 'true',
-        // TASKCAST_POSTGRES_URL not set
-      }
+      const env = { TASKCAST_AUTO_MIGRATE: 'true' }
 
-      // Should not throw
-      await expect(performAutoMigrateIfEnabled(pgSql!, env)).resolves.toBeUndefined()
+      // Should not throw; logs skip message
+      await expect(
+        performAutoMigrateIfEnabled(undefined, undefined, env),
+      ).resolves.toBeUndefined()
     })
   })
 
@@ -270,22 +260,31 @@ describe('CLI start command with auto-migrate', () => {
       try {
         const { performAutoMigrateIfEnabled } = await import('../../src/auto-migrate.js')
 
-        // Create a Postgres instance that will fail
-        const env = {
-          TASKCAST_AUTO_MIGRATE: 'true',
-          TASKCAST_POSTGRES_URL: `postgres://test:test@localhost:${container2.getMappedPort(5432)}/testdb`,
-        }
+        const pgUrl = `postgres://test:test@localhost:${container2.getMappedPort(5432)}/testdb`
+        const env = { TASKCAST_AUTO_MIGRATE: 'true' }
 
-        // First apply valid migrations
-        await performAutoMigrateIfEnabled(sql2, env)
+        // Insert a dirty migration row to trigger the fail-fast path
+        await sql2.unsafe(`
+          CREATE TABLE IF NOT EXISTS _sqlx_migrations (
+              version BIGINT PRIMARY KEY,
+              description TEXT NOT NULL,
+              installed_on TIMESTAMPTZ NOT NULL DEFAULT now(),
+              success BOOLEAN NOT NULL,
+              checksum BYTEA NOT NULL,
+              execution_time BIGINT NOT NULL
+          )
+        `)
+        await sql2.unsafe(
+          `INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time)
+           VALUES (99, 'corrupt test', false, '\\x00', -1)`,
+        )
 
-        // Now try to "apply" a migration with bad SQL by manually inserting a bad entry
-        // Actually, let's test by closing the connection
-        await sql2.end()
-
-        // Try to run migrations on closed connection
-        await expect(performAutoMigrateIfEnabled(sql2, env)).rejects.toThrow(/Auto-migration failed/)
+        // performAutoMigrateIfEnabled should detect the dirty row and throw with wrapped message
+        await expect(performAutoMigrateIfEnabled(sql2, pgUrl, env)).rejects.toThrow(
+          /^Auto-migration failed:/,
+        )
       } finally {
+        await sql2?.end().catch(() => {})
         await container2?.stop()
       }
     })
@@ -319,8 +318,9 @@ describe('CLI start command with auto-migrate', () => {
 
         // We can't fully test runStart without it trying to bind a port,
         // but we can test the auto-migrate part
+        const pgUrl = `postgres://test:test@localhost:${container.getMappedPort(5432)}/testdb`
         const { performAutoMigrateIfEnabled } = await import('../../src/auto-migrate.js')
-        await performAutoMigrateIfEnabled(options.postgres, options.env)
+        await performAutoMigrateIfEnabled(options.postgres, pgUrl, options.env)
 
         // Verify migrations were applied
         const versions = await getAppliedMigrationVersions(sql)
@@ -334,28 +334,23 @@ describe('CLI start command with auto-migrate', () => {
       }
     })
 
-    it('runStart skips auto-migrate when postgres is undefined', async () => {
-      const store = new MemoryShortTermStore()
-      const broadcast = new MemoryBroadcastProvider()
-
-      const options: RunStartOptions = {
-        // postgres: undefined (not set)
-        broadcast,
-        shortTermStore: store,
-        port: 37211,
-        config: {},
-        verbose: false,
-        playground: false,
-        env: {
-          TASKCAST_AUTO_MIGRATE: 'true',
-          // TASKCAST_POSTGRES_URL not set
-        },
-      }
-
-      // Should not throw even though auto-migrate is enabled but postgres is undefined
+    it('performAutoMigrateIfEnabled logs skip message when sql is undefined', async () => {
+      // Regression test: when Postgres is not configured (sql is undefined),
+      // performAutoMigrateIfEnabled must log the spec "skipping" message and
+      // return cleanly without attempting to run any migrations.
       const { performAutoMigrateIfEnabled } = await import('../../src/auto-migrate.js')
-      // When postgres is undefined, performAutoMigrateIfEnabled shouldn't be called
-      // This is handled in runStart itself
+
+      const mockError = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+      await performAutoMigrateIfEnabled(undefined, undefined, {
+        TASKCAST_AUTO_MIGRATE: 'true',
+      })
+
+      expect(mockError).toHaveBeenCalledWith(
+        '[taskcast] TASKCAST_AUTO_MIGRATE is set but no Postgres configured — skipping',
+      )
+
+      mockError.mockRestore()
     })
   })
 
@@ -379,14 +374,14 @@ describe('CLI start command with auto-migrate', () => {
     it('skips auto-migrate when using SQLite (no Postgres)', async () => {
       const { performAutoMigrateIfEnabled } = await import('../../src/auto-migrate.js')
 
-      const sqliteAdapters = createSqliteAdapters({ path: tmpSqlitePath! })
-      const env = {
-        TASKCAST_AUTO_MIGRATE: 'true',
-        // TASKCAST_POSTGRES_URL not set (SQLite is being used)
-      }
+      // SQLite adapter is used for storage; no postgres connection is created
+      createSqliteAdapters({ path: tmpSqlitePath! })
+      const env = { TASKCAST_AUTO_MIGRATE: 'true' }
 
-      // Should not throw, just skip
-      await expect(performAutoMigrateIfEnabled(pgSql!, env)).resolves.toBeUndefined()
+      // Should not throw, just skip (no sql connection passed)
+      await expect(
+        performAutoMigrateIfEnabled(undefined, undefined, env),
+      ).resolves.toBeUndefined()
     })
   })
 
@@ -406,12 +401,10 @@ describe('CLI start command with auto-migrate', () => {
 
     it('creates correct table schema for taskcast_tasks', async () => {
       const { performAutoMigrateIfEnabled } = await import('../../src/auto-migrate.js')
-      const env = {
-        TASKCAST_AUTO_MIGRATE: 'true',
-        TASKCAST_POSTGRES_URL: `postgres://test:test@localhost:${pgContainer!.getMappedPort(5432)}/testdb`,
-      }
+      const pgUrl = `postgres://test:test@localhost:${pgContainer!.getMappedPort(5432)}/testdb`
+      const env = { TASKCAST_AUTO_MIGRATE: 'true' }
 
-      await performAutoMigrateIfEnabled(pgSql!, env)
+      await performAutoMigrateIfEnabled(pgSql!, pgUrl, env)
 
       // Verify taskcast_tasks columns
       const columns = await pgSql!`
@@ -431,12 +424,10 @@ describe('CLI start command with auto-migrate', () => {
 
     it('creates correct table schema for taskcast_events', async () => {
       const { performAutoMigrateIfEnabled } = await import('../../src/auto-migrate.js')
-      const env = {
-        TASKCAST_AUTO_MIGRATE: 'true',
-        TASKCAST_POSTGRES_URL: `postgres://test:test@localhost:${pgContainer!.getMappedPort(5432)}/testdb`,
-      }
+      const pgUrl = `postgres://test:test@localhost:${pgContainer!.getMappedPort(5432)}/testdb`
+      const env = { TASKCAST_AUTO_MIGRATE: 'true' }
 
-      await performAutoMigrateIfEnabled(pgSql!, env)
+      await performAutoMigrateIfEnabled(pgSql!, pgUrl, env)
 
       const columns = await pgSql!`
         SELECT column_name, data_type
@@ -456,12 +447,10 @@ describe('CLI start command with auto-migrate', () => {
 
     it('creates _sqlx_migrations table for tracking', async () => {
       const { performAutoMigrateIfEnabled } = await import('../../src/auto-migrate.js')
-      const env = {
-        TASKCAST_AUTO_MIGRATE: 'true',
-        TASKCAST_POSTGRES_URL: `postgres://test:test@localhost:${pgContainer!.getMappedPort(5432)}/testdb`,
-      }
+      const pgUrl = `postgres://test:test@localhost:${pgContainer!.getMappedPort(5432)}/testdb`
+      const env = { TASKCAST_AUTO_MIGRATE: 'true' }
 
-      await performAutoMigrateIfEnabled(pgSql!, env)
+      await performAutoMigrateIfEnabled(pgSql!, pgUrl, env)
 
       const migrationRows = await pgSql!`SELECT * FROM _sqlx_migrations ORDER BY version`
       expect(migrationRows).toHaveLength(2)

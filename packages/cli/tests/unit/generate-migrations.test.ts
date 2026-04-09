@@ -1,54 +1,25 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, readdirSync, mkdirSync } from 'node:fs'
-import { join } from 'node:path'
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs'
+import { join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 
-/**
- * Generator function used in tests.
- * Mirrors the logic from scripts/generate-migrations.js
- */
-function generateMigrationsForDir(migrationsDir: string): string {
-  // Read all .sql files and sort by filename
-  const files = readdirSync(migrationsDir)
-    .filter((f) => f.endsWith('.sql'))
-    .sort()
-
-  const migrations: Array<{ filename: string; sql: string }> = []
-
-  for (const filename of files) {
-    const filepath = join(migrationsDir, filename)
-    const sql = readFileSync(filepath, 'utf8')
-    migrations.push({ filename, sql })
-  }
-
-  // Generate TypeScript code
-  const lines: string[] = []
-  lines.push("/**")
-  lines.push(" * Auto-generated migration embeddings.")
-  lines.push(" * Do not edit manually — run: pnpm generate-migrations")
-  lines.push(" */")
-  lines.push("")
-  lines.push("export interface EmbeddedMigration {")
-  lines.push("  filename: string")
-  lines.push("  sql: string")
-  lines.push("}")
-  lines.push("")
-  lines.push("export const EMBEDDED_MIGRATIONS: readonly EmbeddedMigration[] = [")
-
-  for (const migration of migrations) {
-    lines.push("  {")
-    lines.push(`    filename: ${JSON.stringify(migration.filename)},`)
-    lines.push(`    sql: ${JSON.stringify(migration.sql)},`)
-    lines.push("  },")
-  }
-
-  lines.push("]")
-  lines.push("")
-
-  return lines.join('\n')
+// Import the REAL generator function from the script, so tests exercise
+// the actual implementation (not a local mirror that can drift out of sync).
+const scriptPath = resolve(
+  __dirname,
+  '..',
+  '..',
+  '..',
+  '..',
+  'scripts',
+  'generate-migrations.js',
+)
+// Dynamic import ESM module — vitest supports this
+const { generateMigrations } = (await import(scriptPath)) as {
+  generateMigrations: (dir: string) => string
 }
 
-describe('migration generator', () => {
+describe('migration generator (scripts/generate-migrations.js)', () => {
   let tempDir: string
 
   beforeEach(() => {
@@ -65,10 +36,10 @@ describe('migration generator', () => {
 
     writeFileSync(
       join(migrationsDir, '001_initial.sql'),
-      'CREATE TABLE test (id INT);'
+      'CREATE TABLE test (id INT);',
     )
 
-    const result = generateMigrationsForDir(migrationsDir)
+    const result = generateMigrations(migrationsDir)
 
     expect(result).toContain('export interface EmbeddedMigration')
     expect(result).toContain('export const EMBEDDED_MIGRATIONS')
@@ -89,11 +60,7 @@ CREATE INDEX idx_test_name ON test(name);
 
     writeFileSync(join(migrationsDir, '001_initial.sql'), sqlContent)
 
-    const result = generateMigrationsForDir(migrationsDir)
-
-    // The SQL should be JSON.stringify'd, but when parsed back, it should be identical
-    const match = result.match(/sql: "([^"\\]|\\.)*"/)
-    expect(match).toBeTruthy()
+    const result = generateMigrations(migrationsDir)
 
     // Extract the escaped string and unescape it
     const escapedSql = result.match(/sql: ("(?:[^"\\]|\\.)*")/)?.[1]
@@ -116,9 +83,8 @@ CREATE INDEX idx_test_name ON test(name);
 
     writeFileSync(join(migrationsDir, '001_initial.sql'), sqlContent)
 
-    const result = generateMigrationsForDir(migrationsDir)
+    const result = generateMigrations(migrationsDir)
 
-    // Verify the SQL is properly escaped and can be parsed back
     const escapedSql = result.match(/sql: ("(?:[^"\\]|\\.)*")/)?.[1]
     expect(escapedSql).toBeTruthy()
 
@@ -133,7 +99,7 @@ CREATE INDEX idx_test_name ON test(name);
     writeFileSync(join(migrationsDir, '001_initial.sql'), 'CREATE TABLE t1 (id INT);')
     writeFileSync(join(migrationsDir, '002_workers.sql'), 'CREATE TABLE t2 (id INT);')
 
-    const result = generateMigrationsForDir(migrationsDir)
+    const result = generateMigrations(migrationsDir)
 
     expect(result).toContain('filename: "001_initial.sql"')
     expect(result).toContain('filename: "002_workers.sql"')
@@ -147,7 +113,7 @@ CREATE INDEX idx_test_name ON test(name);
     writeFileSync(join(migrationsDir, '001_first.sql'), 'CREATE TABLE t1 (id INT);')
     writeFileSync(join(migrationsDir, '002_middle.sql'), 'CREATE TABLE t2 (id INT);')
 
-    const result = generateMigrationsForDir(migrationsDir)
+    const result = generateMigrations(migrationsDir)
 
     const firstMatch = result.indexOf('filename: "001_first.sql"')
     const secondMatch = result.indexOf('filename: "002_middle.sql"')
@@ -157,41 +123,59 @@ CREATE INDEX idx_test_name ON test(name);
     expect(secondMatch).toBeLessThan(thirdMatch)
   })
 
-  it('generates empty array when no migrations exist', () => {
+  it('throws when migrations directory is empty (prevents silent empty output)', () => {
     const migrationsDir = join(tempDir, 'migrations')
     mkdirSync(migrationsDir, { recursive: true })
 
-    const result = generateMigrationsForDir(migrationsDir)
-
-    expect(result).toContain('export const EMBEDDED_MIGRATIONS: readonly EmbeddedMigration[] = [')
-    expect(result).toContain(']')
-
-    // Count the number of migration objects (should be 0)
-    // Match only filename fields inside objects (4 spaces indent), not in interface definition
-    const lines = result.split('\n')
-    const objectLines = lines.filter((line) => /^    filename:/.test(line))
-    expect(objectLines.length).toBe(0)
+    // No .sql files at all — must throw, not silently produce empty output.
+    expect(() => generateMigrations(migrationsDir)).toThrow(/No \.sql migration files found/)
   })
 
-  it('ignores non-.sql files', () => {
+  it('throws when directory contains only non-.sql files', () => {
+    const migrationsDir = join(tempDir, 'migrations')
+    mkdirSync(migrationsDir, { recursive: true })
+
+    writeFileSync(join(migrationsDir, 'readme.txt'), 'not a migration')
+
+    expect(() => generateMigrations(migrationsDir)).toThrow(/No \.sql migration files found/)
+  })
+
+  it('throws when a filename does not match the 3-digit zero-padded convention', () => {
+    const migrationsDir = join(tempDir, 'migrations')
+    mkdirSync(migrationsDir, { recursive: true })
+
+    // Two-digit version — must be rejected
+    writeFileSync(join(migrationsDir, '10_bad.sql'), 'CREATE TABLE t (id INT);')
+
+    expect(() => generateMigrations(migrationsDir)).toThrow(/does not match the required/)
+  })
+
+  it('throws on filename without version prefix', () => {
+    const migrationsDir = join(tempDir, 'migrations')
+    mkdirSync(migrationsDir, { recursive: true })
+
+    writeFileSync(join(migrationsDir, 'bad.sql'), 'CREATE TABLE t (id INT);')
+
+    expect(() => generateMigrations(migrationsDir)).toThrow(/does not match the required/)
+  })
+
+  it('ignores non-.sql files alongside valid ones', () => {
     const migrationsDir = join(tempDir, 'migrations')
     mkdirSync(migrationsDir, { recursive: true })
 
     writeFileSync(join(migrationsDir, '001_initial.sql'), 'CREATE TABLE t1 (id INT);')
-    writeFileSync(join(migrationsDir, '002_readme.txt'), 'This is a readme')
-    writeFileSync(join(migrationsDir, '003_workers.sql'), 'CREATE TABLE t2 (id INT);')
+    writeFileSync(join(migrationsDir, 'readme.txt'), 'This is a readme')
+    writeFileSync(join(migrationsDir, '002_workers.sql'), 'CREATE TABLE t2 (id INT);')
 
-    const result = generateMigrationsForDir(migrationsDir)
+    const result = generateMigrations(migrationsDir)
 
-    // Count the number of migration objects (should be 2)
-    // Match only filename fields inside objects (4 spaces indent), not in interface definition
     const lines = result.split('\n')
     const objectLines = lines.filter((line) => /^    filename:/.test(line))
     expect(objectLines.length).toBe(2)
 
     expect(result).toContain('001_initial.sql')
-    expect(result).toContain('003_workers.sql')
-    expect(result).not.toContain('002_readme.txt')
+    expect(result).toContain('002_workers.sql')
+    expect(result).not.toContain('readme.txt')
   })
 
   it('handles migrations with Postgres dollar-quotes', () => {
@@ -207,7 +191,7 @@ $$ LANGUAGE plpgsql;
 
     writeFileSync(join(migrationsDir, '001_initial.sql'), sqlContent)
 
-    const result = generateMigrationsForDir(migrationsDir)
+    const result = generateMigrations(migrationsDir)
 
     const escapedSql = result.match(/sql: ("(?:[^"\\]|\\.)*")/)?.[1]
     expect(escapedSql).toBeTruthy()
@@ -216,21 +200,18 @@ $$ LANGUAGE plpgsql;
     expect(unescapedSql).toBe(sqlContent)
   })
 
-  it('generates valid TypeScript that can be parsed', () => {
+  it('generates valid TypeScript structure with matching brackets', () => {
     const migrationsDir = join(tempDir, 'migrations')
     mkdirSync(migrationsDir, { recursive: true })
 
     writeFileSync(join(migrationsDir, '001_initial.sql'), 'CREATE TABLE test (id INT);')
 
-    const result = generateMigrationsForDir(migrationsDir)
+    const result = generateMigrations(migrationsDir)
 
-    // The result should be valid JavaScript (can eval the exported array)
-    // We test this by checking the structure is correct
     expect(result).toContain('export interface EmbeddedMigration {')
     expect(result).toContain('export const EMBEDDED_MIGRATIONS:')
     expect(result).toContain('readonly EmbeddedMigration[] = [')
 
-    // Count opening and closing brackets
     const openBrackets = (result.match(/\{/g) || []).length
     const closeBrackets = (result.match(/\}/g) || []).length
     expect(openBrackets).toBe(closeBrackets)

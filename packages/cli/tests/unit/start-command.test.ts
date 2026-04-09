@@ -473,12 +473,13 @@ describe('runStart', () => {
     onSpy.mockRestore()
   })
 
-  it('calls performAutoMigrateIfEnabled when postgres is configured', async () => {
+  it('calls performAutoMigrateIfEnabled with sql + postgresUrl + env when postgres is configured', async () => {
     const { performAutoMigrateIfEnabled } = await import('../../src/auto-migrate.js')
     const mockPostgres = {} as ReturnType<typeof import('postgres').default>
 
     const options: RunStartOptions = {
       postgres: mockPostgres,
+      postgresUrl: 'postgres://localhost/taskcast',
       broadcast: {},
       shortTermStore: {},
       port: 3721,
@@ -492,11 +493,16 @@ describe('runStart', () => {
 
     expect(performAutoMigrateIfEnabled).toHaveBeenCalledWith(
       mockPostgres,
+      'postgres://localhost/taskcast',
       expect.objectContaining({ TASKCAST_AUTO_MIGRATE: 'true' }),
     )
   })
 
-  it('skips performAutoMigrateIfEnabled when postgres is not configured', async () => {
+  it('still calls performAutoMigrateIfEnabled with undefined sql when postgres is not configured', async () => {
+    // The decision to skip auto-migrate now lives inside performAutoMigrateIfEnabled
+    // (based on whether a sql connection is present), not in runStart. runStart
+    // always invokes the helper so that the skip-message log happens at the
+    // correct place when TASKCAST_AUTO_MIGRATE is set but no Postgres is configured.
     const { performAutoMigrateIfEnabled } = await import('../../src/auto-migrate.js')
 
     const options: RunStartOptions = {
@@ -510,7 +516,7 @@ describe('runStart', () => {
 
     await runStart(options)
 
-    expect(performAutoMigrateIfEnabled).not.toHaveBeenCalled()
+    expect(performAutoMigrateIfEnabled).toHaveBeenCalledWith(undefined, undefined, undefined)
   })
 
   it('blocks server startup if auto-migrate fails', async () => {
@@ -576,7 +582,9 @@ describe('runStart', () => {
 
     const { serve } = await import('@hono/node-server')
     expect(serve).toHaveBeenCalled()
-    expect(performAutoMigrateIfEnabled).not.toHaveBeenCalled()
+    // performAutoMigrateIfEnabled is still called (to let it log the skip message
+    // if TASKCAST_AUTO_MIGRATE is set), but with sql=undefined.
+    expect(performAutoMigrateIfEnabled).toHaveBeenCalledWith(undefined, undefined, undefined)
   })
 
   it('passes verbose flag to createTaskcastApp', async () => {
@@ -701,6 +709,7 @@ describe('runStart', () => {
 
     const options: RunStartOptions = {
       postgres: mockPostgres,
+      postgresUrl: 'postgres://custom/db',
       broadcast: {},
       shortTermStore: {},
       port: 3721,
@@ -712,6 +721,10 @@ describe('runStart', () => {
 
     await runStart(options)
 
-    expect(performAutoMigrateIfEnabled).toHaveBeenCalledWith(mockPostgres, customEnv)
+    expect(performAutoMigrateIfEnabled).toHaveBeenCalledWith(
+      mockPostgres,
+      'postgres://custom/db',
+      customEnv,
+    )
   })
 })

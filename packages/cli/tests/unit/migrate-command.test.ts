@@ -102,7 +102,6 @@ describe('registerMigrateCommand', () => {
 
   it('reports up to date when no pending migrations', async () => {
     mockLoadConfigFile.mockResolvedValue({ config: {}, source: 'none' })
-    mockSqlUnsafe.mockResolvedValueOnce(undefined) // CREATE TABLE
     mockSqlUnsafe.mockResolvedValueOnce([{ version: 1 }]) // SELECT applied
     mockBuildMigrationFiles.mockReturnValue([{ version: 1, filename: '001_init.sql' }])
 
@@ -118,7 +117,6 @@ describe('registerMigrateCommand', () => {
 
   it('runs pending migrations with --yes flag', async () => {
     mockLoadConfigFile.mockResolvedValue({ config: {}, source: 'none' })
-    mockSqlUnsafe.mockResolvedValueOnce(undefined) // CREATE TABLE
     mockSqlUnsafe.mockResolvedValueOnce([]) // no applied
     mockBuildMigrationFiles.mockReturnValue([
       { version: 1, filename: '001_init.sql' },
@@ -140,7 +138,6 @@ describe('registerMigrateCommand', () => {
 
   it('prompts for confirmation and cancels when declined', async () => {
     mockLoadConfigFile.mockResolvedValue({ config: {}, source: 'none' })
-    mockSqlUnsafe.mockResolvedValueOnce(undefined) // CREATE TABLE
     mockSqlUnsafe.mockResolvedValueOnce([]) // no applied
     mockBuildMigrationFiles.mockReturnValue([
       { version: 1, filename: '001_init.sql' },
@@ -167,7 +164,6 @@ describe('registerMigrateCommand', () => {
 
   it('exits with 1 when no TTY and no --yes flag', async () => {
     mockLoadConfigFile.mockResolvedValue({ config: {}, source: 'none' })
-    mockSqlUnsafe.mockResolvedValueOnce(undefined) // CREATE TABLE
     mockSqlUnsafe.mockResolvedValueOnce([]) // no applied
     mockBuildMigrationFiles.mockReturnValue([
       { version: 1, filename: '001_init.sql' },
@@ -218,7 +214,6 @@ describe('registerMigrateCommand', () => {
       config: { adapters: { longTermStore: { url: 'postgres://config-host/db' } } },
       source: 'file',
     })
-    mockSqlUnsafe.mockResolvedValueOnce(undefined)
     mockSqlUnsafe.mockResolvedValueOnce([{ version: 1 }])
     mockBuildMigrationFiles.mockReturnValue([{ version: 1, filename: '001_init.sql' }])
 
@@ -240,7 +235,6 @@ describe('registerMigrateCommand', () => {
 
   it('displays pending migration filenames before running', async () => {
     mockLoadConfigFile.mockResolvedValue({ config: {}, source: 'none' })
-    mockSqlUnsafe.mockResolvedValueOnce(undefined)
     mockSqlUnsafe.mockResolvedValueOnce([])
     mockBuildMigrationFiles.mockReturnValue([
       { version: 1, filename: '001_init.sql' },

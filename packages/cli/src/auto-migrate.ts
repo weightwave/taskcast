@@ -8,22 +8,28 @@ import { EMBEDDED_MIGRATIONS } from './generated-migrations.js'
  *
  * This function checks two conditions:
  * 1. TASKCAST_AUTO_MIGRATE env var is truthy (case-insensitive, parsed via parseBooleanEnv)
- * 2. Postgres URL is configured (TASKCAST_POSTGRES_URL env var)
+ * 2. A Postgres connection was provided (`sql` is not undefined)
  *
- * If both are true, runs migrations and logs the result:
- * - "Applied N migrations" if N > 0
- * - "Database schema up to date" if N = 0
- * - "Auto-migration failed: <error_message>" if an error occurs
+ * If both are true, runs migrations and logs the result.
  *
- * If auto-migrate is disabled, returns immediately (no-op).
- * If Postgres is not configured, logs info message and returns (no-op).
+ * Log messages (spec §Error Handling & Log Messages):
+ * - Banner (before running): `[taskcast] TASKCAST_AUTO_MIGRATE enabled — running Postgres migrations on <url>`
+ * - Skip (no Postgres):     `[taskcast] TASKCAST_AUTO_MIGRATE is set but no Postgres configured — skipping`
+ * - Up to date:             `[taskcast] Database schema up to date (<N> migration(s) already applied)`
+ * - Applied:                `[taskcast] Applied <N> new migration(s): <filename1>, <filename2>, ...`
+ * - Failure:                `[taskcast] Auto-migration failed: <error_message>`
  *
- * @param sql - Postgres connection instance
+ * All messages go to stderr (console.error / eprintln!) to match the Rust
+ * implementation's convention and keep stdout clean for machine-readable output.
+ *
+ * @param sql - Postgres connection instance, or undefined if Postgres is not configured
+ * @param postgresUrl - Resolved Postgres URL (for log banner), or undefined
  * @param env - Environment variables (defaults to process.env for testability)
  * @throws Error with message "Auto-migration failed: <original_error>" if migration fails
  */
 export async function performAutoMigrateIfEnabled(
-  sql: ReturnType<typeof postgres>,
+  sql: ReturnType<typeof postgres> | undefined,
+  postgresUrl: string | undefined,
   env: Record<string, string | undefined> = process.env,
 ): Promise<void> {
   // Check if auto-migrate is enabled
@@ -32,25 +38,34 @@ export async function performAutoMigrateIfEnabled(
     return
   }
 
-  // Check if Postgres is configured
-  const postgresUrl = env['TASKCAST_POSTGRES_URL']
-  if (!postgresUrl) {
-    console.log('[taskcast] Auto-migrate disabled: Postgres not configured')
+  // Check if Postgres is actually configured (by the presence of an sql connection).
+  // The env var TASKCAST_POSTGRES_URL alone is insufficient because users may
+  // configure Postgres via the YAML config file only.
+  if (!sql) {
+    console.error('[taskcast] TASKCAST_AUTO_MIGRATE is set but no Postgres configured — skipping')
     return
   }
+
+  // Log banner with URL (if available)
+  const urlDisplay = postgresUrl ?? '<postgres>'
+  console.error(`[taskcast] TASKCAST_AUTO_MIGRATE enabled — running Postgres migrations on ${urlDisplay}`)
 
   // Run migrations
   try {
     const result = await runMigrations(sql, buildMigrationFiles(EMBEDDED_MIGRATIONS))
 
     if (result.applied.length === 0) {
-      console.log('[taskcast] Database schema up to date')
+      console.error(
+        `[taskcast] Database schema up to date (${result.skipped.length} migration(s) already applied)`,
+      )
     } else {
-      console.log(`[taskcast] Applied ${result.applied.length} migrations`)
+      console.error(
+        `[taskcast] Applied ${result.applied.length} new migration(s): ${result.applied.join(', ')}`,
+      )
     }
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err)
-    console.log(`[taskcast] Auto-migration failed: ${errorMessage}`)
+    console.error(`[taskcast] Auto-migration failed: ${errorMessage}`)
     throw new Error(`Auto-migration failed: ${errorMessage}`)
   }
 }

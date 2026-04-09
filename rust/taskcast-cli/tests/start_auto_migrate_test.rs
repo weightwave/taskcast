@@ -449,3 +449,62 @@ async fn start_redis_storage_with_postgres_long_term_auto_migrate() {
 
     handle.abort();
 }
+
+/// Regression test for the fail-fast requirement:
+/// when a dirty migration row exists, `run_auto_migrate` MUST return Err
+/// with a message starting with "Auto-migration failed:".
+///
+/// This mirrors the TS integration test in start-auto-migrate.test.ts
+/// "wraps migration errors in performAutoMigrateIfEnabled".
+#[tokio::test]
+async fn run_auto_migrate_fails_fast_on_dirty_migration() {
+    use taskcast_cli::run_auto_migrate;
+
+    let postgres_container = Postgres::default().start().await.unwrap();
+    let postgres_port = postgres_container.get_host_port_ipv4(5432).await.unwrap();
+    let database_url = format!(
+        "postgres://postgres:postgres@127.0.0.1:{}/postgres",
+        postgres_port
+    );
+
+    let pool = sqlx::PgPool::connect(&database_url).await.unwrap();
+
+    // Create the _sqlx_migrations table and insert a dirty row.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS _sqlx_migrations (
+            version BIGINT PRIMARY KEY,
+            description TEXT NOT NULL,
+            installed_on TIMESTAMPTZ NOT NULL DEFAULT now(),
+            success BOOLEAN NOT NULL,
+            checksum BYTEA NOT NULL,
+            execution_time BIGINT NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time)
+         VALUES (99, 'corrupt test', false, '\\x00', -1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Call run_auto_migrate with enabled=true and pool present.
+    let result = run_auto_migrate(Some(&pool), Some(&database_url), Some("true")).await;
+
+    assert!(result.is_err(), "Expected Err on dirty migration");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.starts_with("Auto-migration failed:"),
+        "Error should start with 'Auto-migration failed:', got: {}",
+        err_msg
+    );
+    assert!(
+        err_msg.contains("Dirty migration found"),
+        "Error should mention dirty migration, got: {}",
+        err_msg
+    );
+}

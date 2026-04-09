@@ -1,48 +1,67 @@
-use std::collections::HashSet;
 use sqlx::PgPool;
 
 use crate::helpers::parse_boolean_env;
 
-/// Automatically run database migrations if enabled.
+/// Automatically run database migrations if TASKCAST_AUTO_MIGRATE is enabled.
 ///
-/// This function checks two conditions:
-/// 1. TASKCAST_AUTO_MIGRATE env var is truthy (case-insensitive, parsed via parse_boolean_env)
-/// 2. Postgres URL is configured (TASKCAST_POSTGRES_URL env var)
+/// This is the Rust counterpart of `performAutoMigrateIfEnabled` in the TS CLI.
+/// Both implementations MUST produce byte-identical log output for the same
+/// outcomes so that users switching between runtimes see consistent behavior.
 ///
-/// If both are true, runs migrations and logs the result:
-/// - "Applied N migrations" if N > 0
-/// - "Database schema up to date" if N = 0
-/// - "Auto-migration failed: <error_message>" if an error occurs (and throws error)
+/// Log messages (spec §Error Handling & Log Messages — fixed for CI assertions):
+/// - Banner:   `[taskcast] TASKCAST_AUTO_MIGRATE enabled — running Postgres migrations on <url>`
+/// - Skip:     `[taskcast] TASKCAST_AUTO_MIGRATE is set but no Postgres configured — skipping`
+/// - Up to date: `[taskcast] Database schema up to date (<N> migration(s) already applied)`
+/// - Applied:  `[taskcast] Applied <N> new migration(s): <filename1>, <filename2>, ...`
+/// - Failure:  `[taskcast] Auto-migration failed: <error_message>`
 ///
-/// If auto-migrate is disabled, returns immediately (no-op).
-/// If Postgres is not configured, logs info message and returns (no-op).
+/// All messages go to stderr (`eprintln!`) to match the TS CLI's convention
+/// (which uses `console.error`). This keeps stdout free for machine-readable output.
+///
+/// The presence of a `pool` is treated as proof that Postgres is configured.
+/// This fixes the silent-bypass bug where auto-migrate would skip when
+/// Postgres was configured only via the YAML config file (not env var).
 ///
 /// # Arguments
-/// * `pool` - The PgPool to run migrations against
-/// * `env_auto_migrate` - TASKCAST_AUTO_MIGRATE env var (for testability)
-/// * `env_postgres_url` - TASKCAST_POSTGRES_URL env var (for testability)
+/// * `pool` - An optional PgPool. If None, auto-migrate is skipped with the
+///            "no Postgres configured" message.
+/// * `postgres_url` - The resolved URL for the banner log (display-only).
+/// * `env_auto_migrate` - TASKCAST_AUTO_MIGRATE env var value (for testability)
 ///
 /// # Returns
-/// Ok(()) if migration succeeds or is skipped (disabled/unconfigured)
-/// Err with message "Auto-migration failed: <original_error>" if migration fails
+/// * `Ok(())` if migration succeeds or is skipped (disabled / unconfigured)
+/// * `Err` with message `"Auto-migration failed: <original_error>"` on failure
 pub async fn run_auto_migrate(
-    pool: &PgPool,
+    pool: Option<&PgPool>,
+    postgres_url: Option<&str>,
     env_auto_migrate: Option<&str>,
-    env_postgres_url: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Check if auto-migrate is enabled
-    let auto_migrate_enabled = parse_boolean_env(env_auto_migrate);
-    if !auto_migrate_enabled {
+    if !parse_boolean_env(env_auto_migrate) {
         return Ok(());
     }
 
-    // Check if Postgres is configured
-    if env_postgres_url.is_none() {
-        eprintln!("[taskcast] Auto-migrate disabled: Postgres not configured");
-        return Ok(());
-    }
+    // Check if Postgres is actually configured: the presence of a pool is proof.
+    // The env var alone is insufficient because Postgres may be configured via
+    // the YAML config file only.
+    let pool = match pool {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "[taskcast] TASKCAST_AUTO_MIGRATE is set but no Postgres configured — skipping"
+            );
+            return Ok(());
+        }
+    };
 
-    // Ensure _sqlx_migrations table exists (same as migrate command)
+    // Log banner with URL (if available)
+    let url_display = postgres_url.unwrap_or("<postgres>");
+    eprintln!(
+        "[taskcast] TASKCAST_AUTO_MIGRATE enabled — running Postgres migrations on {}",
+        url_display
+    );
+
+    // Ensure _sqlx_migrations table exists before querying it
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS _sqlx_migrations (
             version BIGINT PRIMARY KEY,
@@ -55,59 +74,95 @@ pub async fn run_auto_migrate(
     )
     .execute(pool)
     .await
-    .map_err(|e| format!("Failed to check migration state: {e}"))?;
+    .map_err(|e| {
+        let msg = format!("Auto-migration failed: {}", e);
+        eprintln!("[taskcast] {}", msg);
+        msg
+    })?;
 
-    // Fail fast on dirty (failed) migrations
-    let dirty: Vec<(i64,)> = sqlx::query_as(
-        "SELECT version FROM _sqlx_migrations WHERE success = false ORDER BY version",
+    // Fail fast on dirty (failed) migrations — must match TS dirty-check semantics.
+    // TS error text: "Dirty migration found: version N (description). A previous
+    // migration failed. Please fix it manually before running migrations."
+    // Rust produces the same canonical wording.
+    let dirty: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT version, description FROM _sqlx_migrations WHERE success = false ORDER BY version",
     )
     .fetch_all(pool)
     .await
-    .map_err(|e| format!("Failed to query dirty migrations: {e}"))?;
+    .map_err(|e| {
+        let msg = format!("Auto-migration failed: Failed to query dirty migrations: {}", e);
+        eprintln!("[taskcast] {}", msg);
+        msg
+    })?;
 
-    if !dirty.is_empty() {
-        let versions: Vec<String> = dirty.iter().map(|r| r.0.to_string()).collect();
-        let error_msg = format!(
-            "Dirty (failed) migrations found: versions {}. Fix manually before running migrations.",
-            versions.join(", ")
+    if let Some((version, description)) = dirty.into_iter().next() {
+        let inner = format!(
+            "Dirty migration found: version {} ({}). A previous migration failed. Please fix it manually before running migrations.",
+            version, description
         );
-        eprintln!("[taskcast] Auto-migration failed: {}", error_msg);
-        return Err(format!("Auto-migration failed: {}", error_msg).into());
+        eprintln!("[taskcast] Auto-migration failed: {}", inner);
+        return Err(format!("Auto-migration failed: {}", inner).into());
     }
 
-    // Get list of already-applied migrations
-    let applied: Vec<(i64,)> = sqlx::query_as(
+    // Query currently-applied migrations BEFORE running, so we can compute the
+    // precise "newly applied" list and filenames for the success log.
+    let before: Vec<(i64,)> = sqlx::query_as(
         "SELECT version FROM _sqlx_migrations WHERE success = true ORDER BY version",
     )
     .fetch_all(pool)
     .await
-    .map_err(|e| format!("Failed to query applied migrations: {e}"))?;
+    .map_err(|e| {
+        let msg = format!("Auto-migration failed: Failed to query applied migrations: {}", e);
+        eprintln!("[taskcast] {}", msg);
+        msg
+    })?;
+    let before_set: std::collections::HashSet<i64> = before.iter().map(|r| r.0).collect();
 
-    let applied_set: HashSet<i64> = applied.iter().map(|r| r.0).collect();
+    // Single sqlx::migrate!() invocation — use the returned migrator for both
+    // the iter() (to know filenames) and the run() call. This avoids any
+    // divergence between pre-flight count and actual applied set.
     let migrator = sqlx::migrate!("../../migrations/postgres");
-    let pending: Vec<_> = migrator
+
+    match migrator.run(pool).await {
+        Ok(_) => {}
+        Err(err) => {
+            let msg = err.to_string();
+            eprintln!("[taskcast] Auto-migration failed: {}", msg);
+            return Err(format!("Auto-migration failed: {}", msg).into());
+        }
+    }
+
+    // Compute which migrations were newly applied by diffing against `before`.
+    // Reconstruct filenames from (version, description) using the sqlx metadata:
+    // filenames follow the 3-digit zero-padded convention `NNN_description.sql`
+    // where description uses `_` as separator between words. sqlx stores
+    // description with spaces replacing underscores, so we reverse that for the
+    // filename.
+    let newly_applied: Vec<String> = migrator
         .iter()
-        .filter(|m| !applied_set.contains(&m.version))
+        .filter(|m| !before_set.contains(&m.version))
+        .map(|m| format!("{:03}_{}.sql", m.version, m.description.replace(' ', "_")))
         .collect();
 
-    // If nothing pending, log and return
-    if pending.is_empty() {
-        eprintln!("[taskcast] Database schema up to date");
-        return Ok(());
+    if newly_applied.is_empty() {
+        // Count of already-applied migrations in the migration set itself
+        let already_applied_count = migrator
+            .iter()
+            .filter(|m| before_set.contains(&m.version))
+            .count();
+        eprintln!(
+            "[taskcast] Database schema up to date ({} migration(s) already applied)",
+            already_applied_count
+        );
+    } else {
+        eprintln!(
+            "[taskcast] Applied {} new migration(s): {}",
+            newly_applied.len(),
+            newly_applied.join(", ")
+        );
     }
 
-    // Run migrations
-    match sqlx::migrate!("../../migrations/postgres").run(pool).await {
-        Ok(_) => {
-            eprintln!("[taskcast] Applied {} migrations", pending.len());
-            Ok(())
-        }
-        Err(err) => {
-            let error_message = err.to_string();
-            eprintln!("[taskcast] Auto-migration failed: {}", error_message);
-            Err(format!("Auto-migration failed: {}", error_message).into())
-        }
-    }
+    Ok(())
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -116,17 +171,9 @@ pub async fn run_auto_migrate(
 mod tests {
     use super::*;
 
-    // Note: Unit tests for run_auto_migrate are limited because they require:
-    // 1. A PgPool which needs a real (or testcontainer) database
-    // 2. The ability to verify migration state (which requires inspecting _sqlx_migrations table)
-    //
-    // Unit tests that only verify early returns (before pool access) are included below.
-    // Integration tests with testcontainers Postgres verify the full flow.
-
-    // ─── Tests for parse_boolean_env (helper dependency) ──────────────────
-    //
-    // These tests verify the behavior of the dependency helper, showing
-    // different input patterns that affect run_auto_migrate's decision logic.
+    // Full run_auto_migrate coverage lives in integration tests with real
+    // Postgres via testcontainers. Inline unit tests cover parse_boolean_env
+    // dependency and the disabled/no-pool early-return branches.
 
     #[test]
     fn helper_parse_boolean_env_recognizes_true_values() {
@@ -150,5 +197,21 @@ mod tests {
         assert!(!parse_boolean_env(Some("maybe")));
     }
 
-    // Integration tests with real testcontainers Postgres are in tests/integration/
+    #[tokio::test]
+    async fn returns_ok_when_auto_migrate_disabled() {
+        // No pool needed — the function must return without touching the DB
+        // when the env var is not truthy.
+        let result = run_auto_migrate(None, None, None).await;
+        assert!(result.is_ok());
+
+        let result = run_auto_migrate(None, Some("postgres://x"), Some("false")).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn returns_ok_when_enabled_but_pool_is_none() {
+        // Enabled but no pool → logs skip message and returns Ok.
+        let result = run_auto_migrate(None, None, Some("true")).await;
+        assert!(result.is_ok());
+    }
 }
