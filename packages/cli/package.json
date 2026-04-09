@@ -62,6 +62,7 @@
     "postgres": "^3.4.5"
   },
   "devDependencies": {
+    "testcontainers": "^10.13.0",
     "typescript": "^5.7.0",
     "vitest": "^2.1.0"
   }
