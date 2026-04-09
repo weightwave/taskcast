@@ -57,10 +57,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         None => {
-            commands::start::run(commands::start::StartArgs::default()).await?;
+            if let Err(e) = commands::start::run(commands::start::StartArgs::default()).await {
+                eprintln!("[taskcast] {e}");
+                std::process::exit(1);
+            }
         }
         Some(Commands::Start(args)) => {
-            commands::start::run(args).await?;
+            if let Err(e) = commands::start::run(args).await {
+                eprintln!("[taskcast] {e}");
+                std::process::exit(1);
+            }
         }
         Some(Commands::Migrate(args)) => {
             commands::migrate::run(args).await?;

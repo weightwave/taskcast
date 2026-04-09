@@ -65,7 +65,10 @@ export async function performAutoMigrateIfEnabled(
     }
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err)
-    console.error(`[taskcast] Auto-migration failed: ${errorMessage}`)
+    // Do NOT log here — the caller (registerStartCommand's .action() wrapper
+    // or the Rust/TS test harness) is responsible for the single user-facing
+    // [taskcast] Auto-migration failed: ... line. Logging here would produce
+    // a duplicate when the error propagates up.
     throw new Error(`Auto-migration failed: ${errorMessage}`)
   }
 }

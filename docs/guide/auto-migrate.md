@@ -205,7 +205,7 @@ If a migration fails during server startup, the server does not start. This is i
 If `TASKCAST_AUTO_MIGRATE=true` but no PostgreSQL URL is found:
 
 ```
-[taskcast] Auto-migration disabled: Postgres not configured
+[taskcast] TASKCAST_AUTO_MIGRATE is set but no Postgres configured — skipping
 ```
 
 Auto-migration skips silently and server continues. Set a PostgreSQL URL if you want migrations to run.
@@ -232,10 +232,10 @@ GRANT CREATE ON SCHEMA public TO taskcast;
 If the database is already up-to-date:
 
 ```
-[taskcast] Database schema up to date
+[taskcast] Database schema up to date (2 migration(s) already applied)
 ```
 
-Server continues normally. This is the expected state after the first successful migration run.
+Server continues normally. This is the expected state after the first successful migration run. The count in parentheses is the number of migrations already present in the `_sqlx_migrations` tracking table.
 
 ## Disabling Auto-Migrate
 
@@ -275,7 +275,7 @@ CREATE TABLE _sqlx_migrations (
     installed_on TIMESTAMPTZ NOT NULL,       -- when it ran
     success BOOLEAN NOT NULL,                -- whether it succeeded
     checksum BYTEA NOT NULL,                 -- SHA384 of migration SQL
-    execution_time BIGINT NOT NULL           -- duration in milliseconds
+    execution_time BIGINT NOT NULL           -- duration in nanoseconds
 )
 ```
 
@@ -329,9 +329,10 @@ If auto-migrate seems to skip:
 2. Is `TASKCAST_POSTGRES_URL` configured? (Check: `echo $TASKCAST_POSTGRES_URL`)
 3. Check the server logs — Taskcast should log migration status:
    ```
-   [taskcast] Applied 3 migrations
-   [taskcast] Database schema up to date
-   [taskcast] Auto-migration disabled: Postgres not configured
+   [taskcast] TASKCAST_AUTO_MIGRATE enabled — running Postgres migrations on postgres://host:5432/db
+   [taskcast] Applied 3 new migration(s): 001_initial.sql, 002_workers.sql, 003_indexes.sql
+   [taskcast] Database schema up to date (5 migration(s) already applied)
+   [taskcast] TASKCAST_AUTO_MIGRATE is set but no Postgres configured — skipping
    ```
 
 ### "TTY not detected" When Running Migrate

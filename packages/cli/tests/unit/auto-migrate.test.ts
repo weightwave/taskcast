@@ -174,7 +174,10 @@ describe('performAutoMigrateIfEnabled', () => {
 
   // ─── Error handling ────────────────────────────────────────────────────
 
-  it('logs error to stderr and re-throws wrapped error when migration fails', async () => {
+  it('re-throws wrapped error without logging a failure line (caller logs)', async () => {
+    // The helper must NOT log its own failure line. The caller is responsible
+    // for the single "[taskcast] Auto-migration failed: ..." output. Logging
+    // here would produce a duplicate when the error propagates up.
     const env = { TASKCAST_AUTO_MIGRATE: 'true' }
     const mockError = vi.spyOn(console, 'error').mockImplementation(() => {})
     const testError = new Error('Checksum mismatch detected')
@@ -184,14 +187,17 @@ describe('performAutoMigrateIfEnabled', () => {
       'Auto-migration failed: Checksum mismatch detected',
     )
 
-    expect(mockError).toHaveBeenCalledWith(
-      '[taskcast] Auto-migration failed: Checksum mismatch detected',
+    // Exactly one call expected: the "banner" log before runMigrations ran.
+    // No "Auto-migration failed" line should have been emitted by the helper.
+    const failureCalls = mockError.mock.calls.filter((call) =>
+      String(call[0]).includes('Auto-migration failed'),
     )
+    expect(failureCalls).toHaveLength(0)
 
     mockError.mockRestore()
   })
 
-  it('handles non-Error objects thrown by runMigrations', async () => {
+  it('handles non-Error objects thrown by runMigrations (no failure log)', async () => {
     const env = { TASKCAST_AUTO_MIGRATE: 'true' }
     const mockError = vi.spyOn(console, 'error').mockImplementation(() => {})
     vi.mocked(runMigrations).mockRejectedValueOnce('String error')
@@ -200,9 +206,10 @@ describe('performAutoMigrateIfEnabled', () => {
       'Auto-migration failed: String error',
     )
 
-    expect(mockError).toHaveBeenCalledWith(
-      '[taskcast] Auto-migration failed: String error',
+    const failureCalls = mockError.mock.calls.filter((call) =>
+      String(call[0]).includes('Auto-migration failed'),
     )
+    expect(failureCalls).toHaveLength(0)
 
     mockError.mockRestore()
   })

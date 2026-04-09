@@ -451,6 +451,39 @@ describe('registerStartCommand', () => {
 
     expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('sqlite @ /tmp/my.db'))
   })
+
+  it('logs [taskcast] <msg> exactly once and exits 1 when runStart throws', async () => {
+    // Regression test for R2-I1: the .action() wrapper must produce exactly
+    // one "[taskcast] Auto-migration failed: ..." line when runStart throws
+    // (via performAutoMigrateIfEnabled), not a duplicate from the helper itself.
+    const { performAutoMigrateIfEnabled } = await import('../../src/auto-migrate.js')
+    ;(performAutoMigrateIfEnabled as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+      new Error('Auto-migration failed: Checksum mismatch detected'),
+    )
+
+    const program = new Command()
+    program.exitOverride()
+    registerStartCommand(program)
+
+    try {
+      await program.parseAsync(['node', 'test', 'start', '-s', 'sqlite'])
+    } catch (e) {
+      if (!(e instanceof ExitError && e.code === 1)) throw e
+    }
+
+    // Count calls that contain the auto-migration failure message
+    const failureCalls = errorSpy.mock.calls.filter((call) =>
+      String(call[0]).includes('Auto-migration failed'),
+    )
+    expect(failureCalls).toHaveLength(1)
+    expect(failureCalls[0]?.[0]).toBe(
+      '[taskcast] Auto-migration failed: Checksum mismatch detected',
+    )
+    expect(exitSpy).toHaveBeenCalledWith(1)
+
+    // Reset the mock for subsequent tests
+    ;(performAutoMigrateIfEnabled as ReturnType<typeof vi.fn>).mockReset()
+  })
 })
 
 describe('runStart', () => {

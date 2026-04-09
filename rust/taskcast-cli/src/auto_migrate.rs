@@ -61,6 +61,12 @@ pub async fn run_auto_migrate(
         url_display
     );
 
+    // Note on error handling: we do NOT log errors here. The caller (main.rs
+    // for the CLI, or tests for direct invocations) is responsible for the
+    // single user-facing "[taskcast] Auto-migration failed: ..." line.
+    // Logging here would produce a duplicate when errors propagate through
+    // main.rs's explicit error handler.
+
     // Ensure _sqlx_migrations table exists before querying it
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS _sqlx_migrations (
@@ -74,11 +80,7 @@ pub async fn run_auto_migrate(
     )
     .execute(pool)
     .await
-    .map_err(|e| {
-        let msg = format!("Auto-migration failed: {}", e);
-        eprintln!("[taskcast] {}", msg);
-        msg
-    })?;
+    .map_err(|e| format!("Auto-migration failed: {}", e))?;
 
     // Fail fast on dirty (failed) migrations — must match TS dirty-check semantics.
     // TS error text: "Dirty migration found: version N (description). A previous
@@ -89,18 +91,13 @@ pub async fn run_auto_migrate(
     )
     .fetch_all(pool)
     .await
-    .map_err(|e| {
-        let msg = format!("Auto-migration failed: Failed to query dirty migrations: {}", e);
-        eprintln!("[taskcast] {}", msg);
-        msg
-    })?;
+    .map_err(|e| format!("Auto-migration failed: Failed to query dirty migrations: {}", e))?;
 
     if let Some((version, description)) = dirty.into_iter().next() {
         let inner = format!(
             "Dirty migration found: version {} ({}). A previous migration failed. Please fix it manually before running migrations.",
             version, description
         );
-        eprintln!("[taskcast] Auto-migration failed: {}", inner);
         return Err(format!("Auto-migration failed: {}", inner).into());
     }
 
@@ -111,11 +108,7 @@ pub async fn run_auto_migrate(
     )
     .fetch_all(pool)
     .await
-    .map_err(|e| {
-        let msg = format!("Auto-migration failed: Failed to query applied migrations: {}", e);
-        eprintln!("[taskcast] {}", msg);
-        msg
-    })?;
+    .map_err(|e| format!("Auto-migration failed: Failed to query applied migrations: {}", e))?;
     let before_set: std::collections::HashSet<i64> = before.iter().map(|r| r.0).collect();
 
     // Single sqlx::migrate!() invocation — use the returned migrator for both
@@ -123,14 +116,10 @@ pub async fn run_auto_migrate(
     // divergence between pre-flight count and actual applied set.
     let migrator = sqlx::migrate!("../../migrations/postgres");
 
-    match migrator.run(pool).await {
-        Ok(_) => {}
-        Err(err) => {
-            let msg = err.to_string();
-            eprintln!("[taskcast] Auto-migration failed: {}", msg);
-            return Err(format!("Auto-migration failed: {}", msg).into());
-        }
-    }
+    migrator
+        .run(pool)
+        .await
+        .map_err(|err| format!("Auto-migration failed: {}", err))?;
 
     // Compute which migrations were newly applied by diffing against `before`.
     // Reconstruct filenames from (version, description) using the sqlx metadata:
