@@ -1,9 +1,8 @@
 import { Command } from 'commander'
 import postgres from 'postgres'
-import { join, dirname } from 'path'
-import { fileURLToPath } from 'url'
 import { loadConfigFile } from '@taskcast/core'
-import { loadMigrationFiles, runMigrations } from '@taskcast/postgres'
+import { buildMigrationFiles, runMigrations } from '@taskcast/postgres'
+import { EMBEDDED_MIGRATIONS } from '../generated-migrations.js'
 import { resolvePostgresUrl, formatDisplayUrl } from '../migrate-helpers.js'
 import { promptConfirm } from '../utils.js'
 
@@ -30,28 +29,28 @@ export function registerMigrateCommand(program: Command): void {
 
       const target = formatDisplayUrl(pgUrl)
 
-      // TODO: This path works in the monorepo only. For npm publishing,
-      // migrations would need to be bundled with the package.
-      const migrationsDir = join(dirname(fileURLToPath(import.meta.url)), '../../../../migrations/postgres')
-
       const sql = postgres(pgUrl)
       try {
-        // Load migration files and check what's pending
-        const allFiles = loadMigrationFiles(migrationsDir)
+        // Build migration files from embedded migrations
+        const allFiles = buildMigrationFiles(EMBEDDED_MIGRATIONS)
 
-        // Ensure the migrations table exists so we can query applied versions
-        await sql.unsafe(`
-          CREATE TABLE IF NOT EXISTS _sqlx_migrations (
-              version BIGINT PRIMARY KEY,
-              description TEXT NOT NULL,
-              installed_on TIMESTAMPTZ NOT NULL DEFAULT now(),
-              success BOOLEAN NOT NULL,
-              checksum BYTEA NOT NULL,
-              execution_time BIGINT NOT NULL
+        // Query already-applied versions from the tracking table.
+        // If the table does not exist yet, treat all migrations as pending.
+        // (runMigrations() below will create the table idempotently — we do
+        // not duplicate the CREATE TABLE schema here to avoid drift.)
+        let appliedVersions = new Set<number>()
+        try {
+          const appliedRows = await sql.unsafe(
+            'SELECT version FROM _sqlx_migrations WHERE success = true',
           )
-        `)
-        const appliedRows = await sql.unsafe('SELECT version FROM _sqlx_migrations WHERE success = true')
-        const appliedVersions = new Set(appliedRows.map((r) => Number(r['version'])))
+          appliedVersions = new Set(appliedRows.map((r) => Number(r['version'])))
+        } catch (err) {
+          const code = (err as { code?: string }).code
+          // 42P01 = undefined_table (table doesn't exist yet — first-time migration)
+          if (code !== '42P01') {
+            throw err
+          }
+        }
         const pending = allFiles.filter((f) => !appliedVersions.has(f.version))
 
         if (pending.length === 0) {
@@ -77,7 +76,7 @@ export function registerMigrateCommand(program: Command): void {
           }
         }
 
-        const result = await runMigrations(sql, migrationsDir)
+        const result = await runMigrations(sql, allFiles)
 
         for (const filename of result.applied) {
           console.log(`  Applied ${filename}`)

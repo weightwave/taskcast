@@ -3,7 +3,7 @@ import postgres from 'postgres'
 import { GenericContainer, Wait, type StartedTestContainer } from 'testcontainers'
 import { join } from 'node:path'
 import { readFileSync } from 'node:fs'
-import { runMigrations, computeChecksum } from '../../src/migration-runner.js'
+import { runMigrations, buildMigrationFiles, computeChecksum, type EmbeddedMigration } from '../../src/migration-runner.js'
 
 const MIGRATIONS_DIR = join(import.meta.dirname, '../../../../migrations/postgres')
 
@@ -108,5 +108,162 @@ describe('migration runner integration', () => {
 
     // Restore success state
     await sql`UPDATE _sqlx_migrations SET success = true WHERE version = 1`
+  })
+})
+
+describe('migration runner with embedded migrations (array overload)', () => {
+  it('applies embedded migrations from MigrationFile[] array', async () => {
+    // Create fresh database for embedded migration tests
+    const container2 = await new GenericContainer('postgres:16-alpine')
+      .withEnvironment({
+        POSTGRES_USER: 'test',
+        POSTGRES_PASSWORD: 'test',
+        POSTGRES_DB: 'testdb',
+      })
+      .withExposedPorts(5432)
+      .withWaitStrategy(Wait.forLogMessage(/ready to accept connections/, 2))
+      .start()
+
+    const connUri2 = `postgres://test:test@localhost:${container2.getMappedPort(5432)}/testdb`
+    const sql2 = postgres(connUri2)
+
+    try {
+      const embedded: EmbeddedMigration[] = [
+        {
+          filename: '001_create_test_table.sql',
+          sql: 'CREATE TABLE test_table (id SERIAL PRIMARY KEY, name TEXT)',
+        },
+        {
+          filename: '002_add_column.sql',
+          sql: 'ALTER TABLE test_table ADD COLUMN created_at TIMESTAMPTZ DEFAULT now()',
+        },
+      ]
+
+      const migrations = buildMigrationFiles(embedded)
+      const result = await runMigrations(sql2, migrations)
+
+      expect(result.applied).toHaveLength(2)
+      expect(result.applied).toContain('001_create_test_table.sql')
+      expect(result.applied).toContain('002_add_column.sql')
+      expect(result.skipped).toHaveLength(0)
+
+      // Verify table was created
+      const tables = await sql2`
+        SELECT table_name FROM information_schema.tables
+        WHERE table_schema = 'public' AND table_name = 'test_table'
+      `
+      expect(tables).toHaveLength(1)
+    } finally {
+      await sql2?.end()
+      await container2?.stop()
+    }
+  })
+
+  it('skips already-applied embedded migrations on second run', async () => {
+    const container2 = await new GenericContainer('postgres:16-alpine')
+      .withEnvironment({
+        POSTGRES_USER: 'test',
+        POSTGRES_PASSWORD: 'test',
+        POSTGRES_DB: 'testdb',
+      })
+      .withExposedPorts(5432)
+      .withWaitStrategy(Wait.forLogMessage(/ready to accept connections/, 2))
+      .start()
+
+    const connUri2 = `postgres://test:test@localhost:${container2.getMappedPort(5432)}/testdb`
+    const sql2 = postgres(connUri2)
+
+    try {
+      const embedded: EmbeddedMigration[] = [
+        { filename: '001_first.sql', sql: 'CREATE TABLE t1 (id INT)' },
+      ]
+
+      const migrations = buildMigrationFiles(embedded)
+
+      // First run
+      const result1 = await runMigrations(sql2, migrations)
+      expect(result1.applied).toContain('001_first.sql')
+
+      // Second run
+      const result2 = await runMigrations(sql2, migrations)
+      expect(result2.skipped).toContain('001_first.sql')
+      expect(result2.applied).toHaveLength(0)
+    } finally {
+      await sql2?.end()
+      await container2?.stop()
+    }
+  })
+
+  it('verifies checksums for embedded migrations', async () => {
+    const container2 = await new GenericContainer('postgres:16-alpine')
+      .withEnvironment({
+        POSTGRES_USER: 'test',
+        POSTGRES_PASSWORD: 'test',
+        POSTGRES_DB: 'testdb',
+      })
+      .withExposedPorts(5432)
+      .withWaitStrategy(Wait.forLogMessage(/ready to accept connections/, 2))
+      .start()
+
+    const connUri2 = `postgres://test:test@localhost:${container2.getMappedPort(5432)}/testdb`
+    const sql2 = postgres(connUri2)
+
+    try {
+      const embedded: EmbeddedMigration[] = [
+        { filename: '001_test.sql', sql: 'CREATE TABLE t1 (id INT)' },
+      ]
+
+      const migrations = buildMigrationFiles(embedded)
+
+      // Apply the migrations
+      await runMigrations(sql2, migrations)
+
+      // Verify _sqlx_migrations has correct checksum
+      const rows = await sql2`SELECT * FROM _sqlx_migrations WHERE version = 1`
+      expect(rows).toHaveLength(1)
+
+      const row = rows[0]!
+      const expectedChecksum = computeChecksum('CREATE TABLE t1 (id INT)')
+      expect(Buffer.from(row.checksum as Uint8Array).equals(expectedChecksum)).toBe(true)
+    } finally {
+      await sql2?.end()
+      await container2?.stop()
+    }
+  })
+
+  it('detects checksum mismatch for embedded migrations', async () => {
+    const container2 = await new GenericContainer('postgres:16-alpine')
+      .withEnvironment({
+        POSTGRES_USER: 'test',
+        POSTGRES_PASSWORD: 'test',
+        POSTGRES_DB: 'testdb',
+      })
+      .withExposedPorts(5432)
+      .withWaitStrategy(Wait.forLogMessage(/ready to accept connections/, 2))
+      .start()
+
+    const connUri2 = `postgres://test:test@localhost:${container2.getMappedPort(5432)}/testdb`
+    const sql2 = postgres(connUri2)
+
+    try {
+      const embedded1: EmbeddedMigration[] = [
+        { filename: '001_test.sql', sql: 'CREATE TABLE t1 (id INT)' },
+      ]
+
+      const migrations1 = buildMigrationFiles(embedded1)
+      await runMigrations(sql2, migrations1)
+
+      // Now try to apply a different SQL with the same filename
+      const embedded2: EmbeddedMigration[] = [
+        { filename: '001_test.sql', sql: 'CREATE TABLE t1 (id INT, name TEXT)' },
+      ]
+
+      const migrations2 = buildMigrationFiles(embedded2)
+
+      await expect(runMigrations(sql2, migrations2)).rejects.toThrow(/checksum mismatch/i)
+    } finally {
+      await sql2?.end()
+      await container2?.stop()
+    }
   })
 })

@@ -14,7 +14,12 @@ export function resolvePostgresUrl(options: {
 /**
  * Format a Postgres URL for display, stripping credentials.
  *
- * Returns `host:port/dbname`. Falls back to the raw string on parse failure.
+ * Returns `host:port/dbname`. On parse failure:
+ *   - returns `<redacted>` if the raw string contains `@` (which indicates
+ *     possible embedded credentials), so a malformed URL can never leak
+ *     user:pass into a log line;
+ *   - otherwise returns the raw string unchanged, which is safe because it
+ *     cannot contain userinfo.
  */
 export function formatDisplayUrl(pgUrl: string): string {
   try {
@@ -22,6 +27,6 @@ export function formatDisplayUrl(pgUrl: string): string {
     const dbname = parsed.pathname.replace(/^\//, '') || 'postgres'
     return `${parsed.hostname}:${parsed.port || '5432'}/${dbname}`
   } catch {
-    return pgUrl
+    return pgUrl.includes('@') ? '<redacted>' : pgUrl
   }
 }

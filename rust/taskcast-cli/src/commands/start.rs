@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use clap::Args;
 
+use crate::auto_migrate::run_auto_migrate;
 use crate::helpers::{auth_mode_to_string, parse_jwt_algorithm, resolve_port, resolve_storage_mode};
 
 #[derive(Args, Debug)]
@@ -37,6 +38,29 @@ impl Default for StartArgs {
             verbose: false,
         }
     }
+}
+
+/// Create a Postgres pool and run auto-migrations if enabled.
+///
+/// This helper encapsulates the pool creation + auto-migrate flow.
+/// It's called from the main `run()` function in multiple places.
+///
+/// The pool itself (not the env var) is passed to `run_auto_migrate` as
+/// proof that Postgres is configured, so the helper works correctly
+/// regardless of whether the URL came from an env var or the config file.
+async fn create_postgres_pool_with_auto_migrate(
+    postgres_url: &str,
+) -> Result<sqlx::PgPool, Box<dyn std::error::Error>> {
+    let pool = sqlx::PgPool::connect(postgres_url).await?;
+
+    run_auto_migrate(
+        Some(&pool),
+        Some(postgres_url),
+        std::env::var("TASKCAST_AUTO_MIGRATE").ok().as_deref(),
+    )
+    .await?;
+
+    Ok(pool)
 }
 
 pub async fn run(args: StartArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -104,7 +128,7 @@ pub async fn run(args: StartArgs) -> Result<(), Box<dyn std::error::Error>> {
 
             let long_term_store: Option<Arc<dyn taskcast_core::LongTermStore>> =
                 if let Some(ref pg_url) = postgres_url {
-                    let pool = sqlx::PgPool::connect(pg_url).await?;
+                    let pool = create_postgres_pool_with_auto_migrate(pg_url).await?;
                     let store = taskcast_postgres::PostgresLongTermStore::new(pool);
                     Some(Arc::new(store))
                 } else {
@@ -124,7 +148,7 @@ pub async fn run(args: StartArgs) -> Result<(), Box<dyn std::error::Error>> {
 
             let long_term_store: Option<Arc<dyn taskcast_core::LongTermStore>> =
                 if let Some(ref pg_url) = postgres_url {
-                    let pool = sqlx::PgPool::connect(pg_url).await?;
+                    let pool = create_postgres_pool_with_auto_migrate(pg_url).await?;
                     let store = taskcast_postgres::PostgresLongTermStore::new(pool);
                     Some(Arc::new(store))
                 } else {

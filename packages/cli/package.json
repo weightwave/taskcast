@@ -25,6 +25,14 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./helpers": {
+      "types": "./dist/helpers.d.ts",
+      "import": "./dist/helpers.js"
+    },
+    "./auto-migrate": {
+      "types": "./dist/auto-migrate.d.ts",
+      "import": "./dist/auto-migrate.js"
     }
   },
   "publishConfig": {
@@ -34,7 +42,8 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "generate-migrations": "node ../../scripts/generate-migrations.mjs"
   },
   "dependencies": {
     "@hono/node-server": "^1.19.9",
@@ -53,6 +62,7 @@
     "postgres": "^3.4.5"
   },
   "devDependencies": {
+    "testcontainers": "^10.13.0",
     "typescript": "^5.7.0",
     "vitest": "^2.1.0"
   }
