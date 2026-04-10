@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os'
 
 // Import the REAL generator function from the script, so tests exercise
 // the actual implementation (not a local mirror that can drift out of sync).
+// Use .mjs extension so Node.js treats the script as ESM without relying on
+// a `"type": "module"` declaration in the repo-root package.json.
 const scriptPath = resolve(
   __dirname,
   '..',
@@ -12,14 +14,14 @@ const scriptPath = resolve(
   '..',
   '..',
   'scripts',
-  'generate-migrations.js',
+  'generate-migrations.mjs',
 )
 // Dynamic import ESM module — vitest supports this
 const { generateMigrations } = (await import(scriptPath)) as {
   generateMigrations: (dir: string) => string
 }
 
-describe('migration generator (scripts/generate-migrations.js)', () => {
+describe('migration generator (scripts/generate-migrations.mjs)', () => {
   let tempDir: string
 
   beforeEach(() => {

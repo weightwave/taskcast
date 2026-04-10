@@ -227,7 +227,9 @@ If `TASKCAST_AUTO_MIGRATE=true` but no PostgreSQL URL is found:
 [taskcast] TASKCAST_AUTO_MIGRATE is set but no Postgres configured — skipping
 ```
 
-Auto-migration skips silently and server continues. Set a PostgreSQL URL if you want migrations to run.
+Auto-migration logs this explicit skip message on stderr and the server
+continues to start normally. Operators can grep for this line to confirm the
+skip was intentional. Set a PostgreSQL URL if you want migrations to run.
 
 ### Database Permissions
 
