@@ -24,7 +24,7 @@ use crate::helpers::{format_display_url, parse_boolean_env};
 ///
 /// # Arguments
 /// * `pool` - An optional PgPool. If None, auto-migrate is skipped with the
-///            "no Postgres configured" message.
+///   "no Postgres configured" message.
 /// * `postgres_url` - The resolved URL for the banner log (display-only).
 /// * `env_auto_migrate` - TASKCAST_AUTO_MIGRATE env var value (for testability)
 ///
