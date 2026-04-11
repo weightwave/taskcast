@@ -16,6 +16,9 @@ COPY packages/sentry/package.json packages/sentry/
 COPY packages/client/package.json packages/client/
 COPY packages/server-sdk/package.json packages/server-sdk/
 COPY packages/react/package.json packages/react/
+COPY packages/dashboard-web/package.json packages/dashboard-web/
+COPY packages/playground/package.json packages/playground/
+COPY packages/e2e/package.json packages/e2e/
 COPY tsconfig.base.json ./
 RUN pnpm install --frozen-lockfile
 COPY packages/ packages/
