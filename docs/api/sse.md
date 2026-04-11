@@ -114,10 +114,14 @@ interface SSEEnvelope {
   seriesId?: string
   seriesMode?: string
   seriesSnapshot?: boolean  // true when this event is a late-join snapshot (not an incremental delta)
+  clientId?: string      // Producer client ID (only present if the publisher used client seq ordering)
+  clientSeq?: number     // Producer sequence number (only present if the publisher used client seq ordering)
 }
 ```
 
 **About `filteredIndex`:** When filters are applied, `rawIndex` may not be contiguous (filtered-out events are skipped), whereas `filteredIndex` always increments sequentially from 0. Clients use `filteredIndex` together with `since.index` to implement resume-from-last-position.
+
+**About `clientId`/`clientSeq`:** These are publisher-side fields used for [write-time ordering](./rest.md#publish-events). They are echoed through the SSE stream so that downstream consumers can correlate events back to the producing client if needed. They do **not** affect subscription behavior — SSE filtering, resume, and ordering are independent of these fields.
 
 ## Resume from Last Position
 

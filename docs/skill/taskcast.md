@@ -230,9 +230,10 @@ POST   /tasks                       Create task
 GET    /tasks/:taskId               Get task status
 PATCH  /tasks/:taskId/status        Transition status
 DELETE /tasks/:taskId               Delete task (planned)
-POST   /tasks/:taskId/events        Publish event(s)
+POST   /tasks/:taskId/events        Publish event(s) (body: clientId+clientSeq for write-time ordering)
 GET    /tasks/:taskId/events        SSE subscribe (?seriesFormat=delta|accumulated)
 GET    /tasks/:taskId/events/history Query history
+GET    /tasks/:taskId/seq/:clientId  Query expected seq for a client
 ```
 
 ## Task Status Lifecycle

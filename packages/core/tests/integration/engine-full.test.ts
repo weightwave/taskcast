@@ -50,6 +50,11 @@ beforeAll(async () => {
     'utf8',
   )
   await sql.unsafe(migration002)
+  const migration003 = readFileSync(
+    join(import.meta.dirname, '../../../../migrations/postgres/003_client_seq.sql'),
+    'utf8',
+  )
+  await sql.unsafe(migration003)
 
   const broadcast = new RedisBroadcastProvider(pubClient, subClient)
   const shortTermStore = new RedisShortTermStore(storeClient)

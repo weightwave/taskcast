@@ -102,4 +102,58 @@ describe('Server integration — SSE streaming', () => {
     expect(parsed).toHaveProperty('taskId')
     expect(parsed).not.toHaveProperty('filteredIndex')
   })
+
+  it('envelope preserves clientId/clientSeq when publisher uses seq ordering', async () => {
+    const { app, engine } = createTestServer()
+
+    const task = await engine.createTask({})
+    await engine.transitionTask(task.id, 'running')
+    await engine.publishEvent(task.id, {
+      type: 'llm.delta',
+      level: 'info',
+      data: { delta: 'a' },
+      clientId: 'worker-1',
+      clientSeq: 0,
+    })
+    await engine.publishEvent(task.id, {
+      type: 'llm.delta',
+      level: 'info',
+      data: { delta: 'b' },
+      clientId: 'worker-1',
+      clientSeq: 1,
+    })
+    // Event without seq — fields must be absent in envelope
+    await engine.publishEvent(task.id, {
+      type: 'plain',
+      level: 'info',
+      data: null,
+    })
+    await engine.transitionTask(task.id, 'completed')
+
+    // wrap=true (default)
+    const wrapped = await app.request(`/tasks/${task.id}/events?includeStatus=false`)
+    const wrappedEvents = (await collectAllSSEEvents(wrapped))
+      .filter(e => e.event === 'taskcast.event')
+      .map(e => JSON.parse(e.data))
+
+    const deltaWithSeq = wrappedEvents.filter(e => e.type === 'llm.delta')
+    expect(deltaWithSeq).toHaveLength(2)
+    expect(deltaWithSeq[0]).toMatchObject({ clientId: 'worker-1', clientSeq: 0 })
+    expect(deltaWithSeq[1]).toMatchObject({ clientId: 'worker-1', clientSeq: 1 })
+
+    const plain = wrappedEvents.find(e => e.type === 'plain')
+    expect(plain).toBeTruthy()
+    expect(plain).not.toHaveProperty('clientId')
+    expect(plain).not.toHaveProperty('clientSeq')
+
+    // wrap=false — raw events also carry the fields
+    const raw = await app.request(`/tasks/${task.id}/events?wrap=false&includeStatus=false`)
+    const rawEvents = (await collectAllSSEEvents(raw))
+      .filter(e => e.event === 'taskcast.event')
+      .map(e => JSON.parse(e.data))
+
+    const rawDelta = rawEvents.filter(e => e.type === 'llm.delta')
+    expect(rawDelta[0]).toMatchObject({ clientId: 'worker-1', clientSeq: 0 })
+    expect(rawDelta[1]).toMatchObject({ clientId: 'worker-1', clientSeq: 1 })
+  })
 })

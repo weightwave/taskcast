@@ -80,6 +80,8 @@ X-Taskcast-Signature: sha256=abc123...
 
 **请求体** 是事件的 JSON 表示（如果 `wrap=true`，则包裹在 SSEEnvelope 中）。
 
+如果发布方启用了 [客户端序列排序](./rest.zh.md#发布事件)，`clientId` 与 `clientSeq` 字段会端到端透传，并出现在 webhook payload 中（既存在于包裹的 envelope 中，也在事件记录本身中）。下游系统可以据此去重或自行重排序，而无需再回查服务端。
+
 ## 请求头
 
 | 头 | 说明 |
