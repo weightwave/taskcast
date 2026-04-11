@@ -1,0 +1,60 @@
+{
+  "planPath": "docs/superpowers/plans/2026-04-05-rust-daemon.md",
+  "tasks": [
+    {
+      "id": 0,
+      "subject": "Task 0: Graceful Shutdown",
+      "status": "pending",
+      "description": "**Goal:** Add SIGTERM/SIGINT signal handling to `taskcast start` so the server shuts down cleanly.\n\n**Files:**\n- Modify: `rust/taskcast-cli/src/commands/start.rs`\n\n**Acceptance Criteria:**\n- [ ] Server responds to SIGTERM/SIGINT gracefully\n- [ ] Prints shutdown message to stderr\n- [ ] Existing tests pass\n\n**Verify:** `cd rust && cargo test -p taskcast-cli && cargo build -p taskcast-cli`\n\n```json:metadata\n{\"files\": [\"rust/taskcast-cli/src/commands/start.rs\"], \"verifyCommand\": \"cd rust && cargo test -p taskcast-cli\", \"acceptanceCriteria\": [\"SIGTERM/SIGINT handled\", \"shutdown message printed\", \"existing tests pass\"]}\n```"
+    },
+    {
+      "id": 1,
+      "subject": "Task 1: Core Types — ServiceManager Trait",
+      "status": "pending",
+      "description": "**Goal:** Define ServiceManager trait, ServiceInstallOptions, ServiceStatus, create_service_manager() factory.\n\n**Files:**\n- Create: `rust/taskcast-cli/src/commands/service/manager.rs`\n- Create: `rust/taskcast-cli/src/commands/service/mod.rs` (stub)\n- Create: stub files for launchd, systemd, paths, health\n- Modify: `rust/taskcast-cli/src/commands/mod.rs`\n\n**Acceptance Criteria:**\n- [ ] Trait with 6 methods\n- [ ] Types with correct fields\n- [ ] Factory returns correct platform impl\n- [ ] Unit tests pass\n\n**Verify:** `cd rust && cargo test -p taskcast-cli -- service::manager`\n\n```json:metadata\n{\"files\": [\"rust/taskcast-cli/src/commands/service/manager.rs\", \"rust/taskcast-cli/src/commands/service/mod.rs\", \"rust/taskcast-cli/src/commands/mod.rs\"], \"verifyCommand\": \"cd rust && cargo test -p taskcast-cli -- service::manager\", \"acceptanceCriteria\": [\"trait defined\", \"types defined\", \"factory works\", \"tests pass\"]}\n```"
+    },
+    {
+      "id": 2,
+      "subject": "Task 2: Path Resolution and Config/State Helpers",
+      "status": "pending",
+      "blockedBy": [1],
+      "description": "**Goal:** Implement ServicePaths, ensure_config, write_state/read_state_port, get_port.\n\n**Files:**\n- Modify: `rust/taskcast-cli/src/commands/service/paths.rs`\n- Modify: `rust/taskcast-cli/Cargo.toml` (add libc)\n\n**Acceptance Criteria:**\n- [ ] Correct paths per platform\n- [ ] Auto-creates default config\n- [ ] State file round-trip\n- [ ] Port resolution priority\n\n**Verify:** `cd rust && cargo test -p taskcast-cli -- service::paths`\n\n```json:metadata\n{\"files\": [\"rust/taskcast-cli/src/commands/service/paths.rs\", \"rust/taskcast-cli/Cargo.toml\"], \"verifyCommand\": \"cd rust && cargo test -p taskcast-cli -- service::paths\", \"acceptanceCriteria\": [\"platform paths correct\", \"config auto-creation\", \"state roundtrip\", \"port resolution\"]}\n```"
+    },
+    {
+      "id": 3,
+      "subject": "Task 3: macOS launchd Implementation",
+      "status": "pending",
+      "blockedBy": [1, 2],
+      "description": "**Goal:** Implement LaunchdServiceManager — plist generation, launchctl commands, status parsing.\n\n**Files:**\n- Modify: `rust/taskcast-cli/src/commands/service/launchd.rs`\n\n**Acceptance Criteria:**\n- [ ] Correct plist XML for all option combos\n- [ ] launchctl bootstrap/bootout/list commands\n- [ ] PID parsing from launchctl output\n- [ ] NotInstalled when plist missing\n\n**Verify:** `cd rust && cargo test -p taskcast-cli -- service::launchd`\n\n```json:metadata\n{\"files\": [\"rust/taskcast-cli/src/commands/service/launchd.rs\"], \"verifyCommand\": \"cd rust && cargo test -p taskcast-cli -- service::launchd\", \"acceptanceCriteria\": [\"plist generation\", \"launchctl commands\", \"PID parsing\", \"NotInstalled check\"]}\n```"
+    },
+    {
+      "id": 4,
+      "subject": "Task 4: Linux systemd Implementation",
+      "status": "pending",
+      "blockedBy": [1, 2],
+      "description": "**Goal:** Implement SystemdServiceManager — unit file generation, systemctl commands, status parsing.\n\n**Files:**\n- Modify: `rust/taskcast-cli/src/commands/service/systemd.rs`\n\n**Acceptance Criteria:**\n- [ ] Correct unit file for all option combos\n- [ ] systemctl --user commands\n- [ ] Status parsing from systemctl show\n- [ ] NotInstalled when unit file missing\n\n**Verify:** `cd rust && cargo test -p taskcast-cli -- service::systemd`\n\n```json:metadata\n{\"files\": [\"rust/taskcast-cli/src/commands/service/systemd.rs\"], \"verifyCommand\": \"cd rust && cargo test -p taskcast-cli -- service::systemd\", \"acceptanceCriteria\": [\"unit file generation\", \"systemctl commands\", \"status parsing\", \"NotInstalled check\"]}\n```"
+    },
+    {
+      "id": 5,
+      "subject": "Task 5: Health Check",
+      "status": "pending",
+      "blockedBy": [2],
+      "description": "**Goal:** Implement health check polling and detail fetching.\n\n**Files:**\n- Modify: `rust/taskcast-cli/src/commands/service/health.rs`\n\n**Acceptance Criteria:**\n- [ ] poll_health polls at 500ms intervals\n- [ ] Returns true on 2xx, false on timeout\n- [ ] fetch_health_detail parses uptime/storage\n- [ ] format_uptime displays correctly\n\n**Verify:** `cd rust && cargo test -p taskcast-cli -- service::health`\n\n```json:metadata\n{\"files\": [\"rust/taskcast-cli/src/commands/service/health.rs\"], \"verifyCommand\": \"cd rust && cargo test -p taskcast-cli -- service::health\", \"acceptanceCriteria\": [\"polling works\", \"timeout returns false\", \"detail parsing\", \"uptime formatting\"]}\n```"
+    },
+    {
+      "id": 6,
+      "subject": "Task 6: Service Command Handlers",
+      "status": "pending",
+      "blockedBy": [1, 2, 3, 4, 5],
+      "description": "**Goal:** Implement orchestration in service/mod.rs — run(), install, start, stop, restart, status handlers.\n\n**Files:**\n- Modify: `rust/taskcast-cli/src/commands/service/mod.rs`\n\n**Acceptance Criteria:**\n- [ ] ServiceArgs/ServiceCommands Clap parsing\n- [ ] run() dispatches correctly\n- [ ] install validates port, creates config, writes state\n- [ ] start/stop check status first\n- [ ] status shows detail info\n\n**Verify:** `cd rust && cargo test -p taskcast-cli -- service::tests`\n\n```json:metadata\n{\"files\": [\"rust/taskcast-cli/src/commands/service/mod.rs\"], \"verifyCommand\": \"cd rust && cargo test -p taskcast-cli -- service::tests\", \"acceptanceCriteria\": [\"Clap parsing\", \"dispatch\", \"install flow\", \"pre-checks\", \"status detail\"]}\n```"
+    },
+    {
+      "id": 7,
+      "subject": "Task 7: CLI Wiring — main.rs Integration",
+      "status": "pending",
+      "blockedBy": [6],
+      "description": "**Goal:** Wire service subcommand into main.rs, replace placeholders, add aliases.\n\n**Files:**\n- Modify: `rust/taskcast-cli/src/main.rs`\n\n**Acceptance Criteria:**\n- [ ] service subcommand group works\n- [ ] daemon/stop/status aliases delegate correctly\n- [ ] Old placeholder behavior removed\n- [ ] All CLI parsing tests pass\n\n**Verify:** `cd rust && cargo test -p taskcast-cli && cargo build -p taskcast-cli`\n\n```json:metadata\n{\"files\": [\"rust/taskcast-cli/src/main.rs\"], \"verifyCommand\": \"cd rust && cargo test -p taskcast-cli\", \"acceptanceCriteria\": [\"service subcommand works\", \"aliases work\", \"placeholders removed\", \"all tests pass\"]}\n```"
+    }
+  ],
+  "lastUpdated": "2026-04-05T00:00:00Z"
+}

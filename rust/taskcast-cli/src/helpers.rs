@@ -82,6 +82,26 @@ pub fn format_display_url(postgres_url: &str) -> String {
     }
 }
 
+/// Parse a boolean environment variable.
+///
+/// Recognizes truthy values: "1", "true", "yes", "on" (case-insensitive, trimmed).
+/// Recognizes falsy values: "0", "false", "no", "off", "", and None.
+///
+/// # Arguments
+/// * `value` - The optional string value to parse
+///
+/// # Returns
+/// true if value matches a truthy string, false otherwise
+pub fn parse_boolean_env(value: Option<&str>) -> bool {
+    match value {
+        None => false,
+        Some(s) => {
+            let trimmed = s.trim().to_lowercase();
+            matches!(trimmed.as_str(), "1" | "true" | "yes" | "on")
+        }
+    }
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -365,5 +385,167 @@ mod tests {
             format_display_url("postgres://user@db.example.com:5432/prod"),
             "db.example.com:5432/prod"
         );
+    }
+
+    // ─── parse_boolean_env ───────────────────────────────────────────────────
+
+    #[test]
+    fn boolean_parses_1_as_true() {
+        assert_eq!(parse_boolean_env(Some("1")), true);
+    }
+
+    #[test]
+    fn boolean_parses_true_as_true() {
+        assert_eq!(parse_boolean_env(Some("true")), true);
+    }
+
+    #[test]
+    fn boolean_parses_yes_as_true() {
+        assert_eq!(parse_boolean_env(Some("yes")), true);
+    }
+
+    #[test]
+    fn boolean_parses_on_as_true() {
+        assert_eq!(parse_boolean_env(Some("on")), true);
+    }
+
+    #[test]
+    fn boolean_case_insensitive_uppercase_true() {
+        assert_eq!(parse_boolean_env(Some("TRUE")), true);
+    }
+
+    #[test]
+    fn boolean_case_insensitive_uppercase_yes() {
+        assert_eq!(parse_boolean_env(Some("YES")), true);
+    }
+
+    #[test]
+    fn boolean_case_insensitive_uppercase_on() {
+        assert_eq!(parse_boolean_env(Some("ON")), true);
+    }
+
+    #[test]
+    fn boolean_case_insensitive_mixed_case_true() {
+        assert_eq!(parse_boolean_env(Some("True")), true);
+    }
+
+    #[test]
+    fn boolean_case_insensitive_mixed_case_yes() {
+        assert_eq!(parse_boolean_env(Some("Yes")), true);
+    }
+
+    #[test]
+    fn boolean_case_insensitive_mixed_case_on() {
+        assert_eq!(parse_boolean_env(Some("On")), true);
+    }
+
+    #[test]
+    fn boolean_parses_0_as_false() {
+        assert_eq!(parse_boolean_env(Some("0")), false);
+    }
+
+    #[test]
+    fn boolean_parses_false_as_false() {
+        assert_eq!(parse_boolean_env(Some("false")), false);
+    }
+
+    #[test]
+    fn boolean_parses_no_as_false() {
+        assert_eq!(parse_boolean_env(Some("no")), false);
+    }
+
+    #[test]
+    fn boolean_parses_off_as_false() {
+        assert_eq!(parse_boolean_env(Some("off")), false);
+    }
+
+    #[test]
+    fn boolean_parses_empty_string_as_false() {
+        assert_eq!(parse_boolean_env(Some("")), false);
+    }
+
+    #[test]
+    fn boolean_parses_none_as_false() {
+        assert_eq!(parse_boolean_env(None), false);
+    }
+
+    #[test]
+    fn boolean_case_insensitive_uppercase_false() {
+        assert_eq!(parse_boolean_env(Some("FALSE")), false);
+    }
+
+    #[test]
+    fn boolean_case_insensitive_uppercase_no() {
+        assert_eq!(parse_boolean_env(Some("NO")), false);
+    }
+
+    #[test]
+    fn boolean_case_insensitive_uppercase_off() {
+        assert_eq!(parse_boolean_env(Some("OFF")), false);
+    }
+
+    #[test]
+    fn boolean_trims_leading_whitespace() {
+        assert_eq!(parse_boolean_env(Some("  true")), true);
+    }
+
+    #[test]
+    fn boolean_trims_trailing_whitespace() {
+        assert_eq!(parse_boolean_env(Some("true  ")), true);
+    }
+
+    #[test]
+    fn boolean_trims_both_leading_and_trailing() {
+        assert_eq!(parse_boolean_env(Some("  true  ")), true);
+    }
+
+    #[test]
+    fn boolean_trims_whitespace_around_1() {
+        assert_eq!(parse_boolean_env(Some("  1  ")), true);
+    }
+
+    #[test]
+    fn boolean_trims_whitespace_around_yes() {
+        assert_eq!(parse_boolean_env(Some("  yes  ")), true);
+    }
+
+    #[test]
+    fn boolean_trims_whitespace_around_on() {
+        assert_eq!(parse_boolean_env(Some("  on  ")), true);
+    }
+
+    #[test]
+    fn boolean_trims_whitespace_around_falsy() {
+        assert_eq!(parse_boolean_env(Some("  false  ")), false);
+    }
+
+    #[test]
+    fn boolean_only_whitespace_is_false() {
+        assert_eq!(parse_boolean_env(Some("   ")), false);
+    }
+
+    #[test]
+    fn boolean_unknown_strings_are_false() {
+        assert_eq!(parse_boolean_env(Some("maybe")), false);
+    }
+
+    #[test]
+    fn boolean_unknown_with_whitespace_is_false() {
+        assert_eq!(parse_boolean_env(Some("  maybe  ")), false);
+    }
+
+    #[test]
+    fn boolean_2_is_false() {
+        assert_eq!(parse_boolean_env(Some("2")), false);
+    }
+
+    #[test]
+    fn boolean_enabled_is_false() {
+        assert_eq!(parse_boolean_env(Some("enabled")), false);
+    }
+
+    #[test]
+    fn boolean_disabled_is_false() {
+        assert_eq!(parse_boolean_env(Some("disabled")), false);
     }
 }

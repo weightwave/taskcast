@@ -1,0 +1,82 @@
+{
+  "planPath": "docs/superpowers/plans/2026-04-08-auto-migrate-plan.md",
+  "tasks": [
+    {
+      "id": 0,
+      "subject": "Task 0: Extend @taskcast/postgres — array overload + buildMigrationFiles",
+      "status": "pending",
+      "description": "**Goal:** Add `EmbeddedMigration` type + `buildMigrationFiles` helper to `@taskcast/postgres`; extend `runMigrations()` to accept either a directory path or a pre-loaded `MigrationFile[]`. Backward-compatible.\n\n**Files:**\n- Modify: `packages/postgres/src/migration-runner.ts`\n- Modify: `packages/postgres/src/index.ts`\n- Modify: `packages/postgres/tests/unit/migration-runner.test.ts`\n- Modify: `packages/postgres/tests/integration/migration-runner.test.ts`\n\n**Verify:** `cd packages/postgres && pnpm test`\n\n```json:metadata\n{\"files\":[\"packages/postgres/src/migration-runner.ts\",\"packages/postgres/src/index.ts\",\"packages/postgres/tests/unit/migration-runner.test.ts\",\"packages/postgres/tests/integration/migration-runner.test.ts\"],\"verifyCommand\":\"cd packages/postgres && pnpm test\",\"acceptanceCriteria\":[\"EmbeddedMigration interface exported from @taskcast/postgres\",\"buildMigrationFiles helper exported, sorts by version, computes checksums\",\"runMigrations accepts string | MigrationFile[]\",\"All existing runMigrations tests still pass\",\"Unit tests cover sort order, filename validation, checksum consistency, no input mutation\",\"Integration test covers array overload against real Postgres\"]}\n```"
+    },
+    {
+      "id": 1,
+      "subject": "Task 1: parseBooleanEnv (TS) + parse_boolean_env (Rust)",
+      "status": "pending",
+      "description": "**Goal:** Add boolean env var parser in both runtimes recognizing 1/true/yes/on (case-insensitive, trimmed) as truthy. Foundation for T3 (TS auto-migrate) and T6 (Rust auto-migrate).\n\n**Files:**\n- Modify: `packages/cli/src/utils.ts`\n- Create: `packages/cli/tests/unit/parse-boolean-env.test.ts`\n- Modify: `rust/taskcast-cli/src/helpers.rs`\n\n**Verify:** `cd packages/cli && pnpm test tests/unit/parse-boolean-env.test.ts && cd ../../rust/taskcast-cli && cargo test helpers::tests::boolean`\n\n```json:metadata\n{\"files\":[\"packages/cli/src/utils.ts\",\"packages/cli/tests/unit/parse-boolean-env.test.ts\",\"rust/taskcast-cli/src/helpers.rs\"],\"verifyCommand\":\"cd packages/cli && pnpm test tests/unit/parse-boolean-env.test.ts && cd ../../rust/taskcast-cli && cargo test helpers::tests::boolean\",\"acceptanceCriteria\":[\"parseBooleanEnv(undefined) and parseBooleanEnv('') return false\",\"All of 1/true/TRUE/True/yes/YES/on/ON return true\",\"All of 0/false/no/off/maybe/2 return false\",\"Whitespace is trimmed\",\"Rust parse_boolean_env behaves identically\",\"100% branch coverage on both helpers\"]}\n```",
+      "blockedBy": []
+    },
+    {
+      "id": 2,
+      "subject": "Task 2: CLI migration codegen + committed generated file",
+      "status": "pending",
+      "description": "**Goal:** Build-time codegen script that embeds `migrations/postgres/*.sql` into `packages/cli/src/generated/postgres-migrations.ts` (committed to git). Enforces 3-digit zero-padded filename convention. Wires the generator into the cli `build` script.\n\n**Files:**\n- Create: `packages/cli/scripts/generate-migrations.mjs`\n- Create: `packages/cli/src/generated/postgres-migrations.ts` (committed)\n- Modify: `packages/cli/package.json` (build script)\n- Modify: `packages/cli/vitest.config.ts` (coverage exclude `src/generated/**`)\n- Create: `packages/cli/tests/unit/generate-migrations.test.ts`\n- Create: `packages/cli/tests/unit/generated-migrations.test.ts`\n\n**Verify:** `cd packages/cli && pnpm build && pnpm test tests/unit/generate-migrations.test.ts tests/unit/generated-migrations.test.ts`\n\n```json:metadata\n{\"files\":[\"packages/cli/scripts/generate-migrations.mjs\",\"packages/cli/src/generated/postgres-migrations.ts\",\"packages/cli/package.json\",\"packages/cli/vitest.config.ts\",\"packages/cli/tests/unit/generate-migrations.test.ts\",\"packages/cli/tests/unit/generated-migrations.test.ts\"],\"verifyCommand\":\"cd packages/cli && pnpm build && pnpm test tests/unit/generate-migrations.test.ts tests/unit/generated-migrations.test.ts\",\"acceptanceCriteria\":[\"Generator writes atomically (.tmp + rename)\",\"Generator rejects filenames not matching ^\\\\d{3}_[a-zA-Z0-9_]+\\\\.sql$\",\"Generator throws on empty source dir\",\"Generated TS imports EmbeddedMigration from @taskcast/postgres\",\"SQL preserved byte-for-byte via JSON.stringify\",\"pnpm build runs the generator before tsc\",\"pnpm lint succeeds without prior build (committed file)\",\"Stale-file regression test passes\",\"Generated file matches source SQL files in monorepo test\"]}\n```",
+      "blockedBy": []
+    },
+    {
+      "id": 3,
+      "subject": "Task 3: performAutoMigrateIfEnabled helper (TS)",
+      "status": "pending",
+      "description": "**Goal:** Create DI-friendly auto-migrate helper that encapsulates the decision tree (enabled/disabled, sqlite/no-url skip, success/failure) and migration execution. Throws on failure with `Auto-migration failed: <msg>` (caller wraps with `[taskcast]` prefix).\n\n**Files:**\n- Create: `packages/cli/src/auto-migrate.ts`\n\n**Verify:** `cd packages/cli && pnpm lint && pnpm test`\n\n```json:metadata\n{\"files\":[\"packages/cli/src/auto-migrate.ts\"],\"verifyCommand\":\"cd packages/cli && pnpm lint && pnpm test\",\"acceptanceCriteria\":[\"Module exports AutoMigrateOptions, AutoMigrateLogger, AutoMigrateDeps, performAutoMigrateIfEnabled\",\"enabled=false → no-op\",\"sqlite mode or no postgresUrl → skip with info log\",\"Success path: applied N → 'Applied N new migration(s): files'; up to date → 'Database schema up to date (N migration(s) already applied)'\",\"Failure path: closes connection (best-effort), throws Error with message starting 'Auto-migration failed:'\",\"Helper does NOT call process.exit\",\"deps.createSql and deps.logger are injectable\"]}\n```",
+      "blockedBy": [0, 1, 2]
+    },
+    {
+      "id": 4,
+      "subject": "Task 4: Extract runStart and wire auto-migrate (TS start.ts)",
+      "status": "pending",
+      "description": "**Goal:** Refactor `packages/cli/src/commands/start.ts` so the action body becomes an exported `runStart(options): Promise<{stop, port}>`. Insert `performAutoMigrateIfEnabled()` after URL resolution and before adapter creation. The `.action()` becomes a thin shim that catches errors → `console.error('[taskcast] ' + msg)` → `process.exit(1)`.\n\n**Files:**\n- Modify: `packages/cli/src/commands/start.ts`\n\n**Verify:** `cd packages/cli && pnpm build && pnpm test`\n\n```json:metadata\n{\"files\":[\"packages/cli/src/commands/start.ts\"],\"verifyCommand\":\"cd packages/cli && pnpm build && pnpm test\",\"acceptanceCriteria\":[\"runStart(options) exported with RunStartOptions/RunStartHandle types\",\"runStart returns {stop, port} handle\",\"performAutoMigrateIfEnabled is called BEFORE PostgresLongTermStore creation\",\"On auto-migrate failure no adapters or HTTP server are created\",\"Signal handlers (SIGTERM/SIGINT) registered ONLY by .action wrapper, not by runStart\",\"All existing CLI tests still pass\",\"console.error('[taskcast] ' + err.message) yields '[taskcast] Auto-migration failed: ...' (no double prefix)\"]}\n```",
+      "blockedBy": [3]
+    },
+    {
+      "id": 5,
+      "subject": "Task 5: Fix taskcast migrate subcommand to use embedded migrations",
+      "status": "pending",
+      "description": "**Goal:** Switch `packages/cli/src/commands/migrate.ts` from the monorepo-relative SQL directory path to the embedded `POSTGRES_MIGRATIONS` module. Delete the 'works in monorepo only' TODO comment. After this task, both auto-migrate AND manual migrate work identically when the CLI is installed via npm.\n\n**Files:**\n- Modify: `packages/cli/src/commands/migrate.ts`\n\n**Verify:** `cd packages/cli && pnpm test tests/unit/migrate-command.test.ts && pnpm build`\n\n```json:metadata\n{\"files\":[\"packages/cli/src/commands/migrate.ts\"],\"verifyCommand\":\"cd packages/cli && pnpm test tests/unit/migrate-command.test.ts && pnpm build\",\"acceptanceCriteria\":[\"migrate.ts no longer uses fileURLToPath/import.meta.url for path resolution\",\"Imports POSTGRES_MIGRATIONS from ../generated/postgres-migrations.js and buildMigrationFiles from @taskcast/postgres\",\"TODO comment 'works in monorepo only' is deleted\",\"runMigrations(sql, files) called with MigrationFile[] variant\",\"Existing migrate-command unit tests still pass\",\"Smoke test: taskcast migrate -y --url postgres://... applies both migrations and is idempotent on re-run\"]}\n```",
+      "blockedBy": [0, 2]
+    },
+    {
+      "id": 6,
+      "subject": "Task 6: Rust run_auto_migrate + build_postgres_long_term_store",
+      "status": "pending",
+      "description": "**Goal:** Mirror TS auto-migrate in Rust. Add `run_auto_migrate(url)` helper that runs `sqlx::migrate!` and computes log strings symmetric to TS by querying `_sqlx_migrations` before/after. Add `build_postgres_long_term_store(...)` helper that encapsulates the auto-migrate decision and adapter creation, collapsing the existing two duplicate blocks in `start::run`.\n\n**Files:**\n- Modify: `rust/taskcast-cli/src/commands/start.rs`\n\n**Verify:** `cd rust/taskcast-cli && cargo test --test start_tests --test start_env_tests && cd .. && cargo build`\n\n```json:metadata\n{\"files\":[\"rust/taskcast-cli/src/commands/start.rs\"],\"verifyCommand\":\"cd rust/taskcast-cli && cargo test --test start_tests --test start_env_tests && cd .. && cargo build\",\"acceptanceCriteria\":[\"start.rs reads TASKCAST_AUTO_MIGRATE via parse_boolean_env\",\"run_auto_migrate uses temporary pool, closes pool on both success and failure\",\"On success queries _sqlx_migrations before/after to compute newly-applied filenames using {version:03}_{description_with_underscores}.sql convention\",\"Log lines symmetric with TS: 'Applied N new migration(s): files' or 'Database schema up to date (N migration(s) already applied)'\",\"Failure wrapped with '[taskcast] Auto-migration failed: ' prefix\",\"build_postgres_long_term_store collapses the two existing duplicate blocks in start::run\",\"Skip path emits '[taskcast] TASKCAST_AUTO_MIGRATE is set but no Postgres configured — skipping' and continues startup\",\"All existing Rust CLI tests still pass\"]}\n```",
+      "blockedBy": [1]
+    },
+    {
+      "id": 7,
+      "subject": "Task 7: TS integration + in-process E2E tests (testcontainers Postgres)",
+      "status": "pending",
+      "description": "**Goal:** Integration tests covering all 8 cases of performAutoMigrateIfEnabled (happy, idempotency, disabled, no URL, sqlite mode, conn fail, checksum mismatch, dirty migration) plus one in-process E2E that calls runStart against a real Postgres container and verifies _sqlx_migrations + /health.\n\n**Files:**\n- Modify: `packages/cli/package.json` (add testcontainers devDep)\n- Create: `packages/cli/tests/integration/auto-migrate.test.ts`\n\n**Verify:** `cd packages/cli && pnpm test tests/integration/auto-migrate.test.ts`\n\n```json:metadata\n{\"files\":[\"packages/cli/package.json\",\"packages/cli/tests/integration/auto-migrate.test.ts\"],\"verifyCommand\":\"cd packages/cli && pnpm test tests/integration/auto-migrate.test.ts\",\"acceptanceCriteria\":[\"testcontainers@^10.13.0 added to packages/cli devDependencies\",\"pnpm install succeeds at repo root\",\"Single shared Postgres container per suite (beforeAll/afterAll)\",\"Per-test DB reset drops _sqlx_migrations and taskcast tables\",\"All 8 state matrix cases covered: happy, idempotent, disabled, no URL, sqlite mode, conn fail, checksum mismatch, dirty migration\",\"Failing-case tests assert via rejects.toThrow(/^Auto-migration failed:/) — not via logger.error\",\"In-process E2E test boots runStart, verifies _sqlx_migrations populated and /health responds\",\"src/auto-migrate.ts coverage is 100%\"]}\n```",
+      "blockedBy": [3, 4]
+    },
+    {
+      "id": 8,
+      "subject": "Task 8: Rust integration + in-process E2E tests (start_env_tests.rs)",
+      "status": "pending",
+      "description": "**Goal:** Extend `rust/taskcast-cli/tests/start_env_tests.rs` with auto-migrate tests using the existing EnvGuard + testcontainers pattern. Cover happy path, idempotency, skip-when-memory, and fail-fast on bad URL.\n\n**Files:**\n- Modify: `rust/taskcast-cli/tests/start_env_tests.rs`\n\n**Verify:** `cd rust/taskcast-cli && cargo test --test start_env_tests`\n\n```json:metadata\n{\"files\":[\"rust/taskcast-cli/tests/start_env_tests.rs\"],\"verifyCommand\":\"cd rust/taskcast-cli && cargo test --test start_env_tests\",\"acceptanceCriteria\":[\"Uses existing EnvGuard and lock_env() pattern\",\"start_postgres_container helper added (testcontainers PostgresContainer)\",\"count_sqlx_migrations helper added\",\"Happy path: env vars + tokio::spawn(start::run) + sleep + assert _sqlx_migrations count == 2 + /health 200 + handle.abort()\",\"Idempotency: two boots in sequence both end with 2 rows in table\",\"Skip path: TASKCAST_AUTO_MIGRATE=1 with memory storage starts normally\",\"Fail-fast: bad URL → start::run returns Err containing 'Auto-migration failed:'\",\"All existing tests in start_env_tests.rs still pass\"]}\n```",
+      "blockedBy": [6]
+    },
+    {
+      "id": 9,
+      "subject": "Task 9: CI staleness check for generated migrations file",
+      "status": "pending",
+      "description": "**Goal:** Add a CI step that runs the generator and `git diff --exit-code` against the committed `packages/cli/src/generated/postgres-migrations.ts` to catch PRs that modify SQL without regenerating.\n\n**Files:**\n- Modify: `.github/workflows/ci.yml`\n\n**Verify:** `cd /Users/winrey/Projects/taskcast && node packages/cli/scripts/generate-migrations.mjs migrations/postgres packages/cli/src/generated/postgres-migrations.ts && git diff --exit-code packages/cli/src/generated/postgres-migrations.ts`\n\n```json:metadata\n{\"files\":[\".github/workflows/ci.yml\"],\"verifyCommand\":\"cd /Users/winrey/Projects/taskcast && node packages/cli/scripts/generate-migrations.mjs migrations/postgres packages/cli/src/generated/postgres-migrations.ts && git diff --exit-code packages/cli/src/generated/postgres-migrations.ts\",\"acceptanceCriteria\":[\"New CI step runs after pnpm install and before tests\",\"Step regenerates the file and runs git diff --exit-code\",\"Stale file fails CI with an actionable ::error:: message pointing at pnpm --filter @taskcast/cli build\",\"Existing CI jobs continue to pass on the current committed state\"]}\n```",
+      "blockedBy": [2, 4, 6]
+    },
+    {
+      "id": 10,
+      "subject": "Task 10: Documentation + changeset",
+      "status": "pending",
+      "description": "**Goal:** Document TASKCAST_AUTO_MIGRATE in deployment.md (EN+ZH) and packages/cli/README.md. Add a release changeset marking @taskcast/cli and @taskcast/postgres as minor.\n\n**Files:**\n- Modify: `docs/guide/deployment.md`\n- Modify: `docs/guide/deployment.zh.md`\n- Modify: `packages/cli/README.md`\n- Create: `.changeset/auto-migrate.md`\n\n**Verify:** `grep -A1 TASKCAST_AUTO_MIGRATE docs/guide/deployment.md docs/guide/deployment.zh.md packages/cli/README.md && cat .changeset/auto-migrate.md`\n\n```json:metadata\n{\"files\":[\"docs/guide/deployment.md\",\"docs/guide/deployment.zh.md\",\"packages/cli/README.md\",\".changeset/auto-migrate.md\"],\"verifyCommand\":\"grep -A1 TASKCAST_AUTO_MIGRATE docs/guide/deployment.md docs/guide/deployment.zh.md packages/cli/README.md && cat .changeset/auto-migrate.md\",\"acceptanceCriteria\":[\"deployment.md env var table includes TASKCAST_AUTO_MIGRATE row\",\"deployment.md has new 'Database migrations' section with manual + automatic modes and multi-replica warning\",\"deployment.zh.md mirrors EN changes in Chinese\",\"packages/cli/README.md env var table includes TASKCAST_AUTO_MIGRATE row\",\".changeset/auto-migrate.md marks @taskcast/cli and @taskcast/postgres as minor with descriptive summary\"]}\n```",
+      "blockedBy": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    }
+  ],
+  "lastUpdated": "2026-04-08T00:00:00Z"
+}
