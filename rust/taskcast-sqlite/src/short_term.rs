@@ -350,13 +350,12 @@ impl ShortTermStore for SqliteShortTermStore {
                 .data
                 .as_object()
                 .and_then(|po| po.get(field)?.as_str().map(|s| s.to_string()))
-                .and_then(|prev_val| {
+                .zip(
                     event
                         .data
                         .as_object()
-                        .and_then(|no| no.get(field)?.as_str().map(|s| s.to_string()))
-                        .map(|new_val| (prev_val, new_val))
-                });
+                        .and_then(|no| no.get(field)?.as_str().map(|s| s.to_string())),
+                );
 
             if let Some((prev_val, new_val)) = should_concat {
                 let mut new_data = event.data.as_object().cloned().unwrap_or_default();
