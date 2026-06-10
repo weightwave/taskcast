@@ -1,5 +1,19 @@
 # @taskcast/cli
 
+## 1.5.1
+
+### Patch Changes
+
+- c8d12f0: Pin the Rust Docker builder image to Debian bookworm so published Linux binaries run on the runtime image glibc.
+  - @taskcast/core@1.5.1
+  - @taskcast/server@1.5.1
+  - @taskcast/server-sdk@1.5.1
+  - @taskcast/redis@1.5.1
+  - @taskcast/postgres@1.5.1
+  - @taskcast/sqlite@1.5.1
+  - @taskcast/dashboard-web@0.3.9
+  - @taskcast/playground@0.3.9
+
 ## 1.5.0
 
 ### Minor Changes
