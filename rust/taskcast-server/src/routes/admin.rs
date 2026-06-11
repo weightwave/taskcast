@@ -63,7 +63,11 @@ pub async fn admin_token(
 
     // 1. If adminApi is not enabled, this endpoint does not exist
     if config.admin_api != Some(true) {
-        return (StatusCode::NOT_FOUND, axum::Json(json!({ "error": "Not found" }))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(json!({ "error": "Not found" })),
+        )
+            .into_response();
     }
 
     // 2. Parse and validate request body
@@ -123,7 +127,12 @@ pub async fn admin_token(
     let expires_at = now + expires_in;
 
     // 5. If auth mode is JWT, sign a real token
-    if let AuthMode::Jwt(jwt_config) = state.auth_mode.as_ref() {
+    let jwt_config = match state.auth_mode.as_ref() {
+        AuthMode::Jwt(jwt_config) => Some(jwt_config),
+        AuthMode::JwtWithTrustedServices { jwt, .. } => Some(jwt),
+        AuthMode::None => None,
+    };
+    if let Some(jwt_config) = jwt_config {
         if let Some(ref secret) = jwt_config.secret {
             let claims = AdminJwtClaims {
                 sub: "admin".to_string(),
@@ -138,11 +147,7 @@ pub async fn admin_token(
 
             match encode(&header, &claims, &key) {
                 Ok(token) => {
-                    return axum::Json(AdminTokenResponse {
-                        token,
-                        expires_at,
-                    })
-                    .into_response();
+                    return axum::Json(AdminTokenResponse { token, expires_at }).into_response();
                 }
                 Err(_) => {
                     return (

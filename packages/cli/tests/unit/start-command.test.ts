@@ -678,6 +678,56 @@ describe('runStart', () => {
     )
   })
 
+  it('passes jwt config and trusted services to createTaskcastApp', async () => {
+    const options: RunStartOptions = {
+      broadcast: {},
+      shortTermStore: {},
+      port: 3721,
+      config: {
+        auth: {
+          mode: 'jwt',
+          jwt: {
+            algorithm: 'HS256',
+            secret: 'test-secret-that-is-long-enough',
+          },
+        },
+        trustedServices: [
+          {
+            name: 'backend',
+            key: 'service-key-that-is-long-enough',
+            taskIds: '*',
+            scope: ['*'],
+          },
+        ],
+      },
+      verbose: false,
+      playground: false,
+    }
+
+    await runStart(options)
+
+    const { createTaskcastApp } = await import('@taskcast/server')
+    expect(createTaskcastApp).toHaveBeenCalledWith(
+      expect.objectContaining({
+        auth: {
+          mode: 'jwt',
+          jwt: {
+            algorithm: 'HS256',
+            secret: 'test-secret-that-is-long-enough',
+          },
+          trustedServices: [
+            {
+              name: 'backend',
+              key: 'service-key-that-is-long-enough',
+              taskIds: '*',
+              scope: ['*'],
+            },
+          ],
+        },
+      }),
+    )
+  })
+
   it('sets up long-term store when provided', async () => {
     const { TaskEngine } = await import('@taskcast/core')
 

@@ -6,7 +6,6 @@ use axum::middleware;
 use axum::response::IntoResponse;
 use axum::routing::{get, patch, post};
 use axum::{Extension, Router};
-use tower_http::cors::{Any, CorsLayer};
 use taskcast_core::config::TaskcastConfig;
 use taskcast_core::heartbeat_monitor::{HeartbeatMonitor, HeartbeatMonitorOptions};
 use taskcast_core::scheduler::{TaskScheduler, TaskSchedulerOptions};
@@ -16,6 +15,7 @@ use taskcast_core::{
     AssignMode, ConnectionMode, DisconnectPolicy, ShortTermStore, Task, TaskEngine, TaskStatus,
     WorkerStatus,
 };
+use tower_http::cors::{Any, CorsLayer};
 use utoipa::OpenApi;
 use utoipa_scalar::{Scalar, Servable};
 
@@ -149,8 +149,8 @@ pub fn create_app(
             }));
         }
 
-        let worker_routes = crate::routes::workers::workers_router()
-            .with_state(Arc::clone(&manager));
+        let worker_routes =
+            crate::routes::workers::workers_router().with_state(Arc::clone(&manager));
 
         // Mount WS route at top level for /workers/ws (with registry)
         authenticated_routes = authenticated_routes
@@ -202,13 +202,20 @@ pub fn create_app(
     // Apply CORS layer
     let app = match cors_config {
         CorsConfig::Disabled => app,
-        CorsConfig::AllowAll => app.layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any)),
+        CorsConfig::AllowAll => app.layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any),
+        ),
         CorsConfig::AllowOrigins(origins) => {
-            let origins: Vec<_> = origins
-                .iter()
-                .filter_map(|o| o.parse().ok())
-                .collect();
-            app.layer(CorsLayer::new().allow_origin(origins).allow_methods(Any).allow_headers(Any))
+            let origins: Vec<_> = origins.iter().filter_map(|o| o.parse().ok()).collect();
+            app.layer(
+                CorsLayer::new()
+                    .allow_origin(origins)
+                    .allow_methods(Any)
+                    .allow_headers(Any),
+            )
         }
     };
 
@@ -224,6 +231,7 @@ async fn health_detail(AxumState(state): AxumState<AppState>) -> impl IntoRespon
     let auth_mode_str = match state.auth_mode.as_ref() {
         AuthMode::None => "none",
         AuthMode::Jwt(_) => "jwt",
+        AuthMode::JwtWithTrustedServices { .. } => "jwt",
     };
 
     let mut adapters = serde_json::json!({
@@ -270,11 +278,7 @@ pub async fn auto_release_worker(wm: &WorkerManager, task_id: &str) {
 ///
 /// Uses `WorkerManager::dispatch_task` to find and assign a worker, then
 /// sends an `Offer` command via the `WsRegistry`.
-pub async fn dispatch_ws_offer(
-    wm: &WorkerManager,
-    registry: &WsRegistry,
-    task: &Task,
-) {
+pub async fn dispatch_ws_offer(wm: &WorkerManager, registry: &WsRegistry, task: &Task) {
     if let Ok(DispatchResult::Dispatched { worker_id }) = wm.dispatch_task(&task.id).await {
         let summary = task_to_summary(task);
         registry.send(
@@ -291,11 +295,7 @@ pub async fn dispatch_ws_offer(
 ///
 /// Sends an `Available` command to every connected WebSocket worker that is
 /// in `Idle` or `Busy` status (skips `Draining`/`Offline`).
-pub async fn dispatch_ws_race(
-    wm: &WorkerManager,
-    registry: &WsRegistry,
-    task: &Task,
-) {
+pub async fn dispatch_ws_race(wm: &WorkerManager, registry: &WsRegistry, task: &Task) {
     if let Ok(workers) = wm.list_workers(None).await {
         let summary = task_to_summary(task);
         for worker in workers {

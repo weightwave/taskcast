@@ -222,6 +222,75 @@ async fn run_jwt_auth_accepts_valid_token() {
     handle.abort();
 }
 
+#[tokio::test]
+async fn run_jwt_auth_accepts_trusted_service_key_from_config() {
+    let _env = EnvGuard::with_removed(
+        &[],
+        &[
+            "TASKCAST_AUTH_MODE",
+            "TASKCAST_JWT_SECRET",
+            "TASKCAST_JWT_ALGORITHM",
+            "TASKCAST_JWT_PUBLIC_KEY",
+            "TASKCAST_JWT_PUBLIC_KEY_FILE",
+            "TASKCAST_JWT_ISSUER",
+            "TASKCAST_JWT_AUDIENCE",
+        ],
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("taskcast.config.yaml");
+    std::fs::write(
+        &config_path,
+        r#"
+auth:
+  mode: jwt
+  jwt:
+    secret: config-secret-key-for-testing
+trustedServices:
+  - name: backend
+    key: service-key-that-is-long-enough
+    taskIds: "*"
+    scope: ["*"]
+"#,
+    )
+    .unwrap();
+
+    let port = find_available_port().await;
+    let config = config_path.to_string_lossy().into_owned();
+    let handle = tokio::spawn(async move {
+        let _ = taskcast_cli::commands::start::run(StartArgs {
+            port,
+            config: Some(config),
+            ..Default::default()
+        })
+        .await;
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let client = reqwest::Client::new();
+    let res = client
+        .get(&format!("http://127.0.0.1:{port}/tasks"))
+        .header("X-Taskcast-Service-Key", "service-key-that-is-long-enough")
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        res.status().is_success(),
+        "Expected 200, got {}",
+        res.status()
+    );
+
+    let res = client
+        .get(&format!("http://127.0.0.1:{port}/tasks"))
+        .header("X-Taskcast-Service-Key", "wrong-service-key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 401);
+
+    handle.abort();
+}
+
 // ─── JWT env var overrides config file secret ───────────────────────────────
 
 #[tokio::test]

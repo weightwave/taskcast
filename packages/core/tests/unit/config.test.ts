@@ -61,6 +61,28 @@ auth:
     expect(config.port).toBe(4000)
   })
 
+  it('parses trusted services with env interpolation', () => {
+    process.env['TASKCAST_SERVICE_KEY_BACKEND'] = 'backend-service-secret'
+    const yaml = `
+auth:
+  mode: jwt
+trustedServices:
+  - name: backend
+    key: \${TASKCAST_SERVICE_KEY_BACKEND}
+    taskIds: "*"
+    scope: ["*"]
+`
+    const config = parseConfig(yaml, 'yaml')
+    expect(config.trustedServices).toEqual([
+      {
+        name: 'backend',
+        key: 'backend-service-secret',
+        taskIds: '*',
+        scope: ['*'],
+      },
+    ])
+  })
+
   it('deletes port field when env var interpolates to non-numeric string', () => {
     process.env['BAD_PORT'] = 'notanumber'
     const yaml = 'port: ${BAD_PORT}'

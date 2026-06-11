@@ -1,3 +1,4 @@
+use crate::PermissionScope;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -18,6 +19,8 @@ pub struct TaskcastConfig {
     pub admin_api: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth: Option<AuthConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trusted_services: Option<Vec<TrustedServiceConfig>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub adapters: Option<AdaptersConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -100,6 +103,24 @@ pub struct JwtConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct TrustedServiceConfig {
+    pub name: String,
+    pub key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_ids: Option<TrustedServiceTaskIds>,
+    #[serde(default)]
+    pub scope: Vec<PermissionScope>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum TrustedServiceTaskIds {
+    Wildcard(String),
+    List(Vec<String>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AdaptersConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub broadcast: Option<AdapterEntry>,
@@ -134,7 +155,10 @@ pub struct SentryConfig {
     pub capture_storage_errors: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capture_broadcast_errors: Option<bool>,
-    #[serde(rename = "traceSSEConnections", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "traceSSEConnections",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub trace_sse_connections: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trace_event_publish: Option<bool>,
@@ -213,9 +237,11 @@ fn interpolate_value(value: serde_json::Value) -> serde_json::Value {
         serde_json::Value::Array(arr) => {
             serde_json::Value::Array(arr.into_iter().map(interpolate_value).collect())
         }
-        serde_json::Value::Object(map) => {
-            serde_json::Value::Object(map.into_iter().map(|(k, v)| (k, interpolate_value(v))).collect())
-        }
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.into_iter()
+                .map(|(k, v)| (k, interpolate_value(v)))
+                .collect(),
+        ),
         other => other,
     }
 }
@@ -405,9 +431,8 @@ mod tests {
     #[test]
     fn interpolate_mixed_present_and_missing() {
         env::set_var("TASKCAST_TEST_PRESENT", "found");
-        let result = interpolate_env_vars(
-            "${TASKCAST_TEST_PRESENT} and ${TASKCAST_NONEXISTENT_MISSING_99}",
-        );
+        let result =
+            interpolate_env_vars("${TASKCAST_TEST_PRESENT} and ${TASKCAST_NONEXISTENT_MISSING_99}");
         assert_eq!(result, "found and ${TASKCAST_NONEXISTENT_MISSING_99}");
         env::remove_var("TASKCAST_TEST_PRESENT");
     }
@@ -436,14 +461,7 @@ mod tests {
         let config = parse_config(json, ConfigFormat::Json).unwrap();
         assert_eq!(config.auth.as_ref().unwrap().mode, AuthMode::Jwt);
         assert_eq!(
-            config
-                .auth
-                .as_ref()
-                .unwrap()
-                .jwt
-                .as_ref()
-                .unwrap()
-                .secret,
+            config.auth.as_ref().unwrap().jwt.as_ref().unwrap().secret,
             Some("my-secret".to_string())
         );
         env::remove_var("TASKCAST_TEST_SECRET");
@@ -465,9 +483,15 @@ mod tests {
             adapters.broadcast.as_ref().unwrap().url,
             Some("redis://localhost:6379".to_string())
         );
-        assert_eq!(adapters.short_term_store.as_ref().unwrap().provider, "memory");
+        assert_eq!(
+            adapters.short_term_store.as_ref().unwrap().provider,
+            "memory"
+        );
         assert_eq!(adapters.short_term_store.as_ref().unwrap().url, None);
-        assert_eq!(adapters.long_term_store.as_ref().unwrap().provider, "postgres");
+        assert_eq!(
+            adapters.long_term_store.as_ref().unwrap().provider,
+            "postgres"
+        );
     }
 
     #[test]
@@ -561,9 +585,50 @@ auth:
         assert_eq!(auth.mode, AuthMode::Jwt);
         let jwt = auth.jwt.unwrap();
         assert_eq!(jwt.algorithm, Some("RS256".to_string()));
-        assert_eq!(jwt.public_key_file, Some("/etc/keys/public.pem".to_string()));
+        assert_eq!(
+            jwt.public_key_file,
+            Some("/etc/keys/public.pem".to_string())
+        );
         assert_eq!(jwt.issuer, Some("my-app".to_string()));
         assert_eq!(jwt.audience, Some("api".to_string()));
+    }
+
+    #[test]
+    fn parse_yaml_with_trusted_services() {
+        env::set_var("TASKCAST_TEST_SERVICE_KEY", "backend-service-secret");
+        let yaml = r#"
+trustedServices:
+  - name: backend
+    key: ${TASKCAST_TEST_SERVICE_KEY}
+    taskIds: "*"
+    scope: ["*"]
+  - name: worker
+    key: worker-service-secret
+    taskIds: ["task-1", "task-2"]
+    scope: ["event:publish"]
+"#;
+        let config = parse_config(yaml, ConfigFormat::Yaml).unwrap();
+        let trusted_services = config.trusted_services.unwrap();
+        assert_eq!(trusted_services.len(), 2);
+        assert_eq!(trusted_services[0].name, "backend");
+        assert_eq!(trusted_services[0].key, "backend-service-secret");
+        assert_eq!(
+            trusted_services[0].task_ids,
+            Some(TrustedServiceTaskIds::Wildcard("*".to_string()))
+        );
+        assert_eq!(trusted_services[0].scope, vec![PermissionScope::All]);
+        assert_eq!(
+            trusted_services[1].task_ids,
+            Some(TrustedServiceTaskIds::List(vec![
+                "task-1".to_string(),
+                "task-2".to_string(),
+            ]))
+        );
+        assert_eq!(
+            trusted_services[1].scope,
+            vec![PermissionScope::EventPublish]
+        );
+        env::remove_var("TASKCAST_TEST_SERVICE_KEY");
     }
 
     #[test]

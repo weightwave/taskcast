@@ -16,6 +16,10 @@ use taskcast_core::PermissionScope;
 pub enum AuthMode {
     None,
     Jwt(JwtConfig),
+    JwtWithTrustedServices {
+        jwt: JwtConfig,
+        trusted_services: Vec<TrustedServiceConfig>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -25,6 +29,14 @@ pub struct JwtConfig {
     pub public_key: Option<String>,
     pub issuer: Option<String>,
     pub audience: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TrustedServiceConfig {
+    pub name: String,
+    pub key: String,
+    pub task_ids: TaskIdAccess,
+    pub scope: Vec<PermissionScope>,
 }
 
 // ─── AuthContext ─────────────────────────────────────────────────────────────
@@ -38,7 +50,7 @@ pub struct AuthContext {
     pub scope: Vec<PermissionScope>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskIdAccess {
     All,
     List(Vec<String>),
@@ -103,6 +115,8 @@ pub fn check_scope(auth: &AuthContext, required: PermissionScope, task_id: Optio
 
 // ─── Auth Middleware ─────────────────────────────────────────────────────────
 
+const SERVICE_KEY_HEADER: &str = "X-Taskcast-Service-Key";
+
 pub async fn auth_middleware(
     State(auth_mode): State<Arc<AuthMode>>,
     mut req: Request<Body>,
@@ -113,36 +127,96 @@ pub async fn auth_middleware(
             req.extensions_mut().insert(AuthContext::open());
             next.run(req).await
         }
-        AuthMode::Jwt(config) => {
-            let auth_header = req
+        AuthMode::Jwt(config) => jwt_auth_response(config, req, next).await,
+        AuthMode::JwtWithTrustedServices {
+            jwt,
+            trusted_services,
+        } => {
+            let service_key = req
                 .headers()
-                .get("Authorization")
-                .and_then(|v| v.to_str().ok());
+                .get(SERVICE_KEY_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
 
-            let token = match auth_header {
-                Some(header) if header.starts_with("Bearer ") => &header[7..],
-                _ => {
-                    return (
-                        axum::http::StatusCode::UNAUTHORIZED,
-                        axum::Json(json!({ "error": "Missing Bearer token" })),
-                    )
-                        .into_response();
+            if let Some(service_key) = service_key {
+                match trusted_service_auth_context(trusted_services, &service_key) {
+                    Some(ctx) => {
+                        req.extensions_mut().insert(ctx);
+                        return next.run(req).await;
+                    }
+                    None => {
+                        return (
+                            axum::http::StatusCode::UNAUTHORIZED,
+                            axum::Json(json!({ "error": "Invalid service key" })),
+                        )
+                            .into_response();
+                    }
                 }
-            };
-
-            match decode_jwt(token, config) {
-                Ok(ctx) => {
-                    req.extensions_mut().insert(ctx);
-                    next.run(req).await
-                }
-                Err(_) => (
-                    axum::http::StatusCode::UNAUTHORIZED,
-                    axum::Json(json!({ "error": "Invalid or expired token" })),
-                )
-                    .into_response(),
             }
+
+            jwt_auth_response(jwt, req, next).await
         }
     }
+}
+
+async fn jwt_auth_response(config: &JwtConfig, mut req: Request<Body>, next: Next) -> Response {
+    let auth_header = req
+        .headers()
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok());
+
+    let token = match auth_header {
+        Some(header) if header.starts_with("Bearer ") => &header[7..],
+        _ => {
+            return (
+                axum::http::StatusCode::UNAUTHORIZED,
+                axum::Json(json!({ "error": "Missing Bearer token" })),
+            )
+                .into_response();
+        }
+    };
+
+    match decode_jwt(token, config) {
+        Ok(ctx) => {
+            req.extensions_mut().insert(ctx);
+            next.run(req).await
+        }
+        Err(_) => (
+            axum::http::StatusCode::UNAUTHORIZED,
+            axum::Json(json!({ "error": "Invalid or expired token" })),
+        )
+            .into_response(),
+    }
+}
+
+fn trusted_service_auth_context(
+    services: &[TrustedServiceConfig],
+    service_key: &str,
+) -> Option<AuthContext> {
+    services
+        .iter()
+        .find(|service| constant_time_eq(&service.key, service_key))
+        .map(|service| AuthContext {
+            sub: Some(format!("svc:{}", service.name)),
+            jti: None,
+            worker_id: None,
+            task_ids: service.task_ids.clone(),
+            scope: service.scope.clone(),
+        })
+}
+
+fn constant_time_eq(expected: &str, actual: &str) -> bool {
+    let expected = expected.as_bytes();
+    let actual = actual.as_bytes();
+    if expected.len() != actual.len() {
+        return false;
+    }
+
+    let mut diff = 0u8;
+    for (left, right) in expected.iter().zip(actual.iter()) {
+        diff |= *left ^ *right;
+    }
+    diff == 0
 }
 
 fn decode_jwt(token: &str, config: &JwtConfig) -> Result<AuthContext, jsonwebtoken::errors::Error> {
@@ -162,9 +236,7 @@ fn decode_jwt(token: &str, config: &JwtConfig) -> Result<AuthContext, jsonwebtok
         DecodingKey::from_secret(secret.as_bytes())
     } else if let Some(ref public_key) = config.public_key {
         match config.algorithm {
-            Algorithm::ES256 | Algorithm::ES384 => {
-                DecodingKey::from_ec_pem(public_key.as_bytes())?
-            }
+            Algorithm::ES256 | Algorithm::ES384 => DecodingKey::from_ec_pem(public_key.as_bytes())?,
             _ => DecodingKey::from_rsa_pem(public_key.as_bytes())?,
         }
     } else {
@@ -221,7 +293,10 @@ mod tests {
         JwtClaims {
             sub: Some("test-user".to_string()),
             task_ids: None,
-            scope: Some(vec![PermissionScope::TaskCreate, PermissionScope::EventPublish]),
+            scope: Some(vec![
+                PermissionScope::TaskCreate,
+                PermissionScope::EventPublish,
+            ]),
             iss: None,
             aud: None,
             exp: Some(exp),
@@ -303,8 +378,16 @@ mod tests {
             jti: None,
             worker_id: None,
         };
-        assert!(check_scope(&auth, PermissionScope::TaskCreate, Some("any-task-id")));
-        assert!(check_scope(&auth, PermissionScope::TaskCreate, Some("another-task")));
+        assert!(check_scope(
+            &auth,
+            PermissionScope::TaskCreate,
+            Some("any-task-id")
+        ));
+        assert!(check_scope(
+            &auth,
+            PermissionScope::TaskCreate,
+            Some("another-task")
+        ));
     }
 
     #[test]
@@ -316,8 +399,16 @@ mod tests {
             jti: None,
             worker_id: None,
         };
-        assert!(check_scope(&auth, PermissionScope::TaskCreate, Some("task-1")));
-        assert!(check_scope(&auth, PermissionScope::TaskCreate, Some("task-2")));
+        assert!(check_scope(
+            &auth,
+            PermissionScope::TaskCreate,
+            Some("task-1")
+        ));
+        assert!(check_scope(
+            &auth,
+            PermissionScope::TaskCreate,
+            Some("task-2")
+        ));
     }
 
     #[test]
@@ -329,7 +420,11 @@ mod tests {
             jti: None,
             worker_id: None,
         };
-        assert!(!check_scope(&auth, PermissionScope::TaskCreate, Some("task-999")));
+        assert!(!check_scope(
+            &auth,
+            PermissionScope::TaskCreate,
+            Some("task-999")
+        ));
     }
 
     #[test]
@@ -342,7 +437,11 @@ mod tests {
             jti: None,
             worker_id: None,
         };
-        assert!(!check_scope(&auth, PermissionScope::TaskCreate, Some("task-999")));
+        assert!(!check_scope(
+            &auth,
+            PermissionScope::TaskCreate,
+            Some("task-999")
+        ));
 
         // Right task_id, wrong scope
         let auth = AuthContext {
@@ -352,7 +451,11 @@ mod tests {
             jti: None,
             worker_id: None,
         };
-        assert!(!check_scope(&auth, PermissionScope::TaskCreate, Some("task-1")));
+        assert!(!check_scope(
+            &auth,
+            PermissionScope::TaskCreate,
+            Some("task-1")
+        ));
 
         // Both match
         let auth = AuthContext {
@@ -362,7 +465,11 @@ mod tests {
             jti: None,
             worker_id: None,
         };
-        assert!(check_scope(&auth, PermissionScope::TaskCreate, Some("task-1")));
+        assert!(check_scope(
+            &auth,
+            PermissionScope::TaskCreate,
+            Some("task-1")
+        ));
     }
 
     // ─── decode_jwt tests ───────────────────────────────────────────────────
@@ -531,6 +638,34 @@ mod tests {
         assert!(ctx.sub.is_none());
         assert!(matches!(ctx.task_ids, TaskIdAccess::All));
         assert_eq!(ctx.scope, vec![PermissionScope::All]);
+    }
+
+    // ─── Trusted service key tests ──────────────────────────────────────────
+
+    fn trusted_services() -> Vec<TrustedServiceConfig> {
+        vec![TrustedServiceConfig {
+            name: "backend".to_string(),
+            key: "service-key-that-is-long-enough".to_string(),
+            task_ids: TaskIdAccess::All,
+            scope: vec![PermissionScope::All],
+        }]
+    }
+
+    #[test]
+    fn trusted_service_auth_context_accepts_matching_key() {
+        let ctx =
+            trusted_service_auth_context(&trusted_services(), "service-key-that-is-long-enough")
+                .expect("service key should match");
+
+        assert_eq!(ctx.sub, Some("svc:backend".to_string()));
+        assert!(matches!(ctx.task_ids, TaskIdAccess::All));
+        assert_eq!(ctx.scope, vec![PermissionScope::All]);
+    }
+
+    #[test]
+    fn trusted_service_auth_context_rejects_wrong_key() {
+        let ctx = trusted_service_auth_context(&trusted_services(), "wrong-service-key");
+        assert!(ctx.is_none());
     }
 
     // ─── EC (ES256) key tests ────────────────────────────────────────────────

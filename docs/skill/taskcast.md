@@ -95,6 +95,14 @@ const app = createTaskcastApp({
   auth: {
     mode: 'jwt',
     jwt: { algorithm: 'HS256', secret: process.env.JWT_SECRET! },
+    trustedServices: [
+      {
+        name: 'backend',
+        key: process.env.TASKCAST_SERVICE_KEY_BACKEND!,
+        taskIds: '*',
+        scope: ['*'],
+      },
+    ],
   },
 })
 ```
@@ -253,6 +261,11 @@ auth:
   jwt:
     algorithm: HS256
     secret: ${JWT_SECRET}
+trustedServices:
+  - name: backend
+    key: ${TASKCAST_SERVICE_KEY_BACKEND}
+    taskIds: "*"
+    scope: ["*"]
 adapters:
   broadcast: { provider: redis, url: "${REDIS_URL}" }
   shortTerm: { provider: redis, url: "${REDIS_URL}" }
@@ -271,6 +284,7 @@ adapters:
 | `TASKCAST_JWT_PUBLIC_KEY_FILE` | Path to JWT public key PEM |
 | `TASKCAST_JWT_ISSUER` | JWT issuer |
 | `TASKCAST_JWT_AUDIENCE` | JWT audience |
+| `TASKCAST_SERVICE_KEY_*` | Service-to-Taskcast pre-shared keys referenced from `trustedServices` |
 | `TASKCAST_REDIS_URL` | Redis connection URL |
 | `TASKCAST_POSTGRES_URL` | PostgreSQL connection URL |
 
@@ -286,6 +300,8 @@ adapters:
 ```
 
 Scopes: `task:create`, `task:manage`, `event:publish`, `event:subscribe`, `event:history`, `webhook:create`, `*`
+
+Trusted services can call Taskcast with `X-Taskcast-Service-Key: <service-key>`. Matching services receive their configured `scope` and `taskIds`; requests without this header continue through normal Bearer JWT auth.
 
 ## Debugging
 

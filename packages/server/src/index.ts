@@ -1,6 +1,6 @@
 export { createAuthMiddleware, checkScope } from './auth.js'
 export { createVerboseLogger } from './middleware/verbose-logger.js'
-export type { AuthConfig, AuthContext, JWTConfig } from './auth.js'
+export type { AuthConfig, AuthContext, JWTConfig, TrustedServiceConfig } from './auth.js'
 export { createTasksRouter } from './routes/tasks.js'
 export { createSSERouter, createGlobalSSERoute, createSubscriberCounts, getSubscriberCount } from './routes/sse.js'
 export type { SubscriberCounts } from './routes/sse.js'
@@ -247,4 +247,3 @@ export function createTaskcastApp(opts: TaskcastServerOptions): TaskcastApp {
     },
   }
 }
-

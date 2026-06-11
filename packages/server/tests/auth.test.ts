@@ -25,6 +25,16 @@ describe('auth middleware - mode: none', () => {
     const res = await app.request('/test')
     expect(res.status).toBe(200)
   })
+
+  it('ignores service key header when no trusted services are configured', async () => {
+    const app = new Hono()
+    app.use('*', createAuthMiddleware({ mode: 'none' }))
+    app.get('/test', (c) => c.json({ ok: true }))
+    const res = await app.request('/test', {
+      headers: { 'X-Taskcast-Service-Key': 'unused-service-key' },
+    })
+    expect(res.status).toBe(200)
+  })
 })
 
 describe('auth middleware - mode: jwt HS256', () => {
@@ -96,6 +106,99 @@ describe('auth middleware - mode: jwt HS256', () => {
       headers: { Authorization: `Bearer ${token}` },
     })
     expect(res.status).toBe(401)
+  })
+})
+
+describe('auth middleware - trusted services', () => {
+  it('accepts a valid service key and sets service auth context', async () => {
+    const config: AuthConfig = {
+      mode: 'jwt',
+      jwt: { algorithm: 'HS256', secret: 'test-secret-that-is-long-enough' },
+      trustedServices: [
+        {
+          name: 'backend',
+          key: 'service-key-that-is-long-enough',
+          taskIds: '*',
+          scope: ['*'],
+        },
+      ],
+    }
+    const app = new Hono()
+    app.use('*', createAuthMiddleware(config))
+    app.get('/test', (c) => {
+      const auth = c.get('auth')
+      return c.json({ sub: auth.sub, taskIds: auth.taskIds, scope: auth.scope })
+    })
+
+    const res = await app.request('/test', {
+      headers: { 'X-Taskcast-Service-Key': 'service-key-that-is-long-enough' },
+    })
+
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.sub).toBe('svc:backend')
+    expect(body.taskIds).toBe('*')
+    expect(body.scope).toEqual(['*'])
+  })
+
+  it('rejects an invalid service key before falling through to jwt', async () => {
+    const config: AuthConfig = {
+      mode: 'jwt',
+      jwt: { algorithm: 'HS256', secret: 'test-secret-that-is-long-enough' },
+      trustedServices: [
+        {
+          name: 'backend',
+          key: 'service-key-that-is-long-enough',
+          taskIds: '*',
+          scope: ['*'],
+        },
+      ],
+    }
+    const app = new Hono()
+    app.use('*', createAuthMiddleware(config))
+    app.get('/test', (c) => c.json({ ok: true }))
+
+    const res = await app.request('/test', {
+      headers: { 'X-Taskcast-Service-Key': 'wrong-service-key' },
+    })
+
+    expect(res.status).toBe(401)
+    await expect(res.json()).resolves.toEqual({ error: 'Invalid service key' })
+  })
+
+  it('falls back to bearer jwt when no service key is provided', async () => {
+    const secret = new TextEncoder().encode('test-secret-that-is-long-enough')
+    const token = await makeJwt(secret, {
+      taskIds: ['task-1'],
+      scope: ['event:subscribe'],
+    })
+    const config: AuthConfig = {
+      mode: 'jwt',
+      jwt: { algorithm: 'HS256', secret: 'test-secret-that-is-long-enough' },
+      trustedServices: [
+        {
+          name: 'backend',
+          key: 'service-key-that-is-long-enough',
+          taskIds: '*',
+          scope: ['*'],
+        },
+      ],
+    }
+    const app = new Hono()
+    app.use('*', createAuthMiddleware(config))
+    app.get('/test', (c) => {
+      const auth = c.get('auth')
+      return c.json({ taskIds: auth.taskIds, scope: auth.scope })
+    })
+
+    const res = await app.request('/test', {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.taskIds).toEqual(['task-1'])
+    expect(body.scope).toEqual(['event:subscribe'])
   })
 })
 

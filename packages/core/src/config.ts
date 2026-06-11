@@ -1,5 +1,13 @@
 import { load as yamlLoad } from 'js-yaml'
 import { ulid } from 'ulidx'
+import type { PermissionScope } from './types.js'
+
+export interface TrustedServiceConfig {
+  name: string
+  key: string
+  taskIds?: string[] | '*'
+  scope: PermissionScope[]
+}
 
 export interface TaskcastConfig {
   port?: number
@@ -18,6 +26,7 @@ export interface TaskcastConfig {
       audience?: string
     }
   }
+  trustedServices?: TrustedServiceConfig[]
   adapters?: {
     broadcast?: { provider: string; url?: string }
     shortTermStore?: { provider: string; url?: string }

@@ -1,3 +1,5 @@
+import { Buffer } from 'buffer'
+import { timingSafeEqual } from 'crypto'
 import { createMiddleware } from 'hono/factory'
 import { jwtVerify, importSPKI, type KeyLike } from 'jose'
 import type { PermissionScope } from '@taskcast/core'
@@ -13,9 +15,17 @@ export interface JWTConfig {
 
 export type AuthMode = 'none' | 'jwt' | 'custom'
 
+export interface TrustedServiceConfig {
+  name: string
+  key: string
+  taskIds: string[] | '*'
+  scope: PermissionScope[]
+}
+
 export interface AuthConfig {
   mode: AuthMode
   jwt?: JWTConfig
+  trustedServices?: TrustedServiceConfig[]
   middleware?: (req: Request) => Promise<AuthContext | null>
 }
 
@@ -34,9 +44,18 @@ declare module 'hono' {
 }
 
 const OPEN_AUTH: AuthContext = { taskIds: '*', scope: ['*'] }
+const SERVICE_KEY_HEADER = 'X-Taskcast-Service-Key'
 
 export function createAuthMiddleware(config: AuthConfig) {
   return createMiddleware(async (c, next) => {
+    const serviceKey = c.req.header(SERVICE_KEY_HEADER)
+    if (serviceKey !== undefined && config.trustedServices?.length) {
+      const service = findTrustedService(config.trustedServices, serviceKey)
+      if (!service) return c.json({ error: 'Invalid service key' }, 401)
+      c.set('auth', trustedServiceAuthContext(service))
+      return next()
+    }
+
     if (config.mode === 'none') {
       c.set('auth', OPEN_AUTH)
       return next()
@@ -77,6 +96,28 @@ export function createAuthMiddleware(config: AuthConfig) {
 
     return c.json({ error: 'Unauthorized' }, 401)
   })
+}
+
+function findTrustedService(
+  services: TrustedServiceConfig[] | undefined,
+  serviceKey: string,
+): TrustedServiceConfig | undefined {
+  return services?.find((service) => safeEqual(service.key, serviceKey))
+}
+
+function trustedServiceAuthContext(service: TrustedServiceConfig): AuthContext {
+  return {
+    sub: `svc:${service.name}`,
+    taskIds: service.taskIds,
+    scope: service.scope,
+  }
+}
+
+function safeEqual(expected: string, actual: string): boolean {
+  const expectedBuffer = Buffer.from(expected)
+  const actualBuffer = Buffer.from(actual)
+  return expectedBuffer.length === actualBuffer.length
+    && timingSafeEqual(expectedBuffer, actualBuffer)
 }
 
 async function resolveKey(cfg: JWTConfig): Promise<KeyLike | Uint8Array> {

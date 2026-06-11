@@ -69,6 +69,34 @@ fn env_non_empty(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|value| !value.is_empty())
 }
 
+fn trusted_service_task_ids(
+    task_ids: Option<&taskcast_core::config::TrustedServiceTaskIds>,
+) -> taskcast_server::TaskIdAccess {
+    match task_ids {
+        Some(taskcast_core::config::TrustedServiceTaskIds::List(ids)) => {
+            taskcast_server::TaskIdAccess::List(ids.clone())
+        }
+        Some(taskcast_core::config::TrustedServiceTaskIds::Wildcard(_)) | None => {
+            taskcast_server::TaskIdAccess::All
+        }
+    }
+}
+
+fn trusted_services_from_config(
+    services: Option<&[taskcast_core::config::TrustedServiceConfig]>,
+) -> Vec<taskcast_server::TrustedServiceConfig> {
+    services
+        .unwrap_or_default()
+        .iter()
+        .map(|service| taskcast_server::TrustedServiceConfig {
+            name: service.name.clone(),
+            key: service.key.clone(),
+            task_ids: trusted_service_task_ids(service.task_ids.as_ref()),
+            scope: service.scope.clone(),
+        })
+        .collect()
+}
+
 pub async fn run(args: StartArgs) -> Result<(), Box<dyn std::error::Error>> {
     let StartArgs {
         config,
@@ -220,7 +248,7 @@ pub async fn run(args: StartArgs) -> Result<(), Box<dyn std::error::Error>> {
                 None
             };
 
-            taskcast_server::AuthMode::Jwt(taskcast_server::JwtConfig {
+            let jwt = taskcast_server::JwtConfig {
                 algorithm,
                 secret: env_non_empty("TASKCAST_JWT_SECRET").or_else(|| jwt_config?.secret.clone()),
                 public_key,
@@ -228,7 +256,18 @@ pub async fn run(args: StartArgs) -> Result<(), Box<dyn std::error::Error>> {
                     .or_else(|| jwt_config.and_then(|j| j.issuer.clone())),
                 audience: env_non_empty("TASKCAST_JWT_AUDIENCE")
                     .or_else(|| jwt_config.and_then(|j| j.audience.clone())),
-            })
+            };
+            let trusted_services =
+                trusted_services_from_config(file_config.trusted_services.as_deref());
+
+            if trusted_services.is_empty() {
+                taskcast_server::AuthMode::Jwt(jwt)
+            } else {
+                taskcast_server::AuthMode::JwtWithTrustedServices {
+                    jwt,
+                    trusted_services,
+                }
+            }
         }
         _ => taskcast_server::AuthMode::None,
     };

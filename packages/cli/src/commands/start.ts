@@ -14,6 +14,7 @@ import {
 } from '@taskcast/core'
 import type { BroadcastProvider, ShortTermStore, LongTermStore, TaskcastConfig } from '@taskcast/core'
 import { createTaskcastApp } from '@taskcast/server'
+import type { AuthConfig, JWTConfig } from '@taskcast/server'
 import { createRedisAdapters } from '@taskcast/redis'
 import { PostgresLongTermStore } from '@taskcast/postgres'
 import { createSqliteAdapters } from '@taskcast/sqlite'
@@ -38,6 +39,46 @@ function formatConnectionUrlForLog(url: string): string {
     // Parse failed. Only return the raw string if it clearly contains no creds.
     return url.includes('@') ? '<redacted>' : url
   }
+}
+
+function envNonEmpty(key: string): string | undefined {
+  const value = process.env[key]
+  return value === undefined || value === '' ? undefined : value
+}
+
+function buildAuthConfig(config: TaskcastConfig): AuthConfig {
+  const authMode = (envNonEmpty('TASKCAST_AUTH_MODE') ?? config.auth?.mode ?? 'none') as AuthConfig['mode']
+  const auth: AuthConfig = { mode: authMode }
+
+  if (authMode === 'jwt') {
+    const fileJwt = config.auth?.jwt
+    const jwt: JWTConfig = {
+      algorithm: (envNonEmpty('TASKCAST_JWT_ALGORITHM') ?? fileJwt?.algorithm ?? 'HS256') as JWTConfig['algorithm'],
+    }
+    const secret = envNonEmpty('TASKCAST_JWT_SECRET') ?? fileJwt?.secret
+    const publicKey = envNonEmpty('TASKCAST_JWT_PUBLIC_KEY') ?? fileJwt?.publicKey
+    const publicKeyFile = envNonEmpty('TASKCAST_JWT_PUBLIC_KEY_FILE') ?? fileJwt?.publicKeyFile
+    const issuer = envNonEmpty('TASKCAST_JWT_ISSUER') ?? fileJwt?.issuer
+    const audience = envNonEmpty('TASKCAST_JWT_AUDIENCE') ?? fileJwt?.audience
+
+    if (secret !== undefined) jwt.secret = secret
+    if (publicKey !== undefined) jwt.publicKey = publicKey
+    if (publicKeyFile !== undefined) jwt.publicKeyFile = publicKeyFile
+    if (issuer !== undefined) jwt.issuer = issuer
+    if (audience !== undefined) jwt.audience = audience
+    auth.jwt = jwt
+  }
+
+  if (config.trustedServices !== undefined) {
+    auth.trustedServices = config.trustedServices.map((service) => ({
+      name: service.name,
+      key: service.key,
+      taskIds: service.taskIds ?? '*',
+      scope: service.scope,
+    }))
+  }
+
+  return auth
 }
 
 /**
@@ -96,7 +137,7 @@ export async function runStart(options: RunStartOptions): Promise<void> {
   if (options.longTermStore !== undefined) engineOpts.longTermStore = options.longTermStore
   const engine = new TaskEngine(engineOpts)
 
-  const authMode = (process.env['TASKCAST_AUTH_MODE'] ?? options.config.auth?.mode ?? 'none') as 'none' | 'jwt'
+  const auth = buildAuthConfig(options.config)
 
   // Worker assignment system
   const workersEnabled = options.config.workers?.enabled ?? false
@@ -119,7 +160,7 @@ export async function runStart(options: RunStartOptions): Promise<void> {
   const serverOpts: Parameters<typeof createTaskcastApp>[0] = {
     engine,
     shortTermStore: options.shortTermStore,
-    auth: { mode: authMode },
+    auth,
     config: options.config,
     verbose: options.verbose,
   }

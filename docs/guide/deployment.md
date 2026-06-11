@@ -141,6 +141,15 @@ export default {
     },
   },
 
+  trustedServices: [
+    {
+      name: 'backend',
+      key: process.env.TASKCAST_SERVICE_KEY_BACKEND!,
+      taskIds: '*',
+      scope: ['*'],
+    },
+  ],
+
   adapters: {
     broadcast: { provider: 'redis', url: process.env.REDIS_URL },
     shortTerm: { provider: 'redis', url: process.env.REDIS_URL },
@@ -194,6 +203,12 @@ auth:
     algorithm: RS256
     publicKeyFile: /run/secrets/jwt.pub
 
+trustedServices:
+  - name: backend
+    key: ${TASKCAST_SERVICE_KEY_BACKEND}
+    taskIds: "*"
+    scope: ["*"]
+
 adapters:
   broadcast:
     provider: redis
@@ -241,6 +256,7 @@ All configuration options can be overridden via environment variables:
 | `TASKCAST_JWT_PUBLIC_KEY_FILE` | Path to JWT public key file (RS256/ES*) | — |
 | `TASKCAST_JWT_ISSUER` | JWT issuer | — |
 | `TASKCAST_JWT_AUDIENCE` | JWT audience | — |
+| `TASKCAST_SERVICE_KEY_*` | Service-to-Taskcast pre-shared keys referenced from `trustedServices` | — |
 | `TASKCAST_REDIS_URL` | Redis connection URL | — |
 | `TASKCAST_POSTGRES_URL` | PostgreSQL connection URL | — |
 | `SENTRY_DSN` | Sentry DSN | — |
@@ -254,6 +270,7 @@ All configuration options can be overridden via environment variables:
 | Basic config (port, auth, adapters) | Yes | Yes |
 | Environment variable interpolation `${VAR}` | Yes | Yes |
 | File path references | Yes | Yes |
+| Trusted service keys (`trustedServices`) | Yes | Yes |
 | Custom auth middleware | Yes | No |
 | Custom adapter instances | Yes | No — built-in providers only |
 | Sentry custom hooks | Yes | No |
@@ -282,6 +299,34 @@ adapters:
 ```
 
 This configuration uses Redis for broadcast and short-term storage (Redis is required for multi-instance deployments), JWT authentication, and no long-term storage.
+
+### Trusted Service Keys
+
+For public deployments, use JWTs for user-facing clients and pre-shared service keys for server-to-server calls. A trusted service sends:
+
+```http
+X-Taskcast-Service-Key: <service-key>
+```
+
+If the key matches a configured service, Taskcast grants the configured `scope` and `taskIds` directly. If the header is absent, normal JWT Bearer authentication still applies.
+
+```yaml
+auth:
+  mode: jwt
+  jwt:
+    algorithm: RS256
+    publicKey: ${TASKCAST_JWT_PUBLIC_KEY}
+    issuer: your-auth-service
+    audience: taskcast
+
+trustedServices:
+  - name: backend
+    key: ${TASKCAST_SERVICE_KEY_BACKEND}
+    taskIds: "*"
+    scope: ["*"]
+```
+
+Rotate service keys like other shared secrets. Do not expose them to browsers or mobile apps.
 
 ### Full Production Configuration
 

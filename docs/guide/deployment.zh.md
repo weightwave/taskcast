@@ -141,6 +141,15 @@ export default {
     },
   },
 
+  trustedServices: [
+    {
+      name: 'backend',
+      key: process.env.TASKCAST_SERVICE_KEY_BACKEND!,
+      taskIds: '*',
+      scope: ['*'],
+    },
+  ],
+
   adapters: {
     broadcast: { provider: 'redis', url: process.env.REDIS_URL },
     shortTerm: { provider: 'redis', url: process.env.REDIS_URL },
@@ -194,6 +203,12 @@ auth:
     algorithm: RS256
     publicKeyFile: /run/secrets/jwt.pub
 
+trustedServices:
+  - name: backend
+    key: ${TASKCAST_SERVICE_KEY_BACKEND}
+    taskIds: "*"
+    scope: ["*"]
+
 adapters:
   broadcast:
     provider: redis
@@ -241,6 +256,7 @@ cleanup:
 | `TASKCAST_JWT_PUBLIC_KEY_FILE` | JWT 公钥文件路径（RS256/ES*） | — |
 | `TASKCAST_JWT_ISSUER` | JWT 签发者 | — |
 | `TASKCAST_JWT_AUDIENCE` | JWT 受众 | — |
+| `TASKCAST_SERVICE_KEY_*` | `trustedServices` 引用的服务到 Taskcast 预共享密钥 | — |
 | `TASKCAST_REDIS_URL` | Redis 连接 URL | — |
 | `TASKCAST_POSTGRES_URL` | PostgreSQL 连接 URL | — |
 | `SENTRY_DSN` | Sentry DSN | — |
@@ -254,6 +270,7 @@ cleanup:
 | 基础配置（端口、认证、适配器） | ✅ | ✅ |
 | 环境变量插值 `${VAR}` | ✅ | ✅ |
 | 文件路径引用 | ✅ | ✅ |
+| 可信服务密钥（`trustedServices`） | ✅ | ✅ |
 | 自定义 auth 中间件 | ✅ | ❌ |
 | 自定义适配器实例 | ✅ | ❌ 仅支持内置 provider |
 | Sentry 自定义 hooks | ✅ | ❌ |
@@ -282,6 +299,34 @@ adapters:
 ```
 
 这个配置使用 Redis 做广播和短期存储（多实例部署必须用 Redis），JWT 认证，不配置长期存储。
+
+### 可信服务密钥
+
+公开部署时，面向用户/前端的客户端继续使用 JWT；后端等可信服务与 Taskcast 之间使用预共享服务密钥。可信服务请求时发送：
+
+```http
+X-Taskcast-Service-Key: <service-key>
+```
+
+如果密钥命中配置的服务，Taskcast 会直接授予该服务配置的 `scope` 和 `taskIds`。如果没有这个 header，则继续走普通 Bearer JWT 认证。
+
+```yaml
+auth:
+  mode: jwt
+  jwt:
+    algorithm: RS256
+    publicKey: ${TASKCAST_JWT_PUBLIC_KEY}
+    issuer: your-auth-service
+    audience: taskcast
+
+trustedServices:
+  - name: backend
+    key: ${TASKCAST_SERVICE_KEY_BACKEND}
+    taskIds: "*"
+    scope: ["*"]
+```
+
+服务密钥应当按普通共享密钥轮换和保管，不要暴露给浏览器或移动端。
 
 ### 完整生产配置
 
