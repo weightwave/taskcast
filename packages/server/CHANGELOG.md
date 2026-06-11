@@ -1,5 +1,13 @@
 # @taskcast/server
 
+## 1.5.2
+
+### Patch Changes
+
+- 007eec4: Add trusted service pre-shared key authentication for server-to-server Taskcast calls.
+- Updated dependencies [007eec4]
+  - @taskcast/core@1.5.2
+
 ## 1.5.1
 
 ### Patch Changes
