@@ -1,5 +1,20 @@
 # @taskcast/cli
 
+## 1.5.2
+
+### Patch Changes
+
+- 007eec4: Add trusted service pre-shared key authentication for server-to-server Taskcast calls.
+- Updated dependencies [007eec4]
+  - @taskcast/core@1.5.2
+  - @taskcast/server@1.5.2
+  - @taskcast/dashboard-web@0.3.10
+  - @taskcast/playground@0.3.10
+  - @taskcast/postgres@1.5.2
+  - @taskcast/redis@1.5.2
+  - @taskcast/server-sdk@1.5.2
+  - @taskcast/sqlite@1.5.2
+
 ## 1.5.1
 
 ### Patch Changes
