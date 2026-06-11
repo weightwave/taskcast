@@ -670,3 +670,194 @@ describe('RedisShortTermStore - assignments', () => {
     expect(remaining[0]?.taskId).toBe('t2')
   })
 })
+
+// ─── Seq Ordering (Lua scripts) ──────────────────────────────────────────────
+
+describe('RedisShortTermStore - seq ordering', () => {
+  const TTL = 60
+
+  describe('processSeq', () => {
+    it('accepts first seq and initialises expected to seq+1', async () => {
+      const result = await store.processSeq('t1', 'c1', 0, TTL)
+      expect(result).toEqual({ action: 'accept' })
+      expect(await store.getExpectedSeq('t1', 'c1')).toBe(1)
+    })
+
+    it('accepts consecutive seq values', async () => {
+      await store.processSeq('t1', 'c1', 0, TTL)
+      const r1 = await store.processSeq('t1', 'c1', 1, TTL)
+      expect(r1).toEqual({ action: 'accept' })
+      expect(await store.getExpectedSeq('t1', 'c1')).toBe(2)
+    })
+
+    it('rejects stale seq (below expected)', async () => {
+      await store.processSeq('t1', 'c1', 0, TTL)
+      await store.processSeq('t1', 'c1', 1, TTL)
+      const result = await store.processSeq('t1', 'c1', 0, TTL)
+      expect(result).toEqual({ action: 'reject_stale', expected: 2 })
+    })
+
+    it('returns wait for future seq (gap)', async () => {
+      await store.processSeq('t1', 'c1', 0, TTL)
+      const result = await store.processSeq('t1', 'c1', 5, TTL)
+      expect(result).toEqual({ action: 'wait' })
+    })
+
+    it('rejects duplicate for already-waiting seq', async () => {
+      await store.processSeq('t1', 'c1', 0, TTL)
+      await store.processSeq('t1', 'c1', 5, TTL) // registers slot
+      const result = await store.processSeq('t1', 'c1', 5, TTL)
+      expect(result).toEqual({ action: 'reject_duplicate' })
+    })
+
+    it('rejects duplicate for seq == expected when slot exists', async () => {
+      // This tests the edge case: seq was registered as a slot, then
+      // expected advanced to match it, but the slot wasn't removed yet.
+      await store.processSeq('t1', 'c1', 0, TTL)
+      await store.processSeq('t1', 'c1', 2, TTL) // register slot for 2
+      await store.processSeq('t1', 'c1', 1, TTL) // accept 1, expected → 2
+      // Now expected == 2 and slot 2 exists → duplicate
+      // But actually advanceAfterEmit should be called between — let's test the raw Lua
+      // After processSeq(1): expected = 2, slot 2 still exists
+      // processSeq(2) again should see SISMEMBER=1 → reject_duplicate
+      const result = await store.processSeq('t1', 'c1', 2, TTL)
+      expect(result).toEqual({ action: 'reject_duplicate' })
+    })
+
+    it('returns accept with triggerNext when next slot is registered', async () => {
+      await store.processSeq('t1', 'c1', 0, TTL)
+      await store.processSeq('t1', 'c1', 2, TTL) // register slot for 2
+      // Now accept 1 — expected moves to 2, and slot 2 exists → triggerNext: 2
+      const result = await store.processSeq('t1', 'c1', 1, TTL)
+      expect(result).toEqual({ action: 'accept', triggerNext: 2 })
+    })
+
+    it('isolates seq state between different clientIds', async () => {
+      await store.processSeq('t1', 'c1', 0, TTL)
+      await store.processSeq('t1', 'c2', 0, TTL)
+
+      expect(await store.getExpectedSeq('t1', 'c1')).toBe(1)
+      expect(await store.getExpectedSeq('t1', 'c2')).toBe(1)
+
+      await store.processSeq('t1', 'c1', 1, TTL)
+      expect(await store.getExpectedSeq('t1', 'c1')).toBe(2)
+      expect(await store.getExpectedSeq('t1', 'c2')).toBe(1) // unchanged
+    })
+
+    it('isolates seq state between different taskIds', async () => {
+      await store.processSeq('t1', 'c1', 0, TTL)
+      await store.processSeq('t2', 'c1', 0, TTL)
+
+      await store.processSeq('t1', 'c1', 1, TTL)
+      expect(await store.getExpectedSeq('t1', 'c1')).toBe(2)
+      expect(await store.getExpectedSeq('t2', 'c1')).toBe(1)
+    })
+  })
+
+  describe('advanceAfterEmit', () => {
+    it('advances expected when completedSeq matches', async () => {
+      await store.processSeq('t1', 'c1', 0, TTL)
+      // After processSeq(0), expected is 1. But advanceAfterEmit(0) checks if expected == 0.
+      // Since expected is already 1, it won't advance again. This is correct —
+      // processSeq already advanced it.
+      const result = await store.advanceAfterEmit('t1', 'c1', 0, TTL)
+      expect(result).toEqual({})
+    })
+
+    it('returns triggerNext when next slot is registered', async () => {
+      await store.processSeq('t1', 'c1', 0, TTL)
+      await store.processSeq('t1', 'c1', 3, TTL) // register slot 3
+      await store.processSeq('t1', 'c1', 2, TTL) // register slot 2
+      // Accept 1: expected → 2, triggerNext → 2
+      const r = await store.processSeq('t1', 'c1', 1, TTL)
+      expect(r).toEqual({ action: 'accept', triggerNext: 2 })
+
+      // After emitting seq 2: advance expected to 3, check slot 3
+      const advance = await store.advanceAfterEmit('t1', 'c1', 2, TTL)
+      expect(advance).toEqual({ triggerNext: 3 })
+      expect(await store.getExpectedSeq('t1', 'c1')).toBe(3)
+    })
+
+    it('returns empty when no next slot', async () => {
+      await store.processSeq('t1', 'c1', 0, TTL)
+      await store.processSeq('t1', 'c1', 1, TTL)
+      const result = await store.advanceAfterEmit('t1', 'c1', 1, TTL)
+      expect(result).toEqual({})
+    })
+  })
+
+  describe('cancelSlot', () => {
+    it('returns cancelled when slot exists', async () => {
+      await store.processSeq('t1', 'c1', 0, TTL)
+      await store.processSeq('t1', 'c1', 5, TTL) // register slot 5
+      const result = await store.cancelSlot('t1', 'c1', 5)
+      expect(result).toBe('cancelled')
+    })
+
+    it('returns already_triggered when slot does not exist', async () => {
+      await store.processSeq('t1', 'c1', 0, TTL)
+      const result = await store.cancelSlot('t1', 'c1', 99)
+      expect(result).toBe('already_triggered')
+    })
+  })
+
+  describe('getExpectedSeq', () => {
+    it('returns null when no seq state exists', async () => {
+      expect(await store.getExpectedSeq('t1', 'unknown')).toBeNull()
+    })
+
+    it('returns expected seq after initialization', async () => {
+      await store.processSeq('t1', 'c1', 5, TTL)
+      expect(await store.getExpectedSeq('t1', 'c1')).toBe(6)
+    })
+  })
+
+  describe('cleanupSeq', () => {
+    it('cleans up seq state for a specific clientId', async () => {
+      await store.processSeq('t1', 'c1', 0, TTL)
+      await store.processSeq('t1', 'c2', 0, TTL)
+
+      await store.cleanupSeq('t1', 'c1')
+
+      expect(await store.getExpectedSeq('t1', 'c1')).toBeNull()
+      expect(await store.getExpectedSeq('t1', 'c2')).toBe(1) // preserved
+    })
+
+    it('cleans up all seq state for a task (no clientId)', async () => {
+      await store.processSeq('t1', 'c1', 0, TTL)
+      await store.processSeq('t1', 'c2', 0, TTL)
+      await store.processSeq('t1', 'c3', 0, TTL)
+
+      await store.cleanupSeq('t1')
+
+      expect(await store.getExpectedSeq('t1', 'c1')).toBeNull()
+      expect(await store.getExpectedSeq('t1', 'c2')).toBeNull()
+      expect(await store.getExpectedSeq('t1', 'c3')).toBeNull()
+    })
+
+    it('does not affect other tasks during cleanup', async () => {
+      await store.processSeq('t1', 'c1', 0, TTL)
+      await store.processSeq('t2', 'c1', 0, TTL)
+
+      await store.cleanupSeq('t1')
+
+      expect(await store.getExpectedSeq('t1', 'c1')).toBeNull()
+      expect(await store.getExpectedSeq('t2', 'c1')).toBe(1)
+    })
+  })
+
+  describe('TTL behavior', () => {
+    it('sets TTL on seq keys', async () => {
+      await store.processSeq('t1', 'c1', 0, 2) // 2 second TTL
+
+      // Keys should exist
+      expect(await store.getExpectedSeq('t1', 'c1')).toBe(1)
+
+      // Wait for TTL to expire
+      await new Promise((r) => setTimeout(r, 2500))
+
+      // Keys should be gone
+      expect(await store.getExpectedSeq('t1', 'c1')).toBeNull()
+    }, 10_000)
+  })
+})

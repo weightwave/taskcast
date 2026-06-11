@@ -13,6 +13,10 @@
 | 4 | `@taskcast/server-sdk` + `client` + `react` + `cli` + 配置加载 | [04-sdks-cli](./2026-02-28-taskcast-04-sdks-cli.md) |
 | 5 | `@taskcast/sentry` + 集成测试 + 并发测试 | [05-sentry-tests](./2026-02-28-taskcast-05-sentry-tests.md) |
 
+| Feature | 内容 | 文档 |
+|---|---|---|
+| clientSeq | 客户端序号排序（写入时排序） | [client-seq-ordering](./2026-03-20-client-seq-ordering.md) |
+
 ## Overview
 
 Taskcast 是一个统一的长周期任务追踪与管理服务，专为 LLM 流式输出、流式 Agent 等场景设计。解决单页面 SSE 刷新丢失、多客户端无法订阅同一任务等问题。
@@ -117,6 +121,10 @@ interface TaskEvent {
   // 流式序列（可选）
   seriesId?: string
   seriesMode?: 'keep-all' | 'accumulate' | 'latest'
+
+  // 客户端序号（可选，用于写入时排序）
+  clientId?: string    // 发送方标识
+  clientSeq?: number   // 单调递增客户端序号
 }
 ```
 
@@ -136,6 +144,8 @@ interface SSEEnvelope {
   data: unknown
   seriesId?: string
   seriesMode?: string
+  clientId?: string        // 生产者客户端 ID（仅当发布方启用了 client seq 排序时出现）
+  clientSeq?: number       // 生产者序列号（仅当发布方启用了 client seq 排序时出现）
 }
 ```
 
@@ -175,6 +185,13 @@ interface ShortTermStore {
   appendEvent(taskId: string, event: TaskEvent): Promise<void>
   getEvents(taskId: string, opts: EventQueryOptions): Promise<TaskEvent[]>
   setTTL(taskId: string, ttl: number): Promise<void>
+
+  // 客户端序号排序（写入时排序）
+  processSeq(taskId: string, clientId: string, seq: number, ttl: number): Promise<ProcessSeqResult>
+  advanceAfterEmit(taskId: string, clientId: string, completedSeq: number, ttl: number): Promise<{ triggerNext?: number }>
+  cancelSlot(taskId: string, clientId: string, seq: number): Promise<'cancelled' | 'already_triggered'>
+  getExpectedSeq(taskId: string, clientId: string): Promise<number | null>
+  cleanupSeq(taskId: string, clientId?: string): Promise<void>
 }
 
 // 长期层：永久归档（可选）
@@ -190,10 +207,12 @@ interface LongTermStore {
 
 ```
 发消息
+  → 客户端序号排序（若有 clientId/clientSeq：processSeq → accept/wait/reject）
   → 序列合并处理（seriesMode）
   → 短期层 appendEvent（同步，保证有序）
   → 广播层 publish（同步，实时推送）
   → 长期层 saveEvent（异步，不阻塞主流程）
+  → advanceAfterEmit → 触发下一个等待中的序号
 ```
 
 ### 序列消息（seriesId）合并规则
@@ -242,6 +261,7 @@ DELETE /tasks/:taskId                 删除任务
 POST   /tasks/:taskId/events          发布消息（单条或批量）
 GET    /tasks/:taskId/events          SSE 订阅
 GET    /tasks/:taskId/events/history  查询历史消息（REST）
+GET    /tasks/:taskId/seq/:clientId   查询客户端序号状态
 ```
 
 ### SSE 订阅参数
@@ -291,10 +311,30 @@ POST /tasks/:taskId/events
 { type: "llm.delta", level: "info", data: { delta: "hello" },
   seriesId: "msg-1", seriesMode: "accumulate" }
 
+// 带客户端序号（保证写入顺序）
+POST /tasks/:taskId/events
+{ type: "llm.delta", level: "info", data: { delta: "hello" },
+  clientId: "worker-1", clientSeq: 0, seqMode: "hold" }
+
 // 批量
 POST /tasks/:taskId/events
 [{ type: "tool.call", ... }, { type: "tool.result", ... }]
 ```
+
+### 客户端序号排序（clientSeq）
+
+发布事件时可选附加 `clientId` + `clientSeq`，服务器保证同一 `(taskId, clientId)` 的事件按 `clientSeq` 顺序写入。
+
+- 乱序请求会被 hold（默认最多 30 秒），等待缺失的序号补齐后按序写入
+- 可通过 `seqMode: "fast-fail"` 改为立即拒绝乱序请求
+- 不同 `clientId` 之间互不影响
+- 不传 `clientId`/`clientSeq` 则完全跳过排序（向后兼容）
+
+**错误码：**
+- `409 seq_stale` — 序号已被消费
+- `409 seq_duplicate` — 重复序号
+- `409 seq_gap`（fast-fail 模式）— 序号存在间隙
+- `408 seq_timeout` — hold 超时
 
 ### Webhook 回调
 

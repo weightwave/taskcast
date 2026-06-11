@@ -12,7 +12,7 @@ import {
   TaskEventSchema,
   ErrorSchema,
 } from '../schemas.js'
-import { TaskConflictError, InvalidTransitionError, collapseAccumulateSeries } from '@taskcast/core'
+import { TaskConflictError, InvalidTransitionError, SeqStaleError, SeqDuplicateError, SeqGapError, SeqTimeoutError, collapseAccumulateSeries } from '@taskcast/core'
 import type { TaskEngine, CreateTaskInput, PublishEventInput, SinceCursor, TaskError, BlockedRequest, TaskFilter, TaskStatus, EventQueryOptions } from '@taskcast/core'
 
 // ─── Route Definitions ─────────────────────────────────────────────────────
@@ -275,9 +275,24 @@ export function createTasksRouter(engine: TaskEngine, subscriberCounts: Subscrib
         if (d.seriesId !== undefined) eventInput.seriesId = d.seriesId
         if (d.seriesMode !== undefined) eventInput.seriesMode = d.seriesMode
         if (d.seriesAccField !== undefined) eventInput.seriesAccField = d.seriesAccField
+        if (d.clientId !== undefined) eventInput.clientId = d.clientId
+        if (d.clientSeq !== undefined) eventInput.clientSeq = d.clientSeq
+        if (d.seqMode !== undefined) eventInput.seqMode = d.seqMode
         const event = await engine.publishEvent(taskId, eventInput)
         events.push(event)
       } catch (err) {
+        if (err instanceof SeqStaleError) {
+          return c.json({ error: 'seq_stale', expectedSeq: err.expectedSeq, receivedSeq: err.receivedSeq }, 409)
+        }
+        if (err instanceof SeqDuplicateError) {
+          return c.json({ error: 'seq_duplicate', seq: err.seq }, 409)
+        }
+        if (err instanceof SeqGapError) {
+          return c.json({ error: 'seq_gap', expectedSeq: err.expectedSeq, receivedSeq: err.receivedSeq }, 409)
+        }
+        if (err instanceof SeqTimeoutError) {
+          return c.json({ error: 'seq_timeout', seq: err.seq, expectedSeq: err.expectedSeq }, 408)
+        }
         const msg = err instanceof Error ? err.message : String(err)
         if (msg.toLowerCase().includes('not found')) return c.json({ error: msg }, 404)
         return c.json({ error: msg }, 400)
@@ -326,6 +341,19 @@ export function createTasksRouter(engine: TaskEngine, subscriberCounts: Subscrib
     }
 
     return c.json(events)
+  })
+
+  // ─── GET /tasks/:taskId/seq/:clientId — Query expected seq ─────────────────
+  router.get('/:taskId/seq/:clientId', async (c: Context) => {
+    const taskId = c.req.param('taskId') as string
+    const clientId = c.req.param('clientId') as string
+    const auth = c.get('auth')
+    if (!checkScope(auth, 'event:publish', taskId)) return c.json({ error: 'Forbidden' }, 403)
+
+    const expectedSeq = await engine.getExpectedSeq(taskId, clientId)
+    if (expectedSeq === null) return c.json({ error: 'Client not initialized' }, 404)
+
+    return c.json({ clientId, expectedSeq })
   })
 
   // ─── POST /tasks/:taskId/resolve — Resolve a blocked task ─────────────────

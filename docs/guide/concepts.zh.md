@@ -44,6 +44,17 @@ pending → cancelled
 - **level** — 日志级别：`debug`、`info`、`warn`、`error`
 - **data** — 任意 JSON 数据
 - **index** — 在该任务内单调递增的序号
+- **clientId**（可选）— 发送方标识，用于序号排序
+- **clientSeq**（可选）— 客户端分配的单调递增序号
+
+### 客户端序号排序
+
+发布事件时附加 `clientId` 和 `clientSeq`，Taskcast 保证在同一 `(taskId, clientId)` 内按 `clientSeq` 顺序写入事件。这在客户端通过不可靠或并发的传输层发送事件时非常有用。
+
+- **hold 模式**（默认）— 乱序事件会被 hold 等待间隙填补（可配置超时，默认 30 秒）
+- **fast-fail 模式** — 乱序事件立即返回 `409 seq_gap` 错误
+
+不同 `clientId` 之间完全独立。两个字段都不传时完全跳过排序（向后兼容）。
 
 ### 内置事件
 

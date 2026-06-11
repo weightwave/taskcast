@@ -23,8 +23,9 @@ export function createSqliteAdapters(options: SqliteAdapterOptions = {}): {
   db.pragma('foreign_keys = ON')
 
   const __dirname = dirname(fileURLToPath(import.meta.url))
-  const migration = readFileSync(join(__dirname, '../migrations/001_initial.sql'), 'utf8')
-  db.exec(migration)
+  for (const file of ['001_initial.sql', '002_client_seq.sql']) {
+    db.exec(readFileSync(join(__dirname, '../migrations', file), 'utf8'))
+  }
 
   return {
     shortTermStore: new SqliteShortTermStore(db),

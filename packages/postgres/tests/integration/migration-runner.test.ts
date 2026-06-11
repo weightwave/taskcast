@@ -34,7 +34,7 @@ describe('migration runner integration', () => {
   it('applies all migrations on fresh database', async () => {
     const result = await runMigrations(sql, MIGRATIONS_DIR)
 
-    expect(result.applied).toEqual(['001_initial.sql', '002_workers.sql'])
+    expect(result.applied).toEqual(['001_initial.sql', '002_workers.sql', '003_client_seq.sql'])
     expect(result.skipped).toEqual([])
 
     // Verify tables were actually created
@@ -48,19 +48,28 @@ describe('migration runner integration', () => {
     expect(tableNames).toContain('taskcast_tasks')
     expect(tableNames).toContain('taskcast_events')
     expect(tableNames).toContain('taskcast_worker_events')
+
+    // Verify 003 actually added the client_id / client_seq columns
+    const columns = await sql`
+      SELECT column_name FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = 'taskcast_events'
+        AND column_name IN ('client_id', 'client_seq')
+      ORDER BY column_name
+    `
+    expect(columns.map((c) => c.column_name)).toEqual(['client_id', 'client_seq'])
   })
 
   it('skips already-applied on second run', async () => {
     const result = await runMigrations(sql, MIGRATIONS_DIR)
 
     expect(result.applied).toEqual([])
-    expect(result.skipped).toEqual(['001_initial.sql', '002_workers.sql'])
+    expect(result.skipped).toEqual(['001_initial.sql', '002_workers.sql', '003_client_seq.sql'])
   })
 
   it('writes _sqlx_migrations records with correct format', async () => {
     const rows = await sql`SELECT * FROM _sqlx_migrations ORDER BY version`
 
-    expect(rows).toHaveLength(2)
+    expect(rows).toHaveLength(3)
 
     // Verify migration 001
     const row1 = rows[0]!
@@ -83,6 +92,17 @@ describe('migration runner integration', () => {
     const file2Content = readFileSync(join(MIGRATIONS_DIR, '002_workers.sql'), 'utf8')
     const expectedChecksum2 = computeChecksum(file2Content)
     expect(Buffer.from(row2.checksum as Uint8Array).equals(expectedChecksum2)).toBe(true)
+
+    // Verify migration 003
+    const row3 = rows[2]!
+    expect(Number(row3.version)).toBe(3)
+    expect(row3.description).toBe('client seq')
+    expect(row3.success).toBe(true)
+    expect(Number(row3.execution_time)).toBeGreaterThanOrEqual(0)
+
+    const file3Content = readFileSync(join(MIGRATIONS_DIR, '003_client_seq.sql'), 'utf8')
+    const expectedChecksum3 = computeChecksum(file3Content)
+    expect(Buffer.from(row3.checksum as Uint8Array).equals(expectedChecksum3)).toBe(true)
   })
 
   it('rejects tampered checksum', async () => {

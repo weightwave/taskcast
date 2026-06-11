@@ -9,6 +9,7 @@ import type {
   Worker,
   WorkerFilter,
   WorkerAssignment,
+  ProcessSeqResult,
 } from '@taskcast/core'
 
 function makeKeys(prefix: string) {
@@ -365,5 +366,144 @@ export class RedisShortTermStore implements ShortTermStore {
   // Task query by status
   async listByStatus(statuses: TaskStatus[]): Promise<Task[]> {
     return this.listTasks({ status: statuses })
+  }
+
+  // ─── Seq Ordering (Lua scripts for atomicity) ──────────────────────────────
+
+  private seqKey(taskId: string, clientId: string) {
+    return {
+      expected: `${this.KEY.task(taskId)}:seq:${clientId}:expected`,
+      slots: `${this.KEY.task(taskId)}:seq:${clientId}:slots`,
+    }
+  }
+
+  async processSeq(taskId: string, clientId: string, seq: number, ttl: number): Promise<ProcessSeqResult> {
+    const keys = this.seqKey(taskId, clientId)
+    const result = await this.redis.eval(
+      `
+      local expectedKey = KEYS[1]
+      local slotsKey = KEYS[2]
+      local seq = tonumber(ARGV[1])
+      local ttl = tonumber(ARGV[2])
+
+      local expected = redis.call('GET', expectedKey)
+
+      if expected == false then
+        redis.call('SET', expectedKey, seq + 1)
+        redis.call('EXPIRE', expectedKey, ttl)
+        redis.call('EXPIRE', slotsKey, ttl)
+        return {'accept', ''}
+      end
+
+      expected = tonumber(expected)
+
+      if seq < expected then
+        return {'reject_stale', tostring(expected)}
+      end
+
+      if seq == expected then
+        if redis.call('SISMEMBER', slotsKey, seq) == 1 then
+          return {'reject_duplicate', ''}
+        end
+        redis.call('SET', expectedKey, seq + 1)
+        redis.call('EXPIRE', expectedKey, ttl)
+        redis.call('EXPIRE', slotsKey, ttl)
+        if redis.call('SISMEMBER', slotsKey, seq + 1) == 1 then
+          return {'accept', tostring(seq + 1)}
+        end
+        return {'accept', ''}
+      end
+
+      -- seq > expected
+      if redis.call('SISMEMBER', slotsKey, seq) == 1 then
+        return {'reject_duplicate', ''}
+      end
+      redis.call('SADD', slotsKey, seq)
+      redis.call('EXPIRE', expectedKey, ttl)
+      redis.call('EXPIRE', slotsKey, ttl)
+      return {'wait', ''}
+      `,
+      2,
+      keys.expected,
+      keys.slots,
+      seq,
+      ttl,
+    ) as [string, string]
+
+    const [action, extra] = result
+    if (action === 'accept') {
+      return extra ? { action: 'accept', triggerNext: parseInt(extra, 10) } : { action: 'accept' }
+    }
+    if (action === 'reject_stale') {
+      return { action: 'reject_stale', expected: parseInt(extra, 10) }
+    }
+    if (action === 'reject_duplicate') {
+      return { action: 'reject_duplicate' }
+    }
+    return { action: 'wait' }
+  }
+
+  async advanceAfterEmit(taskId: string, clientId: string, completedSeq: number, ttl: number): Promise<{ triggerNext?: number }> {
+    const keys = this.seqKey(taskId, clientId)
+    const result = await this.redis.eval(
+      `
+      local expectedKey = KEYS[1]
+      local slotsKey = KEYS[2]
+      local completedSeq = tonumber(ARGV[1])
+      local ttl = tonumber(ARGV[2])
+
+      local expected = tonumber(redis.call('GET', expectedKey) or '0')
+
+      if expected == completedSeq then
+        redis.call('SET', expectedKey, completedSeq + 1)
+      end
+
+      redis.call('EXPIRE', expectedKey, ttl)
+      redis.call('EXPIRE', slotsKey, ttl)
+
+      local next = completedSeq + 1
+      if redis.call('SISMEMBER', slotsKey, next) == 1 then
+        redis.call('SREM', slotsKey, next)
+        return tostring(next)
+      end
+      return ''
+      `,
+      2,
+      keys.expected,
+      keys.slots,
+      completedSeq,
+      ttl,
+    ) as string
+
+    return result ? { triggerNext: parseInt(result, 10) } : {}
+  }
+
+  async cancelSlot(taskId: string, clientId: string, seq: number): Promise<'cancelled' | 'already_triggered'> {
+    const keys = this.seqKey(taskId, clientId)
+    const removed = await this.redis.srem(keys.slots, seq)
+    return removed > 0 ? 'cancelled' : 'already_triggered'
+  }
+
+  async getExpectedSeq(taskId: string, clientId: string): Promise<number | null> {
+    const keys = this.seqKey(taskId, clientId)
+    const val = await this.redis.get(keys.expected)
+    return val !== null ? parseInt(val, 10) : null
+  }
+
+  async cleanupSeq(taskId: string, clientId?: string): Promise<void> {
+    if (clientId) {
+      const keys = this.seqKey(taskId, clientId)
+      await this.redis.del(keys.expected, keys.slots)
+    } else {
+      const pattern = `${this.KEY.task(taskId)}:seq:*`
+      let cursor = '0'
+      do {
+        const [nextCursor, keys] = await this.redis.scan(cursor, 'MATCH', pattern, 'COUNT', 100)
+        cursor = nextCursor
+        if (keys.length > 0) {
+          await this.redis.del(...keys)
+        }
+      } while (cursor !== '0')
+    }
   }
 }

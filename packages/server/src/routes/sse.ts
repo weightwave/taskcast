@@ -114,6 +114,8 @@ function toEnvelope(event: TaskEvent, filteredIndex: number): SSEEnvelope {
   if (event.seriesMode !== undefined) env.seriesMode = event.seriesMode
   if (event.seriesAccField !== undefined) env.seriesAccField = event.seriesAccField
   if (event.seriesSnapshot !== undefined) env.seriesSnapshot = event.seriesSnapshot
+  if (event.clientId !== undefined) env.clientId = event.clientId
+  if (event.clientSeq !== undefined) env.clientSeq = event.clientSeq
   return env
 }
 
@@ -310,6 +312,8 @@ export function createGlobalSSERoute(engine: TaskEngine): Hono {
           if (event.seriesId !== undefined) envelope.seriesId = event.seriesId
           if (event.seriesMode !== undefined) envelope.seriesMode = event.seriesMode
           if (event.seriesAccField !== undefined) envelope.seriesAccField = event.seriesAccField
+          if (event.clientId !== undefined) envelope.clientId = event.clientId
+          if (event.clientSeq !== undefined) envelope.clientSeq = event.clientSeq
 
           stream.writeSSE({
             event: 'taskcast.event',

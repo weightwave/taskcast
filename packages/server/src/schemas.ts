@@ -65,6 +65,8 @@ export const TaskEventSchema = z
     seriesId: z.string().optional(),
     seriesMode: SeriesModeSchema.optional(),
     seriesAccField: z.string().optional(),
+    clientId: z.string().optional(),
+    clientSeq: z.number().int().optional(),
   })
   .openapi('TaskEvent')
 
@@ -135,6 +137,8 @@ export const TransitionSchema = z
   })
   .openapi('TransitionInput')
 
+export const SeqModeSchema = z.enum(['hold', 'fast-fail'])
+
 export const PublishEventSchema = z
   .object({
     type: z.string(),
@@ -143,7 +147,14 @@ export const PublishEventSchema = z
     seriesId: z.string().optional(),
     seriesMode: SeriesModeSchema.optional(),
     seriesAccField: z.string().optional(),
+    clientId: z.string().optional(),
+    clientSeq: z.number().int().min(0).optional(),
+    seqMode: SeqModeSchema.optional(),
   })
+  .refine(
+    (d) => (d.clientId === undefined) === (d.clientSeq === undefined),
+    { message: 'clientId and clientSeq must both be present or both be absent' },
+  )
   .openapi('PublishEventInput')
 
 export const DeclineSchema = z

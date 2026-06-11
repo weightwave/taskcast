@@ -44,6 +44,17 @@ Events are immutable messages published to a task. Each event has:
 - **level** — Log level: `debug`, `info`, `warn`, or `error`
 - **data** — Arbitrary JSON payload
 - **index** — A monotonically increasing sequence number scoped to the task
+- **clientId** (optional) — Identifies the sender, used for sequence ordering
+- **clientSeq** (optional) — Client-assigned monotonically increasing sequence number
+
+### Client Sequence Ordering
+
+When publishing events with `clientId` and `clientSeq`, Taskcast guarantees that events are written in `clientSeq` order within each `(taskId, clientId)` pair. This is useful when a client sends events over an unreliable or concurrent transport where arrival order is not guaranteed.
+
+- **Hold mode** (default) — Out-of-order events are held until the gap is filled (configurable timeout, default 30s)
+- **Fast-fail mode** — Out-of-order events are immediately rejected with `409 seq_gap`
+
+Different `clientId` values are completely independent. Omitting both `clientId` and `clientSeq` bypasses ordering entirely (backward-compatible).
 
 ### Built-in Events
 

@@ -35,9 +35,56 @@ export class InvalidTransitionError extends Error {
   }
 }
 
+export class SeqStaleError extends Error {
+  public readonly receivedSeq: number
+  public readonly expectedSeq: number
+
+  constructor(receivedSeq: number, expectedSeq: number) {
+    super(`Stale clientSeq: received ${receivedSeq}, expected ${expectedSeq}`)
+    this.name = 'SeqStaleError'
+    this.receivedSeq = receivedSeq
+    this.expectedSeq = expectedSeq
+  }
+}
+
+export class SeqDuplicateError extends Error {
+  public readonly seq: number
+
+  constructor(seq: number) {
+    super(`Duplicate clientSeq: ${seq}`)
+    this.name = 'SeqDuplicateError'
+    this.seq = seq
+  }
+}
+
+export class SeqGapError extends Error {
+  public readonly receivedSeq: number
+  public readonly expectedSeq: number
+
+  constructor(expectedSeq: number, receivedSeq: number) {
+    super(`Seq gap: expected ${expectedSeq}, received ${receivedSeq}`)
+    this.name = 'SeqGapError'
+    this.receivedSeq = receivedSeq
+    this.expectedSeq = expectedSeq
+  }
+}
+
+export class SeqTimeoutError extends Error {
+  public readonly seq: number
+  public readonly expectedSeq: number
+
+  constructor(seq: number, expectedSeq: number) {
+    super(`Seq hold timeout: seq ${seq} waiting for ${expectedSeq}`)
+    this.name = 'SeqTimeoutError'
+    this.seq = seq
+    this.expectedSeq = expectedSeq
+  }
+}
+
 interface TaskEngineOptionsBase {
   broadcast: BroadcastProvider
   hooks?: TaskcastHooks
+  seqHoldTimeout?: number
 }
 
 interface TaskEngineOptionsCanonical extends TaskEngineOptionsBase {
@@ -53,6 +100,8 @@ interface TaskEngineOptionsLegacy extends TaskEngineOptionsBase {
 
 export type TaskEngineOptions = TaskEngineOptionsCanonical | TaskEngineOptionsLegacy
 
+export type SeqMode = 'hold' | 'fast-fail'
+
 export interface PublishEventInput {
   type: string
   level: TaskEvent['level']
@@ -60,6 +109,9 @@ export interface PublishEventInput {
   seriesId?: string
   seriesMode?: TaskEvent['seriesMode']
   seriesAccField?: string
+  clientId?: string
+  clientSeq?: number
+  seqMode?: SeqMode
 }
 
 export interface CreateTaskInput {
@@ -90,6 +142,9 @@ export class TaskEngine {
   /** Per-task promise chain to serialize `_emit` calls, preventing race
    *  conditions where concurrent publishes store events out of index order. */
   private _emitChains = new Map<string, Promise<void>>()
+  private seqHoldTimeout: number
+  /** Pending signal resolvers for seq hold: key = "taskId:clientId:seq" */
+  private seqWaiters = new Map<string, () => void>()
 
   constructor(opts: TaskEngineOptions) {
     if ('shortTerm' in opts && 'shortTermStore' in opts) {
@@ -106,6 +161,7 @@ export class TaskEngine {
         : undefined
     this.broadcast = opts.broadcast
     if (opts.hooks !== undefined) this.hooks = opts.hooks
+    this.seqHoldTimeout = opts.seqHoldTimeout ?? 30_000
   }
 
   async createTask(input: CreateTaskInput): Promise<Task> {
@@ -280,6 +336,7 @@ export class TaskEngine {
     // A reopened task will lazily recreate the entry on next emit.
     if (isTerminal(to)) {
       this._emitChains.delete(taskId)
+      this.shortTermStore.cleanupSeq(taskId).catch(() => { /* best-effort */ })
     }
 
     if (to === 'failed' && updated.error) {
@@ -305,7 +362,90 @@ export class TaskEngine {
       throw new Error(`Cannot publish to task in terminal status: ${task.status}`)
     }
 
-    return this._emit(taskId, input)
+    // No clientId/clientSeq → bypass seq ordering entirely
+    if (input.clientId === undefined || input.clientSeq === undefined) {
+      return this._emit(taskId, input)
+    }
+
+    const ttlSeconds = Math.ceil(this.seqHoldTimeout / 1000) * 2
+    const result = await this.shortTermStore.processSeq(taskId, input.clientId, input.clientSeq, ttlSeconds)
+
+    switch (result.action) {
+      case 'accept': {
+        const event = await this._emit(taskId, input)
+        if (result.triggerNext !== undefined) {
+          this.notifySeqSlot(taskId, input.clientId, result.triggerNext)
+        }
+        return event
+      }
+
+      case 'wait': {
+        if (input.seqMode === 'fast-fail') {
+          await this.shortTermStore.cancelSlot(taskId, input.clientId, input.clientSeq)
+          const expected = await this.shortTermStore.getExpectedSeq(taskId, input.clientId)
+          throw new SeqGapError(expected ?? 0, input.clientSeq)
+        }
+        const signal = await this.waitForSeqSignal(taskId, input.clientId, input.clientSeq, this.seqHoldTimeout)
+        if (signal === 'timeout') {
+          const cancel = await this.shortTermStore.cancelSlot(taskId, input.clientId, input.clientSeq)
+          if (cancel === 'already_triggered') {
+            // Race: timeout fired but signal arrived — proceed
+            const event = await this._emit(taskId, input)
+            const advance = await this.shortTermStore.advanceAfterEmit(taskId, input.clientId, input.clientSeq, ttlSeconds)
+            if (advance.triggerNext !== undefined) {
+              this.notifySeqSlot(taskId, input.clientId, advance.triggerNext)
+            }
+            return event
+          }
+          const expected = await this.shortTermStore.getExpectedSeq(taskId, input.clientId)
+          throw new SeqTimeoutError(input.clientSeq, expected ?? 0)
+        }
+        // Signal received — emit and cascade
+        const event = await this._emit(taskId, input)
+        const advance = await this.shortTermStore.advanceAfterEmit(taskId, input.clientId, input.clientSeq, ttlSeconds)
+        if (advance.triggerNext !== undefined) {
+          this.notifySeqSlot(taskId, input.clientId, advance.triggerNext)
+        }
+        return event
+      }
+
+      case 'reject_stale':
+        throw new SeqStaleError(input.clientSeq, result.expected)
+
+      case 'reject_duplicate':
+        throw new SeqDuplicateError(input.clientSeq)
+    }
+  }
+
+  async getExpectedSeq(taskId: string, clientId: string): Promise<number | null> {
+    return this.shortTermStore.getExpectedSeq(taskId, clientId)
+  }
+
+  private seqWaiterKey(taskId: string, clientId: string, seq: number): string {
+    return `${taskId}:${clientId}:${seq}`
+  }
+
+  private notifySeqSlot(taskId: string, clientId: string, seq: number): void {
+    const key = this.seqWaiterKey(taskId, clientId, seq)
+    const resolve = this.seqWaiters.get(key)
+    if (resolve) {
+      this.seqWaiters.delete(key)
+      resolve()
+    }
+  }
+
+  private waitForSeqSignal(taskId: string, clientId: string, seq: number, timeout: number): Promise<'signal' | 'timeout'> {
+    const key = this.seqWaiterKey(taskId, clientId, seq)
+    return new Promise<'signal' | 'timeout'>((resolve) => {
+      const timer = setTimeout(() => {
+        this.seqWaiters.delete(key)
+        resolve('timeout')
+      }, timeout)
+      this.seqWaiters.set(key, () => {
+        clearTimeout(timer)
+        resolve('signal')
+      })
+    })
   }
 
   async listTasks(filter: TaskFilter): Promise<Task[]> {
@@ -359,6 +499,8 @@ export class TaskEngine {
       ...(input.seriesId !== undefined && { seriesId: input.seriesId }),
       ...(input.seriesMode !== undefined && { seriesMode: input.seriesMode }),
       ...(input.seriesAccField !== undefined && { seriesAccField: input.seriesAccField }),
+      ...(input.clientId !== undefined && { clientId: input.clientId }),
+      ...(input.clientSeq !== undefined && { clientSeq: input.clientSeq }),
     }
 
     const { event, accumulatedEvent, stored } = await processSeries(raw, this.shortTermStore)

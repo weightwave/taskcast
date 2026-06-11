@@ -36,11 +36,9 @@ describe('SqliteShortTermStore', () => {
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), 'taskcast-sqlite-'))
     db = new Database(join(dir, 'test.db'))
-    const migration = readFileSync(
-      join(import.meta.dirname, '../migrations/001_initial.sql'),
-      'utf8',
-    )
-    db.exec(migration)
+    for (const file of ['001_initial.sql', '002_client_seq.sql']) {
+      db.exec(readFileSync(join(import.meta.dirname, '../migrations', file), 'utf8'))
+    }
     db.pragma('journal_mode = WAL')
     db.pragma('foreign_keys = ON')
     store = new SqliteShortTermStore(db)

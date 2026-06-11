@@ -9,6 +9,7 @@ import type {
   Worker,
   WorkerFilter,
   WorkerAssignment,
+  ProcessSeqResult,
 } from '@taskcast/core'
 import { rowToTask, rowToEvent, rowToWorker, rowToWorkerAssignment } from './row-mappers.js'
 
@@ -88,8 +89,8 @@ export class SqliteShortTermStore implements ShortTermStore {
   async appendEvent(taskId: string, event: TaskEvent): Promise<void> {
     this.db
       .prepare(
-        `INSERT INTO taskcast_events (id, task_id, idx, timestamp, type, level, data, series_id, series_mode, series_acc_field)
-         VALUES (@id, @task_id, @idx, @timestamp, @type, @level, @data, @series_id, @series_mode, @series_acc_field)`,
+        `INSERT INTO taskcast_events (id, task_id, idx, timestamp, type, level, data, series_id, series_mode, series_acc_field, client_id, client_seq)
+         VALUES (@id, @task_id, @idx, @timestamp, @type, @level, @data, @series_id, @series_mode, @series_acc_field, @client_id, @client_seq)`,
       )
       .run({
         id: event.id,
@@ -102,6 +103,8 @@ export class SqliteShortTermStore implements ShortTermStore {
         series_id: event.seriesId ?? null,
         series_mode: event.seriesMode ?? null,
         series_acc_field: event.seriesAccField ?? null,
+        client_id: event.clientId ?? null,
+        client_seq: event.clientSeq ?? null,
       })
   }
 
@@ -453,5 +456,93 @@ export class SqliteShortTermStore implements ShortTermStore {
       .all(...statuses) as Record<string, unknown>[]
 
     return rows.map(rowToTask)
+  }
+
+  // ─── Seq Ordering (in-memory — SQLite is single-instance) ─────────────────
+
+  private seqStates = new Map<string, { expected: number; slots: Set<number> }>()
+
+  private seqKey(taskId: string, clientId: string): string {
+    return `${taskId}:${clientId}`
+  }
+
+  async processSeq(taskId: string, clientId: string, seq: number, _ttl: number): Promise<ProcessSeqResult> {
+    const key = this.seqKey(taskId, clientId)
+    const state = this.seqStates.get(key)
+
+    if (!state) {
+      this.seqStates.set(key, { expected: seq + 1, slots: new Set() })
+      return { action: 'accept' }
+    }
+
+    if (seq < state.expected) {
+      return { action: 'reject_stale', expected: state.expected }
+    }
+
+    if (seq === state.expected) {
+      if (state.slots.has(seq)) {
+        return { action: 'reject_duplicate' }
+      }
+      state.expected = seq + 1
+      if (state.slots.has(state.expected)) {
+        return { action: 'accept', triggerNext: state.expected }
+      }
+      return { action: 'accept' }
+    }
+
+    // seq > expected
+    if (state.slots.has(seq)) {
+      return { action: 'reject_duplicate' }
+    }
+    state.slots.add(seq)
+    return { action: 'wait' }
+  }
+
+  async advanceAfterEmit(taskId: string, clientId: string, completedSeq: number, _ttl: number): Promise<{ triggerNext?: number }> {
+    const key = this.seqKey(taskId, clientId)
+    const state = this.seqStates.get(key)
+    if (!state) return {}
+
+    if (state.expected === completedSeq) {
+      state.expected = completedSeq + 1
+    }
+
+    const next = completedSeq + 1
+    if (state.slots.has(next)) {
+      state.slots.delete(next)
+      return { triggerNext: next }
+    }
+    return {}
+  }
+
+  async cancelSlot(taskId: string, clientId: string, seq: number): Promise<'cancelled' | 'already_triggered'> {
+    const key = this.seqKey(taskId, clientId)
+    const state = this.seqStates.get(key)
+    if (!state) return 'already_triggered'
+
+    if (state.slots.has(seq)) {
+      state.slots.delete(seq)
+      return 'cancelled'
+    }
+    return 'already_triggered'
+  }
+
+  async getExpectedSeq(taskId: string, clientId: string): Promise<number | null> {
+    const key = this.seqKey(taskId, clientId)
+    const state = this.seqStates.get(key)
+    return state?.expected ?? null
+  }
+
+  async cleanupSeq(taskId: string, clientId?: string): Promise<void> {
+    if (clientId) {
+      this.seqStates.delete(this.seqKey(taskId, clientId))
+    } else {
+      const prefix = `${taskId}:`
+      for (const key of this.seqStates.keys()) {
+        if (key.startsWith(prefix)) {
+          this.seqStates.delete(key)
+        }
+      }
+    }
   }
 }

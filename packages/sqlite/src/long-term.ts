@@ -65,8 +65,8 @@ export class SqliteLongTermStore implements LongTermStore {
   async saveEvent(event: TaskEvent): Promise<void> {
     this.db
       .prepare(
-        `INSERT INTO taskcast_events (id, task_id, idx, timestamp, type, level, data, series_id, series_mode, series_acc_field)
-         VALUES (@id, @task_id, @idx, @timestamp, @type, @level, @data, @series_id, @series_mode, @series_acc_field)
+        `INSERT INTO taskcast_events (id, task_id, idx, timestamp, type, level, data, series_id, series_mode, series_acc_field, client_id, client_seq)
+         VALUES (@id, @task_id, @idx, @timestamp, @type, @level, @data, @series_id, @series_mode, @series_acc_field, @client_id, @client_seq)
          ON CONFLICT (id) DO NOTHING`,
       )
       .run({
@@ -80,6 +80,8 @@ export class SqliteLongTermStore implements LongTermStore {
         series_id: event.seriesId ?? null,
         series_mode: event.seriesMode ?? null,
         series_acc_field: event.seriesAccField ?? null,
+        client_id: event.clientId ?? null,
+        client_seq: event.clientSeq ?? null,
       })
   }
 

@@ -114,10 +114,14 @@ interface SSEEnvelope {
   seriesId?: string
   seriesMode?: string
   seriesSnapshot?: boolean  // 为 true 时表示此事件是迟到加入的快照（非增量 delta）
+  clientId?: string      // 生产者客户端 ID（仅当发布方启用了 client seq 排序时出现）
+  clientSeq?: number     // 生产者序列号（仅当发布方启用了 client seq 排序时出现）
 }
 ```
 
 **`filteredIndex` 的作用：** 当使用过滤条件时，`rawIndex` 可能不连续（被过滤掉的事件跳过了），而 `filteredIndex` 始终从 0 开始连续递增。客户端用 `filteredIndex` 配合 `since.index` 实现断点续传。
+
+**`clientId`/`clientSeq` 的作用：** 这两个字段由发布端使用，用于 [写入时排序](./rest.zh.md#发布事件)。它们会透传到 SSE 流中，方便下游消费者在需要时将事件与生产客户端关联。它们**不影响**订阅行为 —— SSE 的过滤、断点续传与排序与这两个字段无关。
 
 ## 断点续传
 
