@@ -266,6 +266,11 @@ adapters:
 | `TASKCAST_PORT` | Server port (default: 3721) |
 | `TASKCAST_AUTH_MODE` | none / jwt / custom |
 | `TASKCAST_JWT_SECRET` | JWT HMAC secret |
+| `TASKCAST_JWT_ALGORITHM` | JWT algorithm (HS256/RS256/ES256/etc.) |
+| `TASKCAST_JWT_PUBLIC_KEY` | Inline JWT public key PEM |
+| `TASKCAST_JWT_PUBLIC_KEY_FILE` | Path to JWT public key PEM |
+| `TASKCAST_JWT_ISSUER` | JWT issuer |
+| `TASKCAST_JWT_AUDIENCE` | JWT audience |
 | `TASKCAST_REDIS_URL` | Redis connection URL |
 | `TASKCAST_POSTGRES_URL` | PostgreSQL connection URL |
 

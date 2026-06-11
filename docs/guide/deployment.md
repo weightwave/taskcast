@@ -237,6 +237,7 @@ All configuration options can be overridden via environment variables:
 | `TASKCAST_AUTH_MODE` | Auth mode: `none`, `jwt`, or `custom` | `none` |
 | `TASKCAST_JWT_SECRET` | JWT HMAC secret (HS256) | — |
 | `TASKCAST_JWT_ALGORITHM` | JWT algorithm | `HS256` |
+| `TASKCAST_JWT_PUBLIC_KEY` | Inline JWT public key PEM (RS256/ES*) | — |
 | `TASKCAST_JWT_PUBLIC_KEY_FILE` | Path to JWT public key file (RS256/ES*) | — |
 | `TASKCAST_JWT_ISSUER` | JWT issuer | — |
 | `TASKCAST_JWT_AUDIENCE` | JWT audience | — |

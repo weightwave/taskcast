@@ -237,6 +237,7 @@ cleanup:
 | `TASKCAST_AUTH_MODE` | 认证模式：`none`、`jwt`、`custom` | `none` |
 | `TASKCAST_JWT_SECRET` | JWT HMAC 密钥（HS256） | — |
 | `TASKCAST_JWT_ALGORITHM` | JWT 算法 | `HS256` |
+| `TASKCAST_JWT_PUBLIC_KEY` | 内联 JWT 公钥 PEM（RS256/ES*） | — |
 | `TASKCAST_JWT_PUBLIC_KEY_FILE` | JWT 公钥文件路径（RS256/ES*） | — |
 | `TASKCAST_JWT_ISSUER` | JWT 签发者 | — |
 | `TASKCAST_JWT_AUDIENCE` | JWT 受众 | — |

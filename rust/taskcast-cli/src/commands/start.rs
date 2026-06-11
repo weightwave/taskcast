@@ -3,7 +3,9 @@ use std::sync::Arc;
 use clap::Args;
 
 use crate::auto_migrate::run_auto_migrate;
-use crate::helpers::{auth_mode_to_string, parse_jwt_algorithm, resolve_port, resolve_storage_mode};
+use crate::helpers::{
+    auth_mode_to_string, parse_jwt_algorithm, resolve_port, resolve_storage_mode,
+};
 
 #[derive(Args, Debug)]
 pub struct StartArgs {
@@ -63,6 +65,10 @@ async fn create_postgres_pool_with_auto_migrate(
     Ok(pool)
 }
 
+fn env_non_empty(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|value| !value.is_empty())
+}
+
 pub async fn run(args: StartArgs) -> Result<(), Box<dyn std::error::Error>> {
     let StartArgs {
         config,
@@ -81,9 +87,15 @@ pub async fn run(args: StartArgs) -> Result<(), Box<dyn std::error::Error>> {
     let port = resolve_port(port, file_config.port);
 
     // 3. Resolve adapter URLs
-    let redis_url = std::env::var("TASKCAST_REDIS_URL")
-        .ok()
-        .or_else(|| file_config.adapters.as_ref()?.broadcast.as_ref()?.url.clone());
+    let redis_url = std::env::var("TASKCAST_REDIS_URL").ok().or_else(|| {
+        file_config
+            .adapters
+            .as_ref()?
+            .broadcast
+            .as_ref()?
+            .url
+            .clone()
+    });
     let postgres_url = std::env::var("TASKCAST_POSTGRES_URL").ok().or_else(|| {
         file_config
             .adapters
@@ -178,28 +190,44 @@ pub async fn run(args: StartArgs) -> Result<(), Box<dyn std::error::Error>> {
     ));
 
     // 7. Auth mode
-    let auth_mode_str = std::env::var("TASKCAST_AUTH_MODE")
-        .ok()
-        .or_else(|| file_config.auth.as_ref().map(|a| auth_mode_to_string(&a.mode)));
+    let auth_mode_str = std::env::var("TASKCAST_AUTH_MODE").ok().or_else(|| {
+        file_config
+            .auth
+            .as_ref()
+            .map(|a| auth_mode_to_string(&a.mode))
+    });
 
     let auth_mode = match auth_mode_str.as_deref() {
         Some("jwt") => {
-            let jwt_config = file_config
-                .auth
-                .as_ref()
-                .and_then(|a| a.jwt.as_ref());
+            let jwt_config = file_config.auth.as_ref().and_then(|a| a.jwt.as_ref());
 
-            let algorithm =
-                parse_jwt_algorithm(jwt_config.and_then(|j| j.algorithm.as_deref()));
+            let env_algorithm = env_non_empty("TASKCAST_JWT_ALGORITHM");
+            let algorithm = parse_jwt_algorithm(
+                env_algorithm
+                    .as_deref()
+                    .or_else(|| jwt_config.and_then(|j| j.algorithm.as_deref())),
+            );
+
+            let public_key = if let Some(key) = env_non_empty("TASKCAST_JWT_PUBLIC_KEY") {
+                Some(key)
+            } else if let Some(path) = env_non_empty("TASKCAST_JWT_PUBLIC_KEY_FILE") {
+                Some(std::fs::read_to_string(path)?)
+            } else if let Some(key) = jwt_config.and_then(|j| j.public_key.clone()) {
+                Some(key)
+            } else if let Some(path) = jwt_config.and_then(|j| j.public_key_file.clone()) {
+                Some(std::fs::read_to_string(path)?)
+            } else {
+                None
+            };
 
             taskcast_server::AuthMode::Jwt(taskcast_server::JwtConfig {
                 algorithm,
-                secret: std::env::var("TASKCAST_JWT_SECRET")
-                    .ok()
-                    .or_else(|| jwt_config?.secret.clone()),
-                public_key: jwt_config.and_then(|j| j.public_key.clone()),
-                issuer: jwt_config.and_then(|j| j.issuer.clone()),
-                audience: jwt_config.and_then(|j| j.audience.clone()),
+                secret: env_non_empty("TASKCAST_JWT_SECRET").or_else(|| jwt_config?.secret.clone()),
+                public_key,
+                issuer: env_non_empty("TASKCAST_JWT_ISSUER")
+                    .or_else(|| jwt_config.and_then(|j| j.issuer.clone())),
+                audience: env_non_empty("TASKCAST_JWT_AUDIENCE")
+                    .or_else(|| jwt_config.and_then(|j| j.audience.clone())),
             })
         }
         _ => taskcast_server::AuthMode::None,
@@ -215,8 +243,7 @@ pub async fn run(args: StartArgs) -> Result<(), Box<dyn std::error::Error>> {
     let worker_manager = if workers_enabled {
         println!("[taskcast] Worker assignment system enabled");
 
-        let mut wm_defaults =
-            taskcast_core::worker_manager::WorkerManagerDefaults::default();
+        let mut wm_defaults = taskcast_core::worker_manager::WorkerManagerDefaults::default();
         if let Some(cfg_defaults) = file_config
             .workers
             .as_ref()
@@ -251,25 +278,28 @@ pub async fn run(args: StartArgs) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        Some(Arc::new(
-            taskcast_core::worker_manager::WorkerManager::new(
-                taskcast_core::worker_manager::WorkerManagerOptions {
-                    engine: Arc::clone(&engine),
-                    short_term_store: short_term_for_wm,
-                    broadcast: broadcast_for_wm,
-                    long_term_store: long_term_for_wm,
-                    hooks: None,
-                    defaults: Some(wm_defaults),
-                },
-            ),
-        ))
+        Some(Arc::new(taskcast_core::worker_manager::WorkerManager::new(
+            taskcast_core::worker_manager::WorkerManagerOptions {
+                engine: Arc::clone(&engine),
+                short_term_store: short_term_for_wm,
+                broadcast: broadcast_for_wm,
+                long_term_store: long_term_for_wm,
+                hooks: None,
+                defaults: Some(wm_defaults),
+            },
+        )))
     } else {
         None
     };
 
     // 9. Create and serve app
-    let (app, _ws_registry) =
-        taskcast_server::create_app(engine, auth_mode, worker_manager, None, taskcast_server::CorsConfig::default());
+    let (app, _ws_registry) = taskcast_server::create_app(
+        engine,
+        auth_mode,
+        worker_manager,
+        None,
+        taskcast_server::CorsConfig::default(),
+    );
 
     // Apply verbose request logging middleware if --verbose
     let app = if verbose {
@@ -309,10 +339,8 @@ async fn shutdown_signal() {
 
     #[cfg(unix)]
     {
-        let mut sigterm = tokio::signal::unix::signal(
-            tokio::signal::unix::SignalKind::terminate(),
-        )
-        .expect("failed to register SIGTERM handler");
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to register SIGTERM handler");
 
         tokio::select! {
             _ = ctrl_c => {},

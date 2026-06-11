@@ -26,11 +26,22 @@ struct EnvGuard {
 
 impl EnvGuard {
     fn new(vars: &[(&'static str, &str)]) -> Self {
+        Self::with_removed(vars, &[])
+    }
+
+    fn with_removed(vars: &[(&'static str, &str)], removed: &[&'static str]) -> Self {
         let lock = lock_env();
-        let mut saved = Vec::with_capacity(vars.len());
+        let mut saved = Vec::with_capacity(vars.len() + removed.len());
         for (key, value) in vars {
             saved.push((*key, std::env::var(key).ok()));
             std::env::set_var(key, value);
+        }
+        for key in removed {
+            if vars.iter().any(|(existing, _)| existing == key) {
+                continue;
+            }
+            saved.push((*key, std::env::var(key).ok()));
+            std::env::remove_var(key);
         }
         Self { saved, _lock: lock }
     }
@@ -52,6 +63,67 @@ async fn find_available_port() -> u16 {
     let port = listener.local_addr().unwrap().port();
     drop(listener);
     port
+}
+
+const TEST_RSA_PRIVATE_KEY: &str = r#"-----BEGIN PRIVATE KEY-----
+MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQC5OOCe0r9EjEoD
+rqN0UlG2vv6z0u8SRKxpATooDIlnWFmiSab39pH63UmHTHdr2INOl/EmjcGlBfHm
+jp+3rJKNISKGRgL5h0tbDj3E5Wy9Zfhryecejbq4SOvVX/+pQNkIPAEZYL6wLhtw
+h/6Lz0K6h+rztpYg4UKK9BrAZr6YKCi1PWAaFTrXUBNM8HRQlSyo9+9hqFuyGNzi
+kXd+Rc84KmJl9GZcunOvthYbh55iwsR18aPo/vwWmZ0qieeKsJVmHU1wFv62AIs7
+xI8VLmZJ/YOCFs8TT4qhUfB5mtX4a4zPGtKei9cOuFGyplXOpZNH91HLGfDyBfMK
+/VX+n6pDAgMBAAECggEAA3L5sjtxo5C+BOXvPHuwv3Rv2pPM++W0SDUYcVjg0VnZ
+B9qgD1htTRY3bk7DbCPmBHdz3o65ONETH7X8NDfOETuF7XYt5ZoNXy61G8HuwNm+
+diAv+5oScttFkpc52lvPLtLfOl4nO7FzTvWMjR6/VI9/YpAKqT+vAfA1wOt1rr0+
++FhmhMXqKegcy01qIxVtqNXFTer0hRGY4Sc3pvsMSRvYOfPbsQndIF04u2z1y4Bc
+uHiY6RTAsIzztSzZY0JHBKoXB3l2P239TJ2JzfQQ2hbTAcSsJkaiTAaapeTOFMTS
+PHS1VhzB4DH+r184EC1srJQQoC8DHdUpVzJX8XWYsQKBgQDr/sHzAFlXdrWYnh7c
+IlUuj+Nj3sMD6wv7cBh7u3yLlOjSR6j4MZj3yhDdLuf1I+e0ix95ZoXem9/dNDyz
+/ESYIsZ0wsa+qWDzxwKaqwiMC4IXd0WxS0mHXeL5D7hOFsIsqTSblAm3q0N17gAV
+VMhzJxeAeaN6LkSXbX4nKqX3zwKBgQDI7FCJTH2ZvprraKD2TbjqEqewPnURSmyL
+nuxFOMe9cAuql3BBl/ep6gT7XmHRQZd4dVOYqbpxXVl0VdawzoNXWW0P5S0mxiz9
+XCo/MsvnN5X1W4THPgAE4xZNpj6qdOWT5wXOvYvGP1HaOQxmskXUnJDcQgQT6bTx
+/DXG6KEPTQKBgEkOVHwlX4Lz/MOCL4t2FWiUopAIJdbQrKTpzqp/H88WCf0OsgAj
+Wnda1l2iZ6w7sT7y0ouCcW64UlToFuKg9ZsjKMx8f4oGZT0SHnxC9iJkbaFWCv0X
+kWuWZO01MJj78qBgwShoa5mwKvIW+2+fD26Wa3AaN8FbEWDPRH5bdYWBAoGAEo0X
+JoYkdqSNozym1/b3Is2UJAawQmdvvDhxMjb64jfNK/QNjlDcshiEWz0spOh8dsfG
+bysEpuDqmH4wc2St5cvA8R3E3HahwsbWs70Z7IBKXTwU91x3Hfxlm8fEs3JVnCFR
+fPQtSqGgChkIVxcQsX+/NEb4H2qNpWYXBQWHkWUCgYBJnOJTUphM2cpZlR6rtGu5
+NgZ2F/I/QutO6nizjTq6J4U/UBs9qGH2olKxmuDVEp4VrVqLdNxRVz22w1HU4/6k
+8y7/u7w33zou9ienJN1dZrm+EzmxAOqk28b2Nrb1gUA+MfxGVP83URDPIIp0vVIY
+N1w/tV0JBRl2ihDWvUv6PQ==
+-----END PRIVATE KEY-----"#;
+
+const TEST_RSA_PUBLIC_KEY: &str = r#"-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAuTjgntK/RIxKA66jdFJR
+tr7+s9LvEkSsaQE6KAyJZ1hZokmm9/aR+t1Jh0x3a9iDTpfxJo3BpQXx5o6ft6yS
+jSEihkYC+YdLWw49xOVsvWX4a8nnHo26uEjr1V//qUDZCDwBGWC+sC4bcIf+i89C
+uofq87aWIOFCivQawGa+mCgotT1gGhU611ATTPB0UJUsqPfvYahbshjc4pF3fkXP
+OCpiZfRmXLpzr7YWG4eeYsLEdfGj6P78FpmdKonnirCVZh1NcBb+tgCLO8SPFS5m
+Sf2DghbPE0+KoVHweZrV+GuMzxrSnovXDrhRsqZVzqWTR/dRyxnw8gXzCv1V/p+q
+QwIDAQAB
+-----END PUBLIC KEY-----"#;
+
+fn make_rs256_token(issuer: &str, audience: &str) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let claims = serde_json::json!({
+        "sub": "test-user",
+        "scope": ["*"],
+        "taskIds": "*",
+        "iss": issuer,
+        "aud": audience,
+        "exp": now + 3600,
+        "iat": now
+    });
+    jsonwebtoken::encode(
+        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256),
+        &claims,
+        &jsonwebtoken::EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY.as_bytes()).unwrap(),
+    )
+    .unwrap()
 }
 
 // ─── JWT auth via env var ──────────────────────────────────────────────────────
@@ -189,6 +261,105 @@ async fn run_jwt_env_secret_overrides_config_secret() {
     )
     .unwrap();
 
+    let client = reqwest::Client::new();
+    let res = client
+        .get(&format!("http://127.0.0.1:{port}/tasks"))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        res.status().is_success(),
+        "Expected 200, got {}",
+        res.status()
+    );
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn run_jwt_auth_accepts_rs256_public_key_from_env_and_enforces_audience() {
+    let _env = EnvGuard::with_removed(
+        &[
+            ("TASKCAST_AUTH_MODE", "jwt"),
+            ("TASKCAST_JWT_ALGORITHM", "RS256"),
+            ("TASKCAST_JWT_PUBLIC_KEY", TEST_RSA_PUBLIC_KEY),
+            ("TASKCAST_JWT_ISSUER", "railway-auth"),
+            ("TASKCAST_JWT_AUDIENCE", "taskcast"),
+        ],
+        &["TASKCAST_JWT_SECRET", "TASKCAST_JWT_PUBLIC_KEY_FILE"],
+    );
+
+    let port = find_available_port().await;
+    let handle = tokio::spawn(async move {
+        let _ = taskcast_cli::commands::start::run(StartArgs {
+            port,
+            ..Default::default()
+        })
+        .await;
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let client = reqwest::Client::new();
+    let valid_token = make_rs256_token("railway-auth", "taskcast");
+    let res = client
+        .get(&format!("http://127.0.0.1:{port}/tasks"))
+        .header("Authorization", format!("Bearer {valid_token}"))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        res.status().is_success(),
+        "Expected 200, got {}",
+        res.status()
+    );
+
+    let wrong_audience_token = make_rs256_token("railway-auth", "other-service");
+    let res = client
+        .get(&format!("http://127.0.0.1:{port}/tasks"))
+        .header("Authorization", format!("Bearer {wrong_audience_token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 401);
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn run_jwt_auth_accepts_rs256_public_key_file_from_env() {
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let public_key_path = tmp_dir.path().join("jwt.pub");
+    std::fs::write(&public_key_path, TEST_RSA_PUBLIC_KEY).unwrap();
+    let public_key_path = public_key_path.to_str().unwrap().to_string();
+
+    let _env = EnvGuard::with_removed(
+        &[
+            ("TASKCAST_AUTH_MODE", "jwt"),
+            ("TASKCAST_JWT_ALGORITHM", "RS256"),
+            ("TASKCAST_JWT_PUBLIC_KEY_FILE", &public_key_path),
+        ],
+        &[
+            "TASKCAST_JWT_SECRET",
+            "TASKCAST_JWT_PUBLIC_KEY",
+            "TASKCAST_JWT_ISSUER",
+            "TASKCAST_JWT_AUDIENCE",
+        ],
+    );
+
+    let port = find_available_port().await;
+    let handle = tokio::spawn(async move {
+        let _ = taskcast_cli::commands::start::run(StartArgs {
+            port,
+            ..Default::default()
+        })
+        .await;
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let token = make_rs256_token("any-issuer", "any-audience");
     let client = reqwest::Client::new();
     let res = client
         .get(&format!("http://127.0.0.1:{port}/tasks"))
