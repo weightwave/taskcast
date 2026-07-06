@@ -32,6 +32,22 @@ describe('TaskcastServerClient.createTask', () => {
   })
 })
 
+describe('TaskcastServerClient.getServerInfo', () => {
+  it('GET / and returns server info', async () => {
+    const body = { name: 'taskcast', version: '1.2.3', apiVersion: 'v1' }
+    const fetch = makeFetch([{ status: 200, body }])
+    const client = new TaskcastServerClient({ baseUrl: 'http://taskcast', fetch })
+
+    const info = await client.getServerInfo()
+
+    expect(info).toEqual(body)
+    expect(fetch).toHaveBeenCalledOnce()
+    const [url, opts] = fetch.mock.calls[0]!
+    expect(url).toBe('http://taskcast/')
+    expect(opts.method).toBe('GET')
+  })
+})
+
 describe('TaskcastServerClient.getTask', () => {
   it('GET /tasks/:id and returns task', async () => {
     const fetch = makeFetch([{ status: 200, body: { id: 'task-1', status: 'running' } }])
@@ -46,6 +62,77 @@ describe('TaskcastServerClient.getTask', () => {
     const fetch = makeFetch([{ status: 404, body: { error: 'Task not found' } }])
     const client = new TaskcastServerClient({ baseUrl: 'http://taskcast', fetch })
     await expect(client.getTask('missing')).rejects.toThrow(/not found/i)
+  })
+})
+
+describe('TaskcastServerClient task archives', () => {
+  const archive = {
+    schema: 'taskcast.taskArchive',
+    version: 1,
+    exportedAt: 5000,
+    task: {
+      id: 'task-1',
+      status: 'running',
+      createdAt: 1000,
+      updatedAt: 2000,
+      type: 'demo',
+    },
+    events: [
+      {
+        id: 'event-1',
+        taskId: 'task-1',
+        index: 0,
+        timestamp: 3000,
+        type: 'demo.event',
+        level: 'info',
+        data: { value: 'hello' },
+      },
+    ],
+  }
+
+  it('GET /tasks/:taskId/archive and returns archive unchanged', async () => {
+    const fetch = makeFetch([{ status: 200, body: archive }])
+    const client = new TaskcastServerClient({ baseUrl: 'http://taskcast', fetch })
+
+    const result = await client.exportTaskArchive('task-1')
+
+    expect(result).toEqual(archive)
+    expect(fetch).toHaveBeenCalledOnce()
+    const [url, opts] = fetch.mock.calls[0]!
+    expect(url).toBe('http://taskcast/tasks/task-1/archive')
+    expect(opts.method).toBe('GET')
+  })
+
+  it('POST /tasks/import with archive and overwrite option', async () => {
+    const body = { ok: true, taskId: 'task-1', eventsImported: 1 }
+    const fetch = makeFetch([{ status: 200, body }])
+    const client = new TaskcastServerClient({ baseUrl: 'http://taskcast', fetch })
+
+    const result = await client.importTaskArchive(archive, { overwrite: true })
+
+    expect(result).toEqual(body)
+    expect(fetch).toHaveBeenCalledOnce()
+    const [url, opts] = fetch.mock.calls[0]!
+    expect(url).toBe('http://taskcast/tasks/import')
+    expect(opts.method).toBe('POST')
+    expect(JSON.parse(opts.body)).toEqual({ archive, overwrite: true })
+  })
+
+  it('omits overwrite from import body when no options are provided', async () => {
+    const fetch = makeFetch([{ status: 200, body: { ok: true, taskId: 'task-1', eventsImported: 1 } }])
+    const client = new TaskcastServerClient({ baseUrl: 'http://taskcast', fetch })
+
+    await client.importTaskArchive(archive)
+
+    const [, opts] = fetch.mock.calls[0]!
+    expect(JSON.parse(opts.body)).toEqual({ archive })
+  })
+
+  it('uses existing request error mapping for import errors', async () => {
+    const fetch = makeFetch([{ status: 409, body: { error: 'Task already exists' } }])
+    const client = new TaskcastServerClient({ baseUrl: 'http://taskcast', fetch })
+
+    await expect(client.importTaskArchive(archive)).rejects.toThrow('Task already exists')
   })
 })
 
