@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import type { Task, TaskEvent, WorkerAuditEvent } from '@taskcast/core'
+import type { Task, TaskArchiveRestoreData, TaskEvent, WorkerAuditEvent } from '@taskcast/core'
 import { SqliteLongTermStore } from '../src/long-term.js'
 
 function makeTask(id = 'task-1'): Task {
@@ -25,6 +25,17 @@ function makeEvent(taskId: string, index: number): TaskEvent {
     type: 'llm.delta',
     level: 'info',
     data: { text: `msg-${index}` },
+  }
+}
+
+function makeRestoreData(overrides: Partial<TaskArchiveRestoreData> = {}): TaskArchiveRestoreData {
+  const task = overrides.task ?? { ...makeTask('task-1'), status: 'running', updatedAt: 2000 }
+  const events = overrides.events ?? [makeEvent(task.id, 0), makeEvent(task.id, 1)]
+  return {
+    task,
+    events,
+    nextIndex: overrides.nextIndex ?? events.length,
+    seriesLatest: overrides.seriesLatest ?? [],
   }
 }
 
@@ -265,6 +276,47 @@ describe('SqliteLongTermStore', () => {
     await store.saveEvent(event)
     const events = await store.getEvents('task-1')
     expect(events[0]!.data).toBeNull()
+  })
+
+  // ─── restoreTaskArchive ────────────────────────────────────────────────
+
+  it('should restore a task archive', async () => {
+    const data = makeRestoreData()
+
+    await expect(store.restoreTaskArchive(data)).resolves.toEqual({ overwritten: false })
+
+    await expect(store.getTask('task-1')).resolves.toEqual(data.task)
+    await expect(store.getEvents('task-1')).resolves.toEqual(data.events)
+  })
+
+  it('should reject long-term restore conflicts unless overwrite is true', async () => {
+    const data = makeRestoreData()
+    await store.saveTask(makeTask('task-1'))
+
+    await expect(store.restoreTaskArchive(data)).rejects.toThrow(/already exists/i)
+    await expect(store.restoreTaskArchive(data, { overwrite: true })).resolves.toEqual({ overwritten: true })
+  })
+
+  it('should replace old events on overwrite', async () => {
+    await store.saveTask(makeTask('task-1'))
+    await store.saveEvent(makeEvent('task-1', 0))
+    await store.saveEvent(makeEvent('task-1', 1))
+
+    const importedEvent = {
+      ...makeEvent('task-1', 0),
+      id: 'evt-imported-0',
+      data: { text: 'imported' },
+    }
+    const data = makeRestoreData({
+      task: { ...makeTask('task-1'), status: 'completed', updatedAt: 3000, completedAt: 3000 },
+      events: [importedEvent],
+      nextIndex: 1,
+    })
+
+    await expect(store.restoreTaskArchive(data, { overwrite: true })).resolves.toEqual({ overwritten: true })
+
+    await expect(store.getTask('task-1')).resolves.toEqual(data.task)
+    await expect(store.getEvents('task-1')).resolves.toEqual([importedEvent])
   })
 })
 

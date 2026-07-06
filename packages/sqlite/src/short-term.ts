@@ -5,6 +5,8 @@ import type {
   TaskStatus,
   ShortTermStore,
   EventQueryOptions,
+  TaskArchiveImportOptions,
+  TaskArchiveRestoreData,
   TaskFilter,
   Worker,
   WorkerFilter,
@@ -18,6 +20,10 @@ export class SqliteShortTermStore implements ShortTermStore {
   constructor(private db: Database.Database) {}
 
   async saveTask(task: Task): Promise<void> {
+    this.saveTaskSync(task)
+  }
+
+  private saveTaskSync(task: Task): void {
     const stmt = this.db.prepare(`
       INSERT INTO taskcast_tasks (id, type, status, params, result, error, metadata, auth_config, webhooks, cleanup, created_at, updated_at, completed_at, ttl, tags, assign_mode, cost, assigned_worker, disconnect_policy)
       VALUES (@id, @type, @status, @params, @result, @error, @metadata, @auth_config, @webhooks, @cleanup, @created_at, @updated_at, @completed_at, @ttl, @tags, @assign_mode, @cost, @assigned_worker, @disconnect_policy)
@@ -86,6 +92,10 @@ export class SqliteShortTermStore implements ShortTermStore {
   }
 
   async appendEvent(taskId: string, event: TaskEvent): Promise<void> {
+    this.appendEventSync(taskId, event)
+  }
+
+  private appendEventSync(taskId: string, event: TaskEvent): void {
     this.db
       .prepare(
         `INSERT INTO taskcast_events (id, task_id, idx, timestamp, type, level, data, series_id, series_mode, series_acc_field)
@@ -103,6 +113,41 @@ export class SqliteShortTermStore implements ShortTermStore {
         series_mode: event.seriesMode ?? null,
         series_acc_field: event.seriesAccField ?? null,
       })
+  }
+
+  async restoreTaskArchive(
+    data: TaskArchiveRestoreData,
+    options?: TaskArchiveImportOptions,
+  ): Promise<{ overwritten: boolean }> {
+    const restore = this.db.transaction(() => {
+      const taskId = data.task.id
+      const existing = this.db.prepare('SELECT id FROM taskcast_tasks WHERE id = ?').get(taskId)
+      if (existing && options?.overwrite !== true) {
+        throw new Error(`Task already exists: ${taskId}`)
+      }
+
+      this.db.prepare('DELETE FROM taskcast_events WHERE task_id = ?').run(taskId)
+      this.db.prepare('DELETE FROM taskcast_series_latest WHERE task_id = ?').run(taskId)
+      this.db.prepare('DELETE FROM taskcast_tasks WHERE id = ?').run(taskId)
+      this.saveTaskSync(data.task)
+      for (const event of data.events) {
+        this.appendEventSync(taskId, event)
+      }
+      this.db
+        .prepare(
+          `INSERT INTO taskcast_index_counters (task_id, counter)
+           VALUES (?, ?)
+           ON CONFLICT (task_id) DO UPDATE SET counter = excluded.counter`,
+        )
+        .run(taskId, data.nextIndex - 1)
+      for (const entry of data.seriesLatest) {
+        this.setSeriesLatestSync(entry.taskId, entry.seriesId, entry.event)
+      }
+
+      return { overwritten: Boolean(existing) }
+    })
+
+    return restore()
   }
 
   async getEvents(taskId: string, opts?: EventQueryOptions): Promise<TaskEvent[]> {
@@ -171,6 +216,10 @@ export class SqliteShortTermStore implements ShortTermStore {
   }
 
   async setSeriesLatest(taskId: string, seriesId: string, event: TaskEvent): Promise<void> {
+    this.setSeriesLatestSync(taskId, seriesId, event)
+  }
+
+  private setSeriesLatestSync(taskId: string, seriesId: string, event: TaskEvent): void {
     this.db
       .prepare(
         `INSERT INTO taskcast_series_latest (task_id, series_id, event_json)

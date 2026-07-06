@@ -1,5 +1,13 @@
 import type Database from 'better-sqlite3'
-import type { Task, TaskEvent, LongTermStore, EventQueryOptions, WorkerAuditEvent } from '@taskcast/core'
+import type {
+  Task,
+  TaskEvent,
+  LongTermStore,
+  EventQueryOptions,
+  TaskArchiveImportOptions,
+  TaskArchiveRestoreData,
+  WorkerAuditEvent,
+} from '@taskcast/core'
 import { rowToTask, rowToEvent, rowToWorkerEvent } from './row-mappers.js'
 
 // ─── SqliteLongTermStore ──────────────────────────────────────────────────
@@ -8,6 +16,10 @@ export class SqliteLongTermStore implements LongTermStore {
   constructor(private db: Database.Database) {}
 
   async saveTask(task: Task): Promise<void> {
+    this.saveTaskSync(task)
+  }
+
+  private saveTaskSync(task: Task): void {
     const stmt = this.db.prepare(`
       INSERT INTO taskcast_tasks (id, type, status, params, result, error, metadata, auth_config, webhooks, cleanup, created_at, updated_at, completed_at, ttl, tags, assign_mode, cost, assigned_worker, disconnect_policy)
       VALUES (@id, @type, @status, @params, @result, @error, @metadata, @auth_config, @webhooks, @cleanup, @created_at, @updated_at, @completed_at, @ttl, @tags, @assign_mode, @cost, @assigned_worker, @disconnect_policy)
@@ -63,6 +75,10 @@ export class SqliteLongTermStore implements LongTermStore {
   }
 
   async saveEvent(event: TaskEvent): Promise<void> {
+    this.saveEventSync(event)
+  }
+
+  private saveEventSync(event: TaskEvent): void {
     this.db
       .prepare(
         `INSERT INTO taskcast_events (id, task_id, idx, timestamp, type, level, data, series_id, series_mode, series_acc_field)
@@ -81,6 +97,30 @@ export class SqliteLongTermStore implements LongTermStore {
         series_mode: event.seriesMode ?? null,
         series_acc_field: event.seriesAccField ?? null,
       })
+  }
+
+  async restoreTaskArchive(
+    data: TaskArchiveRestoreData,
+    options?: TaskArchiveImportOptions,
+  ): Promise<{ overwritten: boolean }> {
+    const restore = this.db.transaction(() => {
+      const taskId = data.task.id
+      const existing = this.db.prepare('SELECT id FROM taskcast_tasks WHERE id = ?').get(taskId)
+      if (existing && options?.overwrite !== true) {
+        throw new Error(`Task already exists: ${taskId}`)
+      }
+
+      this.db.prepare('DELETE FROM taskcast_events WHERE task_id = ?').run(taskId)
+      this.db.prepare('DELETE FROM taskcast_tasks WHERE id = ?').run(taskId)
+      this.saveTaskSync(data.task)
+      for (const event of data.events) {
+        this.saveEventSync(event)
+      }
+
+      return { overwritten: Boolean(existing) }
+    })
+
+    return restore()
   }
 
   async getEvents(taskId: string, opts?: EventQueryOptions): Promise<TaskEvent[]> {

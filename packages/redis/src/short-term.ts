@@ -5,6 +5,8 @@ import type {
   TaskStatus,
   ShortTermStore,
   EventQueryOptions,
+  TaskArchiveImportOptions,
+  TaskArchiveRestoreData,
   TaskFilter,
   Worker,
   WorkerFilter,
@@ -54,6 +56,41 @@ export class RedisShortTermStore implements ShortTermStore {
 
   async appendEvent(taskId: string, event: TaskEvent): Promise<void> {
     await this.redis.rpush(this.KEY.events(taskId), JSON.stringify(event))
+  }
+
+  async restoreTaskArchive(
+    data: TaskArchiveRestoreData,
+    options?: TaskArchiveImportOptions,
+  ): Promise<{ overwritten: boolean }> {
+    const taskId = data.task.id
+    const taskKey = this.KEY.task(taskId)
+    const exists = await this.redis.exists(taskKey)
+    if (exists && options?.overwrite !== true) {
+      throw new Error(`Task already exists: ${taskId}`)
+    }
+
+    const existingSeriesIds = await this.redis.smembers(this.KEY.seriesIds(taskId))
+    const pipeline = this.redis.pipeline()
+
+    pipeline.set(taskKey, JSON.stringify(data.task))
+    pipeline.sadd(this.KEY.taskSet, taskId)
+    pipeline.del(this.KEY.events(taskId))
+    for (const event of data.events) {
+      pipeline.rpush(this.KEY.events(taskId), JSON.stringify(event))
+    }
+    pipeline.set(this.KEY.idx(taskId), String(data.nextIndex))
+
+    for (const seriesId of existingSeriesIds) {
+      pipeline.del(this.KEY.seriesLatest(taskId, seriesId))
+    }
+    pipeline.del(this.KEY.seriesIds(taskId))
+    for (const entry of data.seriesLatest) {
+      pipeline.set(this.KEY.seriesLatest(entry.taskId, entry.seriesId), JSON.stringify(entry.event))
+      pipeline.sadd(this.KEY.seriesIds(entry.taskId), entry.seriesId)
+    }
+
+    await pipeline.exec()
+    return { overwritten: Boolean(exists) }
   }
 
   async getEvents(taskId: string, opts?: EventQueryOptions): Promise<TaskEvent[]> {
