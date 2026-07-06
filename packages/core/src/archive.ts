@@ -2,6 +2,9 @@ import type { SeriesLatestEntry, TaskArchive, TaskArchiveEvent, TaskArchiveResto
 
 export const TASK_ARCHIVE_SCHEMA = 'taskcast.taskArchive' as const
 export const TASK_ARCHIVE_VERSION = 1 as const
+const TASK_STATUSES = new Set(['pending', 'assigned', 'running', 'paused', 'blocked', 'completed', 'failed', 'timeout', 'cancelled'])
+const EVENT_LEVELS = new Set(['debug', 'info', 'warn', 'error'])
+const SERIES_MODES = new Set(['keep-all', 'accumulate', 'latest'])
 
 export class InvalidTaskArchiveError extends Error {
   constructor(message: string) {
@@ -11,17 +14,25 @@ export class InvalidTaskArchiveError extends Error {
 }
 
 export function normalizeTaskArchive(archive: TaskArchive): TaskArchive {
+  if (!isRecord(archive)) {
+    throw new InvalidTaskArchiveError('Archive must be an object')
+  }
   if (archive.schema !== TASK_ARCHIVE_SCHEMA) {
     throw new InvalidTaskArchiveError(`Unsupported archive schema: ${String(archive.schema)}`)
   }
   if (archive.version !== TASK_ARCHIVE_VERSION) {
     throw new InvalidTaskArchiveError(`Unsupported archive version: ${String(archive.version)}`)
   }
-  if (!archive.task?.id) {
-    throw new InvalidTaskArchiveError('Archive task.id is required')
+  if (!Number.isFinite(archive.exportedAt)) {
+    throw new InvalidTaskArchiveError('Archive exportedAt must be a finite number')
+  }
+  assertArchiveTask(archive.task)
+  if (!Array.isArray(archive.events)) {
+    throw new InvalidTaskArchiveError('Archive events must be an array')
   }
 
-  const sorted = [...archive.events].sort((a, b) => a.index - b.index)
+  const events = archive.events.map(assertArchiveEvent)
+  const sorted = [...events].sort((a, b) => a.index - b.index)
   const seenIds = new Set<string>()
   const seenIndexes = new Set<number>()
 
@@ -100,6 +111,67 @@ function buildSeriesLatest(events: TaskArchiveEvent[]): SeriesLatestEntry[] {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function assertArchiveTask(task: unknown): asserts task is TaskArchive['task'] {
+  if (!isRecord(task)) {
+    throw new InvalidTaskArchiveError('Archive task must be an object')
+  }
+  if (!isNonEmptyString(task.id)) {
+    throw new InvalidTaskArchiveError('Archive task.id must be a string')
+  }
+  if (typeof task.status !== 'string' || !TASK_STATUSES.has(task.status)) {
+    throw new InvalidTaskArchiveError('Archive task.status is invalid')
+  }
+  if (!Number.isFinite(task.createdAt)) {
+    throw new InvalidTaskArchiveError('Archive task.createdAt must be a finite number')
+  }
+  if (!Number.isFinite(task.updatedAt)) {
+    throw new InvalidTaskArchiveError('Archive task.updatedAt must be a finite number')
+  }
+}
+
+function assertArchiveEvent(event: unknown): TaskArchiveEvent {
+  if (!isRecord(event)) {
+    throw new InvalidTaskArchiveError('Archive event must be an object')
+  }
+  const index = event.index
+  if (!isNonEmptyString(event.id)) {
+    throw new InvalidTaskArchiveError('Archive event.id must be a string')
+  }
+  if (!isNonEmptyString(event.taskId)) {
+    throw new InvalidTaskArchiveError(`Archive event.taskId must be a string for event ${String(event.id)}`)
+  }
+  if (typeof index !== 'number' || !Number.isInteger(index) || index < 0) {
+    throw new InvalidTaskArchiveError(`Archive event.index must be a non-negative integer for event ${String(event.id)}`)
+  }
+  if (!Number.isFinite(event.timestamp)) {
+    throw new InvalidTaskArchiveError(`Archive event.timestamp must be a finite number for event ${String(event.id)}`)
+  }
+  if (typeof event.type !== 'string') {
+    throw new InvalidTaskArchiveError(`Archive event.type must be a string for event ${String(event.id)}`)
+  }
+  if (typeof event.level !== 'string' || !EVENT_LEVELS.has(event.level)) {
+    throw new InvalidTaskArchiveError(`Archive event.level is invalid for event ${String(event.id)}`)
+  }
+  if (!Object.prototype.hasOwnProperty.call(event, 'data')) {
+    throw new InvalidTaskArchiveError(`Archive event.data is required for event ${String(event.id)}`)
+  }
+  if (event.seriesMode !== undefined && (typeof event.seriesMode !== 'string' || !SERIES_MODES.has(event.seriesMode))) {
+    throw new InvalidTaskArchiveError(`Archive event.seriesMode is invalid for event ${String(event.id)}`)
+  }
+  if (event.seriesId !== undefined && typeof event.seriesId !== 'string') {
+    throw new InvalidTaskArchiveError(`Archive event.seriesId must be a string for event ${String(event.id)}`)
+  }
+  if (event.seriesAccField !== undefined && typeof event.seriesAccField !== 'string') {
+    throw new InvalidTaskArchiveError(`Archive event.seriesAccField must be a string for event ${String(event.id)}`)
+  }
+
+  return event as unknown as TaskArchiveEvent
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0
 }
 
 function assertArchivePersistableEvent(event: TaskArchiveEvent): void {

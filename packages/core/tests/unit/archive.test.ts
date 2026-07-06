@@ -35,6 +35,67 @@ function makeArchive(events: TaskEvent[]): TaskArchive {
 }
 
 describe('normalizeTaskArchive', () => {
+  it('rejects malformed archive envelope fields', () => {
+    const malformedArchives = [
+      { ...makeArchive([]), exportedAt: Number.NaN },
+      { ...makeArchive([]), events: undefined },
+      { ...makeArchive([]), task: null },
+    ] as unknown as TaskArchive[]
+
+    for (const archive of malformedArchives) {
+      expect(() => normalizeTaskArchive(archive)).toThrow(InvalidTaskArchiveError)
+    }
+  })
+
+  it('rejects missing or invalid task required fields', () => {
+    const malformedTasks = [
+      { status: undefined },
+      { status: 'unknown' },
+      { createdAt: undefined },
+      { createdAt: Number.NaN },
+      { updatedAt: undefined },
+      { updatedAt: Number.POSITIVE_INFINITY },
+    ]
+
+    for (const taskPatch of malformedTasks) {
+      const archive = {
+        ...makeArchive([]),
+        task: { ...makeTask(), ...taskPatch },
+      } as unknown as TaskArchive
+      expect(() => normalizeTaskArchive(archive)).toThrow(InvalidTaskArchiveError)
+    }
+  })
+
+  it('rejects events missing required fields or data as an own property', () => {
+    const baseEvent = makeEvent('event-1', 'task-1', 0)
+    const { data: _data, ...eventWithoutData } = baseEvent
+    const malformedEvents = [
+      { ...baseEvent, id: undefined },
+      { ...baseEvent, timestamp: undefined },
+      { ...baseEvent, type: undefined },
+      { ...baseEvent, level: undefined },
+      eventWithoutData,
+    ]
+
+    for (const event of malformedEvents) {
+      const archive = makeArchive([event as TaskEvent])
+      expect(() => normalizeTaskArchive(archive)).toThrow(InvalidTaskArchiveError)
+    }
+  })
+
+  it('rejects invalid event level and series mode fields', () => {
+    const malformedEvents = [
+      { ...makeEvent('event-1', 'task-1', 0), level: 'fatal' },
+      { ...makeEvent('event-1', 'task-1', 0), seriesMode: 'first' },
+      { ...makeEvent('event-1', 'task-1', 0), seriesId: 123 },
+      { ...makeEvent('event-1', 'task-1', 0), seriesAccField: 123 },
+    ] as unknown as TaskEvent[]
+
+    for (const event of malformedEvents) {
+      expect(() => normalizeTaskArchive(makeArchive([event]))).toThrow(InvalidTaskArchiveError)
+    }
+  })
+
   it('sorts events by index without changing event identity fields', () => {
     const archive = makeArchive([
       makeEvent('event-2', 'task-1', 1),

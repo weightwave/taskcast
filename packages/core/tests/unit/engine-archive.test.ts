@@ -2,10 +2,11 @@ import { describe, expect, it, vi } from 'vitest'
 import {
   MemoryBroadcastProvider,
   MemoryShortTermStore,
+  InvalidTaskArchiveError,
   TaskConflictError,
   TaskEngine,
 } from '../../src/index.js'
-import type { LongTermStore, TaskArchive } from '../../src/types.js'
+import type { LongTermStore, TaskArchive, TaskEvent } from '../../src/types.js'
 
 function makeEngine(broadcast = new MemoryBroadcastProvider(), longTermStore?: LongTermStore) {
   return new TaskEngine({
@@ -55,6 +56,229 @@ describe('TaskEngine archive import/export', () => {
       task: { id: 'task-1', createdAt: task.createdAt, updatedAt: task.updatedAt },
       events: [{ id: event.id, index: 0, timestamp: event.timestamp }],
     })
+  })
+
+  it('exports full long-term latest-series history instead of compacted short-term history', async () => {
+    const longTermEvents: TaskEvent[] = []
+    const longTermStore = makeLongTermStore({
+      saveEvent: vi.fn(async (event: TaskEvent) => {
+        longTermEvents.push({ ...event })
+      }),
+      getEvents: vi.fn(async () => longTermEvents),
+    })
+    const engine = makeEngine(new MemoryBroadcastProvider(), longTermStore)
+    await engine.createTask({ id: 'task-1' })
+    const first = await engine.publishEvent('task-1', {
+      type: 'task.status',
+      level: 'info',
+      data: { status: 'starting' },
+      seriesId: 'status',
+      seriesMode: 'latest',
+    })
+    const second = await engine.publishEvent('task-1', {
+      type: 'task.status',
+      level: 'info',
+      data: { status: 'ready' },
+      seriesId: 'status',
+      seriesMode: 'latest',
+    })
+
+    await expect(engine.getEvents('task-1')).resolves.toMatchObject([{ index: 1 }])
+
+    const archive = await engine.exportTaskArchive('task-1')
+
+    expect(archive.events.map((event) => event.id)).toEqual([first.id, second.id])
+    expect(archive.events.map((event) => event.index)).toEqual([0, 1])
+  })
+
+  it('exports raw accumulate deltas instead of long-term accumulated values', async () => {
+    const longTermEvents: TaskEvent[] = []
+    const longTermStore = makeLongTermStore({
+      saveEvent: vi.fn(async (event: TaskEvent) => {
+        longTermEvents.push({ ...event })
+      }),
+      getEvents: vi.fn(async () => longTermEvents),
+    })
+    const engine = makeEngine(new MemoryBroadcastProvider(), longTermStore)
+    await engine.createTask({ id: 'task-1' })
+    await engine.publishEvent('task-1', {
+      type: 'task.output',
+      level: 'info',
+      data: { delta: 'hello ' },
+      seriesId: 'output',
+      seriesMode: 'accumulate',
+      seriesAccField: 'delta',
+    })
+    await engine.publishEvent('task-1', {
+      type: 'task.output',
+      level: 'info',
+      data: { delta: 'world' },
+      seriesId: 'output',
+      seriesMode: 'accumulate',
+      seriesAccField: 'delta',
+    })
+
+    expect(longTermEvents.map((event) => event.data)).toEqual([{ delta: 'hello ' }, { delta: 'hello world' }])
+
+    const archive = await engine.exportTaskArchive('task-1')
+
+    expect(archive.events.map((event) => event.data)).toEqual([{ delta: 'hello ' }, { delta: 'world' }])
+  })
+
+  it('exports mixed latest and accumulate series as a contiguous raw archive', async () => {
+    const longTermEvents: TaskEvent[] = []
+    const longTermStore = makeLongTermStore({
+      saveEvent: vi.fn(async (event: TaskEvent) => {
+        longTermEvents.push({ ...event })
+      }),
+      getEvents: vi.fn(async () => longTermEvents),
+    })
+    const engine = makeEngine(new MemoryBroadcastProvider(), longTermStore)
+    await engine.createTask({ id: 'task-1' })
+    await engine.publishEvent('task-1', {
+      type: 'task.status',
+      level: 'info',
+      data: { status: 'starting' },
+      seriesId: 'status',
+      seriesMode: 'latest',
+    })
+    await engine.publishEvent('task-1', {
+      type: 'task.status',
+      level: 'info',
+      data: { status: 'ready' },
+      seriesId: 'status',
+      seriesMode: 'latest',
+    })
+    await engine.publishEvent('task-1', {
+      type: 'task.output',
+      level: 'info',
+      data: { delta: 'hello ' },
+      seriesId: 'output',
+      seriesMode: 'accumulate',
+      seriesAccField: 'delta',
+    })
+    await engine.publishEvent('task-1', {
+      type: 'task.output',
+      level: 'info',
+      data: { delta: 'world' },
+      seriesId: 'output',
+      seriesMode: 'accumulate',
+      seriesAccField: 'delta',
+    })
+
+    await expect(engine.getEvents('task-1')).resolves.toMatchObject([{ index: 1 }, { index: 2 }, { index: 3 }])
+    expect(longTermEvents.map((event) => event.data)).toEqual([
+      { status: 'starting' },
+      { status: 'ready' },
+      { delta: 'hello ' },
+      { delta: 'hello world' },
+    ])
+
+    const archive = await engine.exportTaskArchive('task-1')
+
+    expect(archive.events.map((event) => event.index)).toEqual([0, 1, 2, 3])
+    expect(archive.events.map((event) => event.data)).toEqual([
+      { status: 'starting' },
+      { status: 'ready' },
+      { delta: 'hello ' },
+      { delta: 'world' },
+    ])
+  })
+
+  it('recovers lagging long-term plain-event tails from short-term history', async () => {
+    const longTermEvents: TaskEvent[] = []
+    const longTermStore = makeLongTermStore({
+      saveEvent: vi.fn(async (event: TaskEvent) => {
+        longTermEvents.push({ ...event })
+      }),
+      getEvents: vi.fn(async () => longTermEvents.slice(0, 1)),
+    })
+    const engine = makeEngine(new MemoryBroadcastProvider(), longTermStore)
+    await engine.createTask({ id: 'task-1' })
+    await engine.publishEvent('task-1', { type: 'demo.one', level: 'info', data: { value: 1 } })
+    await engine.publishEvent('task-1', { type: 'demo.two', level: 'info', data: { value: 2 } })
+    await engine.publishEvent('task-1', { type: 'demo.three', level: 'info', data: { value: 3 } })
+
+    const archive = await engine.exportTaskArchive('task-1')
+
+    expect(archive.events.map((event) => event.index)).toEqual([0, 1, 2])
+    expect(archive.events.map((event) => event.type)).toEqual(['demo.one', 'demo.two', 'demo.three'])
+  })
+
+  it('rejects lagging latest-series long-term history that short-term compaction cannot recover', async () => {
+    const longTermEvents: TaskEvent[] = []
+    const longTermStore = makeLongTermStore({
+      saveEvent: vi.fn(async (event: TaskEvent) => {
+        longTermEvents.push({ ...event })
+      }),
+      getEvents: vi.fn(async () => longTermEvents.slice(0, 1)),
+    })
+    const engine = makeEngine(new MemoryBroadcastProvider(), longTermStore)
+    await engine.createTask({ id: 'task-1' })
+    await engine.publishEvent('task-1', {
+      type: 'task.status',
+      level: 'info',
+      data: { status: 'starting' },
+      seriesId: 'status',
+      seriesMode: 'latest',
+    })
+    await engine.publishEvent('task-1', {
+      type: 'task.status',
+      level: 'info',
+      data: { status: 'running' },
+      seriesId: 'status',
+      seriesMode: 'latest',
+    })
+    await engine.publishEvent('task-1', {
+      type: 'task.status',
+      level: 'info',
+      data: { status: 'ready' },
+      seriesId: 'status',
+      seriesMode: 'latest',
+    })
+    await expect(engine.getEvents('task-1')).resolves.toMatchObject([{ index: 2 }])
+
+    await expect(engine.exportTaskArchive('task-1')).rejects.toThrow(InvalidTaskArchiveError)
+  })
+
+  it('does not mask corrupted non-empty long-term history with short-term fallback', async () => {
+    const longTermEvents: TaskEvent[] = []
+    const longTermStore = makeLongTermStore({
+      saveEvent: vi.fn(async (event: TaskEvent) => {
+        longTermEvents.push({ ...event })
+      }),
+      getEvents: vi.fn(async () => [longTermEvents[0]!, longTermEvents[2]!]),
+    })
+    const engine = makeEngine(new MemoryBroadcastProvider(), longTermStore)
+    await engine.createTask({ id: 'task-1' })
+    await engine.publishEvent('task-1', { type: 'demo.one', level: 'info', data: null })
+    await engine.publishEvent('task-1', { type: 'demo.two', level: 'info', data: null })
+    await engine.publishEvent('task-1', { type: 'demo.three', level: 'info', data: null })
+
+    await expect(engine.exportTaskArchive('task-1')).rejects.toThrow(InvalidTaskArchiveError)
+  })
+
+  it('rejects long-term accumulate events that have no matching short-term raw event', async () => {
+    const longTermStore = makeLongTermStore({
+      getEvents: vi.fn(async () => [
+        {
+          id: 'event-1',
+          taskId: 'task-1',
+          index: 0,
+          timestamp: 3000,
+          type: 'task.output',
+          level: 'info',
+          data: { delta: 'hello world' },
+          seriesId: 'output',
+          seriesMode: 'accumulate',
+          seriesAccField: 'delta',
+        },
+      ]),
+    })
+    const engine = makeEngine(new MemoryBroadcastProvider(), longTermStore)
+    await engine.createTask({ id: 'task-1' })
+
+    await expect(engine.exportTaskArchive('task-1')).rejects.toThrow(InvalidTaskArchiveError)
   })
 
   it('imports archive silently and allows publish to continue at the next index', async () => {
@@ -223,5 +447,23 @@ describe('TaskEngine archive import/export', () => {
 
     await expect(shortTermStore.getTask('task-1')).resolves.toBeNull()
     await expect(shortTermStore.getEvents('task-1')).resolves.toEqual([])
+  })
+
+  it('does not restore long-term when short-term archive restore fails', async () => {
+    const shortTermStore = new MemoryShortTermStore()
+    const shortRestore = vi
+      .spyOn(shortTermStore, 'restoreTaskArchive')
+      .mockRejectedValue(new Error('short restore failed'))
+    const longRestore = vi.fn().mockResolvedValue({ overwritten: false })
+    const engine = new TaskEngine({
+      broadcast: new MemoryBroadcastProvider(),
+      shortTermStore,
+      longTermStore: makeLongTermStore({ restoreTaskArchive: longRestore }),
+    })
+
+    await expect(engine.importTaskArchive(makeArchive())).rejects.toThrow('short restore failed')
+
+    expect(shortRestore).toHaveBeenCalledOnce()
+    expect(longRestore).not.toHaveBeenCalled()
   })
 })
