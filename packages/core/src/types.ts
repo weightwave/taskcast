@@ -185,6 +185,37 @@ export interface TaskEvent {
   _accumulatedData?: unknown
 }
 
+export interface TaskArchive {
+  schema: 'taskcast.taskArchive'
+  version: 1
+  exportedAt: number
+  task: Task
+  events: TaskEvent[]
+}
+
+export interface TaskArchiveImportOptions {
+  overwrite?: boolean
+}
+
+export interface TaskArchiveImportResult {
+  taskId: string
+  eventCount: number
+  overwritten: boolean
+}
+
+export interface SeriesLatestEntry {
+  taskId: string
+  seriesId: string
+  event: TaskEvent
+}
+
+export interface TaskArchiveRestoreData {
+  task: Task
+  events: TaskEvent[]
+  nextIndex: number
+  seriesLatest: SeriesLatestEntry[]
+}
+
 export interface SSEEnvelope {
   filteredIndex: number
   rawIndex: number
@@ -253,6 +284,10 @@ export interface ShortTermStore {
   /** Atomically read previous accumulated value, concatenate with new delta, write back. Returns the accumulated event. */
   accumulateSeries(taskId: string, seriesId: string, event: TaskEvent, field: string): Promise<TaskEvent>
   replaceLastSeriesEvent(taskId: string, seriesId: string, event: TaskEvent): Promise<void>
+  restoreTaskArchive(
+    data: TaskArchiveRestoreData,
+    options?: TaskArchiveImportOptions,
+  ): Promise<{ overwritten: boolean }>
 
   // Task query
   listTasks(filter: TaskFilter): Promise<Task[]>
@@ -284,6 +319,10 @@ export interface LongTermStore {
   getTask(taskId: string): Promise<Task | null>
   saveEvent(event: TaskEvent): Promise<void>
   getEvents(taskId: string, opts?: EventQueryOptions): Promise<TaskEvent[]>
+  restoreTaskArchive(
+    data: TaskArchiveRestoreData,
+    options?: TaskArchiveImportOptions,
+  ): Promise<{ overwritten: boolean }>
   saveWorkerEvent(event: WorkerAuditEvent): Promise<void>
   getWorkerEvents(workerId: string, opts?: EventQueryOptions): Promise<WorkerAuditEvent[]>
 }

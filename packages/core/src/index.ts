@@ -1,4 +1,5 @@
 export * from './types.js'
+export * from './archive.js'
 export * from './state-machine.js'
 export * from './filter.js'
 export * from './series.js'
