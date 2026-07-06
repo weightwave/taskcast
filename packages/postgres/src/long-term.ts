@@ -103,6 +103,39 @@ export class PostgresLongTermStore implements LongTermStore {
     `
   }
 
+  async validateTaskArchiveRestore(
+    data: TaskArchiveRestoreData,
+    options?: TaskArchiveImportOptions,
+  ): Promise<void> {
+    await this.validateTaskArchiveRestoreWithClient(this.sql, data, options)
+  }
+
+  private async validateTaskArchiveRestoreWithClient(
+    sql: PostgresClient,
+    data: TaskArchiveRestoreData,
+    options?: TaskArchiveImportOptions,
+  ): Promise<boolean> {
+    const taskId = data.task.id
+    const existing = await sql`SELECT id FROM ${sql(TASKS)} WHERE id = ${taskId}`
+    if (existing.length > 0 && options?.overwrite !== true) {
+      throw new Error(`Task already exists: ${taskId}`)
+    }
+
+    const eventIds = Array.from(new Set(data.events.map((event) => event.id)))
+    for (const eventId of eventIds) {
+      const conflict = await sql`
+        SELECT id FROM ${sql(EVENTS)}
+        WHERE task_id <> ${taskId} AND id = ${eventId}
+        LIMIT 1
+      `
+      if (conflict.length > 0) {
+        throw new Error(`Archive event id conflicts with another task: ${eventId}`)
+      }
+    }
+
+    return existing.length > 0
+  }
+
   async restoreTaskArchive(
     data: TaskArchiveRestoreData,
     options?: TaskArchiveImportOptions,
@@ -110,10 +143,7 @@ export class PostgresLongTermStore implements LongTermStore {
     return this.sql.begin(async (sql) => {
       const tx = sql as unknown as PostgresClient
       const taskId = data.task.id
-      const existing = await tx`SELECT id FROM ${tx(TASKS)} WHERE id = ${taskId}`
-      if (existing.length > 0 && options?.overwrite !== true) {
-        throw new Error(`Task already exists: ${taskId}`)
-      }
+      const overwritten = await this.validateTaskArchiveRestoreWithClient(tx, data, options)
 
       await tx`DELETE FROM ${tx(EVENTS)} WHERE task_id = ${taskId}`
       await tx`DELETE FROM ${tx(TASKS)} WHERE id = ${taskId}`
@@ -122,7 +152,7 @@ export class PostgresLongTermStore implements LongTermStore {
         await this.saveEventWithClient(tx, event, 'strict')
       }
 
-      return { overwritten: existing.length > 0 }
+      return { overwritten }
     })
   }
 

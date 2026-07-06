@@ -64,15 +64,24 @@ export class MemoryShortTermStore implements ShortTermStore {
     this.events.get(taskId)!.push({ ...event })
   }
 
+  async validateTaskArchiveRestore(
+    data: TaskArchiveRestoreData,
+    options?: TaskArchiveImportOptions,
+  ): Promise<void> {
+    const taskId = data.task.id
+    const existing = this.tasks.get(taskId)
+    if (existing && options?.overwrite !== true) {
+      throw new TaskConflictError(taskId)
+    }
+  }
+
   async restoreTaskArchive(
     data: TaskArchiveRestoreData,
     options?: TaskArchiveImportOptions,
   ): Promise<{ overwritten: boolean }> {
     const taskId = data.task.id
     const existing = this.tasks.get(taskId)
-    if (existing && options?.overwrite !== true) {
-      throw new TaskConflictError(taskId)
-    }
+    await this.validateTaskArchiveRestore(data, options)
 
     for (const key of Array.from(this.seriesLatest.keys())) {
       if (key.startsWith(`${taskId}:`)) {

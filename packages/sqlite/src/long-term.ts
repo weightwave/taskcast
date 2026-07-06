@@ -119,16 +119,47 @@ export class SqliteLongTermStore implements LongTermStore {
       })
   }
 
+  async validateTaskArchiveRestore(
+    data: TaskArchiveRestoreData,
+    options?: TaskArchiveImportOptions,
+  ): Promise<void> {
+    this.validateTaskArchiveRestoreSync(data, options)
+  }
+
+  private validateTaskArchiveRestoreSync(
+    data: TaskArchiveRestoreData,
+    options?: TaskArchiveImportOptions,
+  ): boolean {
+    const taskId = data.task.id
+    const existing = this.db.prepare('SELECT id FROM taskcast_tasks WHERE id = ?').get(taskId)
+    if (existing && options?.overwrite !== true) {
+      throw new Error(`Task already exists: ${taskId}`)
+    }
+
+    const eventIds = Array.from(new Set(data.events.map((event) => event.id)))
+    if (eventIds.length > 0) {
+      const conflict = this.db
+        .prepare(
+          `SELECT id FROM taskcast_events
+           WHERE task_id <> ? AND id IN (${eventIds.map(() => '?').join(', ')})
+           LIMIT 1`,
+        )
+        .get(taskId, ...eventIds)
+      if (conflict) {
+        throw new Error(`Archive event id conflicts with another task: ${(conflict as { id: string }).id}`)
+      }
+    }
+
+    return Boolean(existing)
+  }
+
   async restoreTaskArchive(
     data: TaskArchiveRestoreData,
     options?: TaskArchiveImportOptions,
   ): Promise<{ overwritten: boolean }> {
     const restore = this.db.transaction(() => {
       const taskId = data.task.id
-      const existing = this.db.prepare('SELECT id FROM taskcast_tasks WHERE id = ?').get(taskId)
-      if (existing && options?.overwrite !== true) {
-        throw new Error(`Task already exists: ${taskId}`)
-      }
+      const overwritten = this.validateTaskArchiveRestoreSync(data, options)
 
       this.db.prepare('DELETE FROM taskcast_events WHERE task_id = ?').run(taskId)
       this.db.prepare('DELETE FROM taskcast_tasks WHERE id = ?').run(taskId)
@@ -137,7 +168,7 @@ export class SqliteLongTermStore implements LongTermStore {
         this.saveEventStrictSync(event)
       }
 
-      return { overwritten: Boolean(existing) }
+      return { overwritten }
     })
 
     return restore()

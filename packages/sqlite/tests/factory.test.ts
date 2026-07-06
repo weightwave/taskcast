@@ -2,6 +2,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { describe, it, expect, afterEach } from 'vitest'
+import { MemoryBroadcastProvider, TaskEngine, type TaskArchive } from '@taskcast/core'
 import { createSqliteAdapters, SqliteShortTermStore, SqliteLongTermStore } from '../src/index.js'
 
 describe('createSqliteAdapters', () => {
@@ -74,6 +75,46 @@ describe('createSqliteAdapters', () => {
 
     await longTermStore.saveTask(task)
     expect(await longTermStore.getTask('factory-1')).toEqual(task)
+  })
+
+  it('imports a new archive through paired SQLite adapters', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'taskcast-factory-'))
+    const { shortTermStore, longTermStore } = makeFactory(join(dir, 'test.db'))
+    const engine = new TaskEngine({
+      broadcast: new MemoryBroadcastProvider(),
+      shortTermStore,
+      longTermStore,
+    })
+    const archive: TaskArchive = {
+      schema: 'taskcast.taskArchive',
+      version: 1,
+      exportedAt: 5000,
+      task: { id: 'archive-task', status: 'running', createdAt: 1000, updatedAt: 2000 },
+      events: [
+        {
+          id: 'archive-event-0',
+          taskId: 'archive-task',
+          index: 0,
+          timestamp: 3000,
+          type: 'archive.event',
+          level: 'info',
+          data: { value: 1 },
+        },
+      ],
+    }
+
+    const result = await engine.importTaskArchive(archive)
+    const next = await engine.publishEvent('archive-task', {
+      type: 'archive.next',
+      level: 'info',
+      data: { value: 2 },
+    })
+
+    expect(result).toEqual({ taskId: 'archive-task', eventCount: 1, overwritten: false })
+    await expect(shortTermStore.getTask('archive-task')).resolves.toEqual(archive.task)
+    await expect(shortTermStore.getEvents('archive-task')).resolves.toHaveLength(2)
+    await expect(longTermStore.getEvents('archive-task')).resolves.toHaveLength(2)
+    expect(next.index).toBe(1)
   })
 
   it('should use default path ./taskcast.db when no path or env var given', () => {

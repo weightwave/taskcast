@@ -6,7 +6,7 @@ import {
   TaskConflictError,
   TaskEngine,
 } from '../../src/index.js'
-import type { LongTermStore, TaskArchive, TaskEvent } from '../../src/types.js'
+import type { LongTermStore, TaskArchive, TaskArchiveRestoreData, TaskEvent } from '../../src/types.js'
 
 function makeEngine(broadcast = new MemoryBroadcastProvider(), longTermStore?: LongTermStore) {
   return new TaskEngine({
@@ -26,7 +26,14 @@ function makeArchive(events: TaskArchive['events'] = []): TaskArchive {
   }
 }
 
-function makeLongTermStore(overrides: Partial<LongTermStore> = {}): LongTermStore {
+function makeLongTermStore(
+  overrides: Partial<LongTermStore> & {
+    validateTaskArchiveRestore?: (
+      data: TaskArchiveRestoreData,
+      options?: { overwrite?: boolean },
+    ) => Promise<void>
+  } = {},
+): LongTermStore {
   return {
     saveTask: vi.fn().mockResolvedValue(undefined),
     getTask: vi.fn().mockResolvedValue(null),
@@ -465,5 +472,51 @@ describe('TaskEngine archive import/export', () => {
 
     expect(shortRestore).toHaveBeenCalledOnce()
     expect(longRestore).not.toHaveBeenCalled()
+  })
+
+  it('validates long-term restore before mutating short-term state', async () => {
+    const shortTermStore = new MemoryShortTermStore()
+    const shortRestore = vi.spyOn(shortTermStore, 'restoreTaskArchive')
+    const longValidate = vi.fn().mockRejectedValue(new Error('long preflight failed'))
+    const longRestore = vi.fn().mockResolvedValue({ overwritten: false })
+    const engine = new TaskEngine({
+      broadcast: new MemoryBroadcastProvider(),
+      shortTermStore,
+      longTermStore: makeLongTermStore({
+        validateTaskArchiveRestore: longValidate,
+        restoreTaskArchive: longRestore,
+      }),
+    })
+
+    await expect(engine.importTaskArchive(makeArchive())).rejects.toThrow('long preflight failed')
+
+    expect(longValidate).toHaveBeenCalledOnce()
+    expect(shortRestore).not.toHaveBeenCalled()
+    expect(longRestore).not.toHaveBeenCalled()
+    await expect(shortTermStore.getTask('task-1')).resolves.toBeNull()
+    await expect(shortTermStore.getEvents('task-1')).resolves.toEqual([])
+  })
+
+  it('uses validated restore-phase overwrite without reporting new imports as overwritten', async () => {
+    const shortTermStore = new MemoryShortTermStore()
+    const originalRestore = shortTermStore.restoreTaskArchive.bind(shortTermStore)
+    const shortValidate = vi.fn().mockResolvedValue(undefined)
+    const shortRestore = vi.fn(async (data: TaskArchiveRestoreData, options?: { overwrite?: boolean }) => {
+      if (options?.overwrite !== true) throw new Error('restore overwrite option missing')
+      await originalRestore(data, options)
+      return { overwritten: true }
+    })
+    shortTermStore.validateTaskArchiveRestore = shortValidate
+    shortTermStore.restoreTaskArchive = shortRestore
+    const engine = new TaskEngine({
+      broadcast: new MemoryBroadcastProvider(),
+      shortTermStore,
+    })
+
+    const result = await engine.importTaskArchive(makeArchive())
+
+    expect(shortValidate).toHaveBeenCalled()
+    expect(shortRestore).toHaveBeenCalledWith(expect.any(Object), { overwrite: true })
+    expect(result).toEqual({ taskId: 'task-1', eventCount: 0, overwritten: false })
   })
 })

@@ -58,6 +58,39 @@ export class RedisShortTermStore implements ShortTermStore {
     await this.redis.rpush(this.KEY.events(taskId), JSON.stringify(event))
   }
 
+  async validateTaskArchiveRestore(
+    data: TaskArchiveRestoreData,
+    options?: TaskArchiveImportOptions,
+  ): Promise<void> {
+    const taskId = data.task.id
+    const taskKey = this.KEY.task(taskId)
+    const taskType = await this.redis.type(taskKey)
+    await this.assertRedisType(taskKey, taskType, ['none', 'string'])
+
+    const exists = taskType !== 'none'
+    if (exists && options?.overwrite !== true) {
+      throw new Error(`Task already exists: ${taskId}`)
+    }
+
+    await this.assertRedisType(this.KEY.taskSet, await this.redis.type(this.KEY.taskSet), ['none', 'set'])
+    await this.assertRedisType(this.KEY.events(taskId), await this.redis.type(this.KEY.events(taskId)), ['none', 'list'])
+    await this.assertRedisType(this.KEY.idx(taskId), await this.redis.type(this.KEY.idx(taskId)), ['none', 'string'])
+
+    const seriesIdsKey = this.KEY.seriesIds(taskId)
+    await this.assertRedisType(seriesIdsKey, await this.redis.type(seriesIdsKey), ['none', 'set'])
+    const existingSeriesIds = await this.redis.smembers(seriesIdsKey)
+    for (const seriesId of existingSeriesIds) {
+      const key = this.KEY.seriesLatest(taskId, seriesId)
+      await this.assertRedisType(key, await this.redis.type(key), ['none', 'string'])
+    }
+  }
+
+  private async assertRedisType(key: string, actual: string, allowed: string[]): Promise<void> {
+    if (!allowed.includes(actual)) {
+      throw new Error(`Redis key type mismatch for ${key}: expected ${allowed.join(' or ')}, got ${actual}`)
+    }
+  }
+
   async restoreTaskArchive(
     data: TaskArchiveRestoreData,
     options?: TaskArchiveImportOptions,
@@ -65,9 +98,7 @@ export class RedisShortTermStore implements ShortTermStore {
     const taskId = data.task.id
     const taskKey = this.KEY.task(taskId)
     const exists = await this.redis.exists(taskKey)
-    if (exists && options?.overwrite !== true) {
-      throw new Error(`Task already exists: ${taskId}`)
-    }
+    await this.validateTaskArchiveRestore(data, options)
 
     const existingSeriesIds = await this.redis.smembers(this.KEY.seriesIds(taskId))
     const pipeline = this.redis.pipeline()

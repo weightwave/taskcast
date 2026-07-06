@@ -225,7 +225,7 @@ describe('RedisShortTermStore - restoreTaskArchive', () => {
     await expect(store.getSeriesLatest('task-1', 'new-series')).resolves.toEqual(importedLatest)
   })
 
-  it('rejects when a Redis pipeline command fails', async () => {
+  it('rejects wrong key types before mutating restore state', async () => {
     const data = makeRestoreData({
       task: makeTask('task-archive'),
       events: [{ ...makeEvent(0), taskId: 'task-archive' }],
@@ -233,7 +233,10 @@ describe('RedisShortTermStore - restoreTaskArchive', () => {
     })
     await redis.set('taskcast:tasks', 'not-a-set')
 
-    await expect(store.restoreTaskArchive(data)).rejects.toThrow(/Redis pipeline failed/)
+    await expect(store.restoreTaskArchive(data)).rejects.toThrow(/Redis key type mismatch/)
+    await expect(store.getTask('task-archive')).resolves.toBeNull()
+    await expect(store.getEvents('task-archive')).resolves.toEqual([])
+    await expect(redis.exists('taskcast:idx:task-archive')).resolves.toBe(0)
   })
 })
 

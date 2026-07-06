@@ -296,6 +296,11 @@ export interface ShortTermStore {
   /** Atomically read previous accumulated value, concatenate with new delta, write back. Returns the accumulated event. */
   accumulateSeries(taskId: string, seriesId: string, event: TaskEvent, field: string): Promise<TaskEvent>
   replaceLastSeriesEvent(taskId: string, seriesId: string, event: TaskEvent): Promise<void>
+  /** Validates deterministic archive restore conflicts before mutation; engine calls this before multi-store restore. */
+  validateTaskArchiveRestore?(
+    data: TaskArchiveRestoreData,
+    options?: TaskArchiveImportOptions,
+  ): Promise<void>
   /** Stores with native archive restore should implement this; engine import checks availability before use. */
   restoreTaskArchive?(
     data: TaskArchiveRestoreData,
@@ -332,6 +337,11 @@ export interface LongTermStore {
   getTask(taskId: string): Promise<Task | null>
   saveEvent(event: TaskEvent): Promise<void>
   getEvents(taskId: string, opts?: EventQueryOptions): Promise<TaskEvent[]>
+  /** Validates deterministic archive restore conflicts before mutation; engine calls this before multi-store restore. */
+  validateTaskArchiveRestore?(
+    data: TaskArchiveRestoreData,
+    options?: TaskArchiveImportOptions,
+  ): Promise<void>
   /** Stores with native archive restore should implement this; engine import checks availability before use. */
   restoreTaskArchive?(
     data: TaskArchiveRestoreData,

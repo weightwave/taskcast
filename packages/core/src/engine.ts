@@ -407,17 +407,33 @@ export class TaskEngine {
     }
 
     const restoreData = buildTaskArchiveRestoreData(normalized)
-    const restored = await this.shortTermStore.restoreTaskArchive(restoreData, options)
-    let longTermRestored: { overwritten: boolean } | undefined
+    const shortTermValidated = typeof this.shortTermStore.validateTaskArchiveRestore === 'function'
+    const longTermValidated = this.longTermStore
+      ? typeof this.longTermStore.validateTaskArchiveRestore === 'function'
+      : false
+
+    await this.shortTermStore.validateTaskArchiveRestore?.(restoreData, options)
     if (this.longTermStore) {
-      longTermRestored = await this.longTermStore.restoreTaskArchive!(restoreData, options)
+      await this.longTermStore.validateTaskArchiveRestore?.(restoreData, options)
+    }
+
+    const restoreOptions = { ...options, overwrite: true }
+    await this.shortTermStore.restoreTaskArchive(
+      restoreData,
+      shortTermValidated ? restoreOptions : options,
+    )
+    if (this.longTermStore) {
+      await this.longTermStore.restoreTaskArchive!(
+        restoreData,
+        longTermValidated ? restoreOptions : options,
+      )
     }
     this._emitChains.delete(taskId)
 
     return {
       taskId,
       eventCount: normalized.events.length,
-      overwritten: restored.overwritten || longTermRestored?.overwritten === true || existing !== null,
+      overwritten: existing !== null,
     }
   }
 

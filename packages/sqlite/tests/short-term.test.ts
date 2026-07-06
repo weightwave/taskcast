@@ -378,6 +378,23 @@ describe('SqliteShortTermStore', () => {
     await expect(store.getSeriesLatest('task-1', 'new-series')).resolves.toEqual(importedLatest)
   })
 
+  it('should reject restore when an imported event id collides with another task and roll back', async () => {
+    await store.saveTask(makeTask('other-task'))
+    await store.appendEvent('other-task', { ...makeEvent('other-task', 0), id: 'shared-event-id' })
+
+    const data = makeRestoreData({
+      task: makeTask('target-task'),
+      events: [{ ...makeEvent('target-task', 0), id: 'shared-event-id' }],
+      nextIndex: 1,
+    })
+
+    await expect(store.restoreTaskArchive(data)).rejects.toThrow()
+
+    await expect(store.getTask('target-task')).resolves.toBeNull()
+    await expect(store.getEvents('target-task')).resolves.toEqual([])
+    await expect(store.getEvents('other-task')).resolves.toHaveLength(1)
+  })
+
   // ─── replaceLastSeriesEvent ─────────────────────────────────────────────
 
   it('should replace last series event in event list', async () => {
