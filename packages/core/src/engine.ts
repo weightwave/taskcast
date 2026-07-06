@@ -1,10 +1,14 @@
 import { ulid } from 'ulidx'
 import { canTransition, isTerminal, isSuspended } from './state-machine.js'
 import { processSeries } from './series.js'
+import { buildTaskArchiveRestoreData, normalizeTaskArchive } from './archive.js'
 import type {
   Task,
   TaskStatus,
   TaskEvent,
+  TaskArchive,
+  TaskArchiveImportOptions,
+  TaskArchiveImportResult,
   BlockedRequest,
   TaskFilter,
   BroadcastProvider,
@@ -306,6 +310,53 @@ export class TaskEngine {
     }
 
     return this._emit(taskId, input)
+  }
+
+  async exportTaskArchive(taskId: string): Promise<TaskArchive> {
+    const task = await this.getTask(taskId)
+    if (!task) throw new Error(`Task not found: ${taskId}`)
+
+    const archive: TaskArchive = {
+      schema: 'taskcast.taskArchive',
+      version: 1,
+      exportedAt: Date.now(),
+      task: { ...task },
+      events: (await this.getEvents(taskId)).map((event) => ({ ...event })),
+    }
+
+    return normalizeTaskArchive(archive)
+  }
+
+  async importTaskArchive(
+    archive: TaskArchive,
+    options?: TaskArchiveImportOptions,
+  ): Promise<TaskArchiveImportResult> {
+    const normalized = normalizeTaskArchive(archive)
+    const taskId = normalized.task.id
+    const existing = await this.getTask(taskId)
+
+    if (existing && options?.overwrite !== true) throw new TaskConflictError(taskId)
+
+    if (typeof this.shortTermStore.restoreTaskArchive !== 'function') {
+      throw new Error('shortTermStore does not support restoreTaskArchive')
+    }
+    if (this.longTermStore && typeof this.longTermStore.restoreTaskArchive !== 'function') {
+      throw new Error('longTermStore does not support restoreTaskArchive')
+    }
+
+    const restoreData = buildTaskArchiveRestoreData(normalized)
+    let longTermRestored: { overwritten: boolean } | undefined
+    if (this.longTermStore) {
+      longTermRestored = await this.longTermStore.restoreTaskArchive!(restoreData, options)
+    }
+    const restored = await this.shortTermStore.restoreTaskArchive(restoreData, options)
+    this._emitChains.delete(taskId)
+
+    return {
+      taskId,
+      eventCount: normalized.events.length,
+      overwritten: restored.overwritten || longTermRestored?.overwritten === true || existing !== null,
+    }
   }
 
   async listTasks(filter: TaskFilter): Promise<Task[]> {

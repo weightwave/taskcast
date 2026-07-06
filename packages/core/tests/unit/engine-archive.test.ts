@@ -1,0 +1,227 @@
+import { describe, expect, it, vi } from 'vitest'
+import {
+  MemoryBroadcastProvider,
+  MemoryShortTermStore,
+  TaskConflictError,
+  TaskEngine,
+} from '../../src/index.js'
+import type { LongTermStore, TaskArchive } from '../../src/types.js'
+
+function makeEngine(broadcast = new MemoryBroadcastProvider(), longTermStore?: LongTermStore) {
+  return new TaskEngine({
+    broadcast,
+    shortTermStore: new MemoryShortTermStore(),
+    ...(longTermStore !== undefined ? { longTermStore } : {}),
+  })
+}
+
+function makeArchive(events: TaskArchive['events'] = []): TaskArchive {
+  return {
+    schema: 'taskcast.taskArchive',
+    version: 1,
+    exportedAt: 5000,
+    task: { id: 'task-1', status: 'running', createdAt: 1000, updatedAt: 2000 },
+    events,
+  }
+}
+
+function makeLongTermStore(overrides: Partial<LongTermStore> = {}): LongTermStore {
+  return {
+    saveTask: vi.fn().mockResolvedValue(undefined),
+    getTask: vi.fn().mockResolvedValue(null),
+    saveEvent: vi.fn().mockResolvedValue(undefined),
+    getEvents: vi.fn().mockResolvedValue([]),
+    saveWorkerEvent: vi.fn().mockResolvedValue(undefined),
+    getWorkerEvents: vi.fn().mockResolvedValue([]),
+    ...overrides,
+  }
+}
+
+describe('TaskEngine archive import/export', () => {
+  it('exports task and events preserving original fields', async () => {
+    const engine = makeEngine()
+    const task = await engine.createTask({ id: 'task-1', type: 'demo' })
+    const event = await engine.publishEvent(task.id, {
+      type: 'demo.event',
+      level: 'info',
+      data: { value: 1 },
+    })
+
+    const archive = await engine.exportTaskArchive(task.id)
+
+    expect(archive).toMatchObject({
+      schema: 'taskcast.taskArchive',
+      version: 1,
+      task: { id: 'task-1', createdAt: task.createdAt, updatedAt: task.updatedAt },
+      events: [{ id: event.id, index: 0, timestamp: event.timestamp }],
+    })
+  })
+
+  it('imports archive silently and allows publish to continue at the next index', async () => {
+    const source = makeEngine()
+    await source.createTask({ id: 'task-1' })
+    await source.publishEvent('task-1', { type: 'demo.one', level: 'info', data: null })
+    const archive = await source.exportTaskArchive('task-1')
+
+    const broadcast = new MemoryBroadcastProvider()
+    const handler = vi.fn()
+    broadcast.subscribe('task-1', handler)
+    const target = makeEngine(broadcast)
+
+    const result = await target.importTaskArchive(archive)
+    const next = await target.publishEvent('task-1', { type: 'demo.two', level: 'info', data: null })
+
+    expect(result).toEqual({ taskId: 'task-1', eventCount: 1, overwritten: false })
+    expect(handler).toHaveBeenCalledTimes(1)
+    expect(handler.mock.calls[0]![0].type).toBe('demo.two')
+    expect(next.index).toBe(1)
+  })
+
+  it('rejects an existing task unless overwrite is true', async () => {
+    const engine = makeEngine()
+    await engine.createTask({ id: 'task-1' })
+
+    await expect(engine.importTaskArchive(makeArchive())).rejects.toThrow(TaskConflictError)
+  })
+
+  it('overwrite replaces the full old history', async () => {
+    const engine = makeEngine()
+    await engine.createTask({ id: 'task-1' })
+    await engine.publishEvent('task-1', { type: 'old.event', level: 'info', data: null })
+
+    const result = await engine.importTaskArchive(
+      makeArchive([
+        {
+          id: 'imported-event',
+          taskId: 'task-1',
+          index: 0,
+          timestamp: 3000,
+          type: 'new.event',
+          level: 'info',
+          data: null,
+        },
+      ]),
+      { overwrite: true },
+    )
+    const events = await engine.getEvents('task-1')
+
+    expect(result.overwritten).toBe(true)
+    expect(events.map((event) => event.type)).toEqual(['new.event'])
+  })
+
+  it('rebuilds latest and accumulate series state so future publishes resume correctly', async () => {
+    const target = makeEngine()
+    const archive = makeArchive([
+      {
+        id: 'status-old',
+        taskId: 'task-1',
+        index: 0,
+        timestamp: 3000,
+        type: 'task.status',
+        level: 'info',
+        data: { status: 'starting' },
+        seriesId: 'status',
+        seriesMode: 'latest',
+      },
+      {
+        id: 'status-new',
+        taskId: 'task-1',
+        index: 1,
+        timestamp: 3001,
+        type: 'task.status',
+        level: 'info',
+        data: { status: 'ready' },
+        seriesId: 'status',
+        seriesMode: 'latest',
+      },
+      {
+        id: 'output-1',
+        taskId: 'task-1',
+        index: 2,
+        timestamp: 3002,
+        type: 'task.output',
+        level: 'info',
+        data: { delta: 'hello ' },
+        seriesId: 'output',
+        seriesMode: 'accumulate',
+        seriesAccField: 'delta',
+      },
+      {
+        id: 'output-2',
+        taskId: 'task-1',
+        index: 3,
+        timestamp: 3003,
+        type: 'task.output',
+        level: 'info',
+        data: { delta: 'world' },
+        seriesId: 'output',
+        seriesMode: 'accumulate',
+        seriesAccField: 'delta',
+      },
+    ])
+
+    await target.importTaskArchive(archive)
+    const restoredStatus = await target.getSeriesLatest('task-1', 'status')
+    const restoredOutput = await target.getSeriesLatest('task-1', 'output')
+    const next = await target.publishEvent('task-1', {
+      type: 'task.output',
+      level: 'info',
+      data: { delta: '!' },
+      seriesId: 'output',
+      seriesMode: 'accumulate',
+      seriesAccField: 'delta',
+    })
+    const resumedLatest = await target.getSeriesLatest('task-1', 'output')
+
+    expect(restoredStatus?.data).toEqual({ status: 'ready' })
+    expect(restoredOutput?.data).toEqual({ delta: 'hello world' })
+    expect(next.index).toBe(4)
+    expect(resumedLatest?.data).toEqual({ delta: 'hello world!' })
+  })
+
+  it('export and import do not include or broadcast transient accumulated data', async () => {
+    const source = makeEngine()
+    await source.createTask({ id: 'task-1' })
+    await source.publishEvent('task-1', {
+      type: 'task.output',
+      level: 'info',
+      data: { delta: 'hello ' },
+      seriesId: 'output',
+      seriesMode: 'accumulate',
+    })
+    await source.publishEvent('task-1', {
+      type: 'task.output',
+      level: 'info',
+      data: { delta: 'world' },
+      seriesId: 'output',
+      seriesMode: 'accumulate',
+    })
+
+    const archive = await source.exportTaskArchive('task-1')
+    const broadcast = new MemoryBroadcastProvider()
+    const handler = vi.fn()
+    broadcast.subscribe('task-1', handler)
+    const target = makeEngine(broadcast)
+
+    await target.importTaskArchive(archive)
+
+    expect(handler).not.toHaveBeenCalled()
+    expect(archive.events).toHaveLength(2)
+    expect(archive.events.map((event) => event.data)).toEqual([{ delta: 'hello ' }, { delta: 'world' }])
+    expect(archive.events.some((event) => '_accumulatedData' in event)).toBe(false)
+  })
+
+  it('fails before short-term restore when long-term store cannot restore archives', async () => {
+    const shortTermStore = new MemoryShortTermStore()
+    const engine = new TaskEngine({
+      broadcast: new MemoryBroadcastProvider(),
+      shortTermStore,
+      longTermStore: makeLongTermStore(),
+    })
+
+    await expect(engine.importTaskArchive(makeArchive())).rejects.toThrow(/longTermStore.*restoreTaskArchive/)
+
+    await expect(shortTermStore.getTask('task-1')).resolves.toBeNull()
+    await expect(shortTermStore.getEvents('task-1')).resolves.toEqual([])
+  })
+})

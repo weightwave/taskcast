@@ -9,7 +9,10 @@ import type {
   Worker,
   WorkerFilter,
   WorkerAssignment,
+  TaskArchiveImportOptions,
+  TaskArchiveRestoreData,
 } from './types.js'
+import { TaskConflictError } from './engine.js'
 
 export class MemoryBroadcastProvider implements BroadcastProvider {
   private listeners = new Map<string, Set<(event: TaskEvent) => void>>()
@@ -59,6 +62,33 @@ export class MemoryShortTermStore implements ShortTermStore {
   async appendEvent(taskId: string, event: TaskEvent): Promise<void> {
     if (!this.events.has(taskId)) this.events.set(taskId, [])
     this.events.get(taskId)!.push({ ...event })
+  }
+
+  async restoreTaskArchive(
+    data: TaskArchiveRestoreData,
+    options?: TaskArchiveImportOptions,
+  ): Promise<{ overwritten: boolean }> {
+    const taskId = data.task.id
+    const existing = this.tasks.get(taskId)
+    if (existing && options?.overwrite !== true) {
+      throw new TaskConflictError(taskId)
+    }
+
+    for (const key of Array.from(this.seriesLatest.keys())) {
+      if (key.startsWith(`${taskId}:`)) {
+        this.seriesLatest.delete(key)
+      }
+    }
+
+    this.tasks.set(taskId, { ...data.task })
+    this.events.set(taskId, data.events.map((event) => ({ ...event })))
+    this.indexCounters.set(taskId, data.nextIndex - 1)
+
+    for (const entry of data.seriesLatest) {
+      this.seriesLatest.set(`${entry.taskId}:${entry.seriesId}`, { ...entry.event })
+    }
+
+    return { overwritten: existing !== undefined }
   }
 
   async getEvents(taskId: string, opts?: EventQueryOptions): Promise<TaskEvent[]> {
