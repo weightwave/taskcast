@@ -1,3 +1,4 @@
+pub mod archive;
 pub mod cleanup;
 pub mod config;
 pub mod engine;
@@ -11,6 +12,7 @@ pub mod types;
 pub mod worker_manager;
 pub mod worker_matching;
 
+pub use archive::*;
 pub use cleanup::*;
 pub use engine::*;
 pub use filter::*;

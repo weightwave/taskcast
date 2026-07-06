@@ -484,6 +484,49 @@ pub struct EventQueryOptions {
     pub limit: Option<u64>,
 }
 
+// ─── Archive ────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskArchive {
+    pub schema: String,
+    pub version: u64,
+    pub exported_at: f64,
+    pub task: Task,
+    pub events: Vec<TaskEvent>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskArchiveImportOptions {
+    pub overwrite: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskArchiveImportResult {
+    pub task_id: String,
+    pub event_count: usize,
+    pub overwritten: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SeriesLatestEntry {
+    pub task_id: String,
+    pub series_id: String,
+    pub event: TaskEvent,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskArchiveRestoreData {
+    pub task: Task,
+    pub events: Vec<TaskEvent>,
+    pub next_index: u64,
+    pub series_latest: Vec<SeriesLatestEntry>,
+}
+
 // ─── Storage Interfaces ──────────────────────────────────────────────────────
 
 #[async_trait]
@@ -526,6 +569,32 @@ pub trait ShortTermStore: Send + Sync {
     async fn accumulate_series(&self, task_id: &str, series_id: &str, event: TaskEvent, field: &str) -> Result<TaskEvent, Box<dyn std::error::Error + Send + Sync>>;
     async fn next_index(&self, task_id: &str) -> Result<u64, Box<dyn std::error::Error + Send + Sync>>;
 
+    fn supports_task_archive_restore(&self) -> bool {
+        false
+    }
+
+    async fn validate_task_archive_restore(
+        &self,
+        _data: &TaskArchiveRestoreData,
+        _options: Option<TaskArchiveImportOptions>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "restore_task_archive is not supported by this short-term store",
+        )))
+    }
+
+    async fn restore_task_archive(
+        &self,
+        _data: TaskArchiveRestoreData,
+        _options: Option<TaskArchiveImportOptions>,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "restore_task_archive is not supported by this short-term store",
+        )))
+    }
+
     // Task query
     async fn list_tasks(&self, filter: TaskFilter) -> Result<Vec<Task>, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -561,6 +630,32 @@ pub trait LongTermStore: Send + Sync {
     async fn get_task(&self, task_id: &str) -> Result<Option<Task>, Box<dyn std::error::Error + Send + Sync>>;
     async fn save_event(&self, event: TaskEvent) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
     async fn get_events(&self, task_id: &str, opts: Option<EventQueryOptions>) -> Result<Vec<TaskEvent>, Box<dyn std::error::Error + Send + Sync>>;
+
+    fn supports_task_archive_restore(&self) -> bool {
+        false
+    }
+
+    async fn validate_task_archive_restore(
+        &self,
+        _data: &TaskArchiveRestoreData,
+        _options: Option<TaskArchiveImportOptions>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "restore_task_archive is not supported by this long-term store",
+        )))
+    }
+
+    async fn restore_task_archive(
+        &self,
+        _data: TaskArchiveRestoreData,
+        _options: Option<TaskArchiveImportOptions>,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "restore_task_archive is not supported by this long-term store",
+        )))
+    }
 
     // Worker audit
     async fn save_worker_event(&self, event: WorkerAuditEvent) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;

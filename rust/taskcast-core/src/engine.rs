@@ -1,17 +1,22 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::Mutex as TokioMutex;
 
+use crate::archive::{
+    build_task_archive_restore_data, sanitize_task_archive_event, validate_task_archive,
+    ArchiveError, TASK_ARCHIVE_SCHEMA, TASK_ARCHIVE_VERSION,
+};
 use crate::series::process_series;
 use serde::{Deserialize, Serialize};
 
 use crate::state_machine::{can_transition, is_suspended, is_terminal};
 use crate::types::{
     AssignMode, BlockedRequest, BroadcastProvider, CleanupConfig, DisconnectPolicy,
-    EventQueryOptions, Level, LongTermStore, ShortTermStore, Task, TaskAuthConfig, TaskFilter,
-    TaskcastHooks, TaskError, TaskEvent, TaskStatus, WebhookConfig,
+    EventQueryOptions, Level, LongTermStore, ShortTermStore, Task, TaskArchive,
+    TaskArchiveImportOptions, TaskArchiveImportResult, TaskAuthConfig, TaskFilter, TaskcastHooks,
+    TaskError, TaskEvent, TaskStatus, WebhookConfig,
 };
 
 // ─── Error ───────────────────────────────────────────────────────────────────
@@ -32,6 +37,9 @@ pub enum EngineError {
 
     #[error("Cannot publish to task in terminal status: {0:?}")]
     TaskTerminal(TaskStatus),
+
+    #[error("{0}")]
+    Archive(#[from] ArchiveError),
 
     #[error("{0}")]
     Store(#[from] Box<dyn std::error::Error + Send + Sync>),
@@ -455,6 +463,72 @@ impl TaskEngine {
         self.emit(task_id, input).await
     }
 
+    pub async fn export_task_archive(&self, task_id: &str) -> Result<TaskArchive, EngineError> {
+        let task = self
+            .get_task(task_id)
+            .await?
+            .ok_or_else(|| EngineError::TaskNotFound(task_id.to_string()))?;
+
+        self.build_export_archive(&task).await
+    }
+
+    pub async fn import_task_archive(
+        &self,
+        archive: TaskArchive,
+        options: Option<TaskArchiveImportOptions>,
+    ) -> Result<TaskArchiveImportResult, EngineError> {
+        let import_options = options.unwrap_or_default();
+        let normalized = validate_task_archive(&archive)?;
+        let task_id = normalized.task.id.clone();
+        let existing = self.get_task(&task_id).await?;
+
+        if existing.is_some() && !import_options.overwrite {
+            return Err(EngineError::TaskConflict(task_id));
+        }
+
+        if !self.short_term_store.supports_task_archive_restore() {
+            return Err(unsupported_archive_restore(
+                "shortTermStore does not support restore_task_archive",
+            ));
+        }
+        if let Some(ref long_term_store) = self.long_term_store {
+            if !long_term_store.supports_task_archive_restore() {
+                return Err(unsupported_archive_restore(
+                    "longTermStore does not support restore_task_archive",
+                ));
+            }
+        }
+
+        let event_count = normalized.events.len();
+        let restore_data = build_task_archive_restore_data(&normalized)?;
+        self.short_term_store
+            .validate_task_archive_restore(&restore_data, Some(import_options))
+            .await?;
+        if let Some(ref long_term_store) = self.long_term_store {
+            long_term_store
+                .validate_task_archive_restore(&restore_data, Some(import_options))
+                .await?;
+        }
+
+        let restore_options = Some(TaskArchiveImportOptions { overwrite: true });
+        self.short_term_store
+            .restore_task_archive(restore_data.clone(), restore_options)
+            .await?;
+        if let Some(ref long_term_store) = self.long_term_store {
+            long_term_store
+                .restore_task_archive(restore_data, restore_options)
+                .await?;
+        }
+
+        self.emit_locks.lock().unwrap().remove(&task_id);
+
+        Ok(TaskArchiveImportResult {
+            task_id,
+            event_count,
+            overwritten: existing.is_some(),
+        })
+    }
+
     pub async fn get_events(
         &self,
         task_id: &str,
@@ -507,6 +581,80 @@ impl TaskEngine {
     }
 
     // ─── Private ─────────────────────────────────────────────────────────
+
+    async fn build_export_archive(&self, task: &Task) -> Result<TaskArchive, EngineError> {
+        let short_term_events = self.short_term_store.get_events(&task.id, None).await?;
+        if let Some(ref long_term_store) = self.long_term_store {
+            let long_term_events = long_term_store.get_events(&task.id, None).await?;
+            if !long_term_events.is_empty() {
+                let merged = self.merge_export_histories(&long_term_events, &short_term_events)?;
+                return self.normalize_export_archive(task, merged);
+            }
+        }
+
+        self.normalize_export_archive(task, short_term_events)
+    }
+
+    fn merge_export_histories(
+        &self,
+        long_term_events: &[TaskEvent],
+        short_term_events: &[TaskEvent],
+    ) -> Result<Vec<TaskEvent>, EngineError> {
+        let raw_events: HashMap<(String, u64), TaskEvent> = short_term_events
+            .iter()
+            .cloned()
+            .map(|event| ((event.id.clone(), event.index), event))
+            .collect();
+
+        let mut merged = Vec::with_capacity(long_term_events.len() + short_term_events.len());
+        for event in long_term_events {
+            if event.series_mode == Some(crate::types::SeriesMode::Accumulate) {
+                let raw_event = raw_events
+                    .get(&(event.id.clone(), event.index))
+                    .cloned()
+                    .ok_or_else(|| {
+                        ArchiveError::Invalid(format!(
+                            "Cannot export raw accumulate event {}; matching short-term delta is unavailable",
+                            event.id
+                        ))
+                    })?;
+                merged.push(raw_event);
+            } else {
+                merged.push(event.clone());
+            }
+        }
+
+        let long_term_indexes: HashSet<u64> =
+            long_term_events.iter().map(|event| event.index).collect();
+        let prefix_len = contiguous_prefix_len(long_term_events);
+        if long_term_indexes.len() == long_term_events.len()
+            && prefix_len == long_term_events.len() as u64
+        {
+            for event in short_term_events {
+                if event.index >= prefix_len && !long_term_indexes.contains(&event.index) {
+                    merged.push(event.clone());
+                }
+            }
+        }
+
+        Ok(merged)
+    }
+
+    fn normalize_export_archive(
+        &self,
+        task: &Task,
+        events: Vec<TaskEvent>,
+    ) -> Result<TaskArchive, EngineError> {
+        let archive = TaskArchive {
+            schema: TASK_ARCHIVE_SCHEMA.to_string(),
+            version: TASK_ARCHIVE_VERSION,
+            exported_at: now_millis(),
+            task: task.clone(),
+            events: events.into_iter().map(sanitize_task_archive_event).collect(),
+        };
+
+        Ok(validate_task_archive(&archive)?)
+    }
 
     async fn emit(
         &self,
@@ -586,6 +734,22 @@ fn now_millis() -> f64 {
         .duration_since(UNIX_EPOCH)
         .expect("system time before UNIX epoch")
         .as_millis() as f64
+}
+
+fn contiguous_prefix_len(events: &[TaskEvent]) -> u64 {
+    let indexes: HashSet<u64> = events.iter().map(|event| event.index).collect();
+    let mut expected = 0;
+    while indexes.contains(&expected) {
+        expected += 1;
+    }
+    expected
+}
+
+fn unsupported_archive_restore(message: &'static str) -> EngineError {
+    EngineError::Store(Box::new(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        message,
+    )))
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
