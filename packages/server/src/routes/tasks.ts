@@ -8,12 +8,15 @@ import {
   CreateTaskSchema,
   PublishEventSchema,
   TransitionSchema,
+  ImportTaskArchiveSchema,
+  ImportTaskArchiveResultSchema,
+  TaskArchiveSchema,
   TaskSchema,
   TaskEventSchema,
   ErrorSchema,
 } from '../schemas.js'
-import { TaskConflictError, InvalidTransitionError, collapseAccumulateSeries } from '@taskcast/core'
-import type { TaskEngine, CreateTaskInput, PublishEventInput, SinceCursor, TaskError, BlockedRequest, TaskFilter, TaskStatus, EventQueryOptions } from '@taskcast/core'
+import { TaskConflictError, InvalidTaskArchiveError, InvalidTransitionError, collapseAccumulateSeries } from '@taskcast/core'
+import type { TaskArchive, TaskEngine, CreateTaskInput, PublishEventInput, SinceCursor, TaskError, BlockedRequest, TaskFilter, TaskStatus, EventQueryOptions } from '@taskcast/core'
 
 // ─── Route Definitions ─────────────────────────────────────────────────────
 
@@ -67,6 +70,45 @@ const getTaskRoute = createRoute({
     404: { description: 'Task not found', content: { 'application/json': { schema: ErrorSchema } } },
     403: { description: 'Forbidden', content: { 'application/json': { schema: ErrorSchema } } },
   },
+})
+
+const exportArchiveRoute = createRoute({
+  method: 'get',
+  path: '/{taskId}/archive',
+  tags: ['Tasks'],
+  summary: 'Export task archive',
+  security: [{ Bearer: [] }],
+  request: {
+    params: z.object({ taskId: z.string() }),
+  },
+  responses: {
+    200: { description: 'Task archive', content: { 'application/json': { schema: TaskArchiveSchema } } },
+    403: { description: 'Forbidden', content: { 'application/json': { schema: ErrorSchema } } },
+    404: { description: 'Task not found', content: { 'application/json': { schema: ErrorSchema } } },
+  },
+})
+
+const importArchiveRoute = createRoute({
+  method: 'post',
+  path: '/import',
+  tags: ['Tasks'],
+  summary: 'Import task archive',
+  security: [{ Bearer: [] }],
+  request: {
+    body: { content: { 'application/json': { schema: ImportTaskArchiveSchema } } },
+  },
+  responses: {
+    200: { description: 'Import result', content: { 'application/json': { schema: ImportTaskArchiveResultSchema } } },
+    400: { description: 'Validation error', content: { 'application/json': { schema: ErrorSchema } } },
+    403: { description: 'Forbidden', content: { 'application/json': { schema: ErrorSchema } } },
+    404: { description: 'Task not found', content: { 'application/json': { schema: ErrorSchema } } },
+    409: { description: 'Task ID already exists', content: { 'application/json': { schema: ErrorSchema } } },
+  },
+})
+
+const ImportTaskArchiveBodySchema = z.object({
+  archive: z.unknown(),
+  overwrite: z.boolean().optional(),
 })
 
 const transitionRoute = createRoute({
@@ -209,6 +251,42 @@ export function createTasksRouter(engine: TaskEngine, subscriberCounts: Subscrib
     if (!task) return c.json({ error: 'Task not found' }, 404)
     const subscriberCount = getSubscriberCount(subscriberCounts, taskId)
     return c.json({ ...task, hot: subscriberCount > 0, subscriberCount })
+  })
+
+  register(exportArchiveRoute, async (c) => {
+    const taskId = c.req.param('taskId') as string
+    const auth = c.get('auth')
+    if (!checkScope(auth, 'event:history', taskId)) return c.json({ error: 'Forbidden' }, 403)
+
+    try {
+      const archive = await engine.exportTaskArchive(taskId)
+      return c.json(archive)
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      if (msg.toLowerCase().includes('not found')) return c.json({ error: msg }, 404)
+      throw err
+    }
+  })
+
+  register(importArchiveRoute, async (c) => {
+    const auth = c.get('auth')
+    if (!checkScope(auth, 'task:create')) return c.json({ error: 'Forbidden' }, 403)
+
+    const body = await c.req.json()
+    const parsed = ImportTaskArchiveBodySchema.safeParse(body)
+    if (!parsed.success) return c.json({ error: 'Invalid archive import request' }, 400)
+
+    try {
+      const options = parsed.data.overwrite !== undefined ? { overwrite: parsed.data.overwrite } : undefined
+      const result = await engine.importTaskArchive(parsed.data.archive as TaskArchive, options)
+      return c.json({ ok: true, ...result })
+    } catch (err) {
+      if (err instanceof InvalidTaskArchiveError) return c.json({ error: err.message }, 400)
+      if (err instanceof TaskConflictError) return c.json({ error: err.message }, 409)
+      const msg = err instanceof Error ? err.message : String(err)
+      if (msg.toLowerCase().includes('not found')) return c.json({ error: msg }, 404)
+      throw err
+    }
   })
 
   register(transitionRoute, async (c) => {

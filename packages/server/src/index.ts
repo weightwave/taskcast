@@ -12,7 +12,14 @@ export { WebhookDelivery } from './webhook.js'
 export {
   TaskSchema, TaskEventSchema, WorkerSchema, ErrorSchema,
   CreateTaskSchema, TransitionSchema, PublishEventSchema,
+  TaskArchiveSchema, ImportTaskArchiveSchema, ImportTaskArchiveResultSchema, ServerInfoSchema,
 } from './schemas.js'
+export {
+  TASKCAST_API_VERSION,
+  TASKCAST_SERVER_NAME,
+  TASKCAST_SERVER_VERSION,
+  serverInfo,
+} from './version.js'
 
 import type { Hono } from 'hono'
 import { OpenAPIHono } from '@hono/zod-openapi'
@@ -25,6 +32,7 @@ import { createWorkersRouter } from './routes/workers.js'
 import { WorkerWSRegistry } from './routes/worker-ws.js'
 import { createAdminRouter } from './routes/admin.js'
 import { createVerboseLogger } from './middleware/verbose-logger.js'
+import { TASKCAST_SERVER_VERSION, serverInfo } from './version.js'
 import type { AuthConfig } from './auth.js'
 import { isTerminal, matchesWorkerRule } from '@taskcast/core'
 import type {
@@ -92,7 +100,17 @@ export function createTaskcastApp(opts: TaskcastServerOptions): TaskcastApp {
     app.use('*', cors({ origin }))
   }
 
-  app.get('/health', (c) => c.json({ ok: true }))
+  app.get('/', (c) => c.json({
+    ...serverInfo(),
+    links: {
+      health: '/health',
+      healthDetail: '/health/detail',
+      openapi: '/openapi.json',
+      docs: '/docs',
+    },
+  }))
+
+  app.get('/health', (c) => c.json({ ok: true, ...serverInfo() }))
 
   app.get('/health/detail', (c) => {
     const uptime = Math.floor((Date.now() - startTime) / 1000)
@@ -112,6 +130,7 @@ export function createTaskcastApp(opts: TaskcastServerOptions): TaskcastApp {
 
     return c.json({
       ok: true,
+      ...serverInfo(),
       uptime,
       auth: { mode: authMode },
       adapters,
@@ -126,7 +145,14 @@ export function createTaskcastApp(opts: TaskcastServerOptions): TaskcastApp {
 
   const subscriberCounts = createSubscriberCounts()
 
-  app.use('*', createAuthMiddleware(opts.auth ?? { mode: 'none' }))
+  const authMiddleware = createAuthMiddleware(opts.auth ?? { mode: 'none' })
+  app.use('/tasks', authMiddleware)
+  app.use('/tasks/*', authMiddleware)
+  app.use('/events', authMiddleware)
+  app.use('/events/*', authMiddleware)
+  app.use('/workers', authMiddleware)
+  app.use('/workers/*', authMiddleware)
+
   app.route('/tasks', createTasksRouter(opts.engine, subscriberCounts))
   app.route('/tasks', createSSERouter(opts.engine, subscriberCounts))
   app.route('/events', createGlobalSSERoute(opts.engine))
@@ -228,7 +254,7 @@ export function createTaskcastApp(opts: TaskcastServerOptions): TaskcastApp {
     openapi: '3.1.0',
     info: {
       title: 'Taskcast API',
-      version: '0.3.0',
+      version: TASKCAST_SERVER_VERSION,
       description: 'Unified long-lifecycle task tracking service for LLM streaming, agents, and async workloads.',
     },
     security: [{ Bearer: [] }],
