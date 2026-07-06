@@ -185,12 +185,24 @@ export interface TaskEvent {
   _accumulatedData?: unknown
 }
 
+/**
+ * Archive-persistable event shape.
+ *
+ * TaskArchive v1 stores a complete raw delta event stream for one task:
+ * indexes must be contiguous from 0, accumulate events must be raw deltas, and
+ * latest-mode histories must not be compacted down to latest-only storage.
+ * Presentation/transient event fields such as collapsed `seriesSnapshot` events
+ * and broadcast `_accumulatedData` are not valid archive data.
+ */
+export type TaskArchiveEvent = Omit<TaskEvent, 'seriesSnapshot' | '_accumulatedData'>
+
 export interface TaskArchive {
   schema: 'taskcast.taskArchive'
   version: 1
   exportedAt: number
   task: Task
-  events: TaskEvent[]
+  /** Complete raw delta event stream for the task, ordered by contiguous indexes from 0. */
+  events: TaskArchiveEvent[]
 }
 
 export interface TaskArchiveImportOptions {
@@ -206,12 +218,12 @@ export interface TaskArchiveImportResult {
 export interface SeriesLatestEntry {
   taskId: string
   seriesId: string
-  event: TaskEvent
+  event: TaskArchiveEvent
 }
 
 export interface TaskArchiveRestoreData {
   task: Task
-  events: TaskEvent[]
+  events: TaskArchiveEvent[]
   nextIndex: number
   seriesLatest: SeriesLatestEntry[]
 }

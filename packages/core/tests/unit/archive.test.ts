@@ -52,6 +52,20 @@ describe('normalizeTaskArchive', () => {
     })
   })
 
+  it('sanitizes normalized events to archive-persistable fields', () => {
+    const archive = makeArchive([
+      {
+        ...makeEvent('event-1', 'task-1', 0),
+        debugOnly: true,
+      } as TaskEvent & { debugOnly: true },
+    ])
+
+    const normalized = normalizeTaskArchive(archive)
+
+    expect(normalized.events[0]).toEqual(makeEvent('event-1', 'task-1', 0))
+    expect('debugOnly' in normalized.events[0]!).toBe(false)
+  })
+
   it('rejects unsupported archive version', () => {
     const archive = { ...makeArchive([]), version: 2 as 1 }
     expect(() => normalizeTaskArchive(archive)).toThrow(InvalidTaskArchiveError)
@@ -84,6 +98,26 @@ describe('normalizeTaskArchive', () => {
       makeEvent('event-2', 'task-1', 2),
     ])
     expect(() => normalizeTaskArchive(archive)).toThrow(/contiguous/)
+  })
+
+  it('rejects series snapshot events', () => {
+    const archive = makeArchive([
+      {
+        ...makeEvent('event-1', 'task-1', 0),
+        seriesSnapshot: true,
+      },
+    ])
+    expect(() => normalizeTaskArchive(archive)).toThrow(/seriesSnapshot/)
+  })
+
+  it('rejects broadcast accumulated data', () => {
+    const archive = makeArchive([
+      {
+        ...makeEvent('event-1', 'task-1', 0),
+        _accumulatedData: { delta: 'hello world' },
+      },
+    ])
+    expect(() => normalizeTaskArchive(archive)).toThrow(/_accumulatedData/)
   })
 })
 
