@@ -130,6 +130,15 @@ describe('PostgresLongTermStore - events', () => {
     const events = await store.getEvents('task-1')
     expect(events).toHaveLength(1)
   })
+
+  it('preserves false event data', async () => {
+    await store.saveTask(makeTask())
+    const event = { ...makeEvent('task-1', 0), data: false }
+
+    await store.saveEvent(event)
+
+    await expect(store.getEvents('task-1')).resolves.toEqual([event])
+  })
 })
 
 describe('PostgresLongTermStore - restoreTaskArchive', () => {
@@ -170,6 +179,24 @@ describe('PostgresLongTermStore - restoreTaskArchive', () => {
 
     await expect(store.getTask('task-1')).resolves.toEqual(data.task)
     await expect(store.getEvents('task-1')).resolves.toEqual([importedEvent])
+  })
+
+  it('rejects restore when an imported event id collides with another task and rolls back', async () => {
+    await store.saveTask(makeTask('other-task'))
+    await store.saveEvent({ ...makeEvent('other-task', 0), id: 'shared-event-id' })
+
+    const targetTask = makeTask('target-task')
+    const data = makeRestoreData({
+      task: targetTask,
+      events: [{ ...makeEvent('target-task', 0), id: 'shared-event-id' }],
+      nextIndex: 1,
+    })
+
+    await expect(store.restoreTaskArchive(data)).rejects.toThrow()
+
+    await expect(store.getTask('target-task')).resolves.toBeNull()
+    await expect(store.getEvents('target-task')).resolves.toEqual([])
+    await expect(store.getEvents('other-task')).resolves.toHaveLength(1)
   })
 })
 

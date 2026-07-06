@@ -318,6 +318,24 @@ describe('SqliteLongTermStore', () => {
     await expect(store.getTask('task-1')).resolves.toEqual(data.task)
     await expect(store.getEvents('task-1')).resolves.toEqual([importedEvent])
   })
+
+  it('should reject restore when an imported event id collides with another task and roll back', async () => {
+    await store.saveTask(makeTask('other-task'))
+    await store.saveEvent({ ...makeEvent('other-task', 0), id: 'shared-event-id' })
+
+    const targetTask = makeTask('target-task')
+    const data = makeRestoreData({
+      task: targetTask,
+      events: [{ ...makeEvent('target-task', 0), id: 'shared-event-id' }],
+      nextIndex: 1,
+    })
+
+    await expect(store.restoreTaskArchive(data)).rejects.toThrow()
+
+    await expect(store.getTask('target-task')).resolves.toBeNull()
+    await expect(store.getEvents('target-task')).resolves.toEqual([])
+    await expect(store.getEvents('other-task')).resolves.toHaveLength(1)
+  })
 })
 
 // ─── Worker Event helpers ───────────────────────────────────────────────────

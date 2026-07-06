@@ -89,8 +89,24 @@ export class RedisShortTermStore implements ShortTermStore {
       pipeline.sadd(this.KEY.seriesIds(entry.taskId), entry.seriesId)
     }
 
-    await pipeline.exec()
+    await this.execPipelineOrThrow(pipeline, `restore task archive ${taskId}`)
     return { overwritten: Boolean(exists) }
+  }
+
+  private async execPipelineOrThrow(
+    pipeline: ReturnType<Redis['pipeline']>,
+    context: string,
+  ): Promise<void> {
+    const results = await pipeline.exec()
+    if (!results) {
+      throw new Error(`Redis pipeline failed during ${context}: no results returned`)
+    }
+
+    for (const [index, [err]] of results.entries()) {
+      if (err) {
+        throw new Error(`Redis pipeline failed during ${context} at command ${index}: ${err.message}`)
+      }
+    }
   }
 
   async getEvents(taskId: string, opts?: EventQueryOptions): Promise<TaskEvent[]> {

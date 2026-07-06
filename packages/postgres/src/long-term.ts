@@ -21,6 +21,7 @@ const EVENTS = 'taskcast_events'
 const WORKER_EVENTS = 'taskcast_worker_events'
 
 type PostgresClient = ReturnType<typeof postgres>
+type EventConflictMode = 'ignore' | 'strict'
 
 export class PostgresLongTermStore implements LongTermStore {
   constructor(private sql: ReturnType<typeof postgres>) {}
@@ -79,10 +80,14 @@ export class PostgresLongTermStore implements LongTermStore {
   }
 
   async saveEvent(event: TaskEvent): Promise<void> {
-    await this.saveEventWithClient(this.sql, event)
+    await this.saveEventWithClient(this.sql, event, 'ignore')
   }
 
-  private async saveEventWithClient(sql: PostgresClient, event: TaskEvent): Promise<void> {
+  private async saveEventWithClient(
+    sql: PostgresClient,
+    event: TaskEvent,
+    onConflict: EventConflictMode,
+  ): Promise<void> {
     const t = EVENTS
     await sql`
       INSERT INTO ${sql(t)} (
@@ -94,7 +99,7 @@ export class PostgresLongTermStore implements LongTermStore {
         ${event.seriesId ?? null}, ${event.seriesMode ?? null},
         ${event.seriesAccField ?? null}
       )
-      ON CONFLICT (id) DO NOTHING
+      ${onConflict === 'ignore' ? sql`ON CONFLICT (id) DO NOTHING` : sql``}
     `
   }
 
@@ -114,7 +119,7 @@ export class PostgresLongTermStore implements LongTermStore {
       await tx`DELETE FROM ${tx(TASKS)} WHERE id = ${taskId}`
       await this.saveTaskWithClient(tx, data.task)
       for (const event of data.events) {
-        await this.saveEventWithClient(tx, event)
+        await this.saveEventWithClient(tx, event, 'strict')
       }
 
       return { overwritten: existing.length > 0 }

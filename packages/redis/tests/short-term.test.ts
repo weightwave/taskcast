@@ -224,6 +224,17 @@ describe('RedisShortTermStore - restoreTaskArchive', () => {
     await expect(store.getSeriesLatest('task-1', 'old-series')).resolves.toBeNull()
     await expect(store.getSeriesLatest('task-1', 'new-series')).resolves.toEqual(importedLatest)
   })
+
+  it('rejects when a Redis pipeline command fails', async () => {
+    const data = makeRestoreData({
+      task: makeTask('task-archive'),
+      events: [{ ...makeEvent(0), taskId: 'task-archive' }],
+      nextIndex: 1,
+    })
+    await redis.set('taskcast:tasks', 'not-a-set')
+
+    await expect(store.restoreTaskArchive(data)).rejects.toThrow(/Redis pipeline failed/)
+  })
 })
 
 describe('RedisShortTermStore - TTL', () => {

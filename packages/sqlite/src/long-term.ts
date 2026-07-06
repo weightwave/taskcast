@@ -99,6 +99,26 @@ export class SqliteLongTermStore implements LongTermStore {
       })
   }
 
+  private saveEventStrictSync(event: TaskEvent): void {
+    this.db
+      .prepare(
+        `INSERT INTO taskcast_events (id, task_id, idx, timestamp, type, level, data, series_id, series_mode, series_acc_field)
+         VALUES (@id, @task_id, @idx, @timestamp, @type, @level, @data, @series_id, @series_mode, @series_acc_field)`,
+      )
+      .run({
+        id: event.id,
+        task_id: event.taskId,
+        idx: event.index,
+        timestamp: event.timestamp,
+        type: event.type,
+        level: event.level,
+        data: event.data != null ? JSON.stringify(event.data) : null,
+        series_id: event.seriesId ?? null,
+        series_mode: event.seriesMode ?? null,
+        series_acc_field: event.seriesAccField ?? null,
+      })
+  }
+
   async restoreTaskArchive(
     data: TaskArchiveRestoreData,
     options?: TaskArchiveImportOptions,
@@ -114,7 +134,7 @@ export class SqliteLongTermStore implements LongTermStore {
       this.db.prepare('DELETE FROM taskcast_tasks WHERE id = ?').run(taskId)
       this.saveTaskSync(data.task)
       for (const event of data.events) {
-        this.saveEventSync(event)
+        this.saveEventStrictSync(event)
       }
 
       return { overwritten: Boolean(existing) }
