@@ -260,4 +260,30 @@ async fn openapi_includes_archive_paths_and_schemas() {
     assert!(body["components"]["schemas"]["TaskArchiveImportResult"].is_object());
     assert!(body["components"]["schemas"]["ImportTaskArchiveBody"].is_object());
     assert!(body["components"]["schemas"]["ImportTaskArchiveResponse"].is_object());
+
+    let schemas = &body["components"]["schemas"];
+    let archive_event_schema = resolve_archive_event_schema(schemas);
+    let archive_event_properties = archive_event_schema["properties"]
+        .as_object()
+        .expect("archive event schema should have properties");
+    assert!(
+        !archive_event_properties.contains_key("seriesSnapshot"),
+        "archive event schema must not expose seriesSnapshot"
+    );
+    assert!(
+        !archive_event_properties.contains_key("_accumulatedData"),
+        "archive event schema must not expose _accumulatedData"
+    );
+}
+
+fn resolve_archive_event_schema(schemas: &serde_json::Value) -> &serde_json::Value {
+    let item_schema = &schemas["TaskArchive"]["properties"]["events"]["items"];
+    if let Some(ref_path) = item_schema["$ref"].as_str() {
+        let schema_name = ref_path
+            .strip_prefix("#/components/schemas/")
+            .expect("archive event schema ref should point at components.schemas");
+        &schemas[schema_name]
+    } else {
+        item_schema
+    }
 }

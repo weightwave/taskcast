@@ -493,7 +493,26 @@ pub struct TaskArchive {
     pub version: u64,
     pub exported_at: f64,
     pub task: Task,
+    #[schema(value_type = Vec<TaskArchiveEvent>)]
     pub events: Vec<TaskEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskArchiveEvent {
+    pub id: String,
+    pub task_id: String,
+    pub index: u64,
+    pub timestamp: f64,
+    pub r#type: String,
+    pub level: Level,
+    pub data: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub series_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub series_mode: Option<SeriesMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub series_acc_field: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for TaskArchive {

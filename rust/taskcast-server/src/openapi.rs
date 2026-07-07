@@ -33,6 +33,7 @@ use crate::routes::{sse, tasks, workers};
         taskcast_core::TaskError,
         taskcast_core::TaskEvent,
         taskcast_core::TaskArchive,
+        taskcast_core::TaskArchiveEvent,
         taskcast_core::TaskArchiveImportResult,
         taskcast_core::Level,
         taskcast_core::SeriesMode,

@@ -126,6 +126,20 @@ async fn authenticated_routes_still_require_jwt() {
     res.assert_status(axum_test::http::StatusCode::UNAUTHORIZED);
 }
 
+#[tokio::test]
+async fn openapi_and_docs_bypass_jwt_auth() {
+    let server = make_jwt_server();
+
+    let openapi = server.get("/openapi.json").await;
+    openapi.assert_status_ok();
+
+    let docs = server.get("/docs").await;
+    docs.assert_status_ok();
+
+    let tasks = server.get("/tasks").await;
+    tasks.assert_status(axum_test::http::StatusCode::UNAUTHORIZED);
+}
+
 // ─── health_detail with config adapter overrides ────────────────────────────
 
 use taskcast_core::config::{AdapterEntry, AdaptersConfig, TaskcastConfig};
