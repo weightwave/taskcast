@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::Extension;
+use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use taskcast_core::{
@@ -262,12 +263,13 @@ pub async fn export_task_archive(
 pub async fn import_task_archive(
     State(engine): State<Arc<TaskEngine>>,
     Extension(auth): Extension<AuthContext>,
-    axum::Json(body): axum::Json<ImportTaskArchiveBody>,
+    body: Result<Json<ImportTaskArchiveBody>, JsonRejection>,
 ) -> Result<impl IntoResponse, AppError> {
     if !check_scope(&auth, PermissionScope::TaskManage, None) {
         return Err(AppError::Forbidden);
     }
 
+    let Json(body) = body.map_err(|rejection| AppError::BadRequest(rejection.to_string()))?;
     let options = body
         .overwrite
         .map(|overwrite| TaskArchiveImportOptions { overwrite });

@@ -212,6 +212,18 @@ async fn import_malformed_archive_returns_400() {
 }
 
 #[tokio::test]
+async fn import_archive_deserialize_error_returns_400() {
+    let archive = build_archive("archive-deserialize-error").await;
+    let mut body = json!({ "archive": archive });
+    body["archive"]["events"][0]["seriesSnapshot"] = json!(null);
+    let (_engine, server) = make_no_auth_server();
+
+    let response = server.post("/tasks/import").json(&body).await;
+
+    response.assert_status(StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn archive_routes_enforce_required_jwt_scopes() {
     let (engine, server) = make_jwt_server();
     create_running_task(&engine, "archive-scope").await;
@@ -243,7 +255,9 @@ async fn openapi_includes_archive_paths_and_schemas() {
 
     assert!(body["paths"]["/tasks/{task_id}/archive"].is_object());
     assert!(body["paths"]["/tasks/import"].is_object());
+    assert_eq!(body["info"]["version"], env!("CARGO_PKG_VERSION"));
     assert!(body["components"]["schemas"]["TaskArchive"].is_object());
     assert!(body["components"]["schemas"]["TaskArchiveImportResult"].is_object());
     assert!(body["components"]["schemas"]["ImportTaskArchiveBody"].is_object());
+    assert!(body["components"]["schemas"]["ImportTaskArchiveResponse"].is_object());
 }
