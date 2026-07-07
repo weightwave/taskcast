@@ -4,11 +4,10 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use serde_json::json;
 use taskcast_core::{
-    build_task_archive_restore_data, validate_task_archive, BroadcastProvider, CreateTaskInput,
-    EngineError, EventQueryOptions, Level, LongTermStore, MemoryBroadcastProvider,
-    MemoryShortTermStore, PublishEventInput, SeriesMode, ShortTermStore, Task, TaskArchive,
-    TaskArchiveImportOptions, TaskEngine, TaskEngineOptions, TaskEvent, TaskStatus,
-    WorkerAuditEvent,
+    BroadcastProvider, CreateTaskInput, EngineError, EventQueryOptions, Level, LongTermStore,
+    MemoryBroadcastProvider, MemoryShortTermStore, PublishEventInput, SeriesMode, ShortTermStore,
+    Task, TaskArchive, TaskArchiveImportOptions, TaskEngine, TaskEngineOptions, TaskEvent,
+    TaskStatus, WorkerAuditEvent, build_task_archive_restore_data, validate_task_archive,
 };
 
 fn make_task(id: &str) -> Task {
@@ -131,35 +130,121 @@ fn validate_rejects_duplicate_indexes() {
 }
 
 #[test]
+fn validate_rejects_archive_metadata_optional_timestamps_and_empty_fields() {
+    let mut unsupported_version = make_archive(vec![]);
+    unsupported_version.version = 2;
+    assert!(
+        validate_task_archive(&unsupported_version)
+            .unwrap_err()
+            .to_string()
+            .contains("Unsupported archive version")
+    );
+
+    let mut bad_exported_at = make_archive(vec![]);
+    bad_exported_at.exported_at = f64::NAN;
+    assert!(
+        validate_task_archive(&bad_exported_at)
+            .unwrap_err()
+            .to_string()
+            .contains("exported_at")
+    );
+
+    let mut duplicate_ids = make_archive(vec![
+        make_event("same-id", "task-1", 0, json!(null)),
+        make_event("same-id", "task-1", 1, json!(null)),
+    ]);
+    assert!(
+        validate_task_archive(&duplicate_ids)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate event id")
+    );
+
+    duplicate_ids.task.completed_at = Some(f64::INFINITY);
+    assert!(
+        validate_task_archive(&duplicate_ids)
+            .unwrap_err()
+            .to_string()
+            .contains("completed_at")
+    );
+
+    let mut bad_resume_at = make_archive(vec![]);
+    bad_resume_at.task.resume_at = Some(f64::NEG_INFINITY);
+    assert!(
+        validate_task_archive(&bad_resume_at)
+            .unwrap_err()
+            .to_string()
+            .contains("resume_at")
+    );
+
+    let mut empty_task_id = make_archive(vec![]);
+    empty_task_id.task.id.clear();
+    assert!(
+        validate_task_archive(&empty_task_id)
+            .unwrap_err()
+            .to_string()
+            .contains("task.id")
+    );
+
+    let mut bad_event = make_event("event-1", "task-1", 0, json!(null));
+    bad_event.timestamp = f64::NAN;
+    assert!(
+        validate_task_archive(&make_archive(vec![bad_event]))
+            .unwrap_err()
+            .to_string()
+            .contains("event.timestamp")
+    );
+
+    let mut empty_series_acc_field = make_event("event-1", "task-1", 0, json!(null));
+    empty_series_acc_field.series_id = Some("series".to_string());
+    empty_series_acc_field.series_mode = Some(SeriesMode::Accumulate);
+    empty_series_acc_field.series_acc_field = Some(String::new());
+    assert!(
+        validate_task_archive(&make_archive(vec![empty_series_acc_field]))
+            .unwrap_err()
+            .to_string()
+            .contains("series_acc_field")
+    );
+}
+
+#[test]
 fn validate_rejects_non_contiguous_indexes_task_id_mismatch_and_transient_fields() {
     let non_contiguous = make_archive(vec![
         make_event("event-1", "task-1", 0, json!(null)),
         make_event("event-2", "task-1", 2, json!(null)),
     ]);
-    assert!(validate_task_archive(&non_contiguous)
-        .unwrap_err()
-        .to_string()
-        .contains("contiguous"));
+    assert!(
+        validate_task_archive(&non_contiguous)
+            .unwrap_err()
+            .to_string()
+            .contains("contiguous")
+    );
 
     let mismatch = make_archive(vec![make_event("event-1", "other-task", 0, json!(null))]);
-    assert!(validate_task_archive(&mismatch)
-        .unwrap_err()
-        .to_string()
-        .contains("task_id"));
+    assert!(
+        validate_task_archive(&mismatch)
+            .unwrap_err()
+            .to_string()
+            .contains("task_id")
+    );
 
     let mut snapshot = make_event("event-1", "task-1", 0, json!(null));
     snapshot.series_snapshot = Some(true);
-    assert!(validate_task_archive(&make_archive(vec![snapshot]))
-        .unwrap_err()
-        .to_string()
-        .contains("series_snapshot"));
+    assert!(
+        validate_task_archive(&make_archive(vec![snapshot]))
+            .unwrap_err()
+            .to_string()
+            .contains("series_snapshot")
+    );
 
     let mut accumulated = make_event("event-1", "task-1", 0, json!(null));
     accumulated._accumulated_data = Some(json!({ "delta": "hello world" }));
-    assert!(validate_task_archive(&make_archive(vec![accumulated]))
-        .unwrap_err()
-        .to_string()
-        .contains("_accumulated_data"));
+    assert!(
+        validate_task_archive(&make_archive(vec![accumulated]))
+            .unwrap_err()
+            .to_string()
+            .contains("_accumulated_data")
+    );
 }
 
 #[test]
@@ -315,6 +400,52 @@ fn restore_data_sets_next_index_and_rebuilds_accumulate_and_latest_series() {
     );
 }
 
+#[test]
+fn restore_data_skips_keep_all_and_falls_back_when_accumulate_fields_are_not_strings() {
+    let mut keep_all = make_event("keep-all", "task-1", 0, json!({ "delta": "ignored" }));
+    keep_all.series_id = Some("keep".to_string());
+    keep_all.series_mode = Some(SeriesMode::KeepAll);
+
+    let mut non_string_previous =
+        make_event("non-string-previous", "task-1", 1, json!({ "delta": 1 }));
+    non_string_previous.series_id = Some("numbers".to_string());
+    non_string_previous.series_mode = Some(SeriesMode::Accumulate);
+
+    let mut non_string_current =
+        make_event("non-string-current", "task-1", 2, json!({ "delta": "two" }));
+    non_string_current.series_id = Some("numbers".to_string());
+    non_string_current.series_mode = Some(SeriesMode::Accumulate);
+
+    let mut string_previous =
+        make_event("string-previous", "task-1", 3, json!({ "delta": "hello" }));
+    string_previous.series_id = Some("mixed".to_string());
+    string_previous.series_mode = Some(SeriesMode::Accumulate);
+
+    let mut object_current = make_event("object-current", "task-1", 4, json!({ "delta": 2 }));
+    object_current.series_id = Some("mixed".to_string());
+    object_current.series_mode = Some(SeriesMode::Accumulate);
+
+    let restore = build_task_archive_restore_data(&make_archive(vec![
+        keep_all,
+        non_string_previous,
+        non_string_current,
+        string_previous,
+        object_current,
+    ]))
+    .unwrap();
+    let latest_by_series: HashMap<_, _> = restore
+        .series_latest
+        .iter()
+        .map(|entry| (entry.series_id.as_str(), &entry.event))
+        .collect();
+
+    assert!(!latest_by_series.contains_key("keep"));
+    assert_eq!(latest_by_series["numbers"].id, "non-string-current");
+    assert_eq!(latest_by_series["numbers"].data, json!({ "delta": "two" }));
+    assert_eq!(latest_by_series["mixed"].id, "object-current");
+    assert_eq!(latest_by_series["mixed"].data, json!({ "delta": 2 }));
+}
+
 #[tokio::test]
 async fn engine_import_preserves_history_is_silent_and_next_index_continues() {
     let archive = make_archive(vec![
@@ -369,6 +500,66 @@ async fn engine_import_preserves_history_is_silent_and_next_index_continues() {
 }
 
 #[tokio::test]
+async fn engine_import_rejects_short_term_store_without_archive_restore_support() {
+    let engine = TaskEngine::new(TaskEngineOptions {
+        short_term_store: Arc::new(UnsupportedShortTermStore),
+        broadcast: Arc::new(MemoryBroadcastProvider::new()),
+        long_term_store: None,
+        hooks: None,
+    });
+
+    let result = engine.import_task_archive(make_archive(vec![]), None).await;
+
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("shortTermStore does not support restore_task_archive")
+    );
+}
+
+#[tokio::test]
+async fn default_archive_restore_trait_methods_report_unsupported() {
+    let data = build_task_archive_restore_data(&make_archive(vec![])).unwrap();
+    let short = UnsupportedShortTermStore;
+    let long = MockLongTermStore::default();
+
+    assert!(!short.supports_task_archive_restore());
+    assert!(
+        short
+            .validate_task_archive_restore(&data, None)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("not supported")
+    );
+    assert!(
+        short
+            .restore_task_archive(data.clone(), None)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("not supported")
+    );
+
+    assert!(!long.shares_task_archive_restore_storage());
+    assert!(
+        long.validate_task_archive_restore(&data, None)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("not supported")
+    );
+    assert!(
+        long.restore_task_archive(data, None)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("not supported")
+    );
+}
+
+#[tokio::test]
 async fn engine_import_rejects_conflict_without_overwrite_and_allows_overwrite() {
     let short = Arc::new(MemoryShortTermStore::new());
     let engine = make_engine(
@@ -416,6 +607,59 @@ async fn engine_import_rejects_conflict_without_overwrite_and_allows_overwrite()
 }
 
 #[tokio::test]
+async fn export_prefers_long_term_history_but_uses_short_term_raw_accumulate_deltas() {
+    let short = Arc::new(MemoryShortTermStore::new());
+    let long = Arc::new(MockLongTermStore::default());
+    short.save_task(make_task("task-1")).await.unwrap();
+
+    let mut raw_delta = make_event("delta-0", "task-1", 0, json!({ "delta": "hello" }));
+    raw_delta.series_id = Some("output".to_string());
+    raw_delta.series_mode = Some(SeriesMode::Accumulate);
+    short
+        .append_event("task-1", raw_delta.clone())
+        .await
+        .unwrap();
+    short
+        .append_event(
+            "task-1",
+            make_event("short-only", "task-1", 2, json!({ "value": "tail" })),
+        )
+        .await
+        .unwrap();
+
+    let mut accumulated = make_event("delta-0", "task-1", 0, json!({ "delta": "hello world" }));
+    accumulated.series_id = Some("output".to_string());
+    accumulated.series_mode = Some(SeriesMode::Accumulate);
+    long.save_event(accumulated).await.unwrap();
+    long.save_event(make_event(
+        "long-1",
+        "task-1",
+        1,
+        json!({ "value": "durable" }),
+    ))
+    .await
+    .unwrap();
+
+    let engine = make_engine(
+        Arc::clone(&short),
+        Arc::new(MemoryBroadcastProvider::new()),
+        Some(long),
+    );
+
+    let archive = engine.export_task_archive("task-1").await.unwrap();
+
+    assert_eq!(
+        archive
+            .events
+            .iter()
+            .map(|event| event.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["delta-0", "long-1", "short-only"]
+    );
+    assert_eq!(archive.events[0].data, json!({ "delta": "hello" }));
+}
+
+#[tokio::test]
 async fn export_clears_transient_fields_and_returns_sorted_raw_events() {
     let short = Arc::new(MemoryShortTermStore::new());
     short.save_task(make_task("task-1")).await.unwrap();
@@ -447,14 +691,175 @@ async fn export_clears_transient_fields_and_returns_sorted_raw_events() {
             .collect::<Vec<_>>(),
         vec!["event-1", "event-2"]
     );
-    assert!(archive
-        .events
-        .iter()
-        .all(|event| event.series_snapshot.is_none()));
-    assert!(archive
-        .events
-        .iter()
-        .all(|event| event._accumulated_data.is_none()));
+    assert!(
+        archive
+            .events
+            .iter()
+            .all(|event| event.series_snapshot.is_none())
+    );
+    assert!(
+        archive
+            .events
+            .iter()
+            .all(|event| event._accumulated_data.is_none())
+    );
+}
+
+struct UnsupportedShortTermStore;
+
+#[async_trait]
+impl ShortTermStore for UnsupportedShortTermStore {
+    async fn save_task(&self, _task: Task) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
+
+    async fn get_task(
+        &self,
+        _task_id: &str,
+    ) -> Result<Option<Task>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(None)
+    }
+
+    async fn append_event(
+        &self,
+        _task_id: &str,
+        _event: TaskEvent,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
+
+    async fn get_events(
+        &self,
+        _task_id: &str,
+        _opts: Option<EventQueryOptions>,
+    ) -> Result<Vec<TaskEvent>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(Vec::new())
+    }
+
+    async fn set_ttl(
+        &self,
+        _task_id: &str,
+        _ttl_seconds: u64,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
+
+    async fn get_series_latest(
+        &self,
+        _task_id: &str,
+        _series_id: &str,
+    ) -> Result<Option<TaskEvent>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(None)
+    }
+
+    async fn set_series_latest(
+        &self,
+        _task_id: &str,
+        _series_id: &str,
+        _event: TaskEvent,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
+
+    async fn replace_last_series_event(
+        &self,
+        _task_id: &str,
+        _series_id: &str,
+        _event: TaskEvent,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
+
+    async fn accumulate_series(
+        &self,
+        _task_id: &str,
+        _series_id: &str,
+        event: TaskEvent,
+        _field: &str,
+    ) -> Result<TaskEvent, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(event)
+    }
+
+    async fn next_index(
+        &self,
+        _task_id: &str,
+    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(0)
+    }
+
+    async fn list_tasks(
+        &self,
+        _filter: taskcast_core::TaskFilter,
+    ) -> Result<Vec<Task>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(Vec::new())
+    }
+
+    async fn save_worker(
+        &self,
+        _worker: taskcast_core::Worker,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
+
+    async fn get_worker(
+        &self,
+        _worker_id: &str,
+    ) -> Result<Option<taskcast_core::Worker>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(None)
+    }
+
+    async fn list_workers(
+        &self,
+        _filter: Option<taskcast_core::WorkerFilter>,
+    ) -> Result<Vec<taskcast_core::Worker>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(Vec::new())
+    }
+
+    async fn delete_worker(
+        &self,
+        _worker_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
+
+    async fn claim_task(
+        &self,
+        _task_id: &str,
+        _worker_id: &str,
+        _cost: u32,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(false)
+    }
+
+    async fn add_assignment(
+        &self,
+        _assignment: taskcast_core::WorkerAssignment,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
+
+    async fn get_task_assignment(
+        &self,
+        _task_id: &str,
+    ) -> Result<Option<taskcast_core::WorkerAssignment>, Box<dyn std::error::Error + Send + Sync>>
+    {
+        Ok(None)
+    }
+
+    async fn get_worker_assignments(
+        &self,
+        _worker_id: &str,
+    ) -> Result<Vec<taskcast_core::WorkerAssignment>, Box<dyn std::error::Error + Send + Sync>>
+    {
+        Ok(Vec::new())
+    }
+
+    async fn remove_assignment(
+        &self,
+        _task_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
 }
 
 #[tokio::test]
@@ -469,10 +874,12 @@ async fn engine_import_fails_closed_when_long_term_store_cannot_restore_archives
 
     let result = engine.import_task_archive(make_archive(vec![]), None).await;
 
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("longTermStore does not support restore_task_archive"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("longTermStore does not support restore_task_archive")
+    );
     assert!(short.get_task("task-1").await.unwrap().is_none());
     assert!(short.get_events("task-1", None).await.unwrap().is_empty());
 }
@@ -516,10 +923,12 @@ async fn engine_import_does_not_mutate_short_term_when_long_term_final_restore_f
 
     let result = engine.import_task_archive(make_archive(vec![]), None).await;
 
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("long restore failed"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("long restore failed")
+    );
     assert_eq!(long.restore_options.lock().unwrap().len(), 1);
     assert!(short.get_task("task-1").await.unwrap().is_none());
     assert!(short.get_events("task-1", None).await.unwrap().is_empty());
@@ -539,7 +948,10 @@ async fn engine_import_skips_long_term_final_restore_when_archive_storage_is_sha
         Some(long.clone()),
     );
 
-    let result = engine.import_task_archive(make_archive(vec![]), None).await.unwrap();
+    let result = engine
+        .import_task_archive(make_archive(vec![]), None)
+        .await
+        .unwrap();
 
     assert_eq!(result.task_id, "task-1");
     assert!(long.restore_options.lock().unwrap().is_empty());
