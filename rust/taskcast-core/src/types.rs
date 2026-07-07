@@ -404,7 +404,12 @@ pub struct TaskEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub series_snapshot: Option<bool>,
     /// Transient: accumulated data attached during broadcast, not persisted.
-    #[serde(skip)]
+    #[serde(
+        default,
+        rename = "_accumulatedData",
+        alias = "_accumulated_data",
+        skip_serializing
+    )]
     pub _accumulated_data: Option<serde_json::Value>,
 }
 

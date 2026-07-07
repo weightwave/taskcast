@@ -123,6 +123,46 @@ fn validate_rejects_non_contiguous_indexes_task_id_mismatch_and_transient_fields
 }
 
 #[test]
+fn validate_rejects_deserialized_accumulated_data_fields() {
+    for field_name in ["_accumulatedData", "_accumulated_data"] {
+        let mut event = json!({
+            "id": format!("event-{field_name}"),
+            "taskId": "task-1",
+            "index": 0,
+            "timestamp": 3000.0,
+            "type": "demo.event",
+            "level": "info",
+            "data": null
+        });
+        event
+            .as_object_mut()
+            .unwrap()
+            .insert(field_name.to_string(), json!({ "delta": "transient" }));
+
+        let archive: TaskArchive = serde_json::from_value(json!({
+            "schema": "taskcast.taskArchive",
+            "version": 1,
+            "exportedAt": 5000.0,
+            "task": {
+                "id": "task-1",
+                "type": "demo",
+                "status": "running",
+                "createdAt": 1000.0,
+                "updatedAt": 2000.0
+            },
+            "events": [event]
+        }))
+        .unwrap();
+
+        let err = validate_task_archive(&archive).unwrap_err();
+        assert!(
+            err.to_string().contains("_accumulated_data"),
+            "expected {field_name} to be rejected, got {err}"
+        );
+    }
+}
+
+#[test]
 fn restore_data_sets_next_index_and_rebuilds_accumulate_and_latest_series() {
     let mut latest_old = make_event("status-old", "task-1", 0, json!({ "status": "starting" }));
     latest_old.r#type = "task.status".to_string();
