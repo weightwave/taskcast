@@ -190,6 +190,87 @@ fn validate_rejects_deserialized_null_presentation_fields_by_presence() {
 }
 
 #[test]
+fn task_event_does_not_deserialize_accumulated_data_outside_archive() {
+    for field_name in ["_accumulatedData", "_accumulated_data"] {
+        let mut value = json!({
+            "id": "event-1",
+            "taskId": "task-1",
+            "index": 0,
+            "timestamp": 3000.0,
+            "type": "demo.event",
+            "level": "info",
+            "data": null
+        });
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert(field_name.to_string(), json!({ "delta": "transient" }));
+
+        let event: TaskEvent = serde_json::from_value(value).unwrap();
+
+        assert!(
+            event._accumulated_data.is_none(),
+            "shared TaskEvent should not deserialize {field_name}"
+        );
+    }
+}
+
+#[test]
+fn archive_forbidden_field_error_includes_event_position_and_id() {
+    let mut bad_event = json!({
+        "id": "bad-event",
+        "taskId": "task-1",
+        "index": 1,
+        "timestamp": 3001.0,
+        "type": "demo.event",
+        "level": "info",
+        "data": null
+    });
+    bad_event
+        .as_object_mut()
+        .unwrap()
+        .insert("seriesSnapshot".to_string(), json!(null));
+    let archive = json!({
+        "schema": "taskcast.taskArchive",
+        "version": 1,
+        "exportedAt": 5000.0,
+        "task": {
+            "id": "task-1",
+            "type": "demo",
+            "status": "running",
+            "createdAt": 1000.0,
+            "updatedAt": 2000.0
+        },
+        "events": [
+            {
+                "id": "good-event",
+                "taskId": "task-1",
+                "index": 0,
+                "timestamp": 3000.0,
+                "type": "demo.event",
+                "level": "info",
+                "data": null
+            },
+            bad_event
+        ]
+    });
+
+    let err = serde_json::from_value::<TaskArchive>(archive)
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        err.contains("event[1]"),
+        "expected event position in error, got {err}"
+    );
+    assert!(
+        err.contains("bad-event"),
+        "expected event id in error, got {err}"
+    );
+    assert!(err.contains("seriesSnapshot"));
+}
+
+#[test]
 fn restore_data_sets_next_index_and_rebuilds_accumulate_and_latest_series() {
     let mut latest_old = make_event("status-old", "task-1", 0, json!({ "status": "starting" }));
     latest_old.r#type = "task.status".to_string();
@@ -396,6 +477,30 @@ async fn engine_import_fails_closed_when_long_term_store_cannot_restore_archives
     assert!(short.get_events("task-1", None).await.unwrap().is_empty());
 }
 
+#[tokio::test]
+async fn engine_import_passes_original_options_to_final_restore() {
+    let long = Arc::new(RecordingLongTermStore::default());
+    let engine = make_engine(
+        Arc::new(MemoryShortTermStore::new()),
+        Arc::new(MemoryBroadcastProvider::new()),
+        Some(long.clone()),
+    );
+
+    engine
+        .import_task_archive(
+            make_archive(vec![]),
+            Some(TaskArchiveImportOptions { overwrite: false }),
+        )
+        .await
+        .unwrap();
+
+    let restore_options = long.restore_options.lock().unwrap();
+    assert_eq!(
+        restore_options.as_slice(),
+        &[Some(TaskArchiveImportOptions { overwrite: false })]
+    );
+}
+
 #[derive(Default)]
 struct MockLongTermStore {
     tasks: Mutex<HashMap<String, Task>>,
@@ -437,6 +542,76 @@ impl LongTermStore for MockLongTermStore {
             .filter(|event| event.task_id == task_id)
             .cloned()
             .collect())
+    }
+
+    async fn save_worker_event(
+        &self,
+        _event: WorkerAuditEvent,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
+
+    async fn get_worker_events(
+        &self,
+        _worker_id: &str,
+        _opts: Option<EventQueryOptions>,
+    ) -> Result<Vec<WorkerAuditEvent>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(Vec::new())
+    }
+}
+
+#[derive(Default)]
+struct RecordingLongTermStore {
+    restore_options: Mutex<Vec<Option<TaskArchiveImportOptions>>>,
+}
+
+#[async_trait]
+impl LongTermStore for RecordingLongTermStore {
+    async fn save_task(&self, _task: Task) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
+
+    async fn get_task(
+        &self,
+        _task_id: &str,
+    ) -> Result<Option<Task>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(None)
+    }
+
+    async fn save_event(
+        &self,
+        _event: TaskEvent,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
+
+    async fn get_events(
+        &self,
+        _task_id: &str,
+        _opts: Option<EventQueryOptions>,
+    ) -> Result<Vec<TaskEvent>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(Vec::new())
+    }
+
+    fn supports_task_archive_restore(&self) -> bool {
+        true
+    }
+
+    async fn validate_task_archive_restore(
+        &self,
+        _data: &taskcast_core::TaskArchiveRestoreData,
+        _options: Option<TaskArchiveImportOptions>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
+
+    async fn restore_task_archive(
+        &self,
+        _data: taskcast_core::TaskArchiveRestoreData,
+        options: Option<TaskArchiveImportOptions>,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        self.restore_options.lock().unwrap().push(options);
+        Ok(false)
     }
 
     async fn save_worker_event(

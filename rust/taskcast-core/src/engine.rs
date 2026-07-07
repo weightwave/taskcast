@@ -510,7 +510,7 @@ impl TaskEngine {
                 .await?;
         }
 
-        let restore_options = Some(TaskArchiveImportOptions { overwrite: true });
+        let restore_options = Some(import_options);
         self.short_term_store
             .restore_task_archive(restore_data.clone(), restore_options)
             .await?;

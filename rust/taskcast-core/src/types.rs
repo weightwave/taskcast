@@ -404,12 +404,7 @@ pub struct TaskEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub series_snapshot: Option<bool>,
     /// Transient: accumulated data attached during broadcast, not persisted.
-    #[serde(
-        default,
-        rename = "_accumulatedData",
-        alias = "_accumulated_data",
-        skip_serializing
-    )]
+    #[serde(skip)]
     pub _accumulated_data: Option<serde_json::Value>,
 }
 
@@ -518,13 +513,18 @@ impl<'de> Deserialize<'de> for TaskArchive {
 
         let raw = RawTaskArchive::deserialize(deserializer)?;
         let mut events = Vec::with_capacity(raw.events.len());
-        for event_value in raw.events {
+        for (position, event_value) in raw.events.into_iter().enumerate() {
             if let Some(event) = event_value.as_object() {
                 for forbidden_key in ["seriesSnapshot", "_accumulatedData", "_accumulated_data"] {
                     if event.contains_key(forbidden_key) {
+                        let event_id = event
+                            .get("id")
+                            .and_then(serde_json::Value::as_str)
+                            .map(|id| format!(" id {id}"))
+                            .unwrap_or_default();
                         return Err(serde::de::Error::custom(format!(
-                            "Archive events must be raw deltas; forbidden presentation/transient \
-                             field {forbidden_key} is present"
+                            "Archive event[{position}]{event_id} must be raw deltas; forbidden \
+                             presentation/transient field {forbidden_key} is present"
                         )));
                     }
                 }
