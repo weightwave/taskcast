@@ -407,27 +407,17 @@ export class TaskEngine {
     }
 
     const restoreData = buildTaskArchiveRestoreData(normalized)
-    const shortTermValidated = typeof this.shortTermStore.validateTaskArchiveRestore === 'function'
-    const longTermValidated = this.longTermStore
-      ? typeof this.longTermStore.validateTaskArchiveRestore === 'function'
-      : false
-
     await this.shortTermStore.validateTaskArchiveRestore?.(restoreData, options)
     if (this.longTermStore) {
       await this.longTermStore.validateTaskArchiveRestore?.(restoreData, options)
     }
 
-    const restoreOptions = { ...options, overwrite: true }
-    await this.shortTermStore.restoreTaskArchive(
-      restoreData,
-      shortTermValidated ? restoreOptions : options,
-    )
+    // Durable history is restored before the live short-term cache so a final
+    // long-term failure cannot expose an imported task that was never persisted.
     if (this.longTermStore) {
-      await this.longTermStore.restoreTaskArchive!(
-        restoreData,
-        longTermValidated ? restoreOptions : options,
-      )
+      await this.longTermStore.restoreTaskArchive!(restoreData, options)
     }
+    await this.shortTermStore.restoreTaskArchive(restoreData, options)
     this._emitChains.delete(taskId)
 
     return {

@@ -501,6 +501,30 @@ async fn engine_import_passes_original_options_to_final_restore() {
     );
 }
 
+#[tokio::test]
+async fn engine_import_does_not_mutate_short_term_when_long_term_final_restore_fails() {
+    let short = Arc::new(MemoryShortTermStore::new());
+    let long = Arc::new(RecordingLongTermStore {
+        fail_restore: true,
+        ..Default::default()
+    });
+    let engine = make_engine(
+        Arc::clone(&short),
+        Arc::new(MemoryBroadcastProvider::new()),
+        Some(long.clone()),
+    );
+
+    let result = engine.import_task_archive(make_archive(vec![]), None).await;
+
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("long restore failed"));
+    assert_eq!(long.restore_options.lock().unwrap().len(), 1);
+    assert!(short.get_task("task-1").await.unwrap().is_none());
+    assert!(short.get_events("task-1", None).await.unwrap().is_empty());
+}
+
 #[derive(Default)]
 struct MockLongTermStore {
     tasks: Mutex<HashMap<String, Task>>,
@@ -563,6 +587,7 @@ impl LongTermStore for MockLongTermStore {
 #[derive(Default)]
 struct RecordingLongTermStore {
     restore_options: Mutex<Vec<Option<TaskArchiveImportOptions>>>,
+    fail_restore: bool,
 }
 
 #[async_trait]
@@ -611,6 +636,11 @@ impl LongTermStore for RecordingLongTermStore {
         options: Option<TaskArchiveImportOptions>,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
         self.restore_options.lock().unwrap().push(options);
+        if self.fail_restore {
+            return Err(
+                std::io::Error::new(std::io::ErrorKind::Other, "long restore failed").into(),
+            );
+        }
         Ok(false)
     }
 

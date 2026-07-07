@@ -1,12 +1,14 @@
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use axum_test::http::{header, HeaderValue, StatusCode};
 use axum_test::TestServer;
 use jsonwebtoken::{encode, EncodingKey, Header};
 use serde_json::json;
 use taskcast_core::{
-    CreateTaskInput, Level, MemoryBroadcastProvider, MemoryShortTermStore, PublishEventInput,
-    TaskArchive, TaskEngine, TaskEngineOptions, TaskStatus,
+    CreateTaskInput, EventQueryOptions, Level, LongTermStore, MemoryBroadcastProvider,
+    MemoryShortTermStore, PublishEventInput, SeriesMode, Task, TaskArchive, TaskEngine,
+    TaskEngineOptions, TaskEvent, TaskStatus, WorkerAuditEvent,
 };
 use taskcast_server::{create_app, AuthMode, CorsConfig, JwtConfig};
 
@@ -44,6 +46,17 @@ fn make_jwt_server() -> (Arc<TaskEngine>, TestServer) {
     });
     let (app, _) = create_app(engine.clone(), auth, None, None, CorsConfig::default());
     (engine, TestServer::new(app))
+}
+
+fn make_corrupt_history_server() -> TestServer {
+    let engine = Arc::new(TaskEngine::new(TaskEngineOptions {
+        short_term_store: Arc::new(MemoryShortTermStore::new()),
+        broadcast: Arc::new(MemoryBroadcastProvider::new()),
+        long_term_store: Some(Arc::new(AccumulatedOnlyLongTermStore)),
+        hooks: None,
+    }));
+    let (app, _) = create_app(engine, AuthMode::None, None, None, CorsConfig::default());
+    TestServer::new(app)
 }
 
 fn make_token(scope: &[&str], task_ids: serde_json::Value) -> String {
@@ -143,6 +156,15 @@ async fn export_missing_task_archive_returns_404() {
     let response = server.get("/tasks/missing-task/archive").await;
 
     response.assert_status(StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn export_unavailable_raw_accumulate_history_returns_500() {
+    let server = make_corrupt_history_server();
+
+    let response = server.get("/tasks/task-corrupt/archive").await;
+
+    response.assert_status(StatusCode::INTERNAL_SERVER_ERROR);
 }
 
 #[tokio::test]
@@ -285,5 +307,93 @@ fn resolve_archive_event_schema(schemas: &serde_json::Value) -> &serde_json::Val
         &schemas[schema_name]
     } else {
         item_schema
+    }
+}
+
+struct AccumulatedOnlyLongTermStore;
+
+#[async_trait]
+impl LongTermStore for AccumulatedOnlyLongTermStore {
+    async fn save_task(&self, _task: Task) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
+
+    async fn get_task(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<Task>, Box<dyn std::error::Error + Send + Sync>> {
+        if task_id != "task-corrupt" {
+            return Ok(None);
+        }
+        Ok(Some(Task {
+            id: task_id.to_string(),
+            r#type: Some("archive-test".to_string()),
+            status: TaskStatus::Running,
+            params: None,
+            result: None,
+            error: None,
+            metadata: None,
+            created_at: 1000.0,
+            updated_at: 2000.0,
+            completed_at: None,
+            ttl: None,
+            auth_config: None,
+            webhooks: None,
+            cleanup: None,
+            tags: None,
+            assign_mode: None,
+            cost: None,
+            assigned_worker: None,
+            disconnect_policy: None,
+            reason: None,
+            resume_at: None,
+            blocked_request: None,
+        }))
+    }
+
+    async fn save_event(
+        &self,
+        _event: TaskEvent,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
+
+    async fn get_events(
+        &self,
+        task_id: &str,
+        _opts: Option<EventQueryOptions>,
+    ) -> Result<Vec<TaskEvent>, Box<dyn std::error::Error + Send + Sync>> {
+        if task_id != "task-corrupt" {
+            return Ok(Vec::new());
+        }
+        Ok(vec![TaskEvent {
+            id: "event-1".to_string(),
+            task_id: task_id.to_string(),
+            index: 0,
+            timestamp: 3000.0,
+            r#type: "demo.event".to_string(),
+            level: Level::Info,
+            data: json!({ "delta": "hello world" }),
+            series_id: Some("series-1".to_string()),
+            series_mode: Some(SeriesMode::Accumulate),
+            series_acc_field: Some("delta".to_string()),
+            series_snapshot: None,
+            _accumulated_data: None,
+        }])
+    }
+
+    async fn save_worker_event(
+        &self,
+        _event: WorkerAuditEvent,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
+
+    async fn get_worker_events(
+        &self,
+        _worker_id: &str,
+        _opts: Option<EventQueryOptions>,
+    ) -> Result<Vec<WorkerAuditEvent>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(Vec::new())
     }
 }

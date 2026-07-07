@@ -273,7 +273,13 @@ pub async fn import_task_archive(
     let options = body
         .overwrite
         .map(|overwrite| TaskArchiveImportOptions { overwrite });
-    let result = engine.import_task_archive(body.archive, options).await?;
+    let result = engine
+        .import_task_archive(body.archive, options)
+        .await
+        .map_err(|err| match &err {
+            EngineError::Archive(_) => AppError::BadRequest(err.to_string()),
+            _ => AppError::Engine(err),
+        })?;
 
     Ok(axum::Json(ImportTaskArchiveResponse {
         ok: true,

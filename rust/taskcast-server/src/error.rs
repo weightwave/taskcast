@@ -44,7 +44,7 @@ impl IntoResponse for AppError {
                     format!("Cannot publish to task in terminal status: {status:?}"),
                 ),
                 EngineError::InvalidInput(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
-                EngineError::Archive(e) => (StatusCode::BAD_REQUEST, e.to_string()),
+                EngineError::Archive(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
                 EngineError::Store(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
             },
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),

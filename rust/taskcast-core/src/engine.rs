@@ -511,14 +511,16 @@ impl TaskEngine {
         }
 
         let restore_options = Some(import_options);
-        self.short_term_store
-            .restore_task_archive(restore_data.clone(), restore_options)
-            .await?;
+        // Durable history is restored before the live short-term cache so a final
+        // long-term failure cannot expose an imported task that was never persisted.
         if let Some(ref long_term_store) = self.long_term_store {
             long_term_store
-                .restore_task_archive(restore_data, restore_options)
+                .restore_task_archive(restore_data.clone(), restore_options)
                 .await?;
         }
+        self.short_term_store
+            .restore_task_archive(restore_data, restore_options)
+            .await?;
 
         self.emit_locks.lock().unwrap().remove(&task_id);
 

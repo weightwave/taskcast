@@ -270,7 +270,7 @@ export function createTasksRouter(engine: TaskEngine, subscriberCounts: Subscrib
 
   register(importArchiveRoute, async (c) => {
     const auth = c.get('auth')
-    if (!checkScope(auth, 'task:create')) return c.json({ error: 'Forbidden' }, 403)
+    if (!checkScope(auth, 'task:manage')) return c.json({ error: 'Forbidden' }, 403)
 
     const body = await c.req.json()
     const parsed = ImportTaskArchiveBodySchema.safeParse(body)

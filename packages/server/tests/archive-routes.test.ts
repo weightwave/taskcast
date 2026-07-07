@@ -1,6 +1,10 @@
 import { describe, expect, it, vi } from 'vitest'
+import { SignJWT } from 'jose'
 import { MemoryBroadcastProvider, MemoryShortTermStore, TaskEngine } from '@taskcast/core'
+import type { LongTermStore, Task, TaskEvent } from '@taskcast/core'
 import { createTaskcastApp } from '../src/index.js'
+
+const JWT_SECRET = 'test-secret-that-is-long-enough'
 
 function makeApp() {
   const engine = new TaskEngine({
@@ -11,9 +15,58 @@ function makeApp() {
   return { app, engine }
 }
 
+async function makeToken(scope: string[], taskIds: string[] | '*' = '*') {
+  return new SignJWT({ scope, taskIds })
+    .setProtectedHeader({ alg: 'HS256' })
+    .setExpirationTime('1h')
+    .sign(new TextEncoder().encode(JWT_SECRET))
+}
+
+function makeJwtApp() {
+  const engine = new TaskEngine({
+    broadcast: new MemoryBroadcastProvider(),
+    shortTermStore: new MemoryShortTermStore(),
+  })
+  const { app } = createTaskcastApp({
+    engine,
+    auth: { mode: 'jwt', jwt: { algorithm: 'HS256', secret: JWT_SECRET } },
+  })
+  return { app, engine }
+}
+
 function makeAppWithEngine(engine: TaskEngine) {
   const { app } = createTaskcastApp({ engine, auth: { mode: 'none' } })
   return app
+}
+
+function makeLongTermStoreWithAccumulatedOnlyHistory(): LongTermStore {
+  const task: Task = {
+    id: 'task-corrupt',
+    status: 'running',
+    createdAt: 1000,
+    updatedAt: 2000,
+  }
+  const event: TaskEvent = {
+    id: 'event-1',
+    taskId: task.id,
+    index: 0,
+    timestamp: 3000,
+    type: 'demo.event',
+    level: 'info',
+    data: { delta: 'hello world' },
+    seriesId: 'series-1',
+    seriesMode: 'accumulate',
+    seriesAccField: 'delta',
+  }
+
+  return {
+    saveTask: vi.fn().mockResolvedValue(undefined),
+    getTask: vi.fn().mockResolvedValue(task),
+    saveEvent: vi.fn().mockResolvedValue(undefined),
+    getEvents: vi.fn().mockResolvedValue([event]),
+    saveWorkerEvent: vi.fn().mockResolvedValue(undefined),
+    getWorkerEvents: vi.fn().mockResolvedValue([]),
+  }
 }
 
 function makeArchive(taskId = 'task-1') {
@@ -59,6 +112,24 @@ describe('task archive routes', () => {
     const res = await app.request('/tasks/missing/archive')
 
     expect(res.status).toBe(404)
+  })
+
+  it('returns 500 when export cannot reconstruct raw accumulated history', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const engine = new TaskEngine({
+      broadcast: new MemoryBroadcastProvider(),
+      shortTermStore: new MemoryShortTermStore(),
+      longTermStore: makeLongTermStoreWithAccumulatedOnlyHistory(),
+    })
+    const app = makeAppWithEngine(engine)
+
+    try {
+      const res = await app.request('/tasks/task-corrupt/archive')
+
+      expect(res.status).toBe(500)
+    } finally {
+      consoleError.mockRestore()
+    }
   })
 
   it('imports a valid archive', async () => {
@@ -150,6 +221,49 @@ describe('task archive routes', () => {
     })
 
     expect(res.status).toBe(400)
+  })
+
+  it('requires task:manage scope to import archives', async () => {
+    const { app } = makeJwtApp()
+    const createOnlyToken = await makeToken(['task:create'])
+    const manageToken = await makeToken(['task:manage'])
+
+    const denied = await app.request('/tasks/import', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${createOnlyToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ archive: makeArchive('task-auth') }),
+    })
+    expect(denied.status).toBe(403)
+
+    const allowed = await app.request('/tasks/import', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${manageToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ archive: makeArchive('task-auth') }),
+    })
+    expect(allowed.status).toBe(200)
+  })
+
+  it('requires event:history scope to export archives', async () => {
+    const { app, engine } = makeJwtApp()
+    await engine.createTask({ id: 'task-auth' })
+    const subscribeToken = await makeToken(['event:subscribe'])
+    const historyToken = await makeToken(['event:history'])
+
+    const denied = await app.request('/tasks/task-auth/archive', {
+      headers: { Authorization: `Bearer ${subscribeToken}` },
+    })
+    expect(denied.status).toBe(403)
+
+    const allowed = await app.request('/tasks/task-auth/archive', {
+      headers: { Authorization: `Bearer ${historyToken}` },
+    })
+    expect(allowed.status).toBe(200)
   })
 
   it('surfaces unknown import failures as server errors', async () => {
