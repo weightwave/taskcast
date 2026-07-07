@@ -402,7 +402,14 @@ export class TaskEngine {
     if (typeof this.shortTermStore.restoreTaskArchive !== 'function') {
       throw new Error('shortTermStore does not support restoreTaskArchive')
     }
-    if (this.longTermStore && typeof this.longTermStore.restoreTaskArchive !== 'function') {
+    const longTermSharesArchiveRestoreStorage =
+      this.longTermStore?.sharesTaskArchiveRestoreStorage === true
+
+    if (
+      this.longTermStore &&
+      !longTermSharesArchiveRestoreStorage &&
+      typeof this.longTermStore.restoreTaskArchive !== 'function'
+    ) {
       throw new Error('longTermStore does not support restoreTaskArchive')
     }
 
@@ -414,7 +421,7 @@ export class TaskEngine {
 
     // Durable history is restored before the live short-term cache so a final
     // long-term failure cannot expose an imported task that was never persisted.
-    if (this.longTermStore) {
+    if (this.longTermStore && !longTermSharesArchiveRestoreStorage) {
       await this.longTermStore.restoreTaskArchive!(restoreData, options)
     }
     await this.shortTermStore.restoreTaskArchive(restoreData, options)

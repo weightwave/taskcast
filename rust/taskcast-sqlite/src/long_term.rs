@@ -1,8 +1,10 @@
 use async_trait::async_trait;
-use sqlx::SqlitePool;
+use sqlx::{Row, SqlitePool};
+use std::collections::BTreeSet;
 
 use taskcast_core::types::{
-    EventQueryOptions, LongTermStore, Task, TaskEvent, WorkerAuditEvent,
+    EventQueryOptions, LongTermStore, Task, TaskArchiveImportOptions, TaskArchiveRestoreData,
+    TaskEvent, WorkerAuditEvent,
 };
 
 use crate::row_helpers::{
@@ -13,11 +15,62 @@ use crate::row_helpers::{
 
 pub struct SqliteLongTermStore {
     pool: SqlitePool,
+    shares_task_archive_restore_storage: bool,
 }
 
 impl SqliteLongTermStore {
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            shares_task_archive_restore_storage: false,
+        }
+    }
+
+    pub fn new_shared_archive_restore_storage(pool: SqlitePool) -> Self {
+        Self {
+            pool,
+            shares_task_archive_restore_storage: true,
+        }
+    }
+
+    async fn validate_archive_restore(
+        &self,
+        data: &TaskArchiveRestoreData,
+        options: Option<TaskArchiveImportOptions>,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let task_id = &data.task.id;
+        let existing = sqlx::query("SELECT id FROM taskcast_tasks WHERE id = ?1")
+            .bind(task_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        if existing.is_some() && !options.map(|options| options.overwrite).unwrap_or(false) {
+            return Err(format!("Task already exists: {task_id}").into());
+        }
+
+        let event_ids: Vec<String> = data
+            .events
+            .iter()
+            .map(|event| event.id.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        if !event_ids.is_empty() {
+            let placeholders = vec!["?"; event_ids.len()].join(", ");
+            let sql = format!(
+                "SELECT id FROM taskcast_events WHERE task_id <> ? AND id IN ({placeholders}) LIMIT 1"
+            );
+            let mut query = sqlx::query(&sql).bind(task_id);
+            for event_id in &event_ids {
+                query = query.bind(event_id);
+            }
+            let conflict = query.fetch_optional(&self.pool).await?;
+            if let Some(row) = conflict {
+                let id: String = row.get("id");
+                return Err(format!("Archive event id conflicts with another task: {id}").into());
+            }
+        }
+
+        Ok(existing.is_some())
     }
 }
 
@@ -232,6 +285,125 @@ impl LongTermStore for SqliteLongTermStore {
         };
 
         Ok(rows.iter().map(row_to_event).collect())
+    }
+
+    fn supports_task_archive_restore(&self) -> bool {
+        true
+    }
+
+    fn shares_task_archive_restore_storage(&self) -> bool {
+        self.shares_task_archive_restore_storage
+    }
+
+    async fn validate_task_archive_restore(
+        &self,
+        data: &TaskArchiveRestoreData,
+        options: Option<TaskArchiveImportOptions>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.validate_archive_restore(data, options).await?;
+        Ok(())
+    }
+
+    async fn restore_task_archive(
+        &self,
+        data: TaskArchiveRestoreData,
+        options: Option<TaskArchiveImportOptions>,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let task_id = data.task.id.clone();
+        let overwritten = self.validate_archive_restore(&data, options).await?;
+        let mut tx = self.pool.begin().await?;
+
+        sqlx::query("DELETE FROM taskcast_events WHERE task_id = ?1")
+            .bind(&task_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM taskcast_tasks WHERE id = ?1")
+            .bind(&task_id)
+            .execute(&mut *tx)
+            .await?;
+
+        let task = &data.task;
+        let status_str = status_to_string(&task.status);
+        let params_json = to_json_string(&task.params);
+        let result_json = to_json_string(&task.result);
+        let error_json = to_json_string(&task.error);
+        let metadata_json = to_json_string(&task.metadata);
+        let auth_config_json = to_json_string(&task.auth_config);
+        let webhooks_json = to_json_string(&task.webhooks);
+        let cleanup_json = to_json_string(&task.cleanup);
+        let tags_json = to_json_string(&task.tags);
+        let assign_mode_str: Option<String> = task.assign_mode.as_ref().map(assign_mode_to_string);
+        let cost = task.cost.map(|value| value as i32);
+        let disconnect_policy_str: Option<String> = task
+            .disconnect_policy
+            .as_ref()
+            .map(disconnect_policy_to_string);
+
+        sqlx::query(
+            r#"
+            INSERT INTO taskcast_tasks (
+                id, type, status, params, result, error, metadata,
+                auth_config, webhooks, cleanup, created_at, updated_at, completed_at, ttl,
+                tags, assign_mode, cost, assigned_worker, disconnect_policy
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                ?15, ?16, ?17, ?18, ?19
+            )
+            "#,
+        )
+        .bind(&task.id)
+        .bind(&task.r#type)
+        .bind(&status_str)
+        .bind(&params_json)
+        .bind(&result_json)
+        .bind(&error_json)
+        .bind(&metadata_json)
+        .bind(&auth_config_json)
+        .bind(&webhooks_json)
+        .bind(&cleanup_json)
+        .bind(task.created_at as i64)
+        .bind(task.updated_at as i64)
+        .bind(task.completed_at.map(|value| value as i64))
+        .bind(task.ttl.map(|value| value as i32))
+        .bind(&tags_json)
+        .bind(&assign_mode_str)
+        .bind(cost)
+        .bind(&task.assigned_worker)
+        .bind(&disconnect_policy_str)
+        .execute(&mut *tx)
+        .await?;
+
+        for event in &data.events {
+            let level_str = level_to_string(&event.level);
+            let series_mode_str: Option<String> =
+                event.series_mode.as_ref().and_then(series_mode_to_string);
+            let data_str = json_value_to_string(&event.data);
+
+            sqlx::query(
+                r#"
+                INSERT INTO taskcast_events (
+                    id, task_id, idx, timestamp, type, level, data, series_id, series_mode, series_acc_field
+                ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+                )
+                "#,
+            )
+            .bind(&event.id)
+            .bind(&event.task_id)
+            .bind(event.index as i32)
+            .bind(event.timestamp as i64)
+            .bind(&event.r#type)
+            .bind(&level_str)
+            .bind(&data_str)
+            .bind(&event.series_id)
+            .bind(&series_mode_str)
+            .bind(&event.series_acc_field)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(overwritten)
     }
 
     async fn save_worker_event(

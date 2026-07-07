@@ -35,7 +35,7 @@ pub async fn create_sqlite_adapters(
 
     Ok(SqliteAdapters {
         short_term_store: SqliteShortTermStore::new(pool.clone()),
-        long_term_store: SqliteLongTermStore::new(pool),
+        long_term_store: SqliteLongTermStore::new_shared_archive_restore_storage(pool),
     })
 }
 

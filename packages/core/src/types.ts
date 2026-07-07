@@ -337,6 +337,12 @@ export interface LongTermStore {
   getTask(taskId: string): Promise<Task | null>
   saveEvent(event: TaskEvent): Promise<void>
   getEvents(taskId: string, opts?: EventQueryOptions): Promise<TaskEvent[]>
+  /**
+   * True when short-term archive restore writes the same durable storage this
+   * long-term store reads from. The engine still runs long-term preflight, but
+   * skips a duplicate long-term final restore.
+   */
+  sharesTaskArchiveRestoreStorage?: boolean
   /** Validates deterministic archive restore conflicts before mutation; engine calls this before multi-store restore. */
   validateTaskArchiveRestore?(
     data: TaskArchiveRestoreData,

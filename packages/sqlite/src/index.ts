@@ -28,7 +28,7 @@ export function createSqliteAdapters(options: SqliteAdapterOptions = {}): {
 
   return {
     shortTermStore: new SqliteShortTermStore(db),
-    longTermStore: new SqliteLongTermStore(db),
+    longTermStore: new SqliteLongTermStore(db, true),
     db,
   }
 }

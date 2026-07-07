@@ -525,6 +525,27 @@ async fn engine_import_does_not_mutate_short_term_when_long_term_final_restore_f
     assert!(short.get_events("task-1", None).await.unwrap().is_empty());
 }
 
+#[tokio::test]
+async fn engine_import_skips_long_term_final_restore_when_archive_storage_is_shared() {
+    let short = Arc::new(MemoryShortTermStore::new());
+    let long = Arc::new(RecordingLongTermStore {
+        fail_restore: true,
+        shares_restore_storage: true,
+        ..Default::default()
+    });
+    let engine = make_engine(
+        Arc::clone(&short),
+        Arc::new(MemoryBroadcastProvider::new()),
+        Some(long.clone()),
+    );
+
+    let result = engine.import_task_archive(make_archive(vec![]), None).await.unwrap();
+
+    assert_eq!(result.task_id, "task-1");
+    assert!(long.restore_options.lock().unwrap().is_empty());
+    assert!(short.get_task("task-1").await.unwrap().is_some());
+}
+
 #[derive(Default)]
 struct MockLongTermStore {
     tasks: Mutex<HashMap<String, Task>>,
@@ -588,6 +609,7 @@ impl LongTermStore for MockLongTermStore {
 struct RecordingLongTermStore {
     restore_options: Mutex<Vec<Option<TaskArchiveImportOptions>>>,
     fail_restore: bool,
+    shares_restore_storage: bool,
 }
 
 #[async_trait]
@@ -620,6 +642,10 @@ impl LongTermStore for RecordingLongTermStore {
 
     fn supports_task_archive_restore(&self) -> bool {
         true
+    }
+
+    fn shares_task_archive_restore_storage(&self) -> bool {
+        self.shares_restore_storage
     }
 
     async fn validate_task_archive_restore(

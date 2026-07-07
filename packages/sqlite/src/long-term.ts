@@ -13,7 +13,10 @@ import { rowToTask, rowToEvent, rowToWorkerEvent } from './row-mappers.js'
 // ─── SqliteLongTermStore ──────────────────────────────────────────────────
 
 export class SqliteLongTermStore implements LongTermStore {
-  constructor(private db: Database.Database) {}
+  constructor(
+    private db: Database.Database,
+    public readonly sharesTaskArchiveRestoreStorage = false,
+  ) {}
 
   async saveTask(task: Task): Promise<void> {
     this.saveTaskSync(task)

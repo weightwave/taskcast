@@ -701,6 +701,10 @@ pub trait LongTermStore: Send + Sync {
         false
     }
 
+    fn shares_task_archive_restore_storage(&self) -> bool {
+        false
+    }
+
     async fn validate_task_archive_restore(
         &self,
         _data: &TaskArchiveRestoreData,

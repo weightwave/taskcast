@@ -475,6 +475,31 @@ describe('TaskEngine archive import/export', () => {
     await expect(shortTermStore.getEvents('task-1')).resolves.toEqual([])
   })
 
+  it('skips long-term final restore when archive storage is shared with short-term', async () => {
+    const shortTermStore = new MemoryShortTermStore()
+    const shortRestore = vi.spyOn(shortTermStore, 'restoreTaskArchive')
+    const longValidate = vi.fn().mockResolvedValue(undefined)
+    const longRestore = vi.fn().mockResolvedValue({ overwritten: false })
+    const longTermStore = makeLongTermStore({
+      validateTaskArchiveRestore: longValidate,
+      restoreTaskArchive: longRestore,
+    }) as LongTermStore & { sharesTaskArchiveRestoreStorage?: boolean }
+    longTermStore.sharesTaskArchiveRestoreStorage = true
+    const engine = new TaskEngine({
+      broadcast: new MemoryBroadcastProvider(),
+      shortTermStore,
+      longTermStore,
+    })
+
+    const result = await engine.importTaskArchive(makeArchive())
+
+    expect(longValidate).toHaveBeenCalledOnce()
+    expect(longRestore).not.toHaveBeenCalled()
+    expect(shortRestore).toHaveBeenCalledOnce()
+    expect(result).toEqual({ taskId: 'task-1', eventCount: 0, overwritten: false })
+    await expect(shortTermStore.getTask('task-1')).resolves.toMatchObject({ id: 'task-1' })
+  })
+
   it('validates long-term restore before mutating short-term state', async () => {
     const shortTermStore = new MemoryShortTermStore()
     const shortRestore = vi.spyOn(shortTermStore, 'restoreTaskArchive')

@@ -491,8 +491,16 @@ impl TaskEngine {
                 "shortTermStore does not support restore_task_archive",
             ));
         }
+        let long_term_shares_archive_restore_storage = self
+            .long_term_store
+            .as_ref()
+            .map(|store| store.shares_task_archive_restore_storage())
+            .unwrap_or(false);
+
         if let Some(ref long_term_store) = self.long_term_store {
-            if !long_term_store.supports_task_archive_restore() {
+            if !long_term_shares_archive_restore_storage
+                && !long_term_store.supports_task_archive_restore()
+            {
                 return Err(unsupported_archive_restore(
                     "longTermStore does not support restore_task_archive",
                 ));
@@ -514,9 +522,11 @@ impl TaskEngine {
         // Durable history is restored before the live short-term cache so a final
         // long-term failure cannot expose an imported task that was never persisted.
         if let Some(ref long_term_store) = self.long_term_store {
-            long_term_store
-                .restore_task_archive(restore_data.clone(), restore_options)
-                .await?;
+            if !long_term_shares_archive_restore_storage {
+                long_term_store
+                    .restore_task_archive(restore_data.clone(), restore_options)
+                    .await?;
+            }
         }
         self.short_term_store
             .restore_task_archive(restore_data, restore_options)
