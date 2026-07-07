@@ -65,6 +65,46 @@ fn make_archive(events: Vec<TaskEvent>) -> TaskArchive {
     }
 }
 
+fn validate_archive_json(value: serde_json::Value) -> Result<(), String> {
+    let archive: TaskArchive = serde_json::from_value(value).map_err(|err| err.to_string())?;
+    validate_task_archive(&archive)
+        .map(|_| ())
+        .map_err(|err| err.to_string())
+}
+
+fn archive_json_with_event_field(
+    field_name: &str,
+    field_value: serde_json::Value,
+) -> serde_json::Value {
+    let mut event = json!({
+        "id": format!("event-{field_name}"),
+        "taskId": "task-1",
+        "index": 0,
+        "timestamp": 3000.0,
+        "type": "demo.event",
+        "level": "info",
+        "data": null
+    });
+    event
+        .as_object_mut()
+        .unwrap()
+        .insert(field_name.to_string(), field_value);
+
+    json!({
+        "schema": "taskcast.taskArchive",
+        "version": 1,
+        "exportedAt": 5000.0,
+        "task": {
+            "id": "task-1",
+            "type": "demo",
+            "status": "running",
+            "createdAt": 1000.0,
+            "updatedAt": 2000.0
+        },
+        "events": [event]
+    })
+}
+
 fn make_engine(
     short_term_store: Arc<MemoryShortTermStore>,
     broadcast: Arc<MemoryBroadcastProvider>,
@@ -125,39 +165,26 @@ fn validate_rejects_non_contiguous_indexes_task_id_mismatch_and_transient_fields
 #[test]
 fn validate_rejects_deserialized_accumulated_data_fields() {
     for field_name in ["_accumulatedData", "_accumulated_data"] {
-        let mut event = json!({
-            "id": format!("event-{field_name}"),
-            "taskId": "task-1",
-            "index": 0,
-            "timestamp": 3000.0,
-            "type": "demo.event",
-            "level": "info",
-            "data": null
-        });
-        event
-            .as_object_mut()
-            .unwrap()
-            .insert(field_name.to_string(), json!({ "delta": "transient" }));
-
-        let archive: TaskArchive = serde_json::from_value(json!({
-            "schema": "taskcast.taskArchive",
-            "version": 1,
-            "exportedAt": 5000.0,
-            "task": {
-                "id": "task-1",
-                "type": "demo",
-                "status": "running",
-                "createdAt": 1000.0,
-                "updatedAt": 2000.0
-            },
-            "events": [event]
-        }))
-        .unwrap();
-
-        let err = validate_task_archive(&archive).unwrap_err();
+        let err = validate_archive_json(archive_json_with_event_field(
+            field_name,
+            json!({ "delta": "transient" }),
+        ))
+        .unwrap_err();
         assert!(
-            err.to_string().contains("_accumulated_data"),
+            err.contains(field_name) || err.contains("_accumulated_data"),
             "expected {field_name} to be rejected, got {err}"
+        );
+    }
+}
+
+#[test]
+fn validate_rejects_deserialized_null_presentation_fields_by_presence() {
+    for field_name in ["seriesSnapshot", "_accumulatedData", "_accumulated_data"] {
+        let err = validate_archive_json(archive_json_with_event_field(field_name, json!(null)))
+            .unwrap_err();
+        assert!(
+            err.contains(field_name) || err.contains("_accumulated_data"),
+            "expected {field_name}: null to be rejected, got {err}"
         );
     }
 }

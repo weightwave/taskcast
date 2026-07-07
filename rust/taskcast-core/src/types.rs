@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 
 // ─── Task ───────────────────────────────────────────────────────────────────
@@ -491,7 +491,7 @@ pub struct EventQueryOptions {
 
 // ─── Archive ────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskArchive {
     pub schema: String,
@@ -499,6 +499,48 @@ pub struct TaskArchive {
     pub exported_at: f64,
     pub task: Task,
     pub events: Vec<TaskEvent>,
+}
+
+impl<'de> Deserialize<'de> for TaskArchive {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct RawTaskArchive {
+            schema: String,
+            version: u64,
+            exported_at: f64,
+            task: Task,
+            events: Vec<serde_json::Value>,
+        }
+
+        let raw = RawTaskArchive::deserialize(deserializer)?;
+        let mut events = Vec::with_capacity(raw.events.len());
+        for event_value in raw.events {
+            if let Some(event) = event_value.as_object() {
+                for forbidden_key in ["seriesSnapshot", "_accumulatedData", "_accumulated_data"] {
+                    if event.contains_key(forbidden_key) {
+                        return Err(serde::de::Error::custom(format!(
+                            "Archive events must be raw deltas; forbidden presentation/transient \
+                             field {forbidden_key} is present"
+                        )));
+                    }
+                }
+            }
+
+            events.push(serde_json::from_value(event_value).map_err(serde::de::Error::custom)?);
+        }
+
+        Ok(Self {
+            schema: raw.schema,
+            version: raw.version,
+            exported_at: raw.exported_at,
+            task: raw.task,
+            events,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
