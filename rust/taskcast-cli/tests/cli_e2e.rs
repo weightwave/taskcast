@@ -25,7 +25,13 @@ fn make_server() -> (Arc<TaskEngine>, TestServer) {
         long_term_store: None,
         hooks: None,
     }));
-    let (app, _) = create_app(Arc::clone(&engine), AuthMode::None, None, None, CorsConfig::default());
+    let (app, _) = create_app(
+        Arc::clone(&engine),
+        AuthMode::None,
+        None,
+        None,
+        CorsConfig::default(),
+    );
     (engine, TestServer::new(app))
 }
 
@@ -37,7 +43,15 @@ async fn health_returns_ok() {
     let res = server.get("/health").await;
     res.assert_status_ok();
     let body: serde_json::Value = res.json();
-    assert_eq!(body, json!({ "ok": true }));
+    assert_eq!(
+        body,
+        json!({
+            "ok": true,
+            "name": "taskcast",
+            "version": env!("CARGO_PKG_VERSION"),
+            "apiVersion": "v1"
+        })
+    );
 }
 
 // ─── 2. Health detail returns adapters ───────────────────────────────────────
@@ -450,7 +464,9 @@ async fn full_lifecycle_create_run_publish_complete() {
     // 3. Publish event
     let res = server
         .post(&format!("/tasks/{task_id}/events"))
-        .json(&json!({ "type": "llm.delta", "level": "info", "data": { "delta": "response text" } }))
+        .json(
+            &json!({ "type": "llm.delta", "level": "info", "data": { "delta": "response text" } }),
+        )
         .await;
     res.assert_status(axum_test::http::StatusCode::CREATED);
     let evt: serde_json::Value = res.json();
@@ -690,10 +706,7 @@ async fn format_event_with_server_data() {
     );
     assert!(formatted.contains("llm.delta"), "got: {formatted}");
     assert!(formatted.contains("info"), "got: {formatted}");
-    assert!(
-        formatted.contains(r#""delta":"Hello""#),
-        "got: {formatted}"
-    );
+    assert!(formatted.contains(r#""delta":"Hello""#), "got: {formatted}");
 
     // Format with task ID prefix
     let formatted_with_id = format_event(

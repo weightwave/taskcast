@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest'
 import { TaskEngine, MemoryBroadcastProvider, MemoryShortTermStore } from '@taskcast/core'
-import { createTaskcastApp } from '@taskcast/server'
+import { createTaskcastApp, TASKCAST_SERVER_VERSION } from '@taskcast/server'
 import type { TaskcastApp } from '@taskcast/server'
 import { pingServer } from '../../src/commands/ping.js'
 import { runDoctor, formatDoctorResult } from '../../src/commands/doctor.js'
@@ -42,11 +42,16 @@ describe('ping via HTTP', () => {
     expect(result.latencyMs).toBeGreaterThanOrEqual(0)
   })
 
-  it('verifies /health endpoint returns { ok: true }', async () => {
+  it('verifies /health endpoint returns the version handshake', async () => {
     const res = await taskcastApp.app.request('/health')
     expect(res.status).toBe(200)
     const body = await res.json()
-    expect(body).toEqual({ ok: true })
+    expect(body).toEqual({
+      ok: true,
+      name: 'taskcast',
+      version: TASKCAST_SERVER_VERSION,
+      apiVersion: 'v1',
+    })
   })
 })
 
