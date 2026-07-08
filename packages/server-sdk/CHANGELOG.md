@@ -1,5 +1,13 @@
 # @taskcast/server-sdk
 
+## 1.5.3
+
+### Patch Changes
+
+- 79c6127: Add portable task archive import/export APIs, restore semantics, and public server version reporting.
+- Updated dependencies [79c6127]
+  - @taskcast/core@1.5.3
+
 ## 1.5.2
 
 ### Patch Changes

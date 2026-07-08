@@ -1,5 +1,20 @@
 # @taskcast/cli
 
+## 1.5.3
+
+### Patch Changes
+
+- 79c6127: Add portable task archive import/export APIs, restore semantics, and public server version reporting.
+- Updated dependencies [79c6127]
+  - @taskcast/core@1.5.3
+  - @taskcast/server@1.5.3
+  - @taskcast/server-sdk@1.5.3
+  - @taskcast/postgres@1.5.3
+  - @taskcast/sqlite@1.5.3
+  - @taskcast/redis@1.5.3
+  - @taskcast/dashboard-web@0.3.11
+  - @taskcast/playground@0.3.11
+
 ## 1.5.2
 
 ### Patch Changes
