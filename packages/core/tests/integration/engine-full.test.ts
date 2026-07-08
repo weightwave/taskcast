@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest'
 import { Redis } from 'ioredis'
 import postgres from 'postgres'
-import { GenericContainer, type StartedTestContainer } from 'testcontainers'
+import { GenericContainer, Wait, type StartedTestContainer } from 'testcontainers'
 import { readFileSync } from 'fs'
 import { join } from 'path'
 import { TaskEngine } from '../../src/engine.js'
@@ -28,6 +28,7 @@ beforeAll(async () => {
         POSTGRES_PASSWORD: 'test',
         POSTGRES_DB: 'testdb',
       })
+      .withWaitStrategy(Wait.forLogMessage(/ready to accept connections/, 2))
       .start(),
   ])
 
