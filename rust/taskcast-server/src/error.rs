@@ -32,7 +32,9 @@ impl IntoResponse for AppError {
         let (status, message) = match &self {
             AppError::Engine(e) => match e {
                 EngineError::TaskNotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
-                EngineError::TaskConflict(msg) => (StatusCode::CONFLICT, format!("Task already exists: {msg}")),
+                EngineError::TaskConflict(msg) => {
+                    (StatusCode::CONFLICT, format!("Task already exists: {msg}"))
+                }
                 EngineError::InvalidTransition { from, to } => (
                     StatusCode::CONFLICT,
                     format!("Invalid transition: {from:?} \u{2192} {to:?}"),
@@ -42,18 +44,20 @@ impl IntoResponse for AppError {
                     format!("Cannot publish to task in terminal status: {status:?}"),
                 ),
                 EngineError::InvalidInput(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
+                EngineError::Archive(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
                 EngineError::Store(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
             },
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             AppError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
             AppError::Forbidden => (StatusCode::FORBIDDEN, "Forbidden".to_string()),
-            AppError::MissingToken => (StatusCode::UNAUTHORIZED, "Missing Bearer token".to_string()),
-            AppError::InvalidToken => {
-                (StatusCode::UNAUTHORIZED, "Invalid or expired token".to_string())
+            AppError::MissingToken => {
+                (StatusCode::UNAUTHORIZED, "Missing Bearer token".to_string())
             }
-            AppError::NotImplemented(msg) => {
-                (StatusCode::NOT_IMPLEMENTED, msg.clone())
-            }
+            AppError::InvalidToken => (
+                StatusCode::UNAUTHORIZED,
+                "Invalid or expired token".to_string(),
+            ),
+            AppError::NotImplemented(msg) => (StatusCode::NOT_IMPLEMENTED, msg.clone()),
         };
 
         (status, axum::Json(json!({ "error": message }))).into_response()

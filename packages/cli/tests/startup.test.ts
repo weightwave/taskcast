@@ -4,7 +4,7 @@ import {
   MemoryBroadcastProvider,
   MemoryShortTermStore,
 } from '@taskcast/core'
-import { createTaskcastApp } from '@taskcast/server'
+import { createTaskcastApp, TASKCAST_SERVER_VERSION } from '@taskcast/server'
 
 describe('CLI — startup scenarios', () => {
   it('memory mode: /health responds ok', async () => {
@@ -16,7 +16,12 @@ describe('CLI — startup scenarios', () => {
     const res = await app.request('/health')
     expect(res.status).toBe(200)
     const body = await res.json()
-    expect(body).toEqual({ ok: true })
+    expect(body).toEqual({
+      ok: true,
+      name: 'taskcast',
+      version: TASKCAST_SERVER_VERSION,
+      apiVersion: 'v1',
+    })
   })
 
   it('auth jwt mode rejects unauthenticated requests', async () => {

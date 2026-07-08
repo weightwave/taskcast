@@ -1,4 +1,17 @@
-import type { Task, TaskEvent, TaskStatus, TaskAuthConfig, WebhookConfig, CleanupRule, SeriesMode, SinceCursor, TaskError, SubscribeFilter } from '@taskcast/core'
+import type {
+  Task,
+  TaskEvent,
+  TaskStatus,
+  TaskAuthConfig,
+  WebhookConfig,
+  CleanupRule,
+  SeriesMode,
+  SinceCursor,
+  TaskError,
+  SubscribeFilter,
+  TaskArchive,
+  TaskArchiveImportResult,
+} from '@taskcast/core'
 
 export type CreateTaskInput = Pick<Partial<Task>, 'type' | 'params' | 'result' | 'metadata' | 'ttl' | 'authConfig' | 'webhooks' | 'cleanup'>
 
@@ -14,6 +27,12 @@ export interface TaskcastServerClientOptions {
   baseUrl: string
   token?: string
   fetch?: typeof globalThis.fetch
+}
+
+export interface TaskcastServerInfo {
+  name: 'taskcast'
+  version: string
+  apiVersion: 'v1'
 }
 
 export class TaskcastServerClient {
@@ -33,8 +52,26 @@ export class TaskcastServerClient {
     return this._request<Task>('POST', '/tasks', input)
   }
 
+  async getServerInfo(): Promise<TaskcastServerInfo> {
+    return this._request<TaskcastServerInfo>('GET', '/')
+  }
+
   async getTask(taskId: string): Promise<Task> {
     return this._request<Task>('GET', `/tasks/${taskId}`)
+  }
+
+  async exportTaskArchive(taskId: string): Promise<TaskArchive> {
+    return this._request<TaskArchive>('GET', `/tasks/${taskId}/archive`)
+  }
+
+  async importTaskArchive(
+    archive: TaskArchive,
+    options?: { overwrite?: boolean },
+  ): Promise<{ ok: true } & TaskArchiveImportResult> {
+    return this._request<{ ok: true } & TaskArchiveImportResult>('POST', '/tasks/import', {
+      archive,
+      ...(options?.overwrite !== undefined ? { overwrite: options.overwrite } : {}),
+    })
   }
 
   async transitionTask(

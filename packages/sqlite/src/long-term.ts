@@ -1,13 +1,28 @@
 import type Database from 'better-sqlite3'
-import type { Task, TaskEvent, LongTermStore, EventQueryOptions, WorkerAuditEvent } from '@taskcast/core'
+import type {
+  Task,
+  TaskEvent,
+  LongTermStore,
+  EventQueryOptions,
+  TaskArchiveImportOptions,
+  TaskArchiveRestoreData,
+  WorkerAuditEvent,
+} from '@taskcast/core'
 import { rowToTask, rowToEvent, rowToWorkerEvent } from './row-mappers.js'
 
 // ─── SqliteLongTermStore ──────────────────────────────────────────────────
 
 export class SqliteLongTermStore implements LongTermStore {
-  constructor(private db: Database.Database) {}
+  constructor(
+    private db: Database.Database,
+    public readonly sharesTaskArchiveRestoreStorage = false,
+  ) {}
 
   async saveTask(task: Task): Promise<void> {
+    this.saveTaskSync(task)
+  }
+
+  private saveTaskSync(task: Task): void {
     const stmt = this.db.prepare(`
       INSERT INTO taskcast_tasks (id, type, status, params, result, error, metadata, auth_config, webhooks, cleanup, created_at, updated_at, completed_at, ttl, tags, assign_mode, cost, assigned_worker, disconnect_policy)
       VALUES (@id, @type, @status, @params, @result, @error, @metadata, @auth_config, @webhooks, @cleanup, @created_at, @updated_at, @completed_at, @ttl, @tags, @assign_mode, @cost, @assigned_worker, @disconnect_policy)
@@ -63,6 +78,10 @@ export class SqliteLongTermStore implements LongTermStore {
   }
 
   async saveEvent(event: TaskEvent): Promise<void> {
+    this.saveEventSync(event)
+  }
+
+  private saveEventSync(event: TaskEvent): void {
     this.db
       .prepare(
         `INSERT INTO taskcast_events (id, task_id, idx, timestamp, type, level, data, series_id, series_mode, series_acc_field)
@@ -81,6 +100,81 @@ export class SqliteLongTermStore implements LongTermStore {
         series_mode: event.seriesMode ?? null,
         series_acc_field: event.seriesAccField ?? null,
       })
+  }
+
+  private saveEventStrictSync(event: TaskEvent): void {
+    this.db
+      .prepare(
+        `INSERT INTO taskcast_events (id, task_id, idx, timestamp, type, level, data, series_id, series_mode, series_acc_field)
+         VALUES (@id, @task_id, @idx, @timestamp, @type, @level, @data, @series_id, @series_mode, @series_acc_field)`,
+      )
+      .run({
+        id: event.id,
+        task_id: event.taskId,
+        idx: event.index,
+        timestamp: event.timestamp,
+        type: event.type,
+        level: event.level,
+        data: event.data != null ? JSON.stringify(event.data) : null,
+        series_id: event.seriesId ?? null,
+        series_mode: event.seriesMode ?? null,
+        series_acc_field: event.seriesAccField ?? null,
+      })
+  }
+
+  async validateTaskArchiveRestore(
+    data: TaskArchiveRestoreData,
+    options?: TaskArchiveImportOptions,
+  ): Promise<void> {
+    this.validateTaskArchiveRestoreSync(data, options)
+  }
+
+  private validateTaskArchiveRestoreSync(
+    data: TaskArchiveRestoreData,
+    options?: TaskArchiveImportOptions,
+  ): boolean {
+    const taskId = data.task.id
+    const existing = this.db.prepare('SELECT id FROM taskcast_tasks WHERE id = ?').get(taskId)
+    if (existing && options?.overwrite !== true) {
+      throw new Error(`Task already exists: ${taskId}`)
+    }
+
+    const eventIds = Array.from(new Set(data.events.map((event) => event.id)))
+    if (eventIds.length > 0) {
+      const conflict = this.db
+        .prepare(
+          `SELECT id FROM taskcast_events
+           WHERE task_id <> ? AND id IN (${eventIds.map(() => '?').join(', ')})
+           LIMIT 1`,
+        )
+        .get(taskId, ...eventIds)
+      if (conflict) {
+        throw new Error(`Archive event id conflicts with another task: ${(conflict as { id: string }).id}`)
+      }
+    }
+
+    return Boolean(existing)
+  }
+
+  async restoreTaskArchive(
+    data: TaskArchiveRestoreData,
+    options?: TaskArchiveImportOptions,
+  ): Promise<{ overwritten: boolean }> {
+    const restore = this.db.transaction(() => {
+      const taskId = data.task.id
+      const overwritten = this.validateTaskArchiveRestoreSync(data, options)
+
+      this.db.prepare('DELETE FROM taskcast_events WHERE task_id = ?').run(taskId)
+      this.db.prepare('DELETE FROM taskcast_tasks WHERE id = ?').run(taskId)
+      this.saveTaskSync(data.task)
+      for (const event of data.events) {
+        this.saveEventStrictSync(event)
+      }
+
+      return { overwritten }
+    })
+
+    return restore()
   }
 
   async getEvents(taskId: string, opts?: EventQueryOptions): Promise<TaskEvent[]> {

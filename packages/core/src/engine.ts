@@ -1,10 +1,14 @@
 import { ulid } from 'ulidx'
 import { canTransition, isTerminal, isSuspended } from './state-machine.js'
 import { processSeries } from './series.js'
+import { InvalidTaskArchiveError, buildTaskArchiveRestoreData, normalizeTaskArchive } from './archive.js'
 import type {
   Task,
   TaskStatus,
   TaskEvent,
+  TaskArchive,
+  TaskArchiveImportOptions,
+  TaskArchiveImportResult,
   BlockedRequest,
   TaskFilter,
   BroadcastProvider,
@@ -306,6 +310,128 @@ export class TaskEngine {
     }
 
     return this._emit(taskId, input)
+  }
+
+  async exportTaskArchive(taskId: string): Promise<TaskArchive> {
+    const task = await this.getTask(taskId)
+    if (!task) throw new Error(`Task not found: ${taskId}`)
+
+    return this.buildExportArchive(task)
+  }
+
+  private async buildExportArchive(task: Task): Promise<TaskArchive> {
+    const shortTermEvents = await this.shortTermStore.getEvents(task.id)
+    if (this.longTermStore) {
+      const longTermEvents = await this.longTermStore.getEvents(task.id)
+      if (longTermEvents.length > 0) {
+        return this.normalizeExportArchive(task, this.mergeExportHistories(longTermEvents, shortTermEvents))
+      }
+    }
+
+    return this.normalizeExportArchive(task, shortTermEvents)
+  }
+
+  private mergeExportHistories(longTermEvents: TaskEvent[], shortTermEvents: TaskEvent[]): TaskEvent[] {
+    const rawEvents = new Map<string, TaskEvent>()
+    for (const event of shortTermEvents) {
+      rawEvents.set(`${event.id}:${event.index}`, event)
+    }
+
+    const merged = longTermEvents.map((event) => {
+      if (event.seriesMode !== 'accumulate') {
+        return event
+      }
+
+      const rawEvent = rawEvents.get(`${event.id}:${event.index}`)
+      if (!rawEvent) {
+        throw new InvalidTaskArchiveError(
+          `Cannot export raw accumulate event ${event.id}; matching short-term delta is unavailable`,
+        )
+      }
+      return rawEvent
+    })
+
+    const longTermPrefixEnd = this.getContiguousPrefixEnd(longTermEvents)
+    const longTermIndexes = new Set(longTermEvents.map((event) => event.index))
+    if (longTermIndexes.size === longTermEvents.length && longTermPrefixEnd === longTermIndexes.size - 1) {
+      for (const event of shortTermEvents) {
+        if (event.index > longTermPrefixEnd && !longTermIndexes.has(event.index)) {
+          merged.push(event)
+        }
+      }
+    }
+
+    return merged
+  }
+
+  private getContiguousPrefixEnd(events: TaskEvent[]): number {
+    const indexes = new Set<number>()
+    for (const event of events) {
+      indexes.add(event.index)
+    }
+
+    let expected = 0
+    while (indexes.has(expected)) {
+      expected += 1
+    }
+    return expected - 1
+  }
+
+  private normalizeExportArchive(task: Task, events: TaskEvent[]): TaskArchive {
+    const archive: TaskArchive = {
+      schema: 'taskcast.taskArchive',
+      version: 1,
+      exportedAt: Date.now(),
+      task: { ...task },
+      events: events.map((event) => ({ ...event })),
+    }
+
+    return normalizeTaskArchive(archive)
+  }
+
+  async importTaskArchive(
+    archive: TaskArchive,
+    options?: TaskArchiveImportOptions,
+  ): Promise<TaskArchiveImportResult> {
+    const normalized = normalizeTaskArchive(archive)
+    const taskId = normalized.task.id
+    const existing = await this.getTask(taskId)
+
+    if (existing && options?.overwrite !== true) throw new TaskConflictError(taskId)
+
+    if (typeof this.shortTermStore.restoreTaskArchive !== 'function') {
+      throw new Error('shortTermStore does not support restoreTaskArchive')
+    }
+    const longTermSharesArchiveRestoreStorage =
+      this.longTermStore?.sharesTaskArchiveRestoreStorage === true
+
+    if (
+      this.longTermStore &&
+      !longTermSharesArchiveRestoreStorage &&
+      typeof this.longTermStore.restoreTaskArchive !== 'function'
+    ) {
+      throw new Error('longTermStore does not support restoreTaskArchive')
+    }
+
+    const restoreData = buildTaskArchiveRestoreData(normalized)
+    await this.shortTermStore.validateTaskArchiveRestore?.(restoreData, options)
+    if (this.longTermStore) {
+      await this.longTermStore.validateTaskArchiveRestore?.(restoreData, options)
+    }
+
+    // Durable history is restored before the live short-term cache so a final
+    // long-term failure cannot expose an imported task that was never persisted.
+    if (this.longTermStore && !longTermSharesArchiveRestoreStorage) {
+      await this.longTermStore.restoreTaskArchive!(restoreData, options)
+    }
+    await this.shortTermStore.restoreTaskArchive(restoreData, options)
+    this._emitChains.delete(taskId)
+
+    return {
+      taskId,
+      eventCount: normalized.events.length,
+      overwritten: existing !== null,
+    }
   }
 
   async listTasks(filter: TaskFilter): Promise<Task[]> {

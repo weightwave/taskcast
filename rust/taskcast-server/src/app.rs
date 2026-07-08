@@ -69,6 +69,8 @@ pub fn create_app(
 
     let task_routes = Router::new()
         .route("/", get(tasks::list_tasks).post(tasks::create_task))
+        .route("/import", post(tasks::import_task_archive))
+        .route("/{task_id}/archive", get(tasks::export_task_archive))
         .route("/{task_id}", get(tasks::get_task))
         .route("/{task_id}/status", patch(tasks::transition_task))
         .route("/{task_id}/resolve", post(tasks::resolve_task))
@@ -85,10 +87,22 @@ pub fn create_app(
         .route("/events", get(sse::global_sse_events))
         .with_state(Arc::clone(&engine));
 
-    // Public routes bypass auth (health endpoints)
+    // OpenAPI spec and Scalar UI are public so linked docs work in JWT/custom auth modes.
+    let openapi_spec = ApiDoc::openapi();
+
+    // Public routes bypass auth (health, API root, and docs endpoints)
     let public_routes = Router::new()
+        .route("/", get(root))
         .route("/health", get(health))
-        .route("/health/detail", get(health_detail).with_state(app_state));
+        .route("/health/detail", get(health_detail).with_state(app_state))
+        .route(
+            "/openapi.json",
+            get({
+                let spec = openapi_spec.clone();
+                move || async move { axum::Json(spec) }
+            }),
+        )
+        .merge(Scalar::with_url("/docs", openapi_spec));
 
     // Authenticated routes (tasks, events, workers, etc.)
     let mut authenticated_routes = Router::new()
@@ -164,20 +178,8 @@ pub fn create_app(
         ws_registry_out = Some(ws_registry);
     }
 
-    // OpenAPI spec and Scalar UI
-    let openapi_spec = ApiDoc::openapi();
-    authenticated_routes = authenticated_routes
-        .route(
-            "/openapi.json",
-            get({
-                let spec = openapi_spec.clone();
-                move || async move { axum::Json(spec) }
-            }),
-        )
-        .merge(Scalar::with_url("/docs", openapi_spec));
-
     // Auth middleware is applied only to authenticated routes, so health
-    // endpoints (public_routes) bypass auth — matching the TS implementation.
+    // and docs endpoints (public_routes) bypass auth — matching the TS implementation.
     let authenticated_with_auth = authenticated_routes.layer(middleware::from_fn_with_state(
         Arc::clone(&auth_mode),
         auth_middleware,
@@ -222,8 +224,31 @@ pub fn create_app(
     (app, ws_registry_out)
 }
 
+const SERVER_NAME: &str = "taskcast";
+const API_VERSION: &str = "v1";
+const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+async fn root() -> impl IntoResponse {
+    axum::Json(serde_json::json!({
+        "name": SERVER_NAME,
+        "version": SERVER_VERSION,
+        "apiVersion": API_VERSION,
+        "links": {
+            "health": "/health",
+            "healthDetail": "/health/detail",
+            "openapi": "/openapi.json",
+            "docs": "/docs"
+        }
+    }))
+}
+
 async fn health() -> impl IntoResponse {
-    axum::Json(serde_json::json!({ "ok": true }))
+    axum::Json(serde_json::json!({
+        "ok": true,
+        "name": SERVER_NAME,
+        "version": SERVER_VERSION,
+        "apiVersion": API_VERSION
+    }))
 }
 
 async fn health_detail(AxumState(state): AxumState<AppState>) -> impl IntoResponse {
@@ -258,6 +283,9 @@ async fn health_detail(AxumState(state): AxumState<AppState>) -> impl IntoRespon
 
     axum::Json(serde_json::json!({
         "ok": true,
+        "name": SERVER_NAME,
+        "version": SERVER_VERSION,
+        "apiVersion": API_VERSION,
         "uptime": uptime,
         "auth": { "mode": auth_mode_str },
         "adapters": adapters

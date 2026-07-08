@@ -1,9 +1,7 @@
 use std::sync::Arc;
 
 use axum_test::TestServer;
-use taskcast_core::{
-    MemoryBroadcastProvider, MemoryShortTermStore, TaskEngine, TaskEngineOptions,
-};
+use taskcast_core::{MemoryBroadcastProvider, MemoryShortTermStore, TaskEngine, TaskEngineOptions};
 use taskcast_server::{create_app, AuthMode, CorsConfig, JwtConfig};
 
 fn make_server() -> TestServer {
@@ -18,15 +16,47 @@ fn make_server() -> TestServer {
 }
 
 #[tokio::test]
+async fn root_returns_server_info_and_links() {
+    let server = make_server();
+    let res = server.get("/").await;
+    res.assert_status_ok();
+    let body: serde_json::Value = res.json();
+    assert_eq!(body["name"], "taskcast");
+    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(body["apiVersion"], "v1");
+    assert_eq!(body["links"]["health"], "/health");
+    assert_eq!(body["links"]["healthDetail"], "/health/detail");
+    assert_eq!(body["links"]["openapi"], "/openapi.json");
+    assert_eq!(body["links"]["docs"], "/docs");
+}
+
+#[tokio::test]
+async fn health_returns_version_handshake_fields() {
+    let server = make_server();
+    let res = server.get("/health").await;
+    res.assert_status_ok();
+    let body: serde_json::Value = res.json();
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["name"], "taskcast");
+    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(body["apiVersion"], "v1");
+}
+
+#[tokio::test]
 async fn health_detail_returns_ok_and_uptime() {
     let server = make_server();
     let res = server.get("/health/detail").await;
     res.assert_status_ok();
     let body: serde_json::Value = res.json();
     assert_eq!(body["ok"], true);
+    assert_eq!(body["name"], "taskcast");
+    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(body["apiVersion"], "v1");
     assert!(body["uptime"].is_number());
     // Uptime should parse as a valid u64 (non-negative by type)
-    let _uptime = body["uptime"].as_u64().expect("uptime should be a valid u64");
+    let _uptime = body["uptime"]
+        .as_u64()
+        .expect("uptime should be a valid u64");
 }
 
 #[tokio::test]
@@ -96,6 +126,20 @@ async fn authenticated_routes_still_require_jwt() {
     res.assert_status(axum_test::http::StatusCode::UNAUTHORIZED);
 }
 
+#[tokio::test]
+async fn openapi_and_docs_bypass_jwt_auth() {
+    let server = make_jwt_server();
+
+    let openapi = server.get("/openapi.json").await;
+    openapi.assert_status_ok();
+
+    let docs = server.get("/docs").await;
+    docs.assert_status_ok();
+
+    let tasks = server.get("/tasks").await;
+    tasks.assert_status(axum_test::http::StatusCode::UNAUTHORIZED);
+}
+
 // ─── health_detail with config adapter overrides ────────────────────────────
 
 use taskcast_core::config::{AdapterEntry, AdaptersConfig, TaskcastConfig};
@@ -107,7 +151,13 @@ fn make_server_with_config(config: TaskcastConfig) -> TestServer {
         long_term_store: None,
         hooks: None,
     }));
-    let (app, _) = create_app(engine, AuthMode::None, None, Some(config), CorsConfig::default());
+    let (app, _) = create_app(
+        engine,
+        AuthMode::None,
+        None,
+        Some(config),
+        CorsConfig::default(),
+    );
     TestServer::new(app)
 }
 

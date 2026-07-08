@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import type { Task, TaskEvent, Worker, WorkerAssignment } from '@taskcast/core'
+import type { Task, TaskArchiveRestoreData, TaskEvent, Worker, WorkerAssignment } from '@taskcast/core'
 import { SqliteShortTermStore } from '../src/short-term.js'
 
 function makeTask(id = 'task-1'): Task {
@@ -25,6 +25,17 @@ function makeEvent(taskId: string, index: number): TaskEvent {
     type: 'llm.delta',
     level: 'info',
     data: { text: `msg-${index}` },
+  }
+}
+
+function makeRestoreData(overrides: Partial<TaskArchiveRestoreData> = {}): TaskArchiveRestoreData {
+  const task = overrides.task ?? { ...makeTask('task-1'), status: 'running', updatedAt: 2000 }
+  const events = overrides.events ?? [makeEvent(task.id, 0), makeEvent(task.id, 1)]
+  return {
+    task,
+    events,
+    nextIndex: overrides.nextIndex ?? events.length,
+    seriesLatest: overrides.seriesLatest ?? [],
   }
 }
 
@@ -306,6 +317,82 @@ describe('SqliteShortTermStore', () => {
 
     const latest = await store.getSeriesLatest('task-1', 'series-a')
     expect(latest).toEqual(e1)
+  })
+
+  // ─── restoreTaskArchive ────────────────────────────────────────────────
+
+  it('should restore a task archive and continue indexes after imported events', async () => {
+    const latestEvent: TaskEvent = {
+      ...makeEvent('task-1', 1),
+      id: 'evt-series-latest',
+      seriesId: 'series-a',
+      seriesMode: 'latest',
+      data: { text: 'imported latest' },
+    }
+    const data = makeRestoreData({
+      events: [makeEvent('task-1', 0), latestEvent],
+      seriesLatest: [{ taskId: 'task-1', seriesId: 'series-a', event: latestEvent }],
+    })
+
+    await expect(store.restoreTaskArchive(data)).resolves.toEqual({ overwritten: false })
+
+    await expect(store.getTask('task-1')).resolves.toEqual(data.task)
+    await expect(store.getEvents('task-1')).resolves.toEqual(data.events)
+    await expect(store.getSeriesLatest('task-1', 'series-a')).resolves.toEqual(latestEvent)
+    await expect(store.nextIndex('task-1')).resolves.toBe(data.nextIndex)
+  })
+
+  it('should reject restore conflicts unless overwrite is true', async () => {
+    const data = makeRestoreData()
+    await store.saveTask(makeTask('task-1'))
+
+    await expect(store.restoreTaskArchive(data)).rejects.toThrow(/already exists/i)
+    await expect(store.restoreTaskArchive(data, { overwrite: true })).resolves.toEqual({ overwritten: true })
+  })
+
+  it('should replace old events and series latest state on overwrite', async () => {
+    const oldLatest = { ...makeEvent('task-1', 0), seriesId: 'old-series', seriesMode: 'latest' as const }
+    await store.saveTask(makeTask('task-1'))
+    await store.appendEvent('task-1', oldLatest)
+    await store.setSeriesLatest('task-1', 'old-series', oldLatest)
+    await store.nextIndex('task-1')
+
+    const importedLatest = {
+      ...makeEvent('task-1', 0),
+      id: 'evt-imported-series',
+      seriesId: 'new-series',
+      seriesMode: 'latest' as const,
+      data: { text: 'imported' },
+    }
+    const data = makeRestoreData({
+      task: { ...makeTask('task-1'), status: 'completed', updatedAt: 3000, completedAt: 3000 },
+      events: [importedLatest],
+      nextIndex: 1,
+      seriesLatest: [{ taskId: 'task-1', seriesId: 'new-series', event: importedLatest }],
+    })
+
+    await expect(store.restoreTaskArchive(data, { overwrite: true })).resolves.toEqual({ overwritten: true })
+
+    await expect(store.getEvents('task-1')).resolves.toEqual([importedLatest])
+    await expect(store.getSeriesLatest('task-1', 'old-series')).resolves.toBeNull()
+    await expect(store.getSeriesLatest('task-1', 'new-series')).resolves.toEqual(importedLatest)
+  })
+
+  it('should reject restore when an imported event id collides with another task and roll back', async () => {
+    await store.saveTask(makeTask('other-task'))
+    await store.appendEvent('other-task', { ...makeEvent('other-task', 0), id: 'shared-event-id' })
+
+    const data = makeRestoreData({
+      task: makeTask('target-task'),
+      events: [{ ...makeEvent('target-task', 0), id: 'shared-event-id' }],
+      nextIndex: 1,
+    })
+
+    await expect(store.restoreTaskArchive(data)).rejects.toThrow()
+
+    await expect(store.getTask('target-task')).resolves.toBeNull()
+    await expect(store.getEvents('target-task')).resolves.toEqual([])
+    await expect(store.getEvents('other-task')).resolves.toHaveLength(1)
   })
 
   // ─── replaceLastSeriesEvent ─────────────────────────────────────────────

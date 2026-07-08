@@ -13,6 +13,8 @@ use crate::routes::{sse, tasks, workers};
     paths(
         tasks::list_tasks,
         tasks::create_task,
+        tasks::export_task_archive,
+        tasks::import_task_archive,
         tasks::get_task,
         tasks::transition_task,
         tasks::publish_events,
@@ -30,6 +32,9 @@ use crate::routes::{sse, tasks, workers};
         taskcast_core::TaskStatus,
         taskcast_core::TaskError,
         taskcast_core::TaskEvent,
+        taskcast_core::TaskArchive,
+        taskcast_core::TaskArchiveEvent,
+        taskcast_core::TaskArchiveImportResult,
         taskcast_core::Level,
         taskcast_core::SeriesMode,
         taskcast_core::Worker,
@@ -41,6 +46,8 @@ use crate::routes::{sse, tasks, workers};
         tasks::TransitionBody,
         tasks::TaskErrorBody,
         tasks::PublishEventBody,
+        tasks::ImportTaskArchiveBody,
+        tasks::ImportTaskArchiveResponse,
         workers::DeclineBody,
         workers::WorkerStatusUpdateBody,
         workers::WorkerStatusUpdateValue,
@@ -58,6 +65,8 @@ struct SecurityAddon;
 
 impl Modify for SecurityAddon {
     fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        openapi.info.version = env!("CARGO_PKG_VERSION").to_string();
+
         let components = openapi.components.get_or_insert_with(Default::default);
         components.add_security_scheme(
             "Bearer",

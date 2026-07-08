@@ -5,6 +5,8 @@ import type {
   TaskStatus,
   ShortTermStore,
   EventQueryOptions,
+  TaskArchiveImportOptions,
+  TaskArchiveRestoreData,
   TaskFilter,
   Worker,
   WorkerFilter,
@@ -54,6 +56,88 @@ export class RedisShortTermStore implements ShortTermStore {
 
   async appendEvent(taskId: string, event: TaskEvent): Promise<void> {
     await this.redis.rpush(this.KEY.events(taskId), JSON.stringify(event))
+  }
+
+  async validateTaskArchiveRestore(
+    data: TaskArchiveRestoreData,
+    options?: TaskArchiveImportOptions,
+  ): Promise<void> {
+    const taskId = data.task.id
+    const taskKey = this.KEY.task(taskId)
+    const taskType = await this.redis.type(taskKey)
+    await this.assertRedisType(taskKey, taskType, ['none', 'string'])
+
+    const exists = taskType !== 'none'
+    if (exists && options?.overwrite !== true) {
+      throw new Error(`Task already exists: ${taskId}`)
+    }
+
+    await this.assertRedisType(this.KEY.taskSet, await this.redis.type(this.KEY.taskSet), ['none', 'set'])
+    await this.assertRedisType(this.KEY.events(taskId), await this.redis.type(this.KEY.events(taskId)), ['none', 'list'])
+    await this.assertRedisType(this.KEY.idx(taskId), await this.redis.type(this.KEY.idx(taskId)), ['none', 'string'])
+
+    const seriesIdsKey = this.KEY.seriesIds(taskId)
+    await this.assertRedisType(seriesIdsKey, await this.redis.type(seriesIdsKey), ['none', 'set'])
+    const existingSeriesIds = await this.redis.smembers(seriesIdsKey)
+    for (const seriesId of existingSeriesIds) {
+      const key = this.KEY.seriesLatest(taskId, seriesId)
+      await this.assertRedisType(key, await this.redis.type(key), ['none', 'string'])
+    }
+  }
+
+  private async assertRedisType(key: string, actual: string, allowed: string[]): Promise<void> {
+    if (!allowed.includes(actual)) {
+      throw new Error(`Redis key type mismatch for ${key}: expected ${allowed.join(' or ')}, got ${actual}`)
+    }
+  }
+
+  async restoreTaskArchive(
+    data: TaskArchiveRestoreData,
+    options?: TaskArchiveImportOptions,
+  ): Promise<{ overwritten: boolean }> {
+    const taskId = data.task.id
+    const taskKey = this.KEY.task(taskId)
+    const exists = await this.redis.exists(taskKey)
+    await this.validateTaskArchiveRestore(data, options)
+
+    const existingSeriesIds = await this.redis.smembers(this.KEY.seriesIds(taskId))
+    const pipeline = this.redis.pipeline()
+
+    pipeline.set(taskKey, JSON.stringify(data.task))
+    pipeline.sadd(this.KEY.taskSet, taskId)
+    pipeline.del(this.KEY.events(taskId))
+    for (const event of data.events) {
+      pipeline.rpush(this.KEY.events(taskId), JSON.stringify(event))
+    }
+    pipeline.set(this.KEY.idx(taskId), String(data.nextIndex))
+
+    for (const seriesId of existingSeriesIds) {
+      pipeline.del(this.KEY.seriesLatest(taskId, seriesId))
+    }
+    pipeline.del(this.KEY.seriesIds(taskId))
+    for (const entry of data.seriesLatest) {
+      pipeline.set(this.KEY.seriesLatest(entry.taskId, entry.seriesId), JSON.stringify(entry.event))
+      pipeline.sadd(this.KEY.seriesIds(entry.taskId), entry.seriesId)
+    }
+
+    await this.execPipelineOrThrow(pipeline, `restore task archive ${taskId}`)
+    return { overwritten: Boolean(exists) }
+  }
+
+  private async execPipelineOrThrow(
+    pipeline: ReturnType<Redis['pipeline']>,
+    context: string,
+  ): Promise<void> {
+    const results = await pipeline.exec()
+    if (!results) {
+      throw new Error(`Redis pipeline failed during ${context}: no results returned`)
+    }
+
+    for (const [index, [err]] of results.entries()) {
+      if (err) {
+        throw new Error(`Redis pipeline failed during ${context} at command ${index}: ${err.message}`)
+      }
+    }
   }
 
   async getEvents(taskId: string, opts?: EventQueryOptions): Promise<TaskEvent[]> {

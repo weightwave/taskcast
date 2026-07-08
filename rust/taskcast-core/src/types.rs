@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 
 // ─── Task ───────────────────────────────────────────────────────────────────
@@ -484,6 +484,115 @@ pub struct EventQueryOptions {
     pub limit: Option<u64>,
 }
 
+// ─── Archive ────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskArchive {
+    pub schema: String,
+    pub version: u64,
+    pub exported_at: f64,
+    pub task: Task,
+    #[schema(value_type = Vec<TaskArchiveEvent>)]
+    pub events: Vec<TaskEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskArchiveEvent {
+    pub id: String,
+    pub task_id: String,
+    pub index: u64,
+    pub timestamp: f64,
+    pub r#type: String,
+    pub level: Level,
+    pub data: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub series_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub series_mode: Option<SeriesMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub series_acc_field: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for TaskArchive {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct RawTaskArchive {
+            schema: String,
+            version: u64,
+            exported_at: f64,
+            task: Task,
+            events: Vec<serde_json::Value>,
+        }
+
+        let raw = RawTaskArchive::deserialize(deserializer)?;
+        let mut events = Vec::with_capacity(raw.events.len());
+        for (position, event_value) in raw.events.into_iter().enumerate() {
+            if let Some(event) = event_value.as_object() {
+                for forbidden_key in ["seriesSnapshot", "_accumulatedData", "_accumulated_data"] {
+                    if event.contains_key(forbidden_key) {
+                        let event_id = event
+                            .get("id")
+                            .and_then(serde_json::Value::as_str)
+                            .map(|id| format!(" id {id}"))
+                            .unwrap_or_default();
+                        return Err(serde::de::Error::custom(format!(
+                            "Archive event[{position}]{event_id} must be raw deltas; forbidden \
+                             presentation/transient field {forbidden_key} is present"
+                        )));
+                    }
+                }
+            }
+
+            events.push(serde_json::from_value(event_value).map_err(serde::de::Error::custom)?);
+        }
+
+        Ok(Self {
+            schema: raw.schema,
+            version: raw.version,
+            exported_at: raw.exported_at,
+            task: raw.task,
+            events,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskArchiveImportOptions {
+    pub overwrite: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskArchiveImportResult {
+    pub task_id: String,
+    pub event_count: usize,
+    pub overwritten: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SeriesLatestEntry {
+    pub task_id: String,
+    pub series_id: String,
+    pub event: TaskEvent,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskArchiveRestoreData {
+    pub task: Task,
+    pub events: Vec<TaskEvent>,
+    pub next_index: u64,
+    pub series_latest: Vec<SeriesLatestEntry>,
+}
+
 // ─── Storage Interfaces ──────────────────────────────────────────────────────
 
 #[async_trait]
@@ -526,6 +635,32 @@ pub trait ShortTermStore: Send + Sync {
     async fn accumulate_series(&self, task_id: &str, series_id: &str, event: TaskEvent, field: &str) -> Result<TaskEvent, Box<dyn std::error::Error + Send + Sync>>;
     async fn next_index(&self, task_id: &str) -> Result<u64, Box<dyn std::error::Error + Send + Sync>>;
 
+    fn supports_task_archive_restore(&self) -> bool {
+        false
+    }
+
+    async fn validate_task_archive_restore(
+        &self,
+        _data: &TaskArchiveRestoreData,
+        _options: Option<TaskArchiveImportOptions>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "restore_task_archive is not supported by this short-term store",
+        )))
+    }
+
+    async fn restore_task_archive(
+        &self,
+        _data: TaskArchiveRestoreData,
+        _options: Option<TaskArchiveImportOptions>,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "restore_task_archive is not supported by this short-term store",
+        )))
+    }
+
     // Task query
     async fn list_tasks(&self, filter: TaskFilter) -> Result<Vec<Task>, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -561,6 +696,36 @@ pub trait LongTermStore: Send + Sync {
     async fn get_task(&self, task_id: &str) -> Result<Option<Task>, Box<dyn std::error::Error + Send + Sync>>;
     async fn save_event(&self, event: TaskEvent) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
     async fn get_events(&self, task_id: &str, opts: Option<EventQueryOptions>) -> Result<Vec<TaskEvent>, Box<dyn std::error::Error + Send + Sync>>;
+
+    fn supports_task_archive_restore(&self) -> bool {
+        false
+    }
+
+    fn shares_task_archive_restore_storage(&self) -> bool {
+        false
+    }
+
+    async fn validate_task_archive_restore(
+        &self,
+        _data: &TaskArchiveRestoreData,
+        _options: Option<TaskArchiveImportOptions>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "restore_task_archive is not supported by this long-term store",
+        )))
+    }
+
+    async fn restore_task_archive(
+        &self,
+        _data: TaskArchiveRestoreData,
+        _options: Option<TaskArchiveImportOptions>,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "restore_task_archive is not supported by this long-term store",
+        )))
+    }
 
     // Worker audit
     async fn save_worker_event(&self, event: WorkerAuditEvent) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;

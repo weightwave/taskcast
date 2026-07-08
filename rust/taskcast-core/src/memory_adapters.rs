@@ -6,7 +6,7 @@ use async_trait::async_trait;
 
 use crate::types::{
     BroadcastProvider, EventQueryOptions, ShortTermStore, Task, TaskEvent, TaskFilter, TaskStatus,
-    Worker, WorkerAssignment, WorkerFilter,
+    TaskArchiveImportOptions, TaskArchiveRestoreData, Worker, WorkerAssignment, WorkerFilter,
 };
 
 // ─── MemoryBroadcastProvider ────────────────────────────────────────────────
@@ -304,6 +304,61 @@ impl ShortTermStore for MemoryShortTermStore {
                 .clone()
         };
         Ok(counter.fetch_add(1, Ordering::SeqCst))
+    }
+
+    fn supports_task_archive_restore(&self) -> bool {
+        true
+    }
+
+    async fn validate_task_archive_restore(
+        &self,
+        data: &TaskArchiveRestoreData,
+        options: Option<TaskArchiveImportOptions>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let task_id = &data.task.id;
+        let tasks = self.tasks.read().unwrap();
+        if tasks.contains_key(task_id) && !options.unwrap_or_default().overwrite {
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("Task already exists: {task_id}"),
+            )));
+        }
+        Ok(())
+    }
+
+    async fn restore_task_archive(
+        &self,
+        data: TaskArchiveRestoreData,
+        options: Option<TaskArchiveImportOptions>,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        self.validate_task_archive_restore(&data, options).await?;
+
+        let task_id = data.task.id.clone();
+        let overwritten = {
+            let tasks = self.tasks.read().unwrap();
+            tasks.contains_key(&task_id)
+        };
+
+        {
+            let mut series = self.series_latest.write().unwrap();
+            let prefix = format!("{task_id}:");
+            series.retain(|key, _| !key.starts_with(&prefix));
+            for entry in &data.series_latest {
+                series.insert(
+                    format!("{}:{}", entry.task_id, entry.series_id),
+                    entry.event.clone(),
+                );
+            }
+        }
+
+        self.tasks.write().unwrap().insert(task_id.clone(), data.task);
+        self.events.write().unwrap().insert(task_id.clone(), data.events);
+        self.index_counters.write().unwrap().insert(
+            task_id,
+            Arc::new(AtomicU64::new(data.next_index)),
+        );
+
+        Ok(overwritten)
     }
 
     async fn list_tasks(

@@ -3,6 +3,60 @@ import { TaskEngine, MemoryBroadcastProvider, MemoryShortTermStore } from '@task
 import { createTaskcastApp } from '../src/index.js'
 
 describe('GET /health/detail', () => {
+  it('GET / returns public server info with version links', async () => {
+    const engine = new TaskEngine({
+      broadcast: new MemoryBroadcastProvider(),
+      shortTermStore: new MemoryShortTermStore(),
+    })
+    const { app } = createTaskcastApp({ engine, auth: { mode: 'none' } })
+
+    const res = await app.request('/')
+    expect(res.status).toBe(200)
+
+    const body = await res.json()
+    expect(body).toMatchObject({
+      name: 'taskcast',
+      apiVersion: 'v1',
+      links: {
+        health: '/health',
+        healthDetail: '/health/detail',
+        openapi: '/openapi.json',
+        docs: '/docs',
+      },
+    })
+    expect(body.version).toMatch(/^\d+\.\d+\.\d+/)
+  })
+
+  it('GET /health includes version fields', async () => {
+    const engine = new TaskEngine({
+      broadcast: new MemoryBroadcastProvider(),
+      shortTermStore: new MemoryShortTermStore(),
+    })
+    const { app } = createTaskcastApp({ engine, auth: { mode: 'none' } })
+
+    const res = await app.request('/health')
+    expect(res.status).toBe(200)
+
+    const body = await res.json()
+    expect(body).toMatchObject({ ok: true, name: 'taskcast', apiVersion: 'v1' })
+    expect(body.version).toMatch(/^\d+\.\d+\.\d+/)
+  })
+
+  it('keeps root and health routes public when auth is enabled', async () => {
+    const engine = new TaskEngine({
+      broadcast: new MemoryBroadcastProvider(),
+      shortTermStore: new MemoryShortTermStore(),
+    })
+    const { app } = createTaskcastApp({
+      engine,
+      auth: { mode: 'jwt', jwt: { secret: 'test-secret', algorithm: 'HS256' } },
+    })
+
+    expect((await app.request('/')).status).toBe(200)
+    expect((await app.request('/health')).status).toBe(200)
+    expect((await app.request('/health/detail')).status).toBe(200)
+  })
+
   it('returns 200 with ok, uptime, auth, and adapters fields', async () => {
     const engine = new TaskEngine({
       broadcast: new MemoryBroadcastProvider(),
@@ -15,6 +69,9 @@ describe('GET /health/detail', () => {
 
     const body = await res.json()
     expect(body).toHaveProperty('ok', true)
+    expect(body).toHaveProperty('name', 'taskcast')
+    expect(body).toHaveProperty('apiVersion', 'v1')
+    expect(body.version).toMatch(/^\d+\.\d+\.\d+/)
     expect(body).toHaveProperty('uptime')
     expect(body).toHaveProperty('auth')
     expect(body).toHaveProperty('adapters')

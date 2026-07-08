@@ -4,6 +4,8 @@ import type {
   TaskEvent,
   LongTermStore,
   EventQueryOptions,
+  TaskArchiveImportOptions,
+  TaskArchiveRestoreData,
   TaskError,
   TaskAuthConfig,
   WebhookConfig,
@@ -18,28 +20,35 @@ const TASKS = 'taskcast_tasks'
 const EVENTS = 'taskcast_events'
 const WORKER_EVENTS = 'taskcast_worker_events'
 
+type PostgresClient = ReturnType<typeof postgres>
+type EventConflictMode = 'ignore' | 'strict'
+
 export class PostgresLongTermStore implements LongTermStore {
   constructor(private sql: ReturnType<typeof postgres>) {}
 
   async saveTask(task: Task): Promise<void> {
+    await this.saveTaskWithClient(this.sql, task)
+  }
+
+  private async saveTaskWithClient(sql: PostgresClient, task: Task): Promise<void> {
     const t = TASKS
-    await this.sql`
-      INSERT INTO ${this.sql(t)} (
+    await sql`
+      INSERT INTO ${sql(t)} (
         id, type, status, params, result, error, metadata,
         auth_config, webhooks, cleanup, created_at, updated_at, completed_at, ttl,
         tags, assign_mode, cost, assigned_worker, disconnect_policy
       ) VALUES (
         ${task.id}, ${task.type ?? null}, ${task.status},
-        ${task.params ? this.sql.json(task.params as never) : null},
-        ${task.result ? this.sql.json(task.result as never) : null},
-        ${task.error ? this.sql.json(task.error as never) : null},
-        ${task.metadata ? this.sql.json(task.metadata as never) : null},
-        ${task.authConfig ? this.sql.json(task.authConfig as never) : null},
-        ${task.webhooks ? this.sql.json(task.webhooks as never) : null},
-        ${task.cleanup ? this.sql.json(task.cleanup as never) : null},
+        ${task.params ? sql.json(task.params as never) : null},
+        ${task.result ? sql.json(task.result as never) : null},
+        ${task.error ? sql.json(task.error as never) : null},
+        ${task.metadata ? sql.json(task.metadata as never) : null},
+        ${task.authConfig ? sql.json(task.authConfig as never) : null},
+        ${task.webhooks ? sql.json(task.webhooks as never) : null},
+        ${task.cleanup ? sql.json(task.cleanup as never) : null},
         ${task.createdAt}, ${task.updatedAt},
         ${task.completedAt ?? null}, ${task.ttl ?? null},
-        ${task.tags ? this.sql.json(task.tags as never) : null},
+        ${task.tags ? sql.json(task.tags as never) : null},
         ${task.assignMode ?? null},
         ${task.cost ?? null},
         ${task.assignedWorker ?? null},
@@ -71,19 +80,80 @@ export class PostgresLongTermStore implements LongTermStore {
   }
 
   async saveEvent(event: TaskEvent): Promise<void> {
+    await this.saveEventWithClient(this.sql, event, 'ignore')
+  }
+
+  private async saveEventWithClient(
+    sql: PostgresClient,
+    event: TaskEvent,
+    onConflict: EventConflictMode,
+  ): Promise<void> {
     const t = EVENTS
-    await this.sql`
-      INSERT INTO ${this.sql(t)} (
+    await sql`
+      INSERT INTO ${sql(t)} (
         id, task_id, idx, timestamp, type, level, data, series_id, series_mode, series_acc_field
       ) VALUES (
         ${event.id}, ${event.taskId}, ${event.index}, ${event.timestamp},
         ${event.type}, ${event.level},
-        ${event.data ? this.sql.json(event.data as never) : null},
+        ${event.data != null ? sql.json(event.data as never) : null},
         ${event.seriesId ?? null}, ${event.seriesMode ?? null},
         ${event.seriesAccField ?? null}
       )
-      ON CONFLICT (id) DO NOTHING
+      ${onConflict === 'ignore' ? sql`ON CONFLICT (id) DO NOTHING` : sql``}
     `
+  }
+
+  async validateTaskArchiveRestore(
+    data: TaskArchiveRestoreData,
+    options?: TaskArchiveImportOptions,
+  ): Promise<void> {
+    await this.validateTaskArchiveRestoreWithClient(this.sql, data, options)
+  }
+
+  private async validateTaskArchiveRestoreWithClient(
+    sql: PostgresClient,
+    data: TaskArchiveRestoreData,
+    options?: TaskArchiveImportOptions,
+  ): Promise<boolean> {
+    const taskId = data.task.id
+    const existing = await sql`SELECT id FROM ${sql(TASKS)} WHERE id = ${taskId}`
+    if (existing.length > 0 && options?.overwrite !== true) {
+      throw new Error(`Task already exists: ${taskId}`)
+    }
+
+    const eventIds = Array.from(new Set(data.events.map((event) => event.id)))
+    for (const eventId of eventIds) {
+      const conflict = await sql`
+        SELECT id FROM ${sql(EVENTS)}
+        WHERE task_id <> ${taskId} AND id = ${eventId}
+        LIMIT 1
+      `
+      if (conflict.length > 0) {
+        throw new Error(`Archive event id conflicts with another task: ${eventId}`)
+      }
+    }
+
+    return existing.length > 0
+  }
+
+  async restoreTaskArchive(
+    data: TaskArchiveRestoreData,
+    options?: TaskArchiveImportOptions,
+  ): Promise<{ overwritten: boolean }> {
+    return this.sql.begin(async (sql) => {
+      const tx = sql as unknown as PostgresClient
+      const taskId = data.task.id
+      const overwritten = await this.validateTaskArchiveRestoreWithClient(tx, data, options)
+
+      await tx`DELETE FROM ${tx(EVENTS)} WHERE task_id = ${taskId}`
+      await tx`DELETE FROM ${tx(TASKS)} WHERE id = ${taskId}`
+      await this.saveTaskWithClient(tx, data.task)
+      for (const event of data.events) {
+        await this.saveEventWithClient(tx, event, 'strict')
+      }
+
+      return { overwritten }
+    })
   }
 
   async getEvents(taskId: string, opts?: EventQueryOptions): Promise<TaskEvent[]> {

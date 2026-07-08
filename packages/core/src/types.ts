@@ -185,6 +185,49 @@ export interface TaskEvent {
   _accumulatedData?: unknown
 }
 
+/**
+ * Archive-persistable event shape.
+ *
+ * TaskArchive v1 stores a complete raw delta event stream for one task:
+ * indexes must be contiguous from 0, accumulate events must be raw deltas, and
+ * latest-mode histories must not be compacted down to latest-only storage.
+ * Presentation/transient event fields such as collapsed `seriesSnapshot` events
+ * and broadcast `_accumulatedData` are not valid archive data.
+ */
+export type TaskArchiveEvent = Omit<TaskEvent, 'seriesSnapshot' | '_accumulatedData'>
+
+export interface TaskArchive {
+  schema: 'taskcast.taskArchive'
+  version: 1
+  exportedAt: number
+  task: Task
+  /** Complete raw delta event stream for the task, ordered by contiguous indexes from 0. */
+  events: TaskArchiveEvent[]
+}
+
+export interface TaskArchiveImportOptions {
+  overwrite?: boolean
+}
+
+export interface TaskArchiveImportResult {
+  taskId: string
+  eventCount: number
+  overwritten: boolean
+}
+
+export interface SeriesLatestEntry {
+  taskId: string
+  seriesId: string
+  event: TaskArchiveEvent
+}
+
+export interface TaskArchiveRestoreData {
+  task: Task
+  events: TaskArchiveEvent[]
+  nextIndex: number
+  seriesLatest: SeriesLatestEntry[]
+}
+
 export interface SSEEnvelope {
   filteredIndex: number
   rawIndex: number
@@ -253,6 +296,16 @@ export interface ShortTermStore {
   /** Atomically read previous accumulated value, concatenate with new delta, write back. Returns the accumulated event. */
   accumulateSeries(taskId: string, seriesId: string, event: TaskEvent, field: string): Promise<TaskEvent>
   replaceLastSeriesEvent(taskId: string, seriesId: string, event: TaskEvent): Promise<void>
+  /** Validates deterministic archive restore conflicts before mutation; engine calls this before multi-store restore. */
+  validateTaskArchiveRestore?(
+    data: TaskArchiveRestoreData,
+    options?: TaskArchiveImportOptions,
+  ): Promise<void>
+  /** Stores with native archive restore should implement this; engine import checks availability before use. */
+  restoreTaskArchive?(
+    data: TaskArchiveRestoreData,
+    options?: TaskArchiveImportOptions,
+  ): Promise<{ overwritten: boolean }>
 
   // Task query
   listTasks(filter: TaskFilter): Promise<Task[]>
@@ -284,6 +337,22 @@ export interface LongTermStore {
   getTask(taskId: string): Promise<Task | null>
   saveEvent(event: TaskEvent): Promise<void>
   getEvents(taskId: string, opts?: EventQueryOptions): Promise<TaskEvent[]>
+  /**
+   * True when short-term archive restore writes the same durable storage this
+   * long-term store reads from. The engine still runs long-term preflight, but
+   * skips a duplicate long-term final restore.
+   */
+  sharesTaskArchiveRestoreStorage?: boolean
+  /** Validates deterministic archive restore conflicts before mutation; engine calls this before multi-store restore. */
+  validateTaskArchiveRestore?(
+    data: TaskArchiveRestoreData,
+    options?: TaskArchiveImportOptions,
+  ): Promise<void>
+  /** Stores with native archive restore should implement this; engine import checks availability before use. */
+  restoreTaskArchive?(
+    data: TaskArchiveRestoreData,
+    options?: TaskArchiveImportOptions,
+  ): Promise<{ overwritten: boolean }>
   saveWorkerEvent(event: WorkerAuditEvent): Promise<void>
   getWorkerEvents(workerId: string, opts?: EventQueryOptions): Promise<WorkerAuditEvent[]>
 }

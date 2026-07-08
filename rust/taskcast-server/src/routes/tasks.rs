@@ -1,16 +1,18 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::Extension;
-use serde::Deserialize;
+use axum::{Extension, Json};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use taskcast_core::{
     AssignMode, BlockedRequest, CleanupConfig, CreateTaskInput, DisconnectPolicy, EngineError,
-    EventQueryOptions, Level, PublishEventInput, SeriesMode, SinceCursor, TaskAuthConfig,
-    TaskEngine, TaskError, TaskFilter, TaskStatus, TransitionPayload, WebhookConfig,
+    EventQueryOptions, Level, PermissionScope, PublishEventInput, SeriesMode, SinceCursor,
+    TaskArchive, TaskArchiveImportOptions, TaskAuthConfig, TaskEngine, TaskError, TaskFilter,
+    TaskStatus, TransitionPayload, WebhookConfig,
 };
 
 use crate::auth::{check_scope, AuthContext};
@@ -74,6 +76,22 @@ pub enum EventsBody {
     Single(PublishEventBody),
 }
 
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportTaskArchiveBody {
+    pub archive: TaskArchive,
+    pub overwrite: Option<bool>,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportTaskArchiveResponse {
+    pub ok: bool,
+    pub task_id: String,
+    pub event_count: usize,
+    pub overwritten: bool,
+}
+
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
 pub struct HistoryQuery {
     #[serde(rename = "since.index")]
@@ -116,11 +134,7 @@ pub async fn list_tasks(
     Extension(subscriber_counts): Extension<SubscriberCounts>,
     Query(query): Query<ListTasksQuery>,
 ) -> Result<impl IntoResponse, AppError> {
-    if !check_scope(
-        &auth,
-        taskcast_core::PermissionScope::EventSubscribe,
-        None,
-    ) {
+    if !check_scope(&auth, taskcast_core::PermissionScope::EventSubscribe, None) {
         return Err(AppError::Forbidden);
     }
 
@@ -174,11 +188,7 @@ pub async fn create_task(
     Extension(auth): Extension<AuthContext>,
     axum::Json(body): axum::Json<CreateTaskBody>,
 ) -> Result<impl IntoResponse, AppError> {
-    if !check_scope(
-        &auth,
-        taskcast_core::PermissionScope::TaskCreate,
-        None,
-    ) {
+    if !check_scope(&auth, taskcast_core::PermissionScope::TaskCreate, None) {
         return Err(AppError::Forbidden);
     }
 
@@ -199,6 +209,84 @@ pub async fn create_task(
 
     let task = engine.create_task(input).await?;
     Ok((StatusCode::CREATED, axum::Json(task)))
+}
+
+#[utoipa::path(
+    get,
+    path = "/tasks/{task_id}/archive",
+    tag = "Tasks",
+    summary = "Export task archive",
+    description = "Export a portable single-task archive with task metadata and raw event history.",
+    security(("Bearer" = [])),
+    params(("task_id" = String, Path, description = "Task ID")),
+    responses(
+        (status = 200, description = "Task archive", body = taskcast_core::TaskArchive),
+        (status = 404, description = "Task not found"),
+        (status = 403, description = "Forbidden"),
+    )
+)]
+pub async fn export_task_archive(
+    State(engine): State<Arc<TaskEngine>>,
+    Extension(auth): Extension<AuthContext>,
+    Path(task_id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    if !check_scope(&auth, PermissionScope::EventHistory, Some(&task_id)) {
+        return Err(AppError::Forbidden);
+    }
+
+    let archive = engine
+        .export_task_archive(&task_id)
+        .await
+        .map_err(|e| match &e {
+            EngineError::TaskNotFound(_) => AppError::NotFound(e.to_string()),
+            _ => AppError::Engine(e),
+        })?;
+
+    Ok(axum::Json(archive))
+}
+
+#[utoipa::path(
+    post,
+    path = "/tasks/import",
+    tag = "Tasks",
+    summary = "Import task archive",
+    description = "Restore a portable single-task archive. Existing tasks conflict unless overwrite is true.",
+    security(("Bearer" = [])),
+    request_body = ImportTaskArchiveBody,
+    responses(
+        (status = 200, description = "Archive imported", body = ImportTaskArchiveResponse),
+        (status = 400, description = "Malformed archive"),
+        (status = 409, description = "Task already exists"),
+        (status = 403, description = "Forbidden"),
+    )
+)]
+pub async fn import_task_archive(
+    State(engine): State<Arc<TaskEngine>>,
+    Extension(auth): Extension<AuthContext>,
+    body: Result<Json<ImportTaskArchiveBody>, JsonRejection>,
+) -> Result<impl IntoResponse, AppError> {
+    if !check_scope(&auth, PermissionScope::TaskManage, None) {
+        return Err(AppError::Forbidden);
+    }
+
+    let Json(body) = body.map_err(|rejection| AppError::BadRequest(rejection.to_string()))?;
+    let options = body
+        .overwrite
+        .map(|overwrite| TaskArchiveImportOptions { overwrite });
+    let result = engine
+        .import_task_archive(body.archive, options)
+        .await
+        .map_err(|err| match &err {
+            EngineError::Archive(_) => AppError::BadRequest(err.to_string()),
+            _ => AppError::Engine(err),
+        })?;
+
+    Ok(axum::Json(ImportTaskArchiveResponse {
+        ok: true,
+        task_id: result.task_id,
+        event_count: result.event_count,
+        overwritten: result.overwritten,
+    }))
 }
 
 #[utoipa::path(
@@ -341,11 +429,10 @@ pub async fn publish_events(
     let is_batch = body.is_array();
 
     let inputs: Vec<PublishEventBody> = if is_batch {
-        serde_json::from_value(body)
-            .map_err(|e| AppError::BadRequest(e.to_string()))?
+        serde_json::from_value(body).map_err(|e| AppError::BadRequest(e.to_string()))?
     } else {
-        let single: PublishEventBody = serde_json::from_value(body)
-            .map_err(|e| AppError::BadRequest(e.to_string()))?;
+        let single: PublishEventBody =
+            serde_json::from_value(body).map_err(|e| AppError::BadRequest(e.to_string()))?;
         vec![single]
     };
 
@@ -439,9 +526,8 @@ pub async fn get_event_history(
     let series_format = query.series_format.as_deref().unwrap_or("delta");
     if series_format == "accumulated" {
         let engine_ref = Arc::clone(&engine);
-        events = taskcast_core::series::collapse_accumulate_series(
-            &events,
-            |tid: &str, sid: &str| {
+        events =
+            taskcast_core::series::collapse_accumulate_series(&events, |tid: &str, sid: &str| {
                 let eng = Arc::clone(&engine_ref);
                 let tid = tid.to_string();
                 let sid = sid.to_string();
@@ -450,10 +536,9 @@ pub async fn get_event_history(
                         .await
                         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
                 }
-            },
-        )
-        .await
-        .unwrap_or(events);
+            })
+            .await
+            .unwrap_or(events);
     }
 
     Ok(axum::Json(events))

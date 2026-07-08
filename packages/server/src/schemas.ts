@@ -45,10 +45,16 @@ export const TaskSchema = z
     updatedAt: z.number(),
     completedAt: z.number().optional(),
     ttl: z.number().int().positive().optional(),
+    authConfig: z.record(z.unknown()).optional(),
+    webhooks: z.array(z.unknown()).optional(),
+    cleanup: z.object({ rules: z.array(z.unknown()) }).optional(),
     tags: z.array(z.string()).optional(),
     assignMode: AssignModeSchema.optional(),
     cost: z.number().int().positive().optional(),
     assignedWorker: z.string().optional(),
+    reason: z.string().optional(),
+    resumeAt: z.number().optional(),
+    blockedRequest: z.object({ type: z.string(), data: z.unknown() }).optional(),
     disconnectPolicy: DisconnectPolicySchema.optional(),
   })
   .openapi('Task')
@@ -67,6 +73,48 @@ export const TaskEventSchema = z
     seriesAccField: z.string().optional(),
   })
   .openapi('TaskEvent')
+
+export const TaskArchiveSchema = z
+  .object({
+    schema: z.literal('taskcast.taskArchive'),
+    version: z.literal(1),
+    exportedAt: z.number(),
+    task: TaskSchema,
+    events: z.array(TaskEventSchema),
+  })
+  .openapi('TaskArchive')
+
+export const ImportTaskArchiveSchema = z
+  .object({
+    archive: TaskArchiveSchema,
+    overwrite: z.boolean().optional(),
+  })
+  .openapi('ImportTaskArchiveInput')
+
+export const ImportTaskArchiveResultSchema = z
+  .object({
+    ok: z.literal(true),
+    taskId: z.string(),
+    eventCount: z.number().int().nonnegative(),
+    overwritten: z.boolean(),
+  })
+  .openapi('ImportTaskArchiveResult')
+
+export const ServerInfoSchema = z
+  .object({
+    name: z.literal('taskcast'),
+    version: z.string(),
+    apiVersion: z.literal('v1'),
+    links: z
+      .object({
+        health: z.string(),
+        healthDetail: z.string(),
+        openapi: z.string(),
+        docs: z.string(),
+      })
+      .optional(),
+  })
+  .openapi('ServerInfo')
 
 export const WorkerSchema = z
   .object({
