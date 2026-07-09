@@ -1,5 +1,12 @@
 # @taskcast/redis
 
+## 1.5.4
+
+### Patch Changes
+
+- Updated dependencies [93cd498]
+  - @taskcast/core@1.5.4
+
 ## 1.5.3
 
 ### Patch Changes

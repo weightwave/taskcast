@@ -1,5 +1,19 @@
 # @taskcast/cli
 
+## 1.5.4
+
+### Patch Changes
+
+- Updated dependencies [93cd498]
+  - @taskcast/core@1.5.4
+  - @taskcast/postgres@1.5.4
+  - @taskcast/sqlite@1.5.4
+  - @taskcast/dashboard-web@0.3.12
+  - @taskcast/playground@0.3.12
+  - @taskcast/redis@1.5.4
+  - @taskcast/server@1.5.4
+  - @taskcast/server-sdk@1.5.4
+
 ## 1.5.3
 
 ### Patch Changes

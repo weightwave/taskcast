@@ -114,8 +114,7 @@ describe('task archive routes', () => {
     expect(res.status).toBe(404)
   })
 
-  it('returns 500 when export cannot reconstruct raw accumulated history', async () => {
-    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+  it('exports compacted accumulated long-term history', async () => {
     const engine = new TaskEngine({
       broadcast: new MemoryBroadcastProvider(),
       shortTermStore: new MemoryShortTermStore(),
@@ -123,13 +122,20 @@ describe('task archive routes', () => {
     })
     const app = makeAppWithEngine(engine)
 
-    try {
-      const res = await app.request('/tasks/task-corrupt/archive')
+    const res = await app.request('/tasks/task-corrupt/archive')
 
-      expect(res.status).toBe(500)
-    } finally {
-      consoleError.mockRestore()
-    }
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.events).toHaveLength(1)
+    expect(body.events[0]).toMatchObject({
+      taskId: 'task-corrupt',
+      index: 0,
+      data: { delta: 'hello world' },
+      seriesId: 'series-1',
+      seriesMode: 'accumulate',
+    })
+    expect(body.events[0]).not.toHaveProperty('_accumulatedData')
+    expect(body.events[0]).not.toHaveProperty('seriesSnapshot')
   })
 
   it('imports a valid archive', async () => {

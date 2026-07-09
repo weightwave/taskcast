@@ -1,6 +1,6 @@
 {
   "name": "@taskcast/cli",
-  "version": "1.5.3",
+  "version": "1.5.4",
   "description": "Standalone Taskcast server CLI — run with npx taskcast.",
   "repository": {
     "type": "git",

@@ -1,5 +1,11 @@
 # @taskcast/core
 
+## 1.5.4
+
+### Patch Changes
+
+- 93cd498: Compact latest and accumulate series in durable storage and task archives.
+
 ## 1.5.3
 
 ### Patch Changes
