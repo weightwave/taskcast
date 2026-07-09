@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 use sqlx::postgres::PgRow;
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 
 use taskcast_core::types::{
     AssignMode, CleanupConfig, DisconnectPolicy, EventQueryOptions, Level, LongTermStore,
@@ -32,10 +32,10 @@ impl PostgresLongTermStore {
     /// Uses sqlx's built-in migration runner with `.sql` files from the shared
     /// `migrations/postgres/` directory at the repo root (embedded at compile time).
     /// Tracks applied migrations in the `_sqlx_migrations` table.
-    pub async fn migrate(
-        &self,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        sqlx::migrate!("../../migrations/postgres").run(&self.pool).await?;
+    pub async fn migrate(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        sqlx::migrate!("../../migrations/postgres")
+            .run(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -64,10 +64,10 @@ impl PostgresLongTermStore {
         let assigned_worker: Option<String> = row.get("assigned_worker");
         let disconnect_policy_str: Option<String> = row.get("disconnect_policy");
 
-        let assign_mode: Option<AssignMode> = assign_mode_str
-            .and_then(|s| serde_json::from_value(JsonValue::String(s)).ok());
-        let disconnect_policy: Option<DisconnectPolicy> = disconnect_policy_str
-            .and_then(|s| serde_json::from_value(JsonValue::String(s)).ok());
+        let assign_mode: Option<AssignMode> =
+            assign_mode_str.and_then(|s| serde_json::from_value(JsonValue::String(s)).ok());
+        let disconnect_policy: Option<DisconnectPolicy> =
+            disconnect_policy_str.and_then(|s| serde_json::from_value(JsonValue::String(s)).ok());
 
         Task {
             id: row.get("id"),
@@ -77,10 +77,8 @@ impl PostgresLongTermStore {
             result: result.and_then(|v| serde_json::from_value(v).ok()),
             error: error.and_then(|v| serde_json::from_value::<TaskError>(v).ok()),
             metadata: metadata.and_then(|v| serde_json::from_value(v).ok()),
-            auth_config: auth_config
-                .and_then(|v| serde_json::from_value::<TaskAuthConfig>(v).ok()),
-            webhooks: webhooks
-                .and_then(|v| serde_json::from_value::<Vec<WebhookConfig>>(v).ok()),
+            auth_config: auth_config.and_then(|v| serde_json::from_value::<TaskAuthConfig>(v).ok()),
+            webhooks: webhooks.and_then(|v| serde_json::from_value::<Vec<WebhookConfig>>(v).ok()),
             cleanup: cleanup.and_then(|v| serde_json::from_value::<CleanupConfig>(v).ok()),
             created_at: created_at_i64 as f64,
             updated_at: updated_at_i64 as f64,
@@ -100,8 +98,8 @@ impl PostgresLongTermStore {
     /// Convert a database row into a `WorkerAuditEvent`.
     fn row_to_worker_event(row: &PgRow) -> WorkerAuditEvent {
         let action_str: String = row.get("action");
-        let action: WorkerAuditAction =
-            serde_json::from_value(JsonValue::String(action_str)).unwrap_or(WorkerAuditAction::Connected);
+        let action: WorkerAuditAction = serde_json::from_value(JsonValue::String(action_str))
+            .unwrap_or(WorkerAuditAction::Connected);
 
         let timestamp_i64: i64 = row.get("timestamp");
         let data: Option<JsonValue> = row.get("data");
@@ -126,8 +124,8 @@ impl PostgresLongTermStore {
         let data: Option<JsonValue> = row.get("data");
 
         let series_mode_str: Option<String> = row.get("series_mode");
-        let series_mode: Option<SeriesMode> = series_mode_str
-            .and_then(|s| serde_json::from_value(JsonValue::String(s)).ok());
+        let series_mode: Option<SeriesMode> =
+            series_mode_str.and_then(|s| serde_json::from_value(JsonValue::String(s)).ok());
 
         TaskEvent {
             id: row.get("id"),
@@ -148,18 +146,23 @@ impl PostgresLongTermStore {
 
 #[async_trait]
 impl LongTermStore for PostgresLongTermStore {
-    async fn save_task(
-        &self,
-        task: Task,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let params_json: Option<JsonValue> =
-            task.params.as_ref().map(|p| serde_json::to_value(p).unwrap_or(JsonValue::Null));
-        let result_json: Option<JsonValue> =
-            task.result.as_ref().map(|r| serde_json::to_value(r).unwrap_or(JsonValue::Null));
-        let error_json: Option<JsonValue> =
-            task.error.as_ref().map(|e| serde_json::to_value(e).unwrap_or(JsonValue::Null));
-        let metadata_json: Option<JsonValue> =
-            task.metadata.as_ref().map(|m| serde_json::to_value(m).unwrap_or(JsonValue::Null));
+    async fn save_task(&self, task: Task) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let params_json: Option<JsonValue> = task
+            .params
+            .as_ref()
+            .map(|p| serde_json::to_value(p).unwrap_or(JsonValue::Null));
+        let result_json: Option<JsonValue> = task
+            .result
+            .as_ref()
+            .map(|r| serde_json::to_value(r).unwrap_or(JsonValue::Null));
+        let error_json: Option<JsonValue> = task
+            .error
+            .as_ref()
+            .map(|e| serde_json::to_value(e).unwrap_or(JsonValue::Null));
+        let metadata_json: Option<JsonValue> = task
+            .metadata
+            .as_ref()
+            .map(|m| serde_json::to_value(m).unwrap_or(JsonValue::Null));
         let auth_config_json: Option<JsonValue> = task
             .auth_config
             .as_ref()
@@ -168,16 +171,20 @@ impl LongTermStore for PostgresLongTermStore {
             .webhooks
             .as_ref()
             .map(|w| serde_json::to_value(w).unwrap_or(JsonValue::Null));
-        let cleanup_json: Option<JsonValue> =
-            task.cleanup.as_ref().map(|c| serde_json::to_value(c).unwrap_or(JsonValue::Null));
+        let cleanup_json: Option<JsonValue> = task
+            .cleanup
+            .as_ref()
+            .map(|c| serde_json::to_value(c).unwrap_or(JsonValue::Null));
 
         let created_at = task.created_at as i64;
         let updated_at = task.updated_at as i64;
         let completed_at = task.completed_at.map(|v| v as i64);
         let ttl = task.ttl.map(|v| v as i32);
 
-        let tags_json: Option<JsonValue> =
-            task.tags.as_ref().map(|t| serde_json::to_value(t).unwrap_or(JsonValue::Null));
+        let tags_json: Option<JsonValue> = task
+            .tags
+            .as_ref()
+            .map(|t| serde_json::to_value(t).unwrap_or(JsonValue::Null));
         let assign_mode_str: Option<String> = task.assign_mode.as_ref().map(|m| {
             serde_json::to_value(m)
                 .ok()
@@ -217,8 +224,8 @@ impl LongTermStore for PostgresLongTermStore {
             "#
         );
 
-        let status_str =
-            serde_json::to_value(&task.status).map(|v| v.as_str().unwrap_or("pending").to_string())?;
+        let status_str = serde_json::to_value(&task.status)
+            .map(|v| v.as_str().unwrap_or("pending").to_string())?;
 
         sqlx::query(&sql)
             .bind(&task.id)
@@ -308,6 +315,105 @@ impl LongTermStore for PostgresLongTermStore {
         Ok(())
     }
 
+    async fn replace_last_series_event(
+        &self,
+        task_id: &str,
+        series_id: &str,
+        event: TaskEvent,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mode = series_mode_to_string(&SeriesMode::Latest).unwrap();
+        let mut tx = self.pool.begin().await?;
+        let sql = format!(
+            r#"
+            SELECT * FROM {EVENTS}
+            WHERE task_id = $1 AND series_id = $2 AND series_mode = $3
+            ORDER BY idx ASC
+            "#
+        );
+        let rows = sqlx::query(&sql)
+            .bind(task_id)
+            .bind(series_id)
+            .bind(&mode)
+            .fetch_all(&mut *tx)
+            .await?;
+
+        if let Some(existing) = rows.first().map(Self::row_to_event) {
+            update_stored_series_event_pg(&mut tx, &existing, &event).await?;
+            let sql = format!(
+                r#"
+                DELETE FROM {EVENTS}
+                WHERE task_id = $1 AND series_id = $2 AND series_mode = $3 AND id <> $4
+                "#
+            );
+            sqlx::query(&sql)
+                .bind(task_id)
+                .bind(series_id)
+                .bind(&mode)
+                .bind(&existing.id)
+                .execute(&mut *tx)
+                .await?;
+        } else {
+            insert_event_pg_tx(&mut tx, &event).await?;
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn accumulate_series(
+        &self,
+        task_id: &str,
+        series_id: &str,
+        event: TaskEvent,
+        field: &str,
+    ) -> Result<TaskEvent, Box<dyn std::error::Error + Send + Sync>> {
+        let mode = series_mode_to_string(&SeriesMode::Accumulate).unwrap();
+        let mut tx = self.pool.begin().await?;
+        let sql = format!(
+            r#"
+            SELECT * FROM {EVENTS}
+            WHERE task_id = $1 AND series_id = $2 AND series_mode = $3
+            ORDER BY idx ASC
+            "#
+        );
+        let rows = sqlx::query(&sql)
+            .bind(task_id)
+            .bind(series_id)
+            .bind(&mode)
+            .fetch_all(&mut *tx)
+            .await?;
+
+        let first = rows.first().map(Self::row_to_event);
+        let previous = rows.last().map(Self::row_to_event);
+        let accumulated = if let Some(previous) = previous {
+            accumulate_task_event(&previous, event, field)
+        } else {
+            event
+        };
+
+        if let Some(first) = first {
+            update_stored_series_event_pg(&mut tx, &first, &accumulated).await?;
+            let sql = format!(
+                r#"
+                DELETE FROM {EVENTS}
+                WHERE task_id = $1 AND series_id = $2 AND series_mode = $3 AND id <> $4
+                "#
+            );
+            sqlx::query(&sql)
+                .bind(task_id)
+                .bind(series_id)
+                .bind(&mode)
+                .bind(&first.id)
+                .execute(&mut *tx)
+                .await?;
+        } else {
+            insert_event_pg_tx(&mut tx, &accumulated).await?;
+        }
+
+        tx.commit().await?;
+        Ok(accumulated)
+    }
+
     async fn get_events(
         &self,
         task_id: &str,
@@ -343,16 +449,12 @@ impl LongTermStore for PostgresLongTermStore {
                     .await?
             } else if let Some(ref id) = since.id {
                 // Look up the anchor event's idx, then fetch events after it
-                let anchor_sql =
-                    format!("SELECT idx FROM {EVENTS} WHERE id = $1");
+                let anchor_sql = format!("SELECT idx FROM {EVENTS} WHERE id = $1");
                 let anchor_row = sqlx::query(&anchor_sql)
                     .bind(id)
                     .fetch_optional(&self.pool)
                     .await?;
-                let anchor_idx: i32 = anchor_row
-                    .as_ref()
-                    .map(|r| r.get("idx"))
-                    .unwrap_or(-1);
+                let anchor_idx: i32 = anchor_row.as_ref().map(|r| r.get("idx")).unwrap_or(-1);
 
                 let sql = format!(
                     "SELECT * FROM {EVENTS} WHERE task_id = $1 AND idx > $2 ORDER BY idx ASC LIMIT $3"
@@ -365,9 +467,8 @@ impl LongTermStore for PostgresLongTermStore {
                     .await?
             } else {
                 // since exists but has no usable cursor fields
-                let sql = format!(
-                    "SELECT * FROM {EVENTS} WHERE task_id = $1 ORDER BY idx ASC LIMIT $2"
-                );
+                let sql =
+                    format!("SELECT * FROM {EVENTS} WHERE task_id = $1 ORDER BY idx ASC LIMIT $2");
                 sqlx::query(&sql)
                     .bind(task_id)
                     .bind(limit_val)
@@ -375,9 +476,8 @@ impl LongTermStore for PostgresLongTermStore {
                     .await?
             }
         } else {
-            let sql = format!(
-                "SELECT * FROM {EVENTS} WHERE task_id = $1 ORDER BY idx ASC LIMIT $2"
-            );
+            let sql =
+                format!("SELECT * FROM {EVENTS} WHERE task_id = $1 ORDER BY idx ASC LIMIT $2");
             sqlx::query(&sql)
                 .bind(task_id)
                 .bind(limit_val)
@@ -386,6 +486,10 @@ impl LongTermStore for PostgresLongTermStore {
         };
 
         Ok(rows.iter().map(Self::row_to_event).collect())
+    }
+
+    fn supports_series_compaction(&self) -> bool {
+        true
     }
 
     async fn save_worker_event(
@@ -443,9 +547,7 @@ impl LongTermStore for PostgresLongTermStore {
                     .await?
             } else if let Some(ref id) = since.id {
                 // Look up the anchor event's timestamp, then fetch events after it
-                let anchor_sql = format!(
-                    "SELECT timestamp FROM {WORKER_EVENTS} WHERE id = $1"
-                );
+                let anchor_sql = format!("SELECT timestamp FROM {WORKER_EVENTS} WHERE id = $1");
                 let anchor_row = sqlx::query(&anchor_sql)
                     .bind(id)
                     .fetch_optional(&self.pool)
@@ -491,6 +593,124 @@ impl LongTermStore for PostgresLongTermStore {
     }
 }
 
+async fn insert_event_pg_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    event: &TaskEvent,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let sql = format!(
+        r#"
+        INSERT INTO {EVENTS} (
+            id, task_id, idx, timestamp, type, level, data, series_id, series_mode, series_acc_field
+        ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+        )
+        ON CONFLICT (id) DO NOTHING
+        "#
+    );
+    let level_str = level_to_string(&event.level)?;
+    let series_mode_str = event.series_mode.as_ref().and_then(series_mode_to_string);
+    let data_json = data_json_for_db(&event.data);
+
+    sqlx::query(&sql)
+        .bind(&event.id)
+        .bind(&event.task_id)
+        .bind(event.index as i32)
+        .bind(event.timestamp as i64)
+        .bind(&event.r#type)
+        .bind(&level_str)
+        .bind(&data_json)
+        .bind(&event.series_id)
+        .bind(&series_mode_str)
+        .bind(&event.series_acc_field)
+        .execute(&mut **tx)
+        .await?;
+
+    Ok(())
+}
+
+async fn update_stored_series_event_pg(
+    tx: &mut Transaction<'_, Postgres>,
+    existing: &TaskEvent,
+    event: &TaskEvent,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let sql = format!(
+        r#"
+        UPDATE {EVENTS}
+        SET timestamp = $1,
+            type = $2,
+            level = $3,
+            data = $4,
+            series_id = $5,
+            series_mode = $6,
+            series_acc_field = $7
+        WHERE id = $8
+        "#
+    );
+    let level_str = level_to_string(&event.level)?;
+    let series_mode_str = event.series_mode.as_ref().and_then(series_mode_to_string);
+    let data_json = data_json_for_db(&event.data);
+
+    sqlx::query(&sql)
+        .bind(event.timestamp as i64)
+        .bind(&event.r#type)
+        .bind(&level_str)
+        .bind(&data_json)
+        .bind(&event.series_id)
+        .bind(&series_mode_str)
+        .bind(&event.series_acc_field)
+        .bind(&existing.id)
+        .execute(&mut **tx)
+        .await?;
+
+    Ok(())
+}
+
+fn accumulate_task_event(previous: &TaskEvent, current: TaskEvent, field: &str) -> TaskEvent {
+    let previous_text = previous
+        .data
+        .as_object()
+        .and_then(|data| data.get(field))
+        .and_then(|value| value.as_str());
+    let current_text = current
+        .data
+        .as_object()
+        .and_then(|data| data.get(field))
+        .and_then(|value| value.as_str());
+
+    match (previous_text, current_text) {
+        (Some(previous_text), Some(current_text)) => {
+            let mut data = current.data.as_object().cloned().unwrap_or_default();
+            data.insert(
+                field.to_string(),
+                serde_json::Value::String(format!("{previous_text}{current_text}")),
+            );
+            TaskEvent {
+                data: serde_json::Value::Object(data),
+                ..current
+            }
+        }
+        _ => current,
+    }
+}
+
+fn level_to_string(level: &Level) -> Result<String, serde_json::Error> {
+    serde_json::to_value(level).map(|value| value.as_str().unwrap_or("info").to_string())
+}
+
+fn series_mode_to_string(mode: &SeriesMode) -> Option<String> {
+    serde_json::to_value(mode)
+        .ok()
+        .and_then(|value| value.as_str().map(|value| value.to_string()))
+}
+
+fn data_json_for_db(data: &JsonValue) -> Option<JsonValue> {
+    if data.is_null() {
+        None
+    } else {
+        Some(data.clone())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -519,8 +739,7 @@ mod tests {
 
     #[test]
     fn level_deserializes_from_db_string() {
-        let level: Level =
-            serde_json::from_value(JsonValue::String("error".to_string())).unwrap();
+        let level: Level = serde_json::from_value(JsonValue::String("error".to_string())).unwrap();
         assert_eq!(level, Level::Error);
     }
 
@@ -529,8 +748,7 @@ mod tests {
         let mode = SeriesMode::Accumulate;
         let v = serde_json::to_value(&mode).unwrap();
         let s = v.as_str().unwrap().to_string();
-        let back: SeriesMode =
-            serde_json::from_value(JsonValue::String(s)).unwrap();
+        let back: SeriesMode = serde_json::from_value(JsonValue::String(s)).unwrap();
         assert_eq!(back, SeriesMode::Accumulate);
     }
 
@@ -559,8 +777,9 @@ mod tests {
     #[test]
     fn optional_json_none_stays_none() {
         let params: Option<HashMap<String, JsonValue>> = None;
-        let json: Option<JsonValue> =
-            params.as_ref().map(|p| serde_json::to_value(p).unwrap_or(JsonValue::Null));
+        let json: Option<JsonValue> = params
+            .as_ref()
+            .map(|p| serde_json::to_value(p).unwrap_or(JsonValue::Null));
         assert!(json.is_none());
     }
 
@@ -598,7 +817,12 @@ mod tests {
 
     #[test]
     fn assign_mode_roundtrip_all_variants() {
-        for mode in &[AssignMode::External, AssignMode::Pull, AssignMode::WsOffer, AssignMode::WsRace] {
+        for mode in &[
+            AssignMode::External,
+            AssignMode::Pull,
+            AssignMode::WsOffer,
+            AssignMode::WsRace,
+        ] {
             let v = serde_json::to_value(mode).unwrap();
             let s = v.as_str().unwrap().to_string();
             let back: AssignMode = serde_json::from_value(JsonValue::String(s)).unwrap();
@@ -622,7 +846,11 @@ mod tests {
 
     #[test]
     fn disconnect_policy_roundtrip_all_variants() {
-        for policy in &[DisconnectPolicy::Reassign, DisconnectPolicy::Mark, DisconnectPolicy::Fail] {
+        for policy in &[
+            DisconnectPolicy::Reassign,
+            DisconnectPolicy::Mark,
+            DisconnectPolicy::Fail,
+        ] {
             let v = serde_json::to_value(policy).unwrap();
             let s = v.as_str().unwrap().to_string();
             let back: DisconnectPolicy = serde_json::from_value(JsonValue::String(s)).unwrap();
@@ -691,8 +919,9 @@ mod tests {
     #[test]
     fn optional_tags_none_stays_none() {
         let tags: Option<Vec<String>> = None;
-        let json: Option<JsonValue> =
-            tags.as_ref().map(|t| serde_json::to_value(t).unwrap_or(JsonValue::Null));
+        let json: Option<JsonValue> = tags
+            .as_ref()
+            .map(|t| serde_json::to_value(t).unwrap_or(JsonValue::Null));
         assert!(json.is_none());
     }
 

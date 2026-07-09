@@ -114,15 +114,16 @@ describe('engine.publishEvent — seriesMode: latest', () => {
     expect(seriesBroadcasts).toHaveLength(3)
   })
 
-  it('writes accumulated (latest) event to longTermStore', async () => {
+  it('writes latest events to longTermStore with series replacement when supported', async () => {
     const store = new MemoryShortTermStore()
     const broadcast = new MemoryBroadcastProvider()
-    const longTermStore: LongTermStore = {
+    const longTermStore = {
       saveTask: vi.fn().mockResolvedValue(undefined),
       getTask: vi.fn().mockResolvedValue(null),
       saveEvent: vi.fn().mockResolvedValue(undefined),
       getEvents: vi.fn().mockResolvedValue([]),
-    }
+      replaceLastSeriesEvent: vi.fn().mockResolvedValue(undefined),
+    } as LongTermStore & { replaceLastSeriesEvent: ReturnType<typeof vi.fn> }
     const engine = new TaskEngine({ shortTermStore: store, broadcast, longTermStore })
     const task = await engine.createTask({ type: 'test' })
     await engine.transitionTask(task.id, 'running')
@@ -143,12 +144,50 @@ describe('engine.publishEvent — seriesMode: latest', () => {
     })
 
     await vi.waitFor(() => {
-      const saveEventCalls = (longTermStore.saveEvent as ReturnType<typeof vi.fn>).mock.calls
-      const latestCalls = saveEventCalls.filter(
-        (c: unknown[]) => (c[0] as TaskEvent).seriesId === 's1',
-      )
-      expect(latestCalls.length).toBe(2)
+      expect(longTermStore.replaceLastSeriesEvent).toHaveBeenCalledTimes(2)
     })
+    expect(longTermStore.saveEvent).not.toHaveBeenCalledWith(
+      expect.objectContaining({ seriesId: 's1' }),
+    )
+  })
+
+  it('writes accumulated events to longTermStore with series accumulation when supported', async () => {
+    const store = new MemoryShortTermStore()
+    const broadcast = new MemoryBroadcastProvider()
+    const longTermStore = {
+      saveTask: vi.fn().mockResolvedValue(undefined),
+      getTask: vi.fn().mockResolvedValue(null),
+      saveEvent: vi.fn().mockResolvedValue(undefined),
+      getEvents: vi.fn().mockResolvedValue([]),
+      accumulateSeries: vi.fn().mockResolvedValue(undefined),
+    } as LongTermStore & { accumulateSeries: ReturnType<typeof vi.fn> }
+    const engine = new TaskEngine({ shortTermStore: store, broadcast, longTermStore })
+    const task = await engine.createTask({ type: 'test' })
+    await engine.transitionTask(task.id, 'running')
+
+    await engine.publishEvent(task.id, {
+      type: 'stream',
+      level: 'info',
+      data: { delta: 'Hello' },
+      seriesId: 'output',
+      seriesMode: 'accumulate',
+      seriesAccField: 'delta',
+    })
+    await engine.publishEvent(task.id, {
+      type: 'stream',
+      level: 'info',
+      data: { delta: ' world' },
+      seriesId: 'output',
+      seriesMode: 'accumulate',
+      seriesAccField: 'delta',
+    })
+
+    await vi.waitFor(() => {
+      expect(longTermStore.accumulateSeries).toHaveBeenCalledTimes(2)
+    })
+    expect(longTermStore.saveEvent).not.toHaveBeenCalledWith(
+      expect.objectContaining({ seriesId: 'output' }),
+    )
   })
 
   it('getSeriesLatest returns the latest value for latest-mode series', async () => {

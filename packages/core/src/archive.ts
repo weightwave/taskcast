@@ -52,7 +52,7 @@ export function normalizeTaskArchive(archive: TaskArchive): TaskArchive {
     seenIndexes.add(event.index)
     if (event.index !== expectedIndex) {
       throw new InvalidTaskArchiveError(
-        `Archive events must be a complete un-compacted event stream with contiguous indexes from 0; expected ${expectedIndex}, got ${event.index}`,
+        `Archive events must have contiguous indexes from 0; expected ${expectedIndex}, got ${event.index}`,
       )
     }
   }
@@ -182,12 +182,12 @@ function assertArchivePersistableEvent(event: TaskArchiveEvent): void {
 
   if (candidate.seriesSnapshot !== undefined) {
     throw new InvalidTaskArchiveError(
-      `Archive events must be complete raw delta events; seriesSnapshot is a collapsed presentation field on event ${event.id}`,
+      `Archive events cannot include presentation fields; seriesSnapshot is a collapsed presentation field on event ${event.id}`,
     )
   }
   if (candidate._accumulatedData !== undefined) {
     throw new InvalidTaskArchiveError(
-      `Archive events must be raw persisted deltas; _accumulatedData is a transient broadcast field on event ${event.id}`,
+      `Archive events cannot include transient broadcast fields; _accumulatedData is transient on event ${event.id}`,
     )
   }
 }

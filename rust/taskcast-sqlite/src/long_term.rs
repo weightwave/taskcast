@@ -1,21 +1,83 @@
 use async_trait::async_trait;
-use sqlx::{Row, SqlitePool};
+use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use std::collections::BTreeSet;
 
 use taskcast_core::types::{
-    EventQueryOptions, LongTermStore, Task, TaskArchiveImportOptions, TaskArchiveRestoreData,
-    TaskEvent, WorkerAuditEvent,
+    EventQueryOptions, LongTermStore, SeriesMode, Task, TaskArchiveImportOptions,
+    TaskArchiveRestoreData, TaskEvent, WorkerAuditEvent,
 };
 
 use crate::row_helpers::{
     assign_mode_to_string, audit_action_to_string, disconnect_policy_to_string,
-    json_value_to_string, level_to_string, row_to_event, row_to_task,
-    row_to_worker_audit_event, series_mode_to_string, status_to_string, to_json_string,
+    json_value_to_string, level_to_string, row_to_event, row_to_task, row_to_worker_audit_event,
+    series_mode_to_string, status_to_string, to_json_string,
 };
 
 pub struct SqliteLongTermStore {
     pool: SqlitePool,
     shares_task_archive_restore_storage: bool,
+}
+
+async fn insert_event_in_sqlite_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    event: &TaskEvent,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let level_str = level_to_string(&event.level);
+    let series_mode_str = event.series_mode.as_ref().and_then(series_mode_to_string);
+    let data_str = json_value_to_string(&event.data);
+
+    sqlx::query(
+        r#"
+        INSERT INTO taskcast_events (
+            id, task_id, idx, timestamp, type, level, data, series_id, series_mode, series_acc_field
+        ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+        )
+        ON CONFLICT (id) DO NOTHING
+        "#,
+    )
+    .bind(&event.id)
+    .bind(&event.task_id)
+    .bind(event.index as i32)
+    .bind(event.timestamp as i64)
+    .bind(&event.r#type)
+    .bind(&level_str)
+    .bind(&data_str)
+    .bind(&event.series_id)
+    .bind(&series_mode_str)
+    .bind(&event.series_acc_field)
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(())
+}
+
+fn accumulate_task_event(previous: &TaskEvent, current: TaskEvent, field: &str) -> TaskEvent {
+    let previous_text = previous
+        .data
+        .as_object()
+        .and_then(|data| data.get(field))
+        .and_then(|value| value.as_str());
+    let current_text = current
+        .data
+        .as_object()
+        .and_then(|data| data.get(field))
+        .and_then(|value| value.as_str());
+
+    match (previous_text, current_text) {
+        (Some(previous_text), Some(current_text)) => {
+            let mut data = current.data.as_object().cloned().unwrap_or_default();
+            data.insert(
+                field.to_string(),
+                serde_json::Value::String(format!("{previous_text}{current_text}")),
+            );
+            TaskEvent {
+                data: serde_json::Value::Object(data),
+                ..current
+            }
+        }
+        _ => current,
+    }
 }
 
 impl SqliteLongTermStore {
@@ -76,10 +138,7 @@ impl SqliteLongTermStore {
 
 #[async_trait]
 impl LongTermStore for SqliteLongTermStore {
-    async fn save_task(
-        &self,
-        task: Task,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn save_task(&self, task: Task) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let status_str = status_to_string(&task.status);
         let params_json = to_json_string(&task.params);
         let result_json = to_json_string(&task.result);
@@ -196,6 +255,154 @@ impl LongTermStore for SqliteLongTermStore {
         Ok(())
     }
 
+    async fn replace_last_series_event(
+        &self,
+        task_id: &str,
+        series_id: &str,
+        event: TaskEvent,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mode = series_mode_to_string(&SeriesMode::Latest).unwrap();
+        let mut tx = self.pool.begin().await?;
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM taskcast_events
+            WHERE task_id = ?1 AND series_id = ?2 AND series_mode = ?3
+            ORDER BY idx ASC
+            "#,
+        )
+        .bind(task_id)
+        .bind(series_id)
+        .bind(&mode)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        if let Some(existing) = rows.first().map(row_to_event) {
+            let level_str = level_to_string(&event.level);
+            let series_mode_str = event.series_mode.as_ref().and_then(series_mode_to_string);
+            let data_str = json_value_to_string(&event.data);
+            sqlx::query(
+                r#"
+                UPDATE taskcast_events
+                SET timestamp = ?1,
+                    type = ?2,
+                    level = ?3,
+                    data = ?4,
+                    series_id = ?5,
+                    series_mode = ?6,
+                    series_acc_field = ?7
+                WHERE id = ?8
+                "#,
+            )
+            .bind(event.timestamp as i64)
+            .bind(&event.r#type)
+            .bind(&level_str)
+            .bind(&data_str)
+            .bind(&event.series_id)
+            .bind(&series_mode_str)
+            .bind(&event.series_acc_field)
+            .bind(&existing.id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                r#"
+                DELETE FROM taskcast_events
+                WHERE task_id = ?1 AND series_id = ?2 AND series_mode = ?3 AND id <> ?4
+                "#,
+            )
+            .bind(task_id)
+            .bind(series_id)
+            .bind(&mode)
+            .bind(&existing.id)
+            .execute(&mut *tx)
+            .await?;
+        } else {
+            insert_event_in_sqlite_tx(&mut tx, &event).await?;
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn accumulate_series(
+        &self,
+        task_id: &str,
+        series_id: &str,
+        event: TaskEvent,
+        field: &str,
+    ) -> Result<TaskEvent, Box<dyn std::error::Error + Send + Sync>> {
+        let mode = series_mode_to_string(&SeriesMode::Accumulate).unwrap();
+        let mut tx = self.pool.begin().await?;
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM taskcast_events
+            WHERE task_id = ?1 AND series_id = ?2 AND series_mode = ?3
+            ORDER BY idx ASC
+            "#,
+        )
+        .bind(task_id)
+        .bind(series_id)
+        .bind(&mode)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let first = rows.first().map(row_to_event);
+        let previous = rows.last().map(row_to_event);
+        let accumulated = if let Some(previous) = previous {
+            accumulate_task_event(&previous, event, field)
+        } else {
+            event
+        };
+
+        if let Some(first) = first {
+            let level_str = level_to_string(&accumulated.level);
+            let series_mode_str = accumulated
+                .series_mode
+                .as_ref()
+                .and_then(series_mode_to_string);
+            let data_str = json_value_to_string(&accumulated.data);
+            sqlx::query(
+                r#"
+                UPDATE taskcast_events
+                SET timestamp = ?1,
+                    type = ?2,
+                    level = ?3,
+                    data = ?4,
+                    series_id = ?5,
+                    series_mode = ?6,
+                    series_acc_field = ?7
+                WHERE id = ?8
+                "#,
+            )
+            .bind(accumulated.timestamp as i64)
+            .bind(&accumulated.r#type)
+            .bind(&level_str)
+            .bind(&data_str)
+            .bind(&accumulated.series_id)
+            .bind(&series_mode_str)
+            .bind(&accumulated.series_acc_field)
+            .bind(&first.id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                r#"
+                DELETE FROM taskcast_events
+                WHERE task_id = ?1 AND series_id = ?2 AND series_mode = ?3 AND id <> ?4
+                "#,
+            )
+            .bind(task_id)
+            .bind(series_id)
+            .bind(&mode)
+            .bind(&first.id)
+            .execute(&mut *tx)
+            .await?;
+        } else {
+            insert_event_in_sqlite_tx(&mut tx, &accumulated).await?;
+        }
+
+        tx.commit().await?;
+        Ok(accumulated)
+    }
+
     async fn get_events(
         &self,
         task_id: &str,
@@ -288,6 +495,10 @@ impl LongTermStore for SqliteLongTermStore {
     }
 
     fn supports_task_archive_restore(&self) -> bool {
+        true
+    }
+
+    fn supports_series_compaction(&self) -> bool {
         true
     }
 

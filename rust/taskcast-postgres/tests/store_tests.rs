@@ -3,7 +3,7 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
 
 use taskcast_core::types::{
-    EventQueryOptions, Level, LongTermStore, SinceCursor, Task, TaskEvent, TaskStatus,
+    EventQueryOptions, Level, LongTermStore, SeriesMode, SinceCursor, Task, TaskEvent, TaskStatus,
     WorkerAuditAction, WorkerAuditEvent,
 };
 use taskcast_postgres::PostgresLongTermStore;
@@ -199,6 +199,87 @@ async fn return_empty_vec_when_no_events() {
     store.save_task(make_task("task-1")).await.unwrap();
     let events = store.get_events("task-1", None).await.unwrap();
     assert!(events.is_empty());
+}
+
+#[tokio::test]
+async fn compact_latest_series_events_in_long_term_storage() {
+    let (store, _container) = setup().await;
+    store.save_task(make_task("task-1")).await.unwrap();
+
+    let mut first = make_event("task-1", 0);
+    first.id = "status-1".to_string();
+    first.r#type = "task.status".to_string();
+    first.data = serde_json::json!({ "status": "starting" });
+    first.series_id = Some("status".to_string());
+    first.series_mode = Some(SeriesMode::Latest);
+
+    let mut second = make_event("task-1", 1);
+    second.id = "status-2".to_string();
+    second.r#type = "task.status".to_string();
+    second.data = serde_json::json!({ "status": "ready" });
+    second.series_id = Some("status".to_string());
+    second.series_mode = Some(SeriesMode::Latest);
+
+    store
+        .replace_last_series_event("task-1", "status", first)
+        .await
+        .unwrap();
+    store
+        .replace_last_series_event("task-1", "status", second)
+        .await
+        .unwrap();
+
+    let events = store.get_events("task-1", None).await.unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].id, "status-1");
+    assert_eq!(events[0].index, 0);
+    assert_eq!(events[0].data, serde_json::json!({ "status": "ready" }));
+}
+
+#[tokio::test]
+async fn compact_accumulate_series_events_in_long_term_storage() {
+    let (store, _container) = setup().await;
+    store.save_task(make_task("task-1")).await.unwrap();
+
+    let mut first = make_event("task-1", 0);
+    first.id = "output-1".to_string();
+    first.r#type = "task.output".to_string();
+    first.data = serde_json::json!({ "delta": "hello " });
+    first.series_id = Some("output".to_string());
+    first.series_mode = Some(SeriesMode::Accumulate);
+    first.series_acc_field = Some("delta".to_string());
+
+    let mut second = make_event("task-1", 1);
+    second.id = "output-2".to_string();
+    second.r#type = "task.output".to_string();
+    second.data = serde_json::json!({ "delta": "world" });
+    second.series_id = Some("output".to_string());
+    second.series_mode = Some(SeriesMode::Accumulate);
+    second.series_acc_field = Some("delta".to_string());
+
+    let first_result = store
+        .accumulate_series("task-1", "output", first, "delta")
+        .await
+        .unwrap();
+    let second_result = store
+        .accumulate_series("task-1", "output", second, "delta")
+        .await
+        .unwrap();
+
+    assert_eq!(first_result.data, serde_json::json!({ "delta": "hello " }));
+    assert_eq!(
+        second_result.data,
+        serde_json::json!({ "delta": "hello world" })
+    );
+
+    let events = store.get_events("task-1", None).await.unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].id, "output-1");
+    assert_eq!(events[0].index, 0);
+    assert_eq!(
+        events[0].data,
+        serde_json::json!({ "delta": "hello world" })
+    );
 }
 
 #[tokio::test]
@@ -463,11 +544,7 @@ async fn filter_worker_events_by_since_timestamp() {
 
     for i in 0..5 {
         store
-            .save_worker_event(make_worker_event(
-                &format!("we-{}", i),
-                "worker-1",
-                i,
-            ))
+            .save_worker_event(make_worker_event(&format!("we-{}", i), "worker-1", i))
             .await
             .unwrap();
     }
@@ -495,11 +572,7 @@ async fn filter_worker_events_by_since_id() {
 
     for i in 0..5 {
         store
-            .save_worker_event(make_worker_event(
-                &format!("we-{}", i),
-                "worker-1",
-                i,
-            ))
+            .save_worker_event(make_worker_event(&format!("we-{}", i), "worker-1", i))
             .await
             .unwrap();
     }
@@ -527,11 +600,7 @@ async fn return_all_worker_events_when_since_id_not_found() {
 
     for i in 0..3 {
         store
-            .save_worker_event(make_worker_event(
-                &format!("we-{}", i),
-                "worker-1",
-                i,
-            ))
+            .save_worker_event(make_worker_event(&format!("we-{}", i), "worker-1", i))
             .await
             .unwrap();
     }
@@ -557,11 +626,7 @@ async fn respect_limit_on_worker_events() {
 
     for i in 0..10 {
         store
-            .save_worker_event(make_worker_event(
-                &format!("we-{}", i),
-                "worker-1",
-                i,
-            ))
+            .save_worker_event(make_worker_event(&format!("we-{}", i), "worker-1", i))
             .await
             .unwrap();
     }
@@ -585,11 +650,7 @@ async fn combine_since_timestamp_and_limit_on_worker_events() {
 
     for i in 0..10 {
         store
-            .save_worker_event(make_worker_event(
-                &format!("we-{}", i),
-                "worker-1",
-                i,
-            ))
+            .save_worker_event(make_worker_event(&format!("we-{}", i), "worker-1", i))
             .await
             .unwrap();
     }

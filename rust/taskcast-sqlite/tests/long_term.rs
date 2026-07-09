@@ -2,7 +2,7 @@ mod helpers;
 
 use helpers::{make_event, make_task, make_worker_event, setup};
 use taskcast_core::types::{
-    EventQueryOptions, LongTermStore, SinceCursor, TaskStatus, WorkerAuditAction,
+    EventQueryOptions, LongTermStore, SeriesMode, SinceCursor, TaskStatus, WorkerAuditAction,
 };
 
 // ─── save_task / get_task ─────────────────────────────────────────────────
@@ -116,6 +116,89 @@ async fn save_and_retrieve_events() {
 
     let events = ctx.long.get_events("task-1", None).await.unwrap();
     assert_eq!(events, vec![e0, e1, e2]);
+}
+
+#[tokio::test]
+async fn compact_latest_series_events_in_long_term_storage() {
+    let ctx = setup().await;
+    ctx.long.save_task(make_task("task-1")).await.unwrap();
+
+    let mut first = make_event("task-1", 0);
+    first.id = "status-1".to_string();
+    first.r#type = "task.status".to_string();
+    first.data = serde_json::json!({ "status": "starting" });
+    first.series_id = Some("status".to_string());
+    first.series_mode = Some(SeriesMode::Latest);
+
+    let mut second = make_event("task-1", 1);
+    second.id = "status-2".to_string();
+    second.r#type = "task.status".to_string();
+    second.data = serde_json::json!({ "status": "ready" });
+    second.series_id = Some("status".to_string());
+    second.series_mode = Some(SeriesMode::Latest);
+
+    ctx.long
+        .replace_last_series_event("task-1", "status", first)
+        .await
+        .unwrap();
+    ctx.long
+        .replace_last_series_event("task-1", "status", second)
+        .await
+        .unwrap();
+
+    let events = ctx.long.get_events("task-1", None).await.unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].id, "status-1");
+    assert_eq!(events[0].index, 0);
+    assert_eq!(events[0].data, serde_json::json!({ "status": "ready" }));
+}
+
+#[tokio::test]
+async fn compact_accumulate_series_events_in_long_term_storage() {
+    let ctx = setup().await;
+    ctx.long.save_task(make_task("task-1")).await.unwrap();
+
+    let mut first = make_event("task-1", 0);
+    first.id = "output-1".to_string();
+    first.r#type = "task.output".to_string();
+    first.data = serde_json::json!({ "delta": "hello " });
+    first.series_id = Some("output".to_string());
+    first.series_mode = Some(SeriesMode::Accumulate);
+    first.series_acc_field = Some("delta".to_string());
+
+    let mut second = make_event("task-1", 1);
+    second.id = "output-2".to_string();
+    second.r#type = "task.output".to_string();
+    second.data = serde_json::json!({ "delta": "world" });
+    second.series_id = Some("output".to_string());
+    second.series_mode = Some(SeriesMode::Accumulate);
+    second.series_acc_field = Some("delta".to_string());
+
+    let first_result = ctx
+        .long
+        .accumulate_series("task-1", "output", first, "delta")
+        .await
+        .unwrap();
+    let second_result = ctx
+        .long
+        .accumulate_series("task-1", "output", second, "delta")
+        .await
+        .unwrap();
+
+    assert_eq!(first_result.data, serde_json::json!({ "delta": "hello " }));
+    assert_eq!(
+        second_result.data,
+        serde_json::json!({ "delta": "hello world" })
+    );
+
+    let events = ctx.long.get_events("task-1", None).await.unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].id, "output-1");
+    assert_eq!(events[0].index, 0);
+    assert_eq!(
+        events[0].data,
+        serde_json::json!({ "delta": "hello world" })
+    );
 }
 
 #[tokio::test]

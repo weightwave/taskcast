@@ -188,9 +188,9 @@ export interface TaskEvent {
 /**
  * Archive-persistable event shape.
  *
- * TaskArchive v1 stores a complete raw delta event stream for one task:
- * indexes must be contiguous from 0, accumulate events must be raw deltas, and
- * latest-mode histories must not be compacted down to latest-only storage.
+ * TaskArchive v1 stores a compacted, replayable event stream for one task:
+ * indexes must be contiguous from 0, latest-mode histories are latest-only,
+ * and accumulate-mode histories may be stored as accumulated snapshots.
  * Presentation/transient event fields such as collapsed `seriesSnapshot` events
  * and broadcast `_accumulatedData` are not valid archive data.
  */
@@ -201,7 +201,7 @@ export interface TaskArchive {
   version: 1
   exportedAt: number
   task: Task
-  /** Complete raw delta event stream for the task, ordered by contiguous indexes from 0. */
+  /** Compacted, replayable event stream for the task, ordered by contiguous indexes from 0. */
   events: TaskArchiveEvent[]
 }
 
@@ -336,6 +336,10 @@ export interface LongTermStore {
   saveTask(task: Task): Promise<void>
   getTask(taskId: string): Promise<Task | null>
   saveEvent(event: TaskEvent): Promise<void>
+  /** Optional series-aware durable write for latest-mode series. */
+  replaceLastSeriesEvent?(taskId: string, seriesId: string, event: TaskEvent): Promise<void>
+  /** Optional series-aware durable write for accumulate-mode series. Returns the accumulated event. */
+  accumulateSeries?(taskId: string, seriesId: string, event: TaskEvent, field: string): Promise<TaskEvent>
   getEvents(taskId: string, opts?: EventQueryOptions): Promise<TaskEvent[]>
   /**
    * True when short-term archive restore writes the same durable storage this

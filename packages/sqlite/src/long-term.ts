@@ -81,6 +81,56 @@ export class SqliteLongTermStore implements LongTermStore {
     this.saveEventSync(event)
   }
 
+  async replaceLastSeriesEvent(taskId: string, seriesId: string, event: TaskEvent): Promise<void> {
+    const replace = this.db.transaction(() => {
+      const existing = this.getSeriesEventsSync(taskId, seriesId, 'latest')[0]
+      if (!existing) {
+        this.saveEventSync(event)
+        return
+      }
+
+      this.updateStoredSeriesEventSync(existing, event)
+      this.deleteDuplicateSeriesEventsSync(taskId, seriesId, 'latest', existing.id)
+    })
+
+    replace()
+  }
+
+  async accumulateSeries(taskId: string, seriesId: string, event: TaskEvent, field: string): Promise<TaskEvent> {
+    const accumulate = this.db.transaction(() => {
+      const existingEvents = this.getSeriesEventsSync(taskId, seriesId, 'accumulate')
+      const first = existingEvents[0]
+      const previous = existingEvents[existingEvents.length - 1]
+
+      let accumulated = event
+      if (previous) {
+        const prevData = typeof previous.data === 'object' && previous.data !== null
+          ? previous.data as Record<string, unknown>
+          : {}
+        const newData = typeof event.data === 'object' && event.data !== null
+          ? event.data as Record<string, unknown>
+          : {}
+        if (typeof prevData[field] === 'string' && typeof newData[field] === 'string') {
+          accumulated = {
+            ...event,
+            data: { ...newData, [field]: prevData[field] + newData[field] },
+          }
+        }
+      }
+
+      if (!first) {
+        this.saveEventSync(accumulated)
+      } else {
+        this.updateStoredSeriesEventSync(first, accumulated)
+        this.deleteDuplicateSeriesEventsSync(taskId, seriesId, 'accumulate', first.id)
+      }
+
+      return accumulated
+    })
+
+    return accumulate()
+  }
+
   private saveEventSync(event: TaskEvent): void {
     this.db
       .prepare(
@@ -100,6 +150,60 @@ export class SqliteLongTermStore implements LongTermStore {
         series_mode: event.seriesMode ?? null,
         series_acc_field: event.seriesAccField ?? null,
       })
+  }
+
+  private getSeriesEventsSync(taskId: string, seriesId: string, mode: TaskEvent['seriesMode']): TaskEvent[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM taskcast_events
+         WHERE task_id = ? AND series_id = ? AND series_mode = ?
+         ORDER BY idx ASC`,
+      )
+      .all(taskId, seriesId, mode) as Record<string, unknown>[]
+
+    return rows.map(rowToEvent)
+  }
+
+  private updateStoredSeriesEventSync(existing: TaskEvent, event: TaskEvent): void {
+    this.db
+      .prepare(
+        `UPDATE taskcast_events
+         SET timestamp = @timestamp,
+             type = @type,
+             level = @level,
+             data = @data,
+             series_id = @series_id,
+             series_mode = @series_mode,
+             series_acc_field = @series_acc_field
+         WHERE id = @existing_id`,
+      )
+      .run({
+        existing_id: existing.id,
+        timestamp: event.timestamp,
+        type: event.type,
+        level: event.level,
+        data: event.data != null ? JSON.stringify(event.data) : null,
+        series_id: event.seriesId ?? null,
+        series_mode: event.seriesMode ?? null,
+        series_acc_field: event.seriesAccField ?? null,
+      })
+  }
+
+  private deleteDuplicateSeriesEventsSync(
+    taskId: string,
+    seriesId: string,
+    mode: TaskEvent['seriesMode'],
+    keepEventId: string,
+  ): void {
+    this.db
+      .prepare(
+        `DELETE FROM taskcast_events
+         WHERE task_id = ?
+           AND series_id = ?
+           AND series_mode = ?
+           AND id <> ?`,
+      )
+      .run(taskId, seriesId, mode, keepEventId)
   }
 
   private saveEventStrictSync(event: TaskEvent): void {

@@ -597,7 +597,11 @@ pub struct TaskArchiveRestoreData {
 
 #[async_trait]
 pub trait BroadcastProvider: Send + Sync {
-    async fn publish(&self, channel: &str, event: TaskEvent) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn publish(
+        &self,
+        channel: &str,
+        event: TaskEvent,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
     async fn subscribe(
         &self,
         channel: &str,
@@ -625,15 +629,53 @@ pub trait BroadcastProvider: Send + Sync {
 #[async_trait]
 pub trait ShortTermStore: Send + Sync {
     async fn save_task(&self, task: Task) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
-    async fn get_task(&self, task_id: &str) -> Result<Option<Task>, Box<dyn std::error::Error + Send + Sync>>;
-    async fn append_event(&self, task_id: &str, event: TaskEvent) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
-    async fn get_events(&self, task_id: &str, opts: Option<EventQueryOptions>) -> Result<Vec<TaskEvent>, Box<dyn std::error::Error + Send + Sync>>;
-    async fn set_ttl(&self, task_id: &str, ttl_seconds: u64) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
-    async fn get_series_latest(&self, task_id: &str, series_id: &str) -> Result<Option<TaskEvent>, Box<dyn std::error::Error + Send + Sync>>;
-    async fn set_series_latest(&self, task_id: &str, series_id: &str, event: TaskEvent) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
-    async fn replace_last_series_event(&self, task_id: &str, series_id: &str, event: TaskEvent) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
-    async fn accumulate_series(&self, task_id: &str, series_id: &str, event: TaskEvent, field: &str) -> Result<TaskEvent, Box<dyn std::error::Error + Send + Sync>>;
-    async fn next_index(&self, task_id: &str) -> Result<u64, Box<dyn std::error::Error + Send + Sync>>;
+    async fn get_task(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<Task>, Box<dyn std::error::Error + Send + Sync>>;
+    async fn append_event(
+        &self,
+        task_id: &str,
+        event: TaskEvent,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn get_events(
+        &self,
+        task_id: &str,
+        opts: Option<EventQueryOptions>,
+    ) -> Result<Vec<TaskEvent>, Box<dyn std::error::Error + Send + Sync>>;
+    async fn set_ttl(
+        &self,
+        task_id: &str,
+        ttl_seconds: u64,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn get_series_latest(
+        &self,
+        task_id: &str,
+        series_id: &str,
+    ) -> Result<Option<TaskEvent>, Box<dyn std::error::Error + Send + Sync>>;
+    async fn set_series_latest(
+        &self,
+        task_id: &str,
+        series_id: &str,
+        event: TaskEvent,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn replace_last_series_event(
+        &self,
+        task_id: &str,
+        series_id: &str,
+        event: TaskEvent,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn accumulate_series(
+        &self,
+        task_id: &str,
+        series_id: &str,
+        event: TaskEvent,
+        field: &str,
+    ) -> Result<TaskEvent, Box<dyn std::error::Error + Send + Sync>>;
+    async fn next_index(
+        &self,
+        task_id: &str,
+    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>>;
 
     fn supports_task_archive_restore(&self) -> bool {
         false
@@ -662,30 +704,68 @@ pub trait ShortTermStore: Send + Sync {
     }
 
     // Task query
-    async fn list_tasks(&self, filter: TaskFilter) -> Result<Vec<Task>, Box<dyn std::error::Error + Send + Sync>>;
+    async fn list_tasks(
+        &self,
+        filter: TaskFilter,
+    ) -> Result<Vec<Task>, Box<dyn std::error::Error + Send + Sync>>;
 
     // Worker state
-    async fn save_worker(&self, worker: Worker) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
-    async fn get_worker(&self, worker_id: &str) -> Result<Option<Worker>, Box<dyn std::error::Error + Send + Sync>>;
-    async fn list_workers(&self, filter: Option<WorkerFilter>) -> Result<Vec<Worker>, Box<dyn std::error::Error + Send + Sync>>;
-    async fn delete_worker(&self, worker_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn save_worker(
+        &self,
+        worker: Worker,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn get_worker(
+        &self,
+        worker_id: &str,
+    ) -> Result<Option<Worker>, Box<dyn std::error::Error + Send + Sync>>;
+    async fn list_workers(
+        &self,
+        filter: Option<WorkerFilter>,
+    ) -> Result<Vec<Worker>, Box<dyn std::error::Error + Send + Sync>>;
+    async fn delete_worker(
+        &self,
+        worker_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
     // Atomic claim
-    async fn claim_task(&self, task_id: &str, worker_id: &str, cost: u32) -> Result<bool, Box<dyn std::error::Error + Send + Sync>>;
+    async fn claim_task(
+        &self,
+        task_id: &str,
+        worker_id: &str,
+        cost: u32,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>>;
 
     // Worker assignments
-    async fn add_assignment(&self, assignment: WorkerAssignment) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
-    async fn remove_assignment(&self, task_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
-    async fn get_worker_assignments(&self, worker_id: &str) -> Result<Vec<WorkerAssignment>, Box<dyn std::error::Error + Send + Sync>>;
-    async fn get_task_assignment(&self, task_id: &str) -> Result<Option<WorkerAssignment>, Box<dyn std::error::Error + Send + Sync>>;
+    async fn add_assignment(
+        &self,
+        assignment: WorkerAssignment,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn remove_assignment(
+        &self,
+        task_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn get_worker_assignments(
+        &self,
+        worker_id: &str,
+    ) -> Result<Vec<WorkerAssignment>, Box<dyn std::error::Error + Send + Sync>>;
+    async fn get_task_assignment(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<WorkerAssignment>, Box<dyn std::error::Error + Send + Sync>>;
 
     // TTL management
-    async fn clear_ttl(&self, _task_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn clear_ttl(
+        &self,
+        _task_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
     }
 
     // Status query
-    async fn list_by_status(&self, _statuses: &[TaskStatus]) -> Result<Vec<Task>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn list_by_status(
+        &self,
+        _statuses: &[TaskStatus],
+    ) -> Result<Vec<Task>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(vec![])
     }
 }
@@ -693,9 +773,41 @@ pub trait ShortTermStore: Send + Sync {
 #[async_trait]
 pub trait LongTermStore: Send + Sync {
     async fn save_task(&self, task: Task) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
-    async fn get_task(&self, task_id: &str) -> Result<Option<Task>, Box<dyn std::error::Error + Send + Sync>>;
-    async fn save_event(&self, event: TaskEvent) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
-    async fn get_events(&self, task_id: &str, opts: Option<EventQueryOptions>) -> Result<Vec<TaskEvent>, Box<dyn std::error::Error + Send + Sync>>;
+    async fn get_task(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<Task>, Box<dyn std::error::Error + Send + Sync>>;
+    async fn save_event(
+        &self,
+        event: TaskEvent,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn replace_last_series_event(
+        &self,
+        _task_id: &str,
+        _series_id: &str,
+        event: TaskEvent,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.save_event(event).await
+    }
+    async fn accumulate_series(
+        &self,
+        _task_id: &str,
+        _series_id: &str,
+        event: TaskEvent,
+        _field: &str,
+    ) -> Result<TaskEvent, Box<dyn std::error::Error + Send + Sync>> {
+        self.save_event(event.clone()).await?;
+        Ok(event)
+    }
+    async fn get_events(
+        &self,
+        task_id: &str,
+        opts: Option<EventQueryOptions>,
+    ) -> Result<Vec<TaskEvent>, Box<dyn std::error::Error + Send + Sync>>;
+
+    fn supports_series_compaction(&self) -> bool {
+        false
+    }
 
     fn supports_task_archive_restore(&self) -> bool {
         false
@@ -728,8 +840,15 @@ pub trait LongTermStore: Send + Sync {
     }
 
     // Worker audit
-    async fn save_worker_event(&self, event: WorkerAuditEvent) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
-    async fn get_worker_events(&self, worker_id: &str, opts: Option<EventQueryOptions>) -> Result<Vec<WorkerAuditEvent>, Box<dyn std::error::Error + Send + Sync>>;
+    async fn save_worker_event(
+        &self,
+        event: WorkerAuditEvent,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn get_worker_events(
+        &self,
+        worker_id: &str,
+        opts: Option<EventQueryOptions>,
+    ) -> Result<Vec<WorkerAuditEvent>, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 // ─── Hooks ───────────────────────────────────────────────────────────────────
@@ -749,9 +868,19 @@ pub struct ErrorContext {
 pub trait TaskcastHooks: Send + Sync {
     fn on_task_failed(&self, _task: &Task, _error: &TaskError) {}
     fn on_task_timeout(&self, _task: &Task) {}
-    fn on_unhandled_error(&self, _err: &(dyn std::error::Error + Send + Sync), _context: &ErrorContext) {}
+    fn on_unhandled_error(
+        &self,
+        _err: &(dyn std::error::Error + Send + Sync),
+        _context: &ErrorContext,
+    ) {
+    }
     fn on_event_dropped(&self, _event: &TaskEvent, _reason: &str) {}
-    fn on_webhook_failed(&self, _config: &WebhookConfig, _err: &(dyn std::error::Error + Send + Sync)) {}
+    fn on_webhook_failed(
+        &self,
+        _config: &WebhookConfig,
+        _err: &(dyn std::error::Error + Send + Sync),
+    ) {
+    }
     fn on_sse_connect(&self, _task_id: &str, _client_id: &str) {}
     fn on_sse_disconnect(&self, _task_id: &str, _client_id: &str, _duration: f64) {}
     fn on_task_created(&self, _task: &Task) {}
@@ -773,24 +902,66 @@ mod tests {
 
     #[test]
     fn task_status_serializes_to_camel_case() {
-        assert_eq!(serde_json::to_string(&TaskStatus::Pending).unwrap(), "\"pending\"");
-        assert_eq!(serde_json::to_string(&TaskStatus::Assigned).unwrap(), "\"assigned\"");
-        assert_eq!(serde_json::to_string(&TaskStatus::Running).unwrap(), "\"running\"");
-        assert_eq!(serde_json::to_string(&TaskStatus::Paused).unwrap(), "\"paused\"");
-        assert_eq!(serde_json::to_string(&TaskStatus::Blocked).unwrap(), "\"blocked\"");
-        assert_eq!(serde_json::to_string(&TaskStatus::Completed).unwrap(), "\"completed\"");
-        assert_eq!(serde_json::to_string(&TaskStatus::Failed).unwrap(), "\"failed\"");
-        assert_eq!(serde_json::to_string(&TaskStatus::Timeout).unwrap(), "\"timeout\"");
-        assert_eq!(serde_json::to_string(&TaskStatus::Cancelled).unwrap(), "\"cancelled\"");
+        assert_eq!(
+            serde_json::to_string(&TaskStatus::Pending).unwrap(),
+            "\"pending\""
+        );
+        assert_eq!(
+            serde_json::to_string(&TaskStatus::Assigned).unwrap(),
+            "\"assigned\""
+        );
+        assert_eq!(
+            serde_json::to_string(&TaskStatus::Running).unwrap(),
+            "\"running\""
+        );
+        assert_eq!(
+            serde_json::to_string(&TaskStatus::Paused).unwrap(),
+            "\"paused\""
+        );
+        assert_eq!(
+            serde_json::to_string(&TaskStatus::Blocked).unwrap(),
+            "\"blocked\""
+        );
+        assert_eq!(
+            serde_json::to_string(&TaskStatus::Completed).unwrap(),
+            "\"completed\""
+        );
+        assert_eq!(
+            serde_json::to_string(&TaskStatus::Failed).unwrap(),
+            "\"failed\""
+        );
+        assert_eq!(
+            serde_json::to_string(&TaskStatus::Timeout).unwrap(),
+            "\"timeout\""
+        );
+        assert_eq!(
+            serde_json::to_string(&TaskStatus::Cancelled).unwrap(),
+            "\"cancelled\""
+        );
     }
 
     #[test]
     fn task_status_deserializes_from_camel_case() {
-        assert_eq!(serde_json::from_str::<TaskStatus>("\"pending\"").unwrap(), TaskStatus::Pending);
-        assert_eq!(serde_json::from_str::<TaskStatus>("\"assigned\"").unwrap(), TaskStatus::Assigned);
-        assert_eq!(serde_json::from_str::<TaskStatus>("\"paused\"").unwrap(), TaskStatus::Paused);
-        assert_eq!(serde_json::from_str::<TaskStatus>("\"blocked\"").unwrap(), TaskStatus::Blocked);
-        assert_eq!(serde_json::from_str::<TaskStatus>("\"cancelled\"").unwrap(), TaskStatus::Cancelled);
+        assert_eq!(
+            serde_json::from_str::<TaskStatus>("\"pending\"").unwrap(),
+            TaskStatus::Pending
+        );
+        assert_eq!(
+            serde_json::from_str::<TaskStatus>("\"assigned\"").unwrap(),
+            TaskStatus::Assigned
+        );
+        assert_eq!(
+            serde_json::from_str::<TaskStatus>("\"paused\"").unwrap(),
+            TaskStatus::Paused
+        );
+        assert_eq!(
+            serde_json::from_str::<TaskStatus>("\"blocked\"").unwrap(),
+            TaskStatus::Blocked
+        );
+        assert_eq!(
+            serde_json::from_str::<TaskStatus>("\"cancelled\"").unwrap(),
+            TaskStatus::Cancelled
+        );
     }
 
     // ─── Level ──────────────────────────────────────────────────────────
@@ -807,9 +978,18 @@ mod tests {
 
     #[test]
     fn series_mode_serializes_to_kebab_case() {
-        assert_eq!(serde_json::to_string(&SeriesMode::KeepAll).unwrap(), "\"keep-all\"");
-        assert_eq!(serde_json::to_string(&SeriesMode::Accumulate).unwrap(), "\"accumulate\"");
-        assert_eq!(serde_json::to_string(&SeriesMode::Latest).unwrap(), "\"latest\"");
+        assert_eq!(
+            serde_json::to_string(&SeriesMode::KeepAll).unwrap(),
+            "\"keep-all\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SeriesMode::Accumulate).unwrap(),
+            "\"accumulate\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SeriesMode::Latest).unwrap(),
+            "\"latest\""
+        );
     }
 
     #[test]
@@ -824,17 +1004,50 @@ mod tests {
 
     #[test]
     fn permission_scope_serializes_with_colon_notation() {
-        assert_eq!(serde_json::to_string(&PermissionScope::TaskCreate).unwrap(), "\"task:create\"");
-        assert_eq!(serde_json::to_string(&PermissionScope::TaskManage).unwrap(), "\"task:manage\"");
-        assert_eq!(serde_json::to_string(&PermissionScope::EventPublish).unwrap(), "\"event:publish\"");
-        assert_eq!(serde_json::to_string(&PermissionScope::EventSubscribe).unwrap(), "\"event:subscribe\"");
-        assert_eq!(serde_json::to_string(&PermissionScope::EventHistory).unwrap(), "\"event:history\"");
-        assert_eq!(serde_json::to_string(&PermissionScope::WebhookCreate).unwrap(), "\"webhook:create\"");
-        assert_eq!(serde_json::to_string(&PermissionScope::WorkerConnect).unwrap(), "\"worker:connect\"");
-        assert_eq!(serde_json::to_string(&PermissionScope::WorkerManage).unwrap(), "\"worker:manage\"");
-        assert_eq!(serde_json::to_string(&PermissionScope::TaskResolve).unwrap(), "\"task:resolve\"");
-        assert_eq!(serde_json::to_string(&PermissionScope::TaskSignal).unwrap(), "\"task:signal\"");
-        assert_eq!(serde_json::to_string(&PermissionScope::All).unwrap(), "\"*\"");
+        assert_eq!(
+            serde_json::to_string(&PermissionScope::TaskCreate).unwrap(),
+            "\"task:create\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PermissionScope::TaskManage).unwrap(),
+            "\"task:manage\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PermissionScope::EventPublish).unwrap(),
+            "\"event:publish\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PermissionScope::EventSubscribe).unwrap(),
+            "\"event:subscribe\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PermissionScope::EventHistory).unwrap(),
+            "\"event:history\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PermissionScope::WebhookCreate).unwrap(),
+            "\"webhook:create\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PermissionScope::WorkerConnect).unwrap(),
+            "\"worker:connect\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PermissionScope::WorkerManage).unwrap(),
+            "\"worker:manage\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PermissionScope::TaskResolve).unwrap(),
+            "\"task:resolve\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PermissionScope::TaskSignal).unwrap(),
+            "\"task:signal\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PermissionScope::All).unwrap(),
+            "\"*\""
+        );
     }
 
     #[test]
@@ -849,18 +1062,36 @@ mod tests {
 
     #[test]
     fn backoff_strategy_serializes_correctly() {
-        assert_eq!(serde_json::to_string(&BackoffStrategy::Fixed).unwrap(), "\"fixed\"");
-        assert_eq!(serde_json::to_string(&BackoffStrategy::Exponential).unwrap(), "\"exponential\"");
-        assert_eq!(serde_json::to_string(&BackoffStrategy::Linear).unwrap(), "\"linear\"");
+        assert_eq!(
+            serde_json::to_string(&BackoffStrategy::Fixed).unwrap(),
+            "\"fixed\""
+        );
+        assert_eq!(
+            serde_json::to_string(&BackoffStrategy::Exponential).unwrap(),
+            "\"exponential\""
+        );
+        assert_eq!(
+            serde_json::to_string(&BackoffStrategy::Linear).unwrap(),
+            "\"linear\""
+        );
     }
 
     // ─── CleanupTarget ──────────────────────────────────────────────────
 
     #[test]
     fn cleanup_target_serializes_correctly() {
-        assert_eq!(serde_json::to_string(&CleanupTarget::All).unwrap(), "\"all\"");
-        assert_eq!(serde_json::to_string(&CleanupTarget::Events).unwrap(), "\"events\"");
-        assert_eq!(serde_json::to_string(&CleanupTarget::Task).unwrap(), "\"task\"");
+        assert_eq!(
+            serde_json::to_string(&CleanupTarget::All).unwrap(),
+            "\"all\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CleanupTarget::Events).unwrap(),
+            "\"events\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CleanupTarget::Task).unwrap(),
+            "\"task\""
+        );
     }
 
     // ─── TaskError ──────────────────────────────────────────────────────
@@ -886,11 +1117,14 @@ mod tests {
             details: Some(details),
         };
         let json = serde_json::to_value(&err).unwrap();
-        assert_eq!(json, json!({
-            "code": "ERR_001",
-            "message": "something broke",
-            "details": { "key": "value" }
-        }));
+        assert_eq!(
+            json,
+            json!({
+                "code": "ERR_001",
+                "message": "something broke",
+                "details": { "key": "value" }
+            })
+        );
     }
 
     // ─── Task (minimal) ─────────────────────────────────────────────────
@@ -1024,7 +1258,10 @@ mod tests {
         assert_eq!(json["error"]["message"], "fail");
 
         // authConfig
-        assert_eq!(json["authConfig"]["rules"][0]["match"]["scope"][0], "task:create");
+        assert_eq!(
+            json["authConfig"]["rules"][0]["match"]["scope"][0],
+            "task:create"
+        );
         assert_eq!(json["authConfig"]["rules"][0]["require"]["sub"][0], "user1");
 
         // webhooks
@@ -1039,8 +1276,14 @@ mod tests {
 
         // cleanup
         assert_eq!(json["cleanup"]["rules"][0]["name"], "cleanup-old");
-        assert_eq!(json["cleanup"]["rules"][0]["match"]["taskTypes"][0], "crawl");
-        assert_eq!(json["cleanup"]["rules"][0]["match"]["status"][0], "completed");
+        assert_eq!(
+            json["cleanup"]["rules"][0]["match"]["taskTypes"][0],
+            "crawl"
+        );
+        assert_eq!(
+            json["cleanup"]["rules"][0]["match"]["status"][0],
+            "completed"
+        );
         assert_eq!(json["cleanup"]["rules"][0]["trigger"]["afterMs"], 86400000);
         assert_eq!(json["cleanup"]["rules"][0]["target"], "all");
     }
@@ -1641,7 +1884,9 @@ mod tests {
                 rules: vec![CleanupRule {
                     name: None,
                     r#match: None,
-                    trigger: CleanupTrigger { after_ms: Some(1000) },
+                    trigger: CleanupTrigger {
+                        after_ms: Some(1000),
+                    },
                     target: CleanupTarget::Task,
                     event_filter: None,
                 }],
@@ -1693,27 +1938,60 @@ mod tests {
     fn taskcast_hooks_default_impls_do_not_panic() {
         let hooks = NoopHooks;
         let task = Task {
-            id: "t".to_string(), r#type: None, status: TaskStatus::Failed,
-            params: None, result: None, error: None, metadata: None,
-            created_at: 0.0, updated_at: 0.0, completed_at: None, ttl: None,
-            auth_config: None, webhooks: None, cleanup: None,
-            tags: None, assign_mode: None, cost: None,
-            assigned_worker: None, disconnect_policy: None,
-            reason: None, resume_at: None, blocked_request: None,
+            id: "t".to_string(),
+            r#type: None,
+            status: TaskStatus::Failed,
+            params: None,
+            result: None,
+            error: None,
+            metadata: None,
+            created_at: 0.0,
+            updated_at: 0.0,
+            completed_at: None,
+            ttl: None,
+            auth_config: None,
+            webhooks: None,
+            cleanup: None,
+            tags: None,
+            assign_mode: None,
+            cost: None,
+            assigned_worker: None,
+            disconnect_policy: None,
+            reason: None,
+            resume_at: None,
+            blocked_request: None,
         };
-        let err = TaskError { code: None, message: "boom".to_string(), details: None };
+        let err = TaskError {
+            code: None,
+            message: "boom".to_string(),
+            details: None,
+        };
         let event = TaskEvent {
-            id: "e".to_string(), task_id: "t".to_string(), index: 0,
-            timestamp: 0.0, r#type: "x".to_string(), level: Level::Info,
-            data: json!(null), series_id: None, series_mode: None,
-            series_acc_field: None, series_snapshot: None, _accumulated_data: None,
+            id: "e".to_string(),
+            task_id: "t".to_string(),
+            index: 0,
+            timestamp: 0.0,
+            r#type: "x".to_string(),
+            level: Level::Info,
+            data: json!(null),
+            series_id: None,
+            series_mode: None,
+            series_acc_field: None,
+            series_snapshot: None,
+            _accumulated_data: None,
         };
         let webhook = WebhookConfig {
             url: "https://example.com".to_string(),
-            filter: None, secret: None, wrap: None, retry: None,
+            filter: None,
+            secret: None,
+            wrap: None,
+            retry: None,
         };
         let io_err: Box<dyn std::error::Error + Send + Sync> = "io error".into();
-        let ctx = ErrorContext { operation: "test".to_string(), task_id: None };
+        let ctx = ErrorContext {
+            operation: "test".to_string(),
+            task_id: None,
+        };
 
         hooks.on_task_failed(&task, &err);
         hooks.on_task_timeout(&task);
@@ -1731,26 +2009,136 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ShortTermStore for StubStore {
-        async fn save_task(&self, _: Task) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
-        async fn get_task(&self, _: &str) -> Result<Option<Task>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
-        async fn append_event(&self, _: &str, _: TaskEvent) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
-        async fn get_events(&self, _: &str, _: Option<EventQueryOptions>) -> Result<Vec<TaskEvent>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
-        async fn set_ttl(&self, _: &str, _: u64) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
-        async fn get_series_latest(&self, _: &str, _: &str) -> Result<Option<TaskEvent>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
-        async fn set_series_latest(&self, _: &str, _: &str, _: TaskEvent) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
-        async fn replace_last_series_event(&self, _: &str, _: &str, _: TaskEvent) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
-        async fn accumulate_series(&self, _: &str, _: &str, event: TaskEvent, _: &str) -> Result<TaskEvent, Box<dyn std::error::Error + Send + Sync>> { Ok(event) }
-        async fn next_index(&self, _: &str) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> { Ok(0) }
-        async fn list_tasks(&self, _: TaskFilter) -> Result<Vec<Task>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
-        async fn save_worker(&self, _: Worker) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
-        async fn get_worker(&self, _: &str) -> Result<Option<Worker>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
-        async fn list_workers(&self, _: Option<WorkerFilter>) -> Result<Vec<Worker>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
-        async fn delete_worker(&self, _: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
-        async fn claim_task(&self, _: &str, _: &str, _: u32) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> { Ok(false) }
-        async fn add_assignment(&self, _: WorkerAssignment) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
-        async fn remove_assignment(&self, _: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { Ok(()) }
-        async fn get_worker_assignments(&self, _: &str) -> Result<Vec<WorkerAssignment>, Box<dyn std::error::Error + Send + Sync>> { Ok(vec![]) }
-        async fn get_task_assignment(&self, _: &str) -> Result<Option<WorkerAssignment>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
+        async fn save_task(&self, _: Task) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        async fn get_task(
+            &self,
+            _: &str,
+        ) -> Result<Option<Task>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(None)
+        }
+        async fn append_event(
+            &self,
+            _: &str,
+            _: TaskEvent,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        async fn get_events(
+            &self,
+            _: &str,
+            _: Option<EventQueryOptions>,
+        ) -> Result<Vec<TaskEvent>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(vec![])
+        }
+        async fn set_ttl(
+            &self,
+            _: &str,
+            _: u64,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        async fn get_series_latest(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Option<TaskEvent>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(None)
+        }
+        async fn set_series_latest(
+            &self,
+            _: &str,
+            _: &str,
+            _: TaskEvent,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        async fn replace_last_series_event(
+            &self,
+            _: &str,
+            _: &str,
+            _: TaskEvent,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        async fn accumulate_series(
+            &self,
+            _: &str,
+            _: &str,
+            event: TaskEvent,
+            _: &str,
+        ) -> Result<TaskEvent, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(event)
+        }
+        async fn next_index(
+            &self,
+            _: &str,
+        ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(0)
+        }
+        async fn list_tasks(
+            &self,
+            _: TaskFilter,
+        ) -> Result<Vec<Task>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(vec![])
+        }
+        async fn save_worker(
+            &self,
+            _: Worker,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        async fn get_worker(
+            &self,
+            _: &str,
+        ) -> Result<Option<Worker>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(None)
+        }
+        async fn list_workers(
+            &self,
+            _: Option<WorkerFilter>,
+        ) -> Result<Vec<Worker>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(vec![])
+        }
+        async fn delete_worker(
+            &self,
+            _: &str,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        async fn claim_task(
+            &self,
+            _: &str,
+            _: &str,
+            _: u32,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(false)
+        }
+        async fn add_assignment(
+            &self,
+            _: WorkerAssignment,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        async fn remove_assignment(
+            &self,
+            _: &str,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        async fn get_worker_assignments(
+            &self,
+            _: &str,
+        ) -> Result<Vec<WorkerAssignment>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(vec![])
+        }
+        async fn get_task_assignment(
+            &self,
+            _: &str,
+        ) -> Result<Option<WorkerAssignment>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(None)
+        }
         // clear_ttl and list_by_status: use defaults
     }
 
@@ -1771,12 +2159,27 @@ mod tests {
     async fn stub_store_all_methods_return_ok() {
         let store = StubStore;
         let task = Task {
-            id: "x".to_string(), r#type: None, status: TaskStatus::Pending,
-            params: None, result: None, error: None, metadata: None,
-            created_at: 0.0, updated_at: 0.0, completed_at: None, ttl: None,
-            auth_config: None, webhooks: None, cleanup: None, tags: None,
-            assign_mode: None, cost: None, assigned_worker: None,
-            disconnect_policy: None, reason: None, resume_at: None,
+            id: "x".to_string(),
+            r#type: None,
+            status: TaskStatus::Pending,
+            params: None,
+            result: None,
+            error: None,
+            metadata: None,
+            created_at: 0.0,
+            updated_at: 0.0,
+            completed_at: None,
+            ttl: None,
+            auth_config: None,
+            webhooks: None,
+            cleanup: None,
+            tags: None,
+            assign_mode: None,
+            cost: None,
+            assigned_worker: None,
+            disconnect_policy: None,
+            reason: None,
+            resume_at: None,
             blocked_request: None,
         };
         let event = TaskEvent {
@@ -1800,10 +2203,20 @@ mod tests {
         assert!(store.get_events("x", None).await.unwrap().is_empty());
         assert!(store.set_ttl("x", 60).await.is_ok());
         assert!(store.get_series_latest("x", "s").await.unwrap().is_none());
-        assert!(store.set_series_latest("x", "s", event.clone()).await.is_ok());
-        assert!(store.replace_last_series_event("x", "s", event).await.is_ok());
+        assert!(store
+            .set_series_latest("x", "s", event.clone())
+            .await
+            .is_ok());
+        assert!(store
+            .replace_last_series_event("x", "s", event)
+            .await
+            .is_ok());
         assert_eq!(store.next_index("x").await.unwrap(), 0);
-        assert!(store.list_tasks(TaskFilter::default()).await.unwrap().is_empty());
+        assert!(store
+            .list_tasks(TaskFilter::default())
+            .await
+            .unwrap()
+            .is_empty());
 
         let worker = Worker {
             id: "w".to_string(),

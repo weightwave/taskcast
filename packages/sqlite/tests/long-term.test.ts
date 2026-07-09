@@ -159,6 +159,77 @@ describe('SqliteLongTermStore', () => {
     expect(events[0]).toEqual(event)
   })
 
+  it('should compact latest series events in long-term storage', async () => {
+    await store.saveTask(makeTask())
+    const first: TaskEvent = {
+      ...makeEvent('task-1', 0),
+      id: 'status-1',
+      type: 'task.status',
+      data: { status: 'starting' },
+      seriesId: 'status',
+      seriesMode: 'latest',
+    }
+    const second: TaskEvent = {
+      ...makeEvent('task-1', 1),
+      id: 'status-2',
+      type: 'task.status',
+      data: { status: 'ready' },
+      seriesId: 'status',
+      seriesMode: 'latest',
+    }
+
+    await store.replaceLastSeriesEvent('task-1', 'status', first)
+    await store.replaceLastSeriesEvent('task-1', 'status', second)
+
+    const events = await store.getEvents('task-1')
+    expect(events).toHaveLength(1)
+    expect(events[0]).toMatchObject({
+      id: 'status-1',
+      index: 0,
+      data: { status: 'ready' },
+      seriesId: 'status',
+      seriesMode: 'latest',
+    })
+  })
+
+  it('should compact accumulate series events in long-term storage', async () => {
+    await store.saveTask(makeTask())
+    const first: TaskEvent = {
+      ...makeEvent('task-1', 0),
+      id: 'output-1',
+      type: 'task.output',
+      data: { delta: 'hello ' },
+      seriesId: 'output',
+      seriesMode: 'accumulate',
+      seriesAccField: 'delta',
+    }
+    const second: TaskEvent = {
+      ...makeEvent('task-1', 1),
+      id: 'output-2',
+      type: 'task.output',
+      data: { delta: 'world' },
+      seriesId: 'output',
+      seriesMode: 'accumulate',
+      seriesAccField: 'delta',
+    }
+
+    await expect(store.accumulateSeries('task-1', 'output', first, 'delta')).resolves.toEqual(first)
+    await expect(store.accumulateSeries('task-1', 'output', second, 'delta')).resolves.toMatchObject({
+      data: { delta: 'hello world' },
+    })
+
+    const events = await store.getEvents('task-1')
+    expect(events).toHaveLength(1)
+    expect(events[0]).toMatchObject({
+      id: 'output-1',
+      index: 0,
+      data: { delta: 'hello world' },
+      seriesId: 'output',
+      seriesMode: 'accumulate',
+      seriesAccField: 'delta',
+    })
+  })
+
   it('should return empty array when no events exist', async () => {
     await store.saveTask(makeTask())
     const events = await store.getEvents('task-1')

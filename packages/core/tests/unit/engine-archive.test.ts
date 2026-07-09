@@ -45,6 +45,74 @@ function makeLongTermStore(
   }
 }
 
+type SeriesAwareLongTermStore = LongTermStore & {
+  replaceLastSeriesEvent: ReturnType<typeof vi.fn>
+  accumulateSeries: ReturnType<typeof vi.fn>
+}
+
+function makeSeriesAwareLongTermStore(events: TaskEvent[]): SeriesAwareLongTermStore {
+  const store = makeLongTermStore({
+    saveEvent: vi.fn(async (event: TaskEvent) => {
+      events.push({ ...event })
+    }),
+    getEvents: vi.fn(async () => events.map((event) => ({ ...event }))),
+  }) as SeriesAwareLongTermStore
+
+  store.replaceLastSeriesEvent = vi.fn(async (taskId: string, seriesId: string, event: TaskEvent) => {
+    const existingIndex = events.findIndex((candidate) => (
+      candidate.taskId === taskId &&
+      candidate.seriesId === seriesId &&
+      candidate.seriesMode === 'latest'
+    ))
+    if (existingIndex === -1) {
+      events.push({ ...event })
+      return
+    }
+
+    const existing = events[existingIndex]!
+    events[existingIndex] = {
+      ...event,
+      id: existing.id,
+      index: existing.index,
+    }
+  })
+
+  store.accumulateSeries = vi.fn(async (taskId: string, seriesId: string, event: TaskEvent, field: string) => {
+    const existingIndex = events.findIndex((candidate) => (
+      candidate.taskId === taskId &&
+      candidate.seriesId === seriesId &&
+      candidate.seriesMode === 'accumulate'
+    ))
+    if (existingIndex === -1) {
+      events.push({ ...event })
+      return event
+    }
+
+    const existing = events[existingIndex]!
+    const prevData = typeof existing.data === 'object' && existing.data !== null
+      ? existing.data as Record<string, unknown>
+      : {}
+    const newData = typeof event.data === 'object' && event.data !== null
+      ? event.data as Record<string, unknown>
+      : {}
+    const accumulated = (
+      typeof prevData[field] === 'string' &&
+      typeof newData[field] === 'string'
+    )
+      ? { ...event, data: { ...newData, [field]: prevData[field] + newData[field] } }
+      : event
+
+    events[existingIndex] = {
+      ...accumulated,
+      id: existing.id,
+      index: existing.index,
+    }
+    return accumulated
+  })
+
+  return store
+}
+
 describe('TaskEngine archive import/export', () => {
   it('exports task and events preserving original fields', async () => {
     const engine = makeEngine()
@@ -65,17 +133,12 @@ describe('TaskEngine archive import/export', () => {
     })
   })
 
-  it('exports full long-term latest-series history instead of compacted short-term history', async () => {
+  it('exports compacted latest-series history from long-term storage', async () => {
     const longTermEvents: TaskEvent[] = []
-    const longTermStore = makeLongTermStore({
-      saveEvent: vi.fn(async (event: TaskEvent) => {
-        longTermEvents.push({ ...event })
-      }),
-      getEvents: vi.fn(async () => longTermEvents),
-    })
+    const longTermStore = makeSeriesAwareLongTermStore(longTermEvents)
     const engine = makeEngine(new MemoryBroadcastProvider(), longTermStore)
     await engine.createTask({ id: 'task-1' })
-    const first = await engine.publishEvent('task-1', {
+    await engine.publishEvent('task-1', {
       type: 'task.status',
       level: 'info',
       data: { status: 'starting' },
@@ -91,21 +154,19 @@ describe('TaskEngine archive import/export', () => {
     })
 
     await expect(engine.getEvents('task-1')).resolves.toMatchObject([{ index: 1 }])
+    expect(longTermStore.replaceLastSeriesEvent).toHaveBeenCalledTimes(2)
+    expect(longTermEvents.map((event) => event.data)).toEqual([{ status: 'ready' }])
 
     const archive = await engine.exportTaskArchive('task-1')
 
-    expect(archive.events.map((event) => event.id)).toEqual([first.id, second.id])
-    expect(archive.events.map((event) => event.index)).toEqual([0, 1])
+    expect(archive.events.map((event) => event.id)).toEqual([second.id])
+    expect(archive.events.map((event) => event.index)).toEqual([0])
+    expect(archive.events.map((event) => event.data)).toEqual([{ status: 'ready' }])
   })
 
-  it('exports raw accumulate deltas instead of long-term accumulated values', async () => {
+  it('exports compacted accumulated series history from long-term storage', async () => {
     const longTermEvents: TaskEvent[] = []
-    const longTermStore = makeLongTermStore({
-      saveEvent: vi.fn(async (event: TaskEvent) => {
-        longTermEvents.push({ ...event })
-      }),
-      getEvents: vi.fn(async () => longTermEvents),
-    })
+    const longTermStore = makeSeriesAwareLongTermStore(longTermEvents)
     const engine = makeEngine(new MemoryBroadcastProvider(), longTermStore)
     await engine.createTask({ id: 'task-1' })
     await engine.publishEvent('task-1', {
@@ -125,21 +186,18 @@ describe('TaskEngine archive import/export', () => {
       seriesAccField: 'delta',
     })
 
-    expect(longTermEvents.map((event) => event.data)).toEqual([{ delta: 'hello ' }, { delta: 'hello world' }])
+    expect(longTermStore.accumulateSeries).toHaveBeenCalledTimes(2)
+    expect(longTermEvents.map((event) => event.data)).toEqual([{ delta: 'hello world' }])
 
     const archive = await engine.exportTaskArchive('task-1')
 
-    expect(archive.events.map((event) => event.data)).toEqual([{ delta: 'hello ' }, { delta: 'world' }])
+    expect(archive.events.map((event) => event.index)).toEqual([0])
+    expect(archive.events.map((event) => event.data)).toEqual([{ delta: 'hello world' }])
   })
 
-  it('exports mixed latest and accumulate series as a contiguous raw archive', async () => {
+  it('exports mixed latest and accumulate series as a compacted contiguous archive', async () => {
     const longTermEvents: TaskEvent[] = []
-    const longTermStore = makeLongTermStore({
-      saveEvent: vi.fn(async (event: TaskEvent) => {
-        longTermEvents.push({ ...event })
-      }),
-      getEvents: vi.fn(async () => longTermEvents),
-    })
+    const longTermStore = makeSeriesAwareLongTermStore(longTermEvents)
     const engine = makeEngine(new MemoryBroadcastProvider(), longTermStore)
     await engine.createTask({ id: 'task-1' })
     await engine.publishEvent('task-1', {
@@ -175,20 +233,16 @@ describe('TaskEngine archive import/export', () => {
 
     await expect(engine.getEvents('task-1')).resolves.toMatchObject([{ index: 1 }, { index: 2 }, { index: 3 }])
     expect(longTermEvents.map((event) => event.data)).toEqual([
-      { status: 'starting' },
       { status: 'ready' },
-      { delta: 'hello ' },
       { delta: 'hello world' },
     ])
 
     const archive = await engine.exportTaskArchive('task-1')
 
-    expect(archive.events.map((event) => event.index)).toEqual([0, 1, 2, 3])
+    expect(archive.events.map((event) => event.index)).toEqual([0, 1])
     expect(archive.events.map((event) => event.data)).toEqual([
-      { status: 'starting' },
       { status: 'ready' },
-      { delta: 'hello ' },
-      { delta: 'world' },
+      { delta: 'hello world' },
     ])
   })
 
@@ -212,7 +266,7 @@ describe('TaskEngine archive import/export', () => {
     expect(archive.events.map((event) => event.type)).toEqual(['demo.one', 'demo.two', 'demo.three'])
   })
 
-  it('rejects lagging latest-series long-term history that short-term compaction cannot recover', async () => {
+  it('recovers lagging latest-series long-term history from short-term state', async () => {
     const longTermEvents: TaskEvent[] = []
     const longTermStore = makeLongTermStore({
       saveEvent: vi.fn(async (event: TaskEvent) => {
@@ -245,7 +299,10 @@ describe('TaskEngine archive import/export', () => {
     })
     await expect(engine.getEvents('task-1')).resolves.toMatchObject([{ index: 2 }])
 
-    await expect(engine.exportTaskArchive('task-1')).rejects.toThrow(InvalidTaskArchiveError)
+    const archive = await engine.exportTaskArchive('task-1')
+
+    expect(archive.events.map((event) => event.index)).toEqual([0])
+    expect(archive.events.map((event) => event.data)).toEqual([{ status: 'ready' }])
   })
 
   it('does not mask corrupted non-empty long-term history with short-term fallback', async () => {
@@ -265,7 +322,7 @@ describe('TaskEngine archive import/export', () => {
     await expect(engine.exportTaskArchive('task-1')).rejects.toThrow(InvalidTaskArchiveError)
   })
 
-  it('rejects long-term accumulate events that have no matching short-term raw event', async () => {
+  it('exports compacted long-term accumulate events without matching short-term raw deltas', async () => {
     const longTermStore = makeLongTermStore({
       getEvents: vi.fn(async () => [
         {
@@ -285,7 +342,10 @@ describe('TaskEngine archive import/export', () => {
     const engine = makeEngine(new MemoryBroadcastProvider(), longTermStore)
     await engine.createTask({ id: 'task-1' })
 
-    await expect(engine.exportTaskArchive('task-1')).rejects.toThrow(InvalidTaskArchiveError)
+    const archive = await engine.exportTaskArchive('task-1')
+
+    expect(archive.events.map((event) => event.index)).toEqual([0])
+    expect(archive.events.map((event) => event.data)).toEqual([{ delta: 'hello world' }])
   })
 
   it('imports archive silently and allows publish to continue at the next index', async () => {
@@ -410,6 +470,62 @@ describe('TaskEngine archive import/export', () => {
     expect(resumedLatest?.data).toEqual({ delta: 'hello world!' })
   })
 
+  it('imports compacted exported series state so future publishes resume correctly', async () => {
+    const source = makeEngine()
+    await source.createTask({ id: 'task-1' })
+    await source.publishEvent('task-1', {
+      type: 'task.status',
+      level: 'info',
+      data: { status: 'starting' },
+      seriesId: 'status',
+      seriesMode: 'latest',
+    })
+    await source.publishEvent('task-1', {
+      type: 'task.status',
+      level: 'info',
+      data: { status: 'ready' },
+      seriesId: 'status',
+      seriesMode: 'latest',
+    })
+    await source.publishEvent('task-1', {
+      type: 'task.output',
+      level: 'info',
+      data: { delta: 'hello ' },
+      seriesId: 'output',
+      seriesMode: 'accumulate',
+      seriesAccField: 'delta',
+    })
+    await source.publishEvent('task-1', {
+      type: 'task.output',
+      level: 'info',
+      data: { delta: 'world' },
+      seriesId: 'output',
+      seriesMode: 'accumulate',
+      seriesAccField: 'delta',
+    })
+    const archive = await source.exportTaskArchive('task-1')
+    const target = makeEngine()
+
+    await target.importTaskArchive(archive)
+    const restoredStatus = await target.getSeriesLatest('task-1', 'status')
+    const restoredOutput = await target.getSeriesLatest('task-1', 'output')
+    const next = await target.publishEvent('task-1', {
+      type: 'task.output',
+      level: 'info',
+      data: { delta: '!' },
+      seriesId: 'output',
+      seriesMode: 'accumulate',
+      seriesAccField: 'delta',
+    })
+    const resumedOutput = await target.getSeriesLatest('task-1', 'output')
+
+    expect(archive.events.map((event) => event.index)).toEqual([0, 1])
+    expect(restoredStatus?.data).toEqual({ status: 'ready' })
+    expect(restoredOutput?.data).toEqual({ delta: 'hello world' })
+    expect(next.index).toBe(2)
+    expect(resumedOutput?.data).toEqual({ delta: 'hello world!' })
+  })
+
   it('export and import do not include or broadcast transient accumulated data', async () => {
     const source = makeEngine()
     await source.createTask({ id: 'task-1' })
@@ -437,8 +553,8 @@ describe('TaskEngine archive import/export', () => {
     await target.importTaskArchive(archive)
 
     expect(handler).not.toHaveBeenCalled()
-    expect(archive.events).toHaveLength(2)
-    expect(archive.events.map((event) => event.data)).toEqual([{ delta: 'hello ' }, { delta: 'world' }])
+    expect(archive.events).toHaveLength(1)
+    expect(archive.events.map((event) => event.data)).toEqual([{ delta: 'hello world' }])
     expect(archive.events.some((event) => '_accumulatedData' in event)).toBe(false)
   })
 

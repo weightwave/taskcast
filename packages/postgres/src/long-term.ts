@@ -83,6 +83,56 @@ export class PostgresLongTermStore implements LongTermStore {
     await this.saveEventWithClient(this.sql, event, 'ignore')
   }
 
+  async replaceLastSeriesEvent(taskId: string, seriesId: string, event: TaskEvent): Promise<void> {
+    await this.sql.begin(async (sql) => {
+      const tx = sql as unknown as PostgresClient
+      const existingEvents = await this.getSeriesEventsWithClient(tx, taskId, seriesId, 'latest')
+      const first = existingEvents[0]
+
+      if (!first) {
+        await this.saveEventWithClient(tx, event, 'ignore')
+        return
+      }
+
+      await this.updateStoredSeriesEventWithClient(tx, first, event)
+      await this.deleteDuplicateSeriesEventsWithClient(tx, taskId, seriesId, 'latest', first.id)
+    })
+  }
+
+  async accumulateSeries(taskId: string, seriesId: string, event: TaskEvent, field: string): Promise<TaskEvent> {
+    return this.sql.begin(async (sql) => {
+      const tx = sql as unknown as PostgresClient
+      const existingEvents = await this.getSeriesEventsWithClient(tx, taskId, seriesId, 'accumulate')
+      const first = existingEvents[0]
+      const previous = existingEvents[existingEvents.length - 1]
+
+      let accumulated = event
+      if (previous) {
+        const prevData = typeof previous.data === 'object' && previous.data !== null
+          ? previous.data as Record<string, unknown>
+          : {}
+        const newData = typeof event.data === 'object' && event.data !== null
+          ? event.data as Record<string, unknown>
+          : {}
+        if (typeof prevData[field] === 'string' && typeof newData[field] === 'string') {
+          accumulated = {
+            ...event,
+            data: { ...newData, [field]: prevData[field] + newData[field] },
+          }
+        }
+      }
+
+      if (!first) {
+        await this.saveEventWithClient(tx, accumulated, 'ignore')
+      } else {
+        await this.updateStoredSeriesEventWithClient(tx, first, accumulated)
+        await this.deleteDuplicateSeriesEventsWithClient(tx, taskId, seriesId, 'accumulate', first.id)
+      }
+
+      return accumulated
+    })
+  }
+
   private async saveEventWithClient(
     sql: PostgresClient,
     event: TaskEvent,
@@ -100,6 +150,56 @@ export class PostgresLongTermStore implements LongTermStore {
         ${event.seriesAccField ?? null}
       )
       ${onConflict === 'ignore' ? sql`ON CONFLICT (id) DO NOTHING` : sql``}
+    `
+  }
+
+  private async getSeriesEventsWithClient(
+    sql: PostgresClient,
+    taskId: string,
+    seriesId: string,
+    mode: SeriesMode,
+  ): Promise<TaskEvent[]> {
+    const rows = await sql`
+      SELECT * FROM ${sql(EVENTS)}
+      WHERE task_id = ${taskId}
+        AND series_id = ${seriesId}
+        AND series_mode = ${mode}
+      ORDER BY idx ASC
+    `
+    return rows.map((row) => this._rowToEvent(row))
+  }
+
+  private async updateStoredSeriesEventWithClient(
+    sql: PostgresClient,
+    existing: TaskEvent,
+    event: TaskEvent,
+  ): Promise<void> {
+    await sql`
+      UPDATE ${sql(EVENTS)}
+      SET timestamp = ${event.timestamp},
+          type = ${event.type},
+          level = ${event.level},
+          data = ${event.data != null ? sql.json(event.data as never) : null},
+          series_id = ${event.seriesId ?? null},
+          series_mode = ${event.seriesMode ?? null},
+          series_acc_field = ${event.seriesAccField ?? null}
+      WHERE id = ${existing.id}
+    `
+  }
+
+  private async deleteDuplicateSeriesEventsWithClient(
+    sql: PostgresClient,
+    taskId: string,
+    seriesId: string,
+    mode: SeriesMode,
+    keepEventId: string,
+  ): Promise<void> {
+    await sql`
+      DELETE FROM ${sql(EVENTS)}
+      WHERE task_id = ${taskId}
+        AND series_id = ${seriesId}
+        AND series_mode = ${mode}
+        AND id <> ${keepEventId}
     `
   }
 

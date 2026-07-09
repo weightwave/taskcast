@@ -16,6 +16,7 @@ import type {
   LongTermStore,
   TaskcastHooks,
   EventQueryOptions,
+  TaskArchiveEvent,
 } from './types.js'
 
 // ─── Error Classes ──────────────────────────────────────────────────────────
@@ -332,36 +333,39 @@ export class TaskEngine {
   }
 
   private mergeExportHistories(longTermEvents: TaskEvent[], shortTermEvents: TaskEvent[]): TaskEvent[] {
-    const rawEvents = new Map<string, TaskEvent>()
+    const shortTermEventsByIndex = new Map<number, TaskEvent>()
     for (const event of shortTermEvents) {
-      rawEvents.set(`${event.id}:${event.index}`, event)
+      shortTermEventsByIndex.set(event.index, event)
     }
 
-    const merged = longTermEvents.map((event) => {
-      if (event.seriesMode !== 'accumulate') {
-        return event
-      }
+    const longTermIndexes = new Set(longTermEvents.map((event) => event.index))
+    const maxLongTermIndex = Math.max(...longTermIndexes)
+    for (let index = 0; index <= maxLongTermIndex; index++) {
+      if (longTermIndexes.has(index)) continue
 
-      const rawEvent = rawEvents.get(`${event.id}:${event.index}`)
-      if (!rawEvent) {
+      const shortTermEvent = shortTermEventsByIndex.get(index)
+      if (shortTermEvent && !this.isCompactableSeriesEvent(shortTermEvent)) {
         throw new InvalidTaskArchiveError(
-          `Cannot export raw accumulate event ${event.id}; matching short-term delta is unavailable`,
+          `Cannot export sparse long-term history; missing durable non-series event at index ${index}`,
         )
       }
-      return rawEvent
-    })
+    }
+
+    const mergedByKey = new Map<string, TaskEvent>()
+    for (const event of longTermEvents) {
+      mergedByKey.set(`${event.id}:${event.index}`, event)
+    }
 
     const longTermPrefixEnd = this.getContiguousPrefixEnd(longTermEvents)
-    const longTermIndexes = new Set(longTermEvents.map((event) => event.index))
-    if (longTermIndexes.size === longTermEvents.length && longTermPrefixEnd === longTermIndexes.size - 1) {
-      for (const event of shortTermEvents) {
-        if (event.index > longTermPrefixEnd && !longTermIndexes.has(event.index)) {
-          merged.push(event)
-        }
+    for (const event of shortTermEvents) {
+      const key = `${event.id}:${event.index}`
+      if (mergedByKey.has(key)) continue
+      if (event.index > longTermPrefixEnd || this.isCompactableSeriesEvent(event)) {
+        mergedByKey.set(key, event)
       }
     }
 
-    return merged
+    return Array.from(mergedByKey.values())
   }
 
   private getContiguousPrefixEnd(events: TaskEvent[]): number {
@@ -377,16 +381,96 @@ export class TaskEngine {
     return expected - 1
   }
 
-  private normalizeExportArchive(task: Task, events: TaskEvent[]): TaskArchive {
+  private async normalizeExportArchive(task: Task, events: TaskEvent[]): Promise<TaskArchive> {
+    const compactedEvents = await this.compactExportEvents(task.id, events)
     const archive: TaskArchive = {
       schema: 'taskcast.taskArchive',
       version: 1,
       exportedAt: Date.now(),
       task: { ...task },
-      events: events.map((event) => ({ ...event })),
+      events: compactedEvents,
     }
 
     return normalizeTaskArchive(archive)
+  }
+
+  private async compactExportEvents(taskId: string, events: TaskEvent[]): Promise<TaskArchiveEvent[]> {
+    type ExportEntry = {
+      event: TaskEvent
+      firstIndex: number
+      lastIndex: number
+      order: number
+    }
+
+    const entries: ExportEntry[] = []
+    const seriesEntries = new Map<string, ExportEntry>()
+    const sorted = [...events].sort((a, b) => a.index - b.index)
+
+    for (const event of sorted) {
+      if (!this.isCompactableSeriesEvent(event)) {
+        entries.push({
+          event,
+          firstIndex: event.index,
+          lastIndex: event.index,
+          order: entries.length,
+        })
+        continue
+      }
+
+      const key = `${event.taskId}:${event.seriesId}`
+      const existing = seriesEntries.get(key)
+      if (!existing) {
+        const entry = {
+          event,
+          firstIndex: event.index,
+          lastIndex: event.index,
+          order: entries.length,
+        }
+        seriesEntries.set(key, entry)
+        entries.push(entry)
+        continue
+      }
+
+      if (event.index >= existing.lastIndex) {
+        existing.event = event
+        existing.lastIndex = event.index
+      }
+    }
+
+    for (const entry of seriesEntries.values()) {
+      const { event } = entry
+      if (!event.seriesId) continue
+
+      const shortTermLatest = await this.shortTermStore.getSeriesLatest(taskId, event.seriesId)
+      if (shortTermLatest && shortTermLatest.index >= entry.lastIndex) {
+        entry.event = shortTermLatest
+        entry.lastIndex = shortTermLatest.index
+      }
+    }
+
+    return entries
+      .sort((a, b) => (a.firstIndex - b.firstIndex) || (a.order - b.order))
+      .map((entry, index) => this.toArchiveEvent(entry.event, index))
+  }
+
+  private isCompactableSeriesEvent(event: TaskEvent): boolean {
+    return Boolean(event.seriesId && (event.seriesMode === 'latest' || event.seriesMode === 'accumulate'))
+  }
+
+  private toArchiveEvent(event: TaskEvent, index: number): TaskArchiveEvent {
+    const { id, taskId, timestamp, type, level, data, seriesId, seriesMode, seriesAccField } = event
+    return {
+      id,
+      taskId,
+      index,
+      timestamp,
+      type,
+      level,
+      data,
+      ...(seriesId !== undefined ? { seriesId } : {}),
+      ...(seriesMode !== undefined ? { seriesMode } : {}),
+      ...(seriesAccField !== undefined ? { seriesAccField } : {}),
+    }
   }
 
   async importTaskArchive(
@@ -499,14 +583,43 @@ export class TaskEngine {
     await this.broadcast.publish(taskId, broadcastEvent)
 
     if (this.longTermStore) {
-      // LongTermStore gets accumulated event (or delta if non-accumulate)
       const storeEvent = accumulatedEvent ?? event
-      this.longTermStore.saveEvent(storeEvent).catch((err) => {
+      this.persistLongTermEvent(event, accumulatedEvent).catch((err) => {
         this.hooks?.onEventDropped?.(storeEvent, String(err))
       })
     }
 
     return event
+  }
+
+  private async persistLongTermEvent(event: TaskEvent, accumulatedEvent?: TaskEvent): Promise<void> {
+    if (!this.longTermStore) return
+
+    if (
+      event.seriesId &&
+      event.seriesMode === 'latest' &&
+      typeof this.longTermStore.replaceLastSeriesEvent === 'function'
+    ) {
+      await this.longTermStore.replaceLastSeriesEvent(event.taskId, event.seriesId, event)
+      return
+    }
+
+    if (
+      event.seriesId &&
+      event.seriesMode === 'accumulate' &&
+      typeof this.longTermStore.accumulateSeries === 'function'
+    ) {
+      await this.longTermStore.accumulateSeries(
+        event.taskId,
+        event.seriesId,
+        event,
+        event.seriesAccField ?? 'delta',
+      )
+      return
+    }
+
+    // Compatibility fallback for older LongTermStore implementations.
+    await this.longTermStore.saveEvent(accumulatedEvent ?? event)
   }
 
 }

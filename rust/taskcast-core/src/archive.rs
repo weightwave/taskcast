@@ -68,7 +68,7 @@ pub fn validate_task_archive(archive: &TaskArchive) -> Result<TaskArchive, Archi
         }
         if event.index != expected_index as u64 {
             return Err(ArchiveError::invalid(format!(
-                "Archive events must be a complete un-compacted event stream with contiguous indexes from 0; expected {}, got {}",
+                "Archive events must have contiguous indexes from 0; expected {}, got {}",
                 expected_index, event.index
             )));
         }
@@ -147,13 +147,13 @@ fn validate_event_shape(event: &TaskEvent) -> Result<(), ArchiveError> {
 fn validate_raw_archive_event(event: &TaskEvent) -> Result<(), ArchiveError> {
     if event.series_snapshot.is_some() {
         return Err(ArchiveError::invalid(format!(
-            "Archive events must be complete raw delta events; series_snapshot is a collapsed presentation field on event {}",
+            "Archive events cannot include presentation fields; series_snapshot is a collapsed presentation field on event {}",
             event.id
         )));
     }
     if event._accumulated_data.is_some() {
         return Err(ArchiveError::invalid(format!(
-            "Archive events must be raw persisted deltas; _accumulated_data is a transient broadcast field on event {}",
+            "Archive events cannot include transient broadcast fields; _accumulated_data is transient on event {}",
             event.id
         )));
     }

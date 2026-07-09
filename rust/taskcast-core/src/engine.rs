@@ -14,9 +14,9 @@ use serde::{Deserialize, Serialize};
 use crate::state_machine::{can_transition, is_suspended, is_terminal};
 use crate::types::{
     AssignMode, BlockedRequest, BroadcastProvider, CleanupConfig, DisconnectPolicy,
-    EventQueryOptions, Level, LongTermStore, ShortTermStore, Task, TaskArchive,
-    TaskArchiveImportOptions, TaskArchiveImportResult, TaskAuthConfig, TaskFilter, TaskcastHooks,
-    TaskError, TaskEvent, TaskStatus, WebhookConfig,
+    EventQueryOptions, Level, LongTermStore, SeriesMode, ShortTermStore, Task, TaskArchive,
+    TaskArchiveImportOptions, TaskArchiveImportResult, TaskAuthConfig, TaskError, TaskEvent,
+    TaskFilter, TaskStatus, TaskcastHooks, WebhookConfig,
 };
 
 // ─── Error ───────────────────────────────────────────────────────────────────
@@ -229,8 +229,7 @@ impl TaskEngine {
         // Snapshot the Arc list, drop the lock, then invoke to prevent deadlock
         // if a listener calls add_creation_listener / remove_creation_listener.
         {
-            let listeners: Vec<CreationListener> =
-                self.creation_listeners.lock().unwrap().clone();
+            let listeners: Vec<CreationListener> = self.creation_listeners.lock().unwrap().clone();
             for listener in &listeners {
                 listener(&task);
             }
@@ -264,10 +263,7 @@ impl TaskEngine {
         let from = task.status.clone();
 
         if !can_transition(&from, &to) {
-            return Err(EngineError::InvalidTransition {
-                from,
-                to,
-            });
+            return Err(EngineError::InvalidTransition { from, to });
         }
 
         let now = now_millis();
@@ -406,7 +402,9 @@ impl TaskEngine {
         }
 
         // Emit taskcast:resolved event when going from blocked → running
-        if from == TaskStatus::Blocked && to == TaskStatus::Running && task.blocked_request.is_some()
+        if from == TaskStatus::Blocked
+            && to == TaskStatus::Running
+            && task.blocked_request.is_some()
         {
             let resolution = payload.as_ref().and_then(|p| p.result.clone());
             self.emit(
@@ -546,7 +544,10 @@ impl TaskEngine {
         task_id: &str,
         opts: Option<EventQueryOptions>,
     ) -> Result<Vec<TaskEvent>, EngineError> {
-        let from_short = self.short_term_store.get_events(task_id, opts.clone()).await?;
+        let from_short = self
+            .short_term_store
+            .get_events(task_id, opts.clone())
+            .await?;
         if !from_short.is_empty() {
             return Ok(from_short);
         }
@@ -600,11 +601,11 @@ impl TaskEngine {
             let long_term_events = long_term_store.get_events(&task.id, None).await?;
             if !long_term_events.is_empty() {
                 let merged = self.merge_export_histories(&long_term_events, &short_term_events)?;
-                return self.normalize_export_archive(task, merged);
+                return self.normalize_export_archive(task, merged).await;
             }
         }
 
-        self.normalize_export_archive(task, short_term_events)
+        self.normalize_export_archive(task, short_term_events).await
     }
 
     fn merge_export_histories(
@@ -612,60 +613,145 @@ impl TaskEngine {
         long_term_events: &[TaskEvent],
         short_term_events: &[TaskEvent],
     ) -> Result<Vec<TaskEvent>, EngineError> {
-        let raw_events: HashMap<(String, u64), TaskEvent> = short_term_events
+        let short_term_by_index: HashMap<u64, TaskEvent> = short_term_events
             .iter()
             .cloned()
-            .map(|event| ((event.id.clone(), event.index), event))
+            .map(|event| (event.index, event))
             .collect();
-
-        let mut merged = Vec::with_capacity(long_term_events.len() + short_term_events.len());
-        for event in long_term_events {
-            if event.series_mode == Some(crate::types::SeriesMode::Accumulate) {
-                let raw_event = raw_events
-                    .get(&(event.id.clone(), event.index))
-                    .cloned()
-                    .ok_or_else(|| {
-                        ArchiveError::Invalid(format!(
-                            "Cannot export raw accumulate event {}; matching short-term delta is unavailable",
-                            event.id
-                        ))
-                    })?;
-                merged.push(raw_event);
-            } else {
-                merged.push(event.clone());
-            }
-        }
 
         let long_term_indexes: HashSet<u64> =
             long_term_events.iter().map(|event| event.index).collect();
-        let prefix_len = contiguous_prefix_len(long_term_events);
-        if long_term_indexes.len() == long_term_events.len()
-            && prefix_len == long_term_events.len() as u64
-        {
-            for event in short_term_events {
-                if event.index >= prefix_len && !long_term_indexes.contains(&event.index) {
-                    merged.push(event.clone());
+        if let Some(max_index) = long_term_indexes.iter().copied().max() {
+            for index in 0..=max_index {
+                if long_term_indexes.contains(&index) {
+                    continue;
                 }
+                if let Some(short_term_event) = short_term_by_index.get(&index) {
+                    if !is_compactable_series_event(short_term_event) {
+                        return Err(ArchiveError::Invalid(format!(
+                            "Cannot export sparse long-term history; missing durable non-series event at index {index}",
+                        ))
+                        .into());
+                    }
+                }
+            }
+        }
+
+        let mut merged = long_term_events.to_vec();
+        let mut merged_keys: HashSet<(String, u64)> = long_term_events
+            .iter()
+            .map(|event| (event.id.clone(), event.index))
+            .collect();
+        let prefix_len = contiguous_prefix_len(long_term_events);
+        for event in short_term_events {
+            let key = (event.id.clone(), event.index);
+            if merged_keys.contains(&key) {
+                continue;
+            }
+            if event.index >= prefix_len || is_compactable_series_event(event) {
+                merged.push(event.clone());
+                merged_keys.insert(key);
             }
         }
 
         Ok(merged)
     }
 
-    fn normalize_export_archive(
+    async fn normalize_export_archive(
         &self,
         task: &Task,
         events: Vec<TaskEvent>,
     ) -> Result<TaskArchive, EngineError> {
+        let compacted_events = self.compact_export_events(&task.id, events).await?;
         let archive = TaskArchive {
             schema: TASK_ARCHIVE_SCHEMA.to_string(),
             version: TASK_ARCHIVE_VERSION,
             exported_at: now_millis(),
             task: task.clone(),
-            events: events.into_iter().map(sanitize_task_archive_event).collect(),
+            events: compacted_events,
         };
 
         Ok(validate_task_archive(&archive)?)
+    }
+
+    async fn compact_export_events(
+        &self,
+        task_id: &str,
+        events: Vec<TaskEvent>,
+    ) -> Result<Vec<TaskEvent>, EngineError> {
+        #[derive(Clone)]
+        struct ExportEntry {
+            event: TaskEvent,
+            first_index: u64,
+            last_index: u64,
+            order: usize,
+        }
+
+        let mut entries = Vec::<ExportEntry>::new();
+        let mut series_entries = HashMap::<String, usize>::new();
+        let mut sorted = events;
+        sorted.sort_by_key(|event| event.index);
+
+        for event in sorted {
+            if !is_compactable_series_event(&event) {
+                entries.push(ExportEntry {
+                    first_index: event.index,
+                    last_index: event.index,
+                    order: entries.len(),
+                    event,
+                });
+                continue;
+            }
+
+            let key = format!(
+                "{}:{}",
+                event.task_id,
+                event.series_id.as_deref().unwrap_or_default()
+            );
+            if let Some(existing_index) = series_entries.get(&key).copied() {
+                let existing = &mut entries[existing_index];
+                if event.index >= existing.last_index {
+                    existing.last_index = event.index;
+                    existing.event = event;
+                }
+            } else {
+                let entry_index = entries.len();
+                series_entries.insert(key, entry_index);
+                entries.push(ExportEntry {
+                    first_index: event.index,
+                    last_index: event.index,
+                    order: entry_index,
+                    event,
+                });
+            }
+        }
+
+        for entry_index in series_entries.values().copied() {
+            let series_id = entries[entry_index].event.series_id.clone();
+            if let Some(series_id) = series_id {
+                let latest = self
+                    .short_term_store
+                    .get_series_latest(task_id, &series_id)
+                    .await?;
+                if let Some(latest) = latest {
+                    if latest.index >= entries[entry_index].last_index {
+                        entries[entry_index].last_index = latest.index;
+                        entries[entry_index].event = latest;
+                    }
+                }
+            }
+        }
+
+        entries.sort_by_key(|entry| (entry.first_index, entry.order));
+        Ok(entries
+            .into_iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let mut event = sanitize_task_archive_event(entry.event);
+                event.index = index as u64;
+                event
+            })
+            .collect())
     }
 
     async fn emit(
@@ -724,11 +810,16 @@ impl TaskEngine {
 
         if let Some(ref long_term_store) = self.long_term_store {
             let long_term_store = Arc::clone(long_term_store);
-            // LongTermStore gets accumulated event (or delta if non-accumulate)
-            let store_event = series_result.accumulated_event.unwrap_or_else(|| event.clone());
+            let raw_event = event.clone();
+            let accumulated_event = series_result.accumulated_event.clone();
+            let store_event = accumulated_event
+                .clone()
+                .unwrap_or_else(|| raw_event.clone());
             let hooks = self.hooks.clone();
             tokio::spawn(async move {
-                if let Err(err) = long_term_store.save_event(store_event.clone()).await {
+                if let Err(err) =
+                    persist_long_term_event(long_term_store, raw_event, accumulated_event).await
+                {
                     if let Some(hooks) = hooks {
                         hooks.on_event_dropped(&store_event, &err.to_string());
                     }
@@ -738,7 +829,51 @@ impl TaskEngine {
 
         Ok(event)
     }
+}
 
+async fn persist_long_term_event(
+    long_term_store: Arc<dyn LongTermStore>,
+    event: TaskEvent,
+    accumulated_event: Option<TaskEvent>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if long_term_store.supports_series_compaction() {
+        if let (Some(series_id), Some(series_mode)) =
+            (event.series_id.clone(), event.series_mode.clone())
+        {
+            match series_mode {
+                SeriesMode::Latest => {
+                    let task_id = event.task_id.clone();
+                    return long_term_store
+                        .replace_last_series_event(&task_id, &series_id, event)
+                        .await;
+                }
+                SeriesMode::Accumulate => {
+                    let task_id = event.task_id.clone();
+                    let field = event
+                        .series_acc_field
+                        .clone()
+                        .unwrap_or_else(|| "delta".to_string());
+                    long_term_store
+                        .accumulate_series(&task_id, &series_id, event, &field)
+                        .await?;
+                    return Ok(());
+                }
+                SeriesMode::KeepAll => {}
+            }
+        }
+    }
+
+    long_term_store
+        .save_event(accumulated_event.unwrap_or(event))
+        .await
+}
+
+fn is_compactable_series_event(event: &TaskEvent) -> bool {
+    event.series_id.is_some()
+        && matches!(
+            event.series_mode,
+            Some(SeriesMode::Latest) | Some(SeriesMode::Accumulate)
+        )
 }
 
 fn now_millis() -> f64 {
@@ -779,6 +914,8 @@ mod tests {
     struct MockLongTermStore {
         tasks: TokioRwLock<HashMap<String, Task>>,
         events: TokioRwLock<Vec<TaskEvent>>,
+        replace_latest_calls: AtomicU64,
+        accumulate_calls: AtomicU64,
         fail_save_event: bool,
     }
 
@@ -787,6 +924,8 @@ mod tests {
             Self {
                 tasks: TokioRwLock::new(HashMap::new()),
                 events: TokioRwLock::new(Vec::new()),
+                replace_latest_calls: AtomicU64::new(0),
+                accumulate_calls: AtomicU64::new(0),
                 fail_save_event: false,
             }
         }
@@ -795,6 +934,8 @@ mod tests {
             Self {
                 tasks: TokioRwLock::new(HashMap::new()),
                 events: TokioRwLock::new(Vec::new()),
+                replace_latest_calls: AtomicU64::new(0),
+                accumulate_calls: AtomicU64::new(0),
                 fail_save_event: true,
             }
         }
@@ -802,16 +943,25 @@ mod tests {
 
     #[async_trait::async_trait]
     impl LongTermStore for MockLongTermStore {
-        async fn save_task(&self, task: Task) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        async fn save_task(
+            &self,
+            task: Task,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             self.tasks.write().await.insert(task.id.clone(), task);
             Ok(())
         }
 
-        async fn get_task(&self, task_id: &str) -> Result<Option<Task>, Box<dyn std::error::Error + Send + Sync>> {
+        async fn get_task(
+            &self,
+            task_id: &str,
+        ) -> Result<Option<Task>, Box<dyn std::error::Error + Send + Sync>> {
             Ok(self.tasks.read().await.get(task_id).cloned())
         }
 
-        async fn save_event(&self, event: TaskEvent) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        async fn save_event(
+            &self,
+            event: TaskEvent,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             if self.fail_save_event {
                 return Err("mock save_event failure".into());
             }
@@ -819,16 +969,116 @@ mod tests {
             Ok(())
         }
 
-        async fn get_events(&self, task_id: &str, _opts: Option<EventQueryOptions>) -> Result<Vec<TaskEvent>, Box<dyn std::error::Error + Send + Sync>> {
-            let events = self.events.read().await;
-            Ok(events.iter().filter(|e| e.task_id == task_id).cloned().collect())
-        }
-
-        async fn save_worker_event(&self, _event: WorkerAuditEvent) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        async fn replace_last_series_event(
+            &self,
+            _task_id: &str,
+            _series_id: &str,
+            event: TaskEvent,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.replace_latest_calls.fetch_add(1, Ordering::SeqCst);
+            let mut events = self.events.write().await;
+            let existing_index = events.iter().position(|candidate| {
+                candidate.task_id == event.task_id
+                    && candidate.series_id == event.series_id
+                    && candidate.series_mode == Some(SeriesMode::Latest)
+            });
+            if let Some(existing_index) = existing_index {
+                let existing = events[existing_index].clone();
+                events[existing_index] = TaskEvent {
+                    id: existing.id,
+                    index: existing.index,
+                    ..event
+                };
+            } else {
+                events.push(event);
+            }
             Ok(())
         }
 
-        async fn get_worker_events(&self, _worker_id: &str, _opts: Option<EventQueryOptions>) -> Result<Vec<WorkerAuditEvent>, Box<dyn std::error::Error + Send + Sync>> {
+        async fn accumulate_series(
+            &self,
+            _task_id: &str,
+            _series_id: &str,
+            event: TaskEvent,
+            field: &str,
+        ) -> Result<TaskEvent, Box<dyn std::error::Error + Send + Sync>> {
+            self.accumulate_calls.fetch_add(1, Ordering::SeqCst);
+            let mut events = self.events.write().await;
+            let existing_index = events.iter().position(|candidate| {
+                candidate.task_id == event.task_id
+                    && candidate.series_id == event.series_id
+                    && candidate.series_mode == Some(SeriesMode::Accumulate)
+            });
+
+            let accumulated = if let Some(existing_index) = existing_index {
+                let existing = events[existing_index].clone();
+                let previous = existing
+                    .data
+                    .as_object()
+                    .and_then(|data| data.get(field))
+                    .and_then(|value| value.as_str());
+                let current = event
+                    .data
+                    .as_object()
+                    .and_then(|data| data.get(field))
+                    .and_then(|value| value.as_str());
+                let accumulated = match (previous, current) {
+                    (Some(previous), Some(current)) => {
+                        let mut data = event.data.as_object().cloned().unwrap_or_default();
+                        data.insert(
+                            field.to_string(),
+                            serde_json::Value::String(format!("{previous}{current}")),
+                        );
+                        TaskEvent {
+                            data: serde_json::Value::Object(data),
+                            ..event
+                        }
+                    }
+                    _ => event,
+                };
+                events[existing_index] = TaskEvent {
+                    id: existing.id,
+                    index: existing.index,
+                    ..accumulated.clone()
+                };
+                accumulated
+            } else {
+                events.push(event.clone());
+                event
+            };
+
+            Ok(accumulated)
+        }
+
+        async fn get_events(
+            &self,
+            task_id: &str,
+            _opts: Option<EventQueryOptions>,
+        ) -> Result<Vec<TaskEvent>, Box<dyn std::error::Error + Send + Sync>> {
+            let events = self.events.read().await;
+            Ok(events
+                .iter()
+                .filter(|e| e.task_id == task_id)
+                .cloned()
+                .collect())
+        }
+
+        fn supports_series_compaction(&self) -> bool {
+            true
+        }
+
+        async fn save_worker_event(
+            &self,
+            _event: WorkerAuditEvent,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+
+        async fn get_worker_events(
+            &self,
+            _worker_id: &str,
+            _opts: Option<EventQueryOptions>,
+        ) -> Result<Vec<WorkerAuditEvent>, Box<dyn std::error::Error + Send + Sync>> {
             Ok(Vec::new())
         }
     }
@@ -841,7 +1091,9 @@ mod tests {
 
     impl MockHooks {
         fn new() -> Self {
-            Self { dropped_count: AtomicU64::new(0) }
+            Self {
+                dropped_count: AtomicU64::new(0),
+            }
         }
     }
 
@@ -874,7 +1126,10 @@ mod tests {
     #[tokio::test]
     async fn create_task_generates_id_and_sets_status_pending() {
         let engine = make_engine();
-        let task = engine.create_task(CreateTaskInput::default()).await.unwrap();
+        let task = engine
+            .create_task(CreateTaskInput::default())
+            .await
+            .unwrap();
 
         assert!(!task.id.is_empty());
         assert_eq!(task.status, TaskStatus::Pending);
@@ -1487,8 +1742,7 @@ mod tests {
         let tasks = engine.list_tasks(TaskFilter::default()).await.unwrap();
         assert_eq!(tasks.len(), 3);
 
-        let ids: std::collections::HashSet<String> =
-            tasks.iter().map(|t| t.id.clone()).collect();
+        let ids: std::collections::HashSet<String> = tasks.iter().map(|t| t.id.clone()).collect();
         assert!(ids.contains("t1"));
         assert!(ids.contains("t2"));
         assert!(ids.contains("t3"));
@@ -1564,7 +1818,10 @@ mod tests {
     #[tokio::test]
     async fn concurrent_publish_event_maintains_unique_monotonic_indices() {
         let engine = make_shared_engine();
-        let task = engine.create_task(CreateTaskInput::default()).await.unwrap();
+        let task = engine
+            .create_task(CreateTaskInput::default())
+            .await
+            .unwrap();
         engine
             .transition_task(&task.id, TaskStatus::Running, None)
             .await
@@ -1618,7 +1875,10 @@ mod tests {
     #[tokio::test]
     async fn concurrent_status_transitions_final_state_is_consistent() {
         let engine = make_shared_engine();
-        let task = engine.create_task(CreateTaskInput::default()).await.unwrap();
+        let task = engine
+            .create_task(CreateTaskInput::default())
+            .await
+            .unwrap();
         engine
             .transition_task(&task.id, TaskStatus::Running, None)
             .await
@@ -1659,7 +1919,10 @@ mod tests {
         for _ in 0..count {
             let engine = Arc::clone(&engine);
             handles.push(tokio::spawn(async move {
-                engine.create_task(CreateTaskInput::default()).await.unwrap()
+                engine
+                    .create_task(CreateTaskInput::default())
+                    .await
+                    .unwrap()
             }));
         }
 
@@ -1677,7 +1940,10 @@ mod tests {
     async fn concurrent_subscribers_all_receive_all_events_in_order() {
         let broadcast = Arc::new(MemoryBroadcastProvider::new());
         let engine = Arc::new(make_engine_with_broadcast(Arc::clone(&broadcast)));
-        let task = engine.create_task(CreateTaskInput::default()).await.unwrap();
+        let task = engine
+            .create_task(CreateTaskInput::default())
+            .await
+            .unwrap();
         engine
             .transition_task(&task.id, TaskStatus::Running, None)
             .await
@@ -1737,7 +2003,10 @@ mod tests {
                 "subscriber {i} received {} events, expected {event_count}",
                 ids.len()
             );
-            assert_eq!(*ids, published_ids, "subscriber {i} received events in wrong order");
+            assert_eq!(
+                *ids, published_ids,
+                "subscriber {i} received events in wrong order"
+            );
         }
 
         for unsub in unsubs {
@@ -1759,12 +2028,16 @@ mod tests {
     #[tokio::test]
     async fn create_task_saves_to_long_term() {
         let long_term_store = Arc::new(MockLongTermStore::new());
-        let engine = make_engine_with_long_term(Arc::clone(&long_term_store) as Arc<dyn LongTermStore>);
+        let engine =
+            make_engine_with_long_term(Arc::clone(&long_term_store) as Arc<dyn LongTermStore>);
 
-        let task = engine.create_task(CreateTaskInput {
-            id: Some("lt-1".to_string()),
-            ..Default::default()
-        }).await.unwrap();
+        let task = engine
+            .create_task(CreateTaskInput {
+                id: Some("lt-1".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
 
         let retrieved = long_term_store.get_task(&task.id).await.unwrap();
         assert!(retrieved.is_some());
@@ -1780,12 +2053,24 @@ mod tests {
             status: TaskStatus::Completed,
             created_at: 1000.0,
             updated_at: 1000.0,
-            r#type: None, params: None, result: None, error: None,
-            metadata: None, completed_at: None, ttl: None,
-            auth_config: None, webhooks: None, cleanup: None,
-            tags: None, assign_mode: None, cost: None,
-            assigned_worker: None, disconnect_policy: None,
-            reason: None, resume_at: None, blocked_request: None,
+            r#type: None,
+            params: None,
+            result: None,
+            error: None,
+            metadata: None,
+            completed_at: None,
+            ttl: None,
+            auth_config: None,
+            webhooks: None,
+            cleanup: None,
+            tags: None,
+            assign_mode: None,
+            cost: None,
+            assigned_worker: None,
+            disconnect_policy: None,
+            reason: None,
+            resume_at: None,
+            blocked_request: None,
         };
         long_term_store.save_task(task).await.unwrap();
 
@@ -1798,14 +2083,21 @@ mod tests {
     #[tokio::test]
     async fn transition_task_saves_to_long_term() {
         let long_term_store = Arc::new(MockLongTermStore::new());
-        let engine = make_engine_with_long_term(Arc::clone(&long_term_store) as Arc<dyn LongTermStore>);
+        let engine =
+            make_engine_with_long_term(Arc::clone(&long_term_store) as Arc<dyn LongTermStore>);
 
-        engine.create_task(CreateTaskInput {
-            id: Some("lt-2".to_string()),
-            ..Default::default()
-        }).await.unwrap();
+        engine
+            .create_task(CreateTaskInput {
+                id: Some("lt-2".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
 
-        engine.transition_task("lt-2", TaskStatus::Running, None).await.unwrap();
+        engine
+            .transition_task("lt-2", TaskStatus::Running, None)
+            .await
+            .unwrap();
 
         let retrieved = long_term_store.get_task("lt-2").await.unwrap().unwrap();
         assert_eq!(retrieved.status, TaskStatus::Running);
@@ -1814,23 +2106,36 @@ mod tests {
     #[tokio::test]
     async fn emit_saves_event_to_long_term_async() {
         let long_term_store = Arc::new(MockLongTermStore::new());
-        let engine = make_engine_with_long_term(Arc::clone(&long_term_store) as Arc<dyn LongTermStore>);
+        let engine =
+            make_engine_with_long_term(Arc::clone(&long_term_store) as Arc<dyn LongTermStore>);
 
-        engine.create_task(CreateTaskInput {
-            id: Some("lt-3".to_string()),
-            ..Default::default()
-        }).await.unwrap();
-        engine.transition_task("lt-3", TaskStatus::Running, None).await.unwrap();
+        engine
+            .create_task(CreateTaskInput {
+                id: Some("lt-3".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        engine
+            .transition_task("lt-3", TaskStatus::Running, None)
+            .await
+            .unwrap();
 
-        engine.publish_event("lt-3", PublishEventInput {
-            r#type: "test".to_string(),
-            level: Level::Info,
-            data: serde_json::json!(null),
-            series_id: None,
-            series_mode: None,
+        engine
+            .publish_event(
+                "lt-3",
+                PublishEventInput {
+                    r#type: "test".to_string(),
+                    level: Level::Info,
+                    data: serde_json::json!(null),
+                    series_id: None,
+                    series_mode: None,
 
-            series_acc_field: None,
-        }).await.unwrap();
+                    series_acc_field: None,
+                },
+            )
+            .await
+            .unwrap();
 
         // The long_term_store save is async (tokio::spawn), give it a moment
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1852,21 +2157,33 @@ mod tests {
             hooks: Some(Arc::clone(&hooks) as Arc<dyn TaskcastHooks>),
         });
 
-        engine.create_task(CreateTaskInput {
-            id: Some("lt-fail".to_string()),
-            ..Default::default()
-        }).await.unwrap();
-        engine.transition_task("lt-fail", TaskStatus::Running, None).await.unwrap();
+        engine
+            .create_task(CreateTaskInput {
+                id: Some("lt-fail".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        engine
+            .transition_task("lt-fail", TaskStatus::Running, None)
+            .await
+            .unwrap();
 
-        engine.publish_event("lt-fail", PublishEventInput {
-            r#type: "test".to_string(),
-            level: Level::Info,
-            data: serde_json::json!(null),
-            series_id: None,
-            series_mode: None,
+        engine
+            .publish_event(
+                "lt-fail",
+                PublishEventInput {
+                    r#type: "test".to_string(),
+                    level: Level::Info,
+                    data: serde_json::json!(null),
+                    series_id: None,
+                    series_mode: None,
 
-            series_acc_field: None,
-        }).await.unwrap();
+                    series_acc_field: None,
+                },
+            )
+            .await
+            .unwrap();
 
         // Give async spawn time to execute
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1901,28 +2218,37 @@ mod tests {
             })
             .await
             .unwrap();
-        engine.transition_task("t1", TaskStatus::Running, None).await.unwrap();
+        engine
+            .transition_task("t1", TaskStatus::Running, None)
+            .await
+            .unwrap();
 
         engine
-            .publish_event("t1", PublishEventInput {
-                r#type: "llm.chunk".to_string(),
-                level: Level::Info,
-                data: serde_json::json!({"delta": "Hello "}),
-                series_id: Some("s1".to_string()),
-                series_mode: Some(SeriesMode::Accumulate),
-                series_acc_field: Some("delta".to_string()),
-            })
+            .publish_event(
+                "t1",
+                PublishEventInput {
+                    r#type: "llm.chunk".to_string(),
+                    level: Level::Info,
+                    data: serde_json::json!({"delta": "Hello "}),
+                    series_id: Some("s1".to_string()),
+                    series_mode: Some(SeriesMode::Accumulate),
+                    series_acc_field: Some("delta".to_string()),
+                },
+            )
             .await
             .unwrap();
         engine
-            .publish_event("t1", PublishEventInput {
-                r#type: "llm.chunk".to_string(),
-                level: Level::Info,
-                data: serde_json::json!({"delta": "world"}),
-                series_id: Some("s1".to_string()),
-                series_mode: Some(SeriesMode::Accumulate),
-                series_acc_field: Some("delta".to_string()),
-            })
+            .publish_event(
+                "t1",
+                PublishEventInput {
+                    r#type: "llm.chunk".to_string(),
+                    level: Level::Info,
+                    data: serde_json::json!({"delta": "world"}),
+                    series_id: Some("s1".to_string()),
+                    series_mode: Some(SeriesMode::Accumulate),
+                    series_acc_field: Some("delta".to_string()),
+                },
+            )
             .await
             .unwrap();
 
@@ -1943,7 +2269,10 @@ mod tests {
             })
             .await
             .unwrap();
-        engine.transition_task("t1", TaskStatus::Running, None).await.unwrap();
+        engine
+            .transition_task("t1", TaskStatus::Running, None)
+            .await
+            .unwrap();
 
         // Subscribe to collect broadcast events
         let received = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1958,44 +2287,53 @@ mod tests {
             .await;
 
         engine
-            .publish_event("t1", PublishEventInput {
-                r#type: "llm.chunk".to_string(),
-                level: Level::Info,
-                data: serde_json::json!({"delta": "Hello "}),
-                series_id: Some("s1".to_string()),
-                series_mode: Some(SeriesMode::Accumulate),
-                series_acc_field: Some("delta".to_string()),
-            })
+            .publish_event(
+                "t1",
+                PublishEventInput {
+                    r#type: "llm.chunk".to_string(),
+                    level: Level::Info,
+                    data: serde_json::json!({"delta": "Hello "}),
+                    series_id: Some("s1".to_string()),
+                    series_mode: Some(SeriesMode::Accumulate),
+                    series_acc_field: Some("delta".to_string()),
+                },
+            )
             .await
             .unwrap();
         engine
-            .publish_event("t1", PublishEventInput {
-                r#type: "llm.chunk".to_string(),
-                level: Level::Info,
-                data: serde_json::json!({"delta": "world"}),
-                series_id: Some("s1".to_string()),
-                series_mode: Some(SeriesMode::Accumulate),
-                series_acc_field: Some("delta".to_string()),
-            })
+            .publish_event(
+                "t1",
+                PublishEventInput {
+                    r#type: "llm.chunk".to_string(),
+                    level: Level::Info,
+                    data: serde_json::json!({"delta": "world"}),
+                    series_id: Some("s1".to_string()),
+                    series_mode: Some(SeriesMode::Accumulate),
+                    series_acc_field: Some("delta".to_string()),
+                },
+            )
             .await
             .unwrap();
 
         let events = received.lock().unwrap();
-        let chunks: Vec<_> = events
-            .iter()
-            .filter(|e| e.r#type == "llm.chunk")
-            .collect();
+        let chunks: Vec<_> = events.iter().filter(|e| e.r#type == "llm.chunk").collect();
 
         assert_eq!(chunks.len(), 2);
         // First broadcast: delta="Hello ", accumulated_data="Hello "
         assert_eq!(chunks[0].data["delta"], "Hello ");
         assert!(chunks[0]._accumulated_data.is_some());
-        assert_eq!(chunks[0]._accumulated_data.as_ref().unwrap()["delta"], "Hello ");
+        assert_eq!(
+            chunks[0]._accumulated_data.as_ref().unwrap()["delta"],
+            "Hello "
+        );
 
         // Second broadcast: delta="world", accumulated_data="Hello world"
         assert_eq!(chunks[1].data["delta"], "world");
         assert!(chunks[1]._accumulated_data.is_some());
-        assert_eq!(chunks[1]._accumulated_data.as_ref().unwrap()["delta"], "Hello world");
+        assert_eq!(
+            chunks[1]._accumulated_data.as_ref().unwrap()["delta"],
+            "Hello world"
+        );
     }
 
     #[tokio::test]
@@ -2008,28 +2346,37 @@ mod tests {
             })
             .await
             .unwrap();
-        engine.transition_task("t1", TaskStatus::Running, None).await.unwrap();
+        engine
+            .transition_task("t1", TaskStatus::Running, None)
+            .await
+            .unwrap();
 
         engine
-            .publish_event("t1", PublishEventInput {
-                r#type: "llm.chunk".to_string(),
-                level: Level::Info,
-                data: serde_json::json!({"delta": "Hello "}),
-                series_id: Some("s1".to_string()),
-                series_mode: Some(SeriesMode::Accumulate),
-                series_acc_field: Some("delta".to_string()),
-            })
+            .publish_event(
+                "t1",
+                PublishEventInput {
+                    r#type: "llm.chunk".to_string(),
+                    level: Level::Info,
+                    data: serde_json::json!({"delta": "Hello "}),
+                    series_id: Some("s1".to_string()),
+                    series_mode: Some(SeriesMode::Accumulate),
+                    series_acc_field: Some("delta".to_string()),
+                },
+            )
             .await
             .unwrap();
         engine
-            .publish_event("t1", PublishEventInput {
-                r#type: "llm.chunk".to_string(),
-                level: Level::Info,
-                data: serde_json::json!({"delta": "world"}),
-                series_id: Some("s1".to_string()),
-                series_mode: Some(SeriesMode::Accumulate),
-                series_acc_field: Some("delta".to_string()),
-            })
+            .publish_event(
+                "t1",
+                PublishEventInput {
+                    r#type: "llm.chunk".to_string(),
+                    level: Level::Info,
+                    data: serde_json::json!({"delta": "world"}),
+                    series_id: Some("s1".to_string()),
+                    series_mode: Some(SeriesMode::Accumulate),
+                    series_acc_field: Some("delta".to_string()),
+                },
+            )
             .await
             .unwrap();
 
@@ -2042,7 +2389,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn emit_accumulate_stores_accumulated_in_long_term() {
+    async fn emit_accumulate_compacts_accumulated_in_long_term() {
         let long_term = Arc::new(MockLongTermStore::new());
         let engine = TaskEngine::new(TaskEngineOptions {
             short_term_store: Arc::new(MemoryShortTermStore::new()),
@@ -2057,40 +2404,102 @@ mod tests {
             })
             .await
             .unwrap();
-        engine.transition_task("t1", TaskStatus::Running, None).await.unwrap();
+        engine
+            .transition_task("t1", TaskStatus::Running, None)
+            .await
+            .unwrap();
 
         engine
-            .publish_event("t1", PublishEventInput {
-                r#type: "llm.chunk".to_string(),
-                level: Level::Info,
-                data: serde_json::json!({"delta": "Hello "}),
-                series_id: Some("s1".to_string()),
-                series_mode: Some(SeriesMode::Accumulate),
-                series_acc_field: Some("delta".to_string()),
-            })
+            .publish_event(
+                "t1",
+                PublishEventInput {
+                    r#type: "llm.chunk".to_string(),
+                    level: Level::Info,
+                    data: serde_json::json!({"delta": "Hello "}),
+                    series_id: Some("s1".to_string()),
+                    series_mode: Some(SeriesMode::Accumulate),
+                    series_acc_field: Some("delta".to_string()),
+                },
+            )
             .await
             .unwrap();
         engine
-            .publish_event("t1", PublishEventInput {
-                r#type: "llm.chunk".to_string(),
-                level: Level::Info,
-                data: serde_json::json!({"delta": "world"}),
-                series_id: Some("s1".to_string()),
-                series_mode: Some(SeriesMode::Accumulate),
-                series_acc_field: Some("delta".to_string()),
-            })
+            .publish_event(
+                "t1",
+                PublishEventInput {
+                    r#type: "llm.chunk".to_string(),
+                    level: Level::Info,
+                    data: serde_json::json!({"delta": "world"}),
+                    series_id: Some("s1".to_string()),
+                    series_mode: Some(SeriesMode::Accumulate),
+                    series_acc_field: Some("delta".to_string()),
+                },
+            )
             .await
             .unwrap();
 
         // Give async spawn time to execute
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        // LongTermStore should have accumulated events (not deltas)
+        // LongTermStore should have one compacted accumulated event.
         let lt_events = long_term.events.read().await;
-        let chunks: Vec<_> = lt_events.iter().filter(|e| e.r#type == "llm.chunk").collect();
-        assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0].data["delta"], "Hello ");
-        assert_eq!(chunks[1].data["delta"], "Hello world");
+        let chunks: Vec<_> = lt_events
+            .iter()
+            .filter(|e| e.r#type == "llm.chunk")
+            .collect();
+        assert_eq!(long_term.accumulate_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].data["delta"], "Hello world");
+    }
+
+    #[tokio::test]
+    async fn emit_latest_compacts_in_long_term() {
+        let long_term = Arc::new(MockLongTermStore::new());
+        let engine = TaskEngine::new(TaskEngineOptions {
+            short_term_store: Arc::new(MemoryShortTermStore::new()),
+            broadcast: Arc::new(MemoryBroadcastProvider::new()),
+            long_term_store: Some(Arc::clone(&long_term) as Arc<dyn LongTermStore>),
+            hooks: None,
+        });
+        engine
+            .create_task(CreateTaskInput {
+                id: Some("t1".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        engine
+            .transition_task("t1", TaskStatus::Running, None)
+            .await
+            .unwrap();
+
+        for status in ["starting", "ready"] {
+            engine
+                .publish_event(
+                    "t1",
+                    PublishEventInput {
+                        r#type: "task.status".to_string(),
+                        level: Level::Info,
+                        data: serde_json::json!({"status": status}),
+                        series_id: Some("status".to_string()),
+                        series_mode: Some(SeriesMode::Latest),
+                        series_acc_field: None,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let lt_events = long_term.events.read().await;
+        let statuses: Vec<_> = lt_events
+            .iter()
+            .filter(|event| event.r#type == "task.status")
+            .collect();
+        assert_eq!(long_term.replace_latest_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].data["status"], "ready");
     }
 
     #[tokio::test]
@@ -2112,7 +2521,8 @@ mod tests {
         };
         long_term_store.events.write().await.push(event.clone());
 
-        let engine = make_engine_with_long_term(Arc::clone(&long_term_store) as Arc<dyn LongTermStore>);
+        let engine =
+            make_engine_with_long_term(Arc::clone(&long_term_store) as Arc<dyn LongTermStore>);
 
         let events = engine.get_events("cold-task", None).await.unwrap();
         assert_eq!(events.len(), 1);
@@ -2122,21 +2532,34 @@ mod tests {
     #[tokio::test]
     async fn get_events_prefers_short_term_store() {
         let long_term_store = Arc::new(MockLongTermStore::new());
-        let engine = make_engine_with_long_term(Arc::clone(&long_term_store) as Arc<dyn LongTermStore>);
+        let engine =
+            make_engine_with_long_term(Arc::clone(&long_term_store) as Arc<dyn LongTermStore>);
 
-        let task = engine.create_task(CreateTaskInput {
-            r#type: Some("test".to_string()),
-            ..Default::default()
-        }).await.unwrap();
-        engine.transition_task(&task.id, TaskStatus::Running, None).await.unwrap();
-        engine.publish_event(&task.id, PublishEventInput {
-            r#type: "test".to_string(),
-            level: Level::Info,
-            data: serde_json::json!({}),
-            series_id: None,
-            series_mode: None,
-            series_acc_field: None,
-        }).await.unwrap();
+        let task = engine
+            .create_task(CreateTaskInput {
+                r#type: Some("test".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        engine
+            .transition_task(&task.id, TaskStatus::Running, None)
+            .await
+            .unwrap();
+        engine
+            .publish_event(
+                &task.id,
+                PublishEventInput {
+                    r#type: "test".to_string(),
+                    level: Level::Info,
+                    data: serde_json::json!({}),
+                    series_id: None,
+                    series_mode: None,
+                    series_acc_field: None,
+                },
+            )
+            .await
+            .unwrap();
 
         let events = engine.get_events(&task.id, None).await.unwrap();
         assert!(!events.is_empty());
@@ -2153,7 +2576,10 @@ mod tests {
             })
             .await
             .unwrap();
-        engine.transition_task("t1", TaskStatus::Running, None).await.unwrap();
+        engine
+            .transition_task("t1", TaskStatus::Running, None)
+            .await
+            .unwrap();
 
         let received = Arc::new(std::sync::Mutex::new(Vec::new()));
         let received_clone = Arc::clone(&received);
@@ -2167,14 +2593,17 @@ mod tests {
             .await;
 
         engine
-            .publish_event("t1", PublishEventInput {
-                r#type: "progress".to_string(),
-                level: Level::Info,
-                data: serde_json::json!({"pct": 50}),
-                series_id: None,
-                series_mode: None,
-                series_acc_field: None,
-            })
+            .publish_event(
+                "t1",
+                PublishEventInput {
+                    r#type: "progress".to_string(),
+                    level: Level::Info,
+                    data: serde_json::json!({"pct": 50}),
+                    series_id: None,
+                    series_mode: None,
+                    series_acc_field: None,
+                },
+            )
             .await
             .unwrap();
 
