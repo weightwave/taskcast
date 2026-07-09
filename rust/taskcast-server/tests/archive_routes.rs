@@ -159,12 +159,23 @@ async fn export_missing_task_archive_returns_404() {
 }
 
 #[tokio::test]
-async fn export_unavailable_raw_accumulate_history_returns_500() {
+async fn export_compacted_accumulate_history_returns_archive() {
     let server = make_corrupt_history_server();
 
     let response = server.get("/tasks/task-corrupt/archive").await;
 
-    response.assert_status(StatusCode::INTERNAL_SERVER_ERROR);
+    response.assert_status_ok();
+    let archive: TaskArchive = response.json();
+    assert_eq!(archive.task.id, "task-corrupt");
+    assert_eq!(archive.events.len(), 1);
+    let event = &archive.events[0];
+    assert_eq!(event.task_id, "task-corrupt");
+    assert_eq!(event.index, 0);
+    assert_eq!(event.data, json!({ "delta": "hello world" }));
+    assert_eq!(event.series_id.as_deref(), Some("series-1"));
+    assert_eq!(event.series_mode, Some(SeriesMode::Accumulate));
+    assert!(event.series_snapshot.is_none());
+    assert!(event._accumulated_data.is_none());
 }
 
 #[tokio::test]
