@@ -259,9 +259,35 @@ cleanup:
 | `TASKCAST_SERVICE_KEY_*` | `trustedServices` 引用的服务到 Taskcast 预共享密钥 | — |
 | `TASKCAST_REDIS_URL` | Redis 连接 URL | — |
 | `TASKCAST_POSTGRES_URL` | PostgreSQL 连接 URL | — |
+| `TASKCAST_POSTGRES_MAX_CONNECTIONS` | 每个 Taskcast 进程的 PostgreSQL 连接池最大连接数；仅接受正整数 | `10` |
+| `TASKCAST_STORAGE` | 短期存储/广播存储模式：`memory`、`redis` 或 `sqlite` | `memory` |
 | `SENTRY_DSN` | Sentry DSN | — |
 
 **优先级：** CLI 参数 > 环境变量 > 配置文件 > 默认值
+
+### 存储选择与 PostgreSQL 启用
+
+对于 CLI 服务端，短期存储/广播存储按以下顺序解析：CLI `--storage`、
+`TASKCAST_STORAGE`、已配置的短期存储/广播 provider、非空 Redis URL，然后是 `memory`。如果同时配置了短期存储
+和广播 provider，它们必须是同一 provider。显式选择 `memory` 或 `sqlite` 时，不会仅因存在 Redis URL
+就启用 Redis。
+
+PostgreSQL 长期存储单独解析。SQLite 会使 PostgreSQL 保持未启用。当
+`adapters.longTermStore.provider` 显式为 `postgres` 时，必须提供非空的
+`TASKCAST_POSTGRES_URL` 或 `adapters.longTermStore.url`。未配置长期 provider 时，非空的
+`TASKCAST_POSTGRES_URL` 会启用 PostgreSQL；配置其他长期 provider 则会使其保持未启用。
+
+### 依赖健康与恢复
+
+启动时会在 HTTP 绑定前检查每个已启用的 Redis 和 PostgreSQL 依赖，如果某个依赖无法连接，启动会失败。
+`/health` 是存活性端点，不执行任何依赖 I/O。`/health/ready` 是就绪性端点：它会检查已启用的依赖，任一依赖不可用时返回 HTTP `503`。
+`/health/detail` 仅提供经脱敏的依赖状态，绝不包含凭据。
+
+依赖在此后恢复可用时，受管理的重连和连接池行为会使后续操作恢复；但被断连中断的业务请求可能失败，且绝不会被自动重放。
+Redis PubSub 订阅在运行时报告 PubSub 就绪前会被恢复。已类型化的依赖连通性故障使用现有的
+`{ "error": string }` 业务封装并返回 HTTP `503`。
+
+`dependency_state_change` 和受节流的 `dependency_outage_summary` 事件会以结构化 JSON 记录写入 stderr。如果希望导出或保留这些记录，请配置自己的日志采集器；Taskcast 不会自动发送它们到日志服务。
 
 ### TS/JS vs YAML/JSON 功能对比
 

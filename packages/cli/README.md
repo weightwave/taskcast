@@ -59,9 +59,38 @@ Taskcast searches for config files in the current directory:
 | `TASKCAST_JWT_SECRET` | JWT HMAC secret | -- |
 | `TASKCAST_REDIS_URL` | Redis connection URL | -- |
 | `TASKCAST_POSTGRES_URL` | PostgreSQL connection URL | -- |
+| `TASKCAST_POSTGRES_MAX_CONNECTIONS` | Maximum PostgreSQL pool connections per Taskcast process; positive integer only | `10` |
 | `TASKCAST_STORAGE` | `memory` \| `redis` \| `sqlite` | `memory` |
 | `TASKCAST_SQLITE_PATH` | SQLite database file path | `./taskcast.db` |
 | `TASKCAST_LOG_LEVEL` | Minimum server log level (`debug`, `info`, `warn`, or `error`); invalid values fail startup. HTTP 5xx failures are emitted as structured JSON on stderr. | `info` |
+
+### Storage Resolution
+
+The short-term/broadcast storage priority is `--storage`, `TASKCAST_STORAGE`,
+the configured short-term/broadcast provider, a non-empty Redis URL, then
+`memory`. Configured short-term and broadcast providers must match. Explicit
+`memory` and `sqlite` do not activate Redis merely because a Redis URL exists.
+
+PostgreSQL long-term storage is separate: a configured PostgreSQL provider
+requires a non-empty `TASKCAST_POSTGRES_URL` or configured long-term-store URL.
+Without a configured long-term provider, a non-empty `TASKCAST_POSTGRES_URL`
+activates PostgreSQL; a different configured provider does not. SQLite disables
+PostgreSQL activation.
+
+### Dependency Availability and Recovery
+
+The server checks active Redis and PostgreSQL dependencies before binding HTTP.
+`/health` is a liveness endpoint and performs no dependency I/O. `/health/ready`
+checks active dependencies and returns `503` when one is unavailable;
+`/health/detail` reports sanitized dependency state and never credentials.
+
+An operation interrupted by a disconnect can fail and is not automatically
+replayed. Later operations can recover through managed reconnect/pool behavior.
+Redis PubSub subscriptions are restored before PubSub is reported ready. Typed
+dependency-connectivity failures use HTTP `503` with the existing
+`{ "error": string }` business envelope. `dependency_state_change` and
+throttled `dependency_outage_summary` records are structured JSON written to
+stderr; ship those records through your own logging pipeline if needed.
 
 ### SQLite Storage
 

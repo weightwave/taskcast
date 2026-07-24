@@ -432,8 +432,26 @@ cleanup:
 | `TASKCAST_JWT_PUBLIC_KEY_FILE` | Path to JWT public key | — |
 | `TASKCAST_REDIS_URL` | Redis connection URL | — |
 | `TASKCAST_POSTGRES_URL` | PostgreSQL connection URL | — |
+| `TASKCAST_POSTGRES_MAX_CONNECTIONS` | Maximum PostgreSQL pool connections per Taskcast process; positive integer only | `10` |
+| `TASKCAST_STORAGE` | Short-term/broadcast storage mode: `memory`, `redis`, or `sqlite` | `memory` |
 | `TASKCAST_LOG_LEVEL` | Minimum server log level (`debug`, `info`, `warn`, or `error`); invalid values fail startup. HTTP 5xx failures are emitted as structured JSON on stderr. | `info` |
 | `SENTRY_DSN` | Sentry error tracking DSN | — |
+
+### Storage and Dependency Health
+
+For the CLI server, short-term/broadcast storage is selected in this order:
+`--storage`, `TASKCAST_STORAGE`, the configured short-term/broadcast provider,
+a non-empty Redis URL, then `memory`. Configured short-term and broadcast
+providers must match. An explicit `memory` or `sqlite` selection prevents a
+Redis URL from auto-selecting Redis. PostgreSQL long-term storage is resolved
+separately: an explicitly configured PostgreSQL provider requires a non-empty
+`TASKCAST_POSTGRES_URL` or configured long-term-store URL; without a configured
+long-term provider, a non-empty `TASKCAST_POSTGRES_URL` activates PostgreSQL.
+SQLite does not activate PostgreSQL storage.
+
+Active Redis and PostgreSQL dependencies must be reachable before the server
+binds HTTP. See the [deployment guide](./docs/guide/deployment.md) for readiness,
+recovery, and dependency logging behavior.
 
 ## API Overview
 

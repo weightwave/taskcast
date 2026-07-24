@@ -259,9 +259,46 @@ All configuration options can be overridden via environment variables:
 | `TASKCAST_SERVICE_KEY_*` | Service-to-Taskcast pre-shared keys referenced from `trustedServices` | — |
 | `TASKCAST_REDIS_URL` | Redis connection URL | — |
 | `TASKCAST_POSTGRES_URL` | PostgreSQL connection URL | — |
+| `TASKCAST_POSTGRES_MAX_CONNECTIONS` | Maximum PostgreSQL pool connections per Taskcast process; positive integer only | `10` |
+| `TASKCAST_STORAGE` | Short-term/broadcast storage mode: `memory`, `redis`, or `sqlite` | `memory` |
 | `SENTRY_DSN` | Sentry DSN | — |
 
 **Precedence:** CLI flags > environment variables > config file > defaults
+
+### Storage Selection and PostgreSQL Activation
+
+For the CLI server, short-term/broadcast storage resolves in this order: CLI
+`--storage`, `TASKCAST_STORAGE`, the configured short-term/broadcast provider,
+a non-empty Redis URL, then `memory`. If both short-term and broadcast providers
+are configured, they must be the same provider. An explicit `memory` or `sqlite`
+selection does not activate Redis just because a Redis URL is present.
+
+PostgreSQL long-term storage is resolved independently. SQLite leaves PostgreSQL
+inactive. When `adapters.longTermStore.provider` is explicitly `postgres`, a
+non-empty `TASKCAST_POSTGRES_URL` or `adapters.longTermStore.url` is required.
+Without a configured long-term provider, a non-empty `TASKCAST_POSTGRES_URL`
+activates PostgreSQL; configuring another long-term provider leaves it inactive.
+
+### Dependency Health and Recovery
+
+Startup checks every active Redis and PostgreSQL dependency before HTTP binds,
+and startup fails when one cannot be reached. `/health` is a liveness endpoint
+and performs no dependency I/O. `/health/ready` is a readiness endpoint: it
+checks active dependencies and returns HTTP `503` when any active dependency is
+unavailable. `/health/detail` exposes sanitized dependency state only and never
+includes credentials.
+
+Managed reconnect and pool behavior lets later operations recover after a
+dependency becomes available again, but a business request interrupted by a
+disconnect can fail and is never automatically replayed. Redis PubSub
+subscriptions are restored before the runtime reports PubSub ready. Typed
+dependency-connectivity failures return HTTP `503` using the existing
+`{ "error": string }` business envelope.
+
+`dependency_state_change` and throttled `dependency_outage_summary` events are
+structured JSON records written to stderr. Configure your own log collector if
+you want to ship or retain them; Taskcast does not automatically send them to a
+logging service.
 
 ### TS/JS vs YAML/JSON Feature Comparison
 

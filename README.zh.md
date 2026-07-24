@@ -434,8 +434,22 @@ cleanup:
 | `TASKCAST_JWT_PUBLIC_KEY_FILE` | JWT 公钥文件路径 | — |
 | `TASKCAST_REDIS_URL` | Redis 连接 URL | — |
 | `TASKCAST_POSTGRES_URL` | PostgreSQL 连接 URL | — |
+| `TASKCAST_POSTGRES_MAX_CONNECTIONS` | 每个 Taskcast 进程的 PostgreSQL 连接池最大连接数；仅接受正整数 | `10` |
+| `TASKCAST_STORAGE` | 短期存储/广播存储模式：`memory`、`redis` 或 `sqlite` | `memory` |
 | `TASKCAST_LOG_LEVEL` | 服务端最低日志级别（`debug`、`info`、`warn` 或 `error`）；非法值会阻止启动。HTTP 5xx 故障会以结构化 JSON 写入 stderr。 | `info` |
 | `SENTRY_DSN` | Sentry 错误追踪 DSN | — |
+
+### 存储与依赖健康
+
+对于 CLI 服务端，短期存储/广播存储按以下顺序选择：`--storage`、
+`TASKCAST_STORAGE`、已配置的短期存储/广播 provider、非空 Redis URL，然后是
+`memory`。已配置的短期存储与广播 provider 必须一致。显式选择 `memory`
+或 `sqlite` 时，Redis URL 不会自动选择 Redis。PostgreSQL 长期存储会单独解析：显式
+配置 PostgreSQL provider 时，必须提供非空的 `TASKCAST_POSTGRES_URL` 或已配置的长期存储 URL；未配置
+长期 provider 时，非空的 `TASKCAST_POSTGRES_URL` 会启用 PostgreSQL。SQLite 不会启用 PostgreSQL 存储。
+
+已启用的 Redis 和 PostgreSQL 依赖必须在服务绑定 HTTP 前可连接。请查阅
+[部署指南](./docs/guide/deployment.zh.md)，了解就绪性、恢复与依赖日志行为。
 
 ## API 概览
 
