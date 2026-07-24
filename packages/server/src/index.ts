@@ -1,6 +1,18 @@
 export { createAuthMiddleware, checkScope } from './auth.js'
 export { createVerboseLogger } from './middleware/verbose-logger.js'
+export {
+  createHttpFailureLogger,
+  parseLogLevel,
+  sanitizeErrorMessage,
+} from './middleware/http-failure-logger.js'
 export type { AuthConfig, AuthContext, JWTConfig, TrustedServiceConfig } from './auth.js'
+export type {
+  HttpFailureKind,
+  HttpFailureLog,
+  HttpFailureLogger,
+  HttpFailureLoggerOptions,
+  LogLevel,
+} from './middleware/http-failure-logger.js'
 export { createTasksRouter } from './routes/tasks.js'
 export { createSSERouter, createGlobalSSERoute, createSubscriberCounts, getSubscriberCount } from './routes/sse.js'
 export type { SubscriberCounts } from './routes/sse.js'
@@ -32,6 +44,11 @@ import { createWorkersRouter } from './routes/workers.js'
 import { WorkerWSRegistry } from './routes/worker-ws.js'
 import { createAdminRouter } from './routes/admin.js'
 import { createVerboseLogger } from './middleware/verbose-logger.js'
+import {
+  createHttpFailureLogger,
+  type HttpFailureLogger,
+  type LogLevel,
+} from './middleware/http-failure-logger.js'
 import { TASKCAST_SERVER_VERSION, serverInfo } from './version.js'
 import type { AuthConfig } from './auth.js'
 import { isTerminal, matchesWorkerRule } from '@taskcast/core'
@@ -56,6 +73,10 @@ export interface TaskcastServerOptions {
   verbose?: boolean
   /** Custom logger function for verbose mode (defaults to console.log). Useful for testing. */
   verboseLogger?: (line: string) => void
+  /** Minimum server log level. Defaults to info. */
+  logLevel?: LogLevel
+  /** Structured 5xx log sink. Defaults to one JSON line on stderr. */
+  errorLogger?: HttpFailureLogger
   cors?: boolean | { origin: string | string[] }
   scheduler?: {
     enabled?: boolean
@@ -88,6 +109,11 @@ export interface TaskcastApp {
 export function createTaskcastApp(opts: TaskcastServerOptions): TaskcastApp {
   const startTime = Date.now()
   const app = new OpenAPIHono()
+
+  app.use('*', createHttpFailureLogger({
+    logLevel: opts.logLevel ?? 'info',
+    ...(opts.errorLogger ? { logger: opts.errorLogger } : {}),
+  }))
 
   // Apply verbose logger before all routes when enabled
   if (opts.verbose) {
