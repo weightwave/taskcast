@@ -1,5 +1,6 @@
 use clap::Subcommand;
 
+use crate::config_dir::taskcast_config_dir;
 use crate::node_config::{NodeConfigManager, NodeEntry, NodeListEntry, TokenType};
 
 #[derive(Subcommand)]
@@ -44,15 +45,12 @@ pub fn format_node_list(nodes: &[NodeListEntry]) -> String {
         .join("\n")
 }
 
-fn get_config_manager() -> NodeConfigManager {
-    let config_dir = dirs::home_dir()
-        .expect("could not determine home directory")
-        .join(".taskcast");
-    NodeConfigManager::new(config_dir)
+fn get_config_manager() -> Result<NodeConfigManager, Box<dyn std::error::Error>> {
+    Ok(NodeConfigManager::new(taskcast_config_dir()?))
 }
 
 pub fn run(command: NodeCommands) -> Result<(), Box<dyn std::error::Error>> {
-    let mgr = get_config_manager();
+    let mgr = get_config_manager()?;
 
     match command {
         NodeCommands::Add {

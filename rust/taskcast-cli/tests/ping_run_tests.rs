@@ -1,18 +1,13 @@
 use std::net::SocketAddr;
-use std::sync::Mutex;
+
+mod common;
 
 use axum::{routing::get, Json, Router};
+use common::config_dir::IsolatedConfigDir;
 use serde_json::json;
-use tempfile::TempDir;
-use tokio::net::TcpListener;
-
 use taskcast_cli::commands::ping::{run, PingArgs};
 use taskcast_cli::node_config::{NodeConfigManager, NodeEntry};
-
-/// Global lock to serialize tests that modify the HOME env var.
-static HOME_LOCK: Mutex<()> = Mutex::new(());
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+use tokio::net::TcpListener;
 
 async fn start_mock_server(app: Router) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -26,28 +21,17 @@ async fn start_mock_server(app: Router) -> String {
     base_url
 }
 
-fn setup_home() -> TempDir {
-    let dir = TempDir::new().unwrap();
-    std::env::set_var("HOME", dir.path());
-    dir
+fn setup_config_dir() -> IsolatedConfigDir {
+    IsolatedConfigDir::new()
 }
-
-// ─── run() success with default node ────────────────────────────────────────
 
 #[tokio::test]
 async fn run_success_default_node() {
-    let _lock = HOME_LOCK.lock().unwrap();
-
-    // Start a mock server that returns 200 OK on /health
-    let app = Router::new().route(
-        "/health",
-        get(|| async { Json(json!({ "ok": true })) }),
-    );
+    let app = Router::new().route("/health", get(|| async { Json(json!({ "ok": true })) }));
     let base_url = start_mock_server(app).await;
 
-    // Set up HOME and configure the default node to point to our mock server
-    let dir = setup_home();
-    let mgr = NodeConfigManager::new(dir.path().join(".taskcast"));
+    let dir = setup_config_dir();
+    let mgr = NodeConfigManager::new(dir.path().to_path_buf());
     mgr.add(
         "mock",
         NodeEntry {
@@ -58,25 +42,17 @@ async fn run_success_default_node() {
     );
     mgr.set_current("mock").unwrap();
 
-    // run() should succeed
     let result = run(PingArgs { node: None }).await;
     assert!(result.is_ok(), "run should succeed: {:?}", result.err());
 }
 
-// ─── run() success with named node ──────────────────────────────────────────
-
 #[tokio::test]
 async fn run_success_named_node() {
-    let _lock = HOME_LOCK.lock().unwrap();
-
-    let app = Router::new().route(
-        "/health",
-        get(|| async { Json(json!({ "ok": true })) }),
-    );
+    let app = Router::new().route("/health", get(|| async { Json(json!({ "ok": true })) }));
     let base_url = start_mock_server(app).await;
 
-    let dir = setup_home();
-    let mgr = NodeConfigManager::new(dir.path().join(".taskcast"));
+    let dir = setup_config_dir();
+    let mgr = NodeConfigManager::new(dir.path().to_path_buf());
     mgr.add(
         "my-server",
         NodeEntry {
@@ -86,7 +62,6 @@ async fn run_success_named_node() {
         },
     );
 
-    // Explicitly name the node via the --node flag
     let result = run(PingArgs {
         node: Some("my-server".to_string()),
     })
@@ -94,12 +69,9 @@ async fn run_success_named_node() {
     assert!(result.is_ok(), "run should succeed: {:?}", result.err());
 }
 
-// ─── run() with non-existent named node returns error ───────────────────────
-
 #[tokio::test]
 async fn run_node_not_found_returns_error() {
-    let _lock = HOME_LOCK.lock().unwrap();
-    let _dir = setup_home();
+    let _dir = setup_config_dir();
 
     let result = run(PingArgs {
         node: Some("nonexistent".to_string()),
@@ -113,14 +85,10 @@ async fn run_node_not_found_returns_error() {
     );
 }
 
-// ─── run() with unreachable server returns error ────────────────────────────
-
 #[tokio::test]
 async fn run_ping_failure_returns_error() {
-    let _lock = HOME_LOCK.lock().unwrap();
-
-    let dir = setup_home();
-    let mgr = NodeConfigManager::new(dir.path().join(".taskcast"));
+    let dir = setup_config_dir();
+    let mgr = NodeConfigManager::new(dir.path().to_path_buf());
     mgr.add(
         "bad-server",
         NodeEntry {

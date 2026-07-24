@@ -1,5 +1,6 @@
 use clap::Args;
 
+use crate::config_dir::taskcast_config_dir;
 use crate::node_config::NodeConfigManager;
 
 #[derive(Args, Debug)]
@@ -42,10 +43,7 @@ pub async fn ping_server(url: &str) -> PingResult {
 }
 
 pub async fn run(args: PingArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let config_dir = dirs::home_dir()
-        .expect("could not determine home directory")
-        .join(".taskcast");
-    let mgr = NodeConfigManager::new(config_dir);
+    let mgr = NodeConfigManager::new(taskcast_config_dir()?);
 
     let node = match args.node {
         Some(name) => match mgr.get(&name) {

@@ -1,6 +1,7 @@
 mod auto_migrate;
 mod client;
 mod commands;
+mod config_dir;
 mod helpers;
 mod node_config;
 mod tty;

@@ -1,7 +1,8 @@
 use clap::Args;
 use std::collections::HashMap;
 
-use crate::node_config::NodeEntry;
+use crate::config_dir::taskcast_config_dir;
+use crate::node_config::{NodeConfigManager, NodeEntry};
 
 #[derive(Args)]
 pub struct DoctorArgs {
@@ -212,10 +213,7 @@ pub fn format_doctor_result(result: &DoctorResult) -> String {
 }
 
 pub async fn run(args: DoctorArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let config_dir = dirs::home_dir()
-        .expect("could not determine home directory")
-        .join(".taskcast");
-    let mgr = crate::node_config::NodeConfigManager::new(config_dir);
+    let mgr = NodeConfigManager::new(taskcast_config_dir()?);
 
     let node = if let Some(ref name) = args.node {
         match mgr.get(name) {
