@@ -53,6 +53,21 @@ pub enum CorsConfig {
     AllowOrigins(Vec<String>),
 }
 
+/// Runtime-specific additions to the application factory.
+pub struct RuntimeAppOptions {
+    pub runtime_health: RuntimeHealth,
+    pub additional_routes: Router,
+}
+
+impl Default for RuntimeAppOptions {
+    fn default() -> Self {
+        Self {
+            runtime_health: RuntimeHealth::default(),
+            additional_routes: Router::new(),
+        }
+    }
+}
+
 pub fn create_app(
     engine: Arc<TaskEngine>,
     auth_mode: AuthMode,
@@ -107,8 +122,10 @@ pub fn create_app_with_failure_logger_and_routes(
         config,
         cors_config,
         failure_logger,
-        RuntimeHealth::default(),
-        additional_routes,
+        RuntimeAppOptions {
+            runtime_health: RuntimeHealth::default(),
+            additional_routes,
+        },
     )
 }
 
@@ -119,9 +136,12 @@ pub fn create_app_with_runtime_health_and_routes(
     config: Option<TaskcastConfig>,
     cors_config: CorsConfig,
     failure_logger: Arc<dyn crate::http_failure::HttpFailureLogger>,
-    runtime_health: RuntimeHealth,
-    additional_routes: Router,
+    runtime_options: RuntimeAppOptions,
 ) -> (Router, Option<WsRegistry>) {
+    let RuntimeAppOptions {
+        runtime_health,
+        additional_routes,
+    } = runtime_options;
     let auth_mode = Arc::new(auth_mode);
     let subscriber_counts = create_subscriber_counts();
 

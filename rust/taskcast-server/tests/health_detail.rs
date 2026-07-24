@@ -7,8 +7,8 @@ use taskcast_core::{DependencyName, DependencyUnavailableError};
 use taskcast_core::{MemoryBroadcastProvider, MemoryShortTermStore, TaskEngine, TaskEngineOptions};
 use taskcast_server::{
     create_app, create_app_with_runtime_health_and_routes, AuthMode, CorsConfig, DependencyCheck,
-    DependencyHealthRegistry, JwtConfig, RuntimeAdapterDescriptors, RuntimeHealth,
-    StderrHttpFailureLogger,
+    DependencyHealthRegistry, JwtConfig, RuntimeAdapterDescriptors, RuntimeAppOptions,
+    RuntimeHealth, StderrHttpFailureLogger,
 };
 
 fn make_server() -> TestServer {
@@ -20,6 +20,32 @@ fn make_server() -> TestServer {
     }));
     let (app, _) = create_app(engine, AuthMode::None, None, None, CorsConfig::default());
     TestServer::new(app)
+}
+
+#[tokio::test]
+async fn runtime_app_options_default_preserves_default_health_detail() {
+    let engine = Arc::new(TaskEngine::new(TaskEngineOptions {
+        short_term_store: Arc::new(MemoryShortTermStore::new()),
+        broadcast: Arc::new(MemoryBroadcastProvider::new()),
+        long_term_store: None,
+        hooks: None,
+    }));
+    let (app, _) = create_app_with_runtime_health_and_routes(
+        engine,
+        AuthMode::None,
+        None,
+        None,
+        CorsConfig::default(),
+        Arc::new(StderrHttpFailureLogger::new(
+            taskcast_server::LogLevel::Info,
+        )),
+        RuntimeAppOptions::default(),
+    );
+
+    let body: serde_json::Value = TestServer::new(app).get("/health/detail").await.json();
+    assert_eq!(body["adapters"]["broadcast"]["provider"], "memory");
+    assert_eq!(body["adapters"]["shortTermStore"]["provider"], "memory");
+    assert!(body["adapters"]["longTermStore"].is_null());
 }
 
 #[tokio::test]
@@ -315,8 +341,10 @@ async fn health_detail_uses_effective_runtime_adapters_over_file_config() {
         Arc::new(StderrHttpFailureLogger::new(
             taskcast_server::LogLevel::Info,
         )),
-        runtime_health,
-        axum::Router::new(),
+        RuntimeAppOptions {
+            runtime_health,
+            additional_routes: axum::Router::new(),
+        },
     );
     let body: serde_json::Value = TestServer::new(app).get("/health/detail").await.json();
 
@@ -445,8 +473,10 @@ async fn liveness_stays_up_while_readiness_and_detail_track_recovery() {
         Arc::new(StderrHttpFailureLogger::new(
             taskcast_server::LogLevel::Info,
         )),
-        runtime_health,
-        axum::Router::new(),
+        RuntimeAppOptions {
+            runtime_health,
+            additional_routes: axum::Router::new(),
+        },
     );
     let server = TestServer::new(app);
 

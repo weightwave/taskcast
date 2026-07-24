@@ -624,8 +624,10 @@ pub async fn run(args: StartArgs) -> Result<(), Box<dyn std::error::Error>> {
         Some(file_config.clone()),
         taskcast_server::CorsConfig::default(),
         Arc::clone(&failure_logger),
-        runtime_health,
-        additional_routes,
+        taskcast_server::RuntimeAppOptions {
+            runtime_health,
+            additional_routes,
+        },
     );
 
     // Apply verbose request logging middleware if --verbose
