@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import { Redis } from 'ioredis'
 import { GenericContainer, type StartedTestContainer } from 'testcontainers'
 import type { DependencyObservation } from '@taskcast/core'
@@ -88,10 +88,13 @@ describe('managed Redis command client', () => {
 
     const eventNames = ['ready', 'reconnecting', 'close', 'end', 'error'] as const
     expect(eventNames.every((event) => managed.client.listenerCount(event) > 0)).toBe(true)
+    const disconnect = vi.spyOn(managed.client, 'disconnect')
     await managed.close()
     await managed.close()
+    expect(disconnect).toHaveBeenCalledOnce()
+    expect(disconnect).toHaveBeenCalledWith(false)
     expect(eventNames.every((event) => managed.client.listenerCount(event) === 0)).toBe(true)
-    expect(managed.client.status).toBe('end')
+    disconnect.mockRestore()
     expect(observations.some((observation) => observation.state === 'healthy')).toBe(true)
     expect(
       observations.every((observation) =>

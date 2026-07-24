@@ -12,8 +12,9 @@ use taskcast_core::types::{
 };
 use taskcast_core::TaskEvent;
 use taskcast_redis::RedisShortTermStore;
+use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
-use testcontainers_modules::redis::Redis;
+use testcontainers::GenericImage;
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -83,8 +84,13 @@ async fn flush_redis(redis_url: &str) {
 }
 
 /// Start a Redis container and return (container, redis_url).
-async fn start_redis() -> (testcontainers::ContainerAsync<Redis>, String) {
-    let container = Redis::default().start().await.unwrap();
+async fn start_redis() -> (testcontainers::ContainerAsync<GenericImage>, String) {
+    let container = GenericImage::new("redis", "7-alpine")
+        .with_exposed_port(6379.tcp())
+        .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
+        .start()
+        .await
+        .unwrap();
     let port = container.get_host_port_ipv4(6379).await.unwrap();
     let url = format!("redis://127.0.0.1:{port}");
     (container, url)
