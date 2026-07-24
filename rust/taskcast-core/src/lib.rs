@@ -1,6 +1,7 @@
 pub mod archive;
 pub mod cleanup;
 pub mod config;
+pub mod dependency;
 pub mod engine;
 pub mod filter;
 pub mod heartbeat_monitor;
@@ -14,6 +15,7 @@ pub mod worker_matching;
 
 pub use archive::*;
 pub use cleanup::*;
+pub use dependency::*;
 pub use engine::*;
 pub use filter::*;
 pub use heartbeat_monitor::*;
