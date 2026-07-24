@@ -57,6 +57,26 @@ pub fn create_app(
     config: Option<TaskcastConfig>,
     cors_config: CorsConfig,
 ) -> (Router, Option<WsRegistry>) {
+    create_app_with_failure_logger(
+        engine,
+        auth_mode,
+        worker_manager,
+        config,
+        cors_config,
+        Arc::new(crate::http_failure::StderrHttpFailureLogger::new(
+            crate::http_failure::LogLevel::Info,
+        )),
+    )
+}
+
+pub fn create_app_with_failure_logger(
+    engine: Arc<TaskEngine>,
+    auth_mode: AuthMode,
+    worker_manager: Option<Arc<WorkerManager>>,
+    config: Option<TaskcastConfig>,
+    cors_config: CorsConfig,
+    failure_logger: Arc<dyn crate::http_failure::HttpFailureLogger>,
+) -> (Router, Option<WsRegistry>) {
     let auth_mode = Arc::new(auth_mode);
     let subscriber_counts = create_subscriber_counts();
 
@@ -220,6 +240,11 @@ pub fn create_app(
             )
         }
     };
+
+    let app = app.layer(middleware::from_fn_with_state(
+        failure_logger,
+        crate::http_failure::http_failure_logger_middleware,
+    ));
 
     (app, ws_registry_out)
 }
