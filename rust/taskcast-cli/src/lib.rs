@@ -1,6 +1,7 @@
 pub mod auto_migrate;
 pub mod client;
 pub mod commands;
+pub mod config_dir;
 pub mod helpers;
 pub mod node_config;
 pub mod tty;
