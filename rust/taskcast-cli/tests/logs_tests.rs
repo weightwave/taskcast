@@ -1230,7 +1230,7 @@ async fn run_logs_node_lookup_client_creation_and_sse() {
     let engine = make_engine();
     let base_url = start_server(engine.clone()).await;
 
-    let config_dir = setup_config_dir_with_node(&base_url, "default");
+    let _config_dir = setup_config_dir_with_node(&base_url, "default");
 
     // Create and complete a task with an event
     let task = engine
@@ -1339,7 +1339,7 @@ async fn run_logs_with_types_and_levels_query_params() {
     let engine = make_engine();
     let base_url = start_server(engine.clone()).await;
 
-    let config_dir = setup_config_dir_with_node(&base_url, "default");
+    let _config_dir = setup_config_dir_with_node(&base_url, "default");
 
     let task = engine
         .create_task(CreateTaskInput {
@@ -1521,7 +1521,7 @@ async fn run_tail_node_lookup_and_url_construction() {
     let engine = make_engine();
     let base_url = start_server(engine.clone()).await;
 
-    let config_dir = setup_config_dir_with_node(&base_url, "default");
+    let _config_dir = setup_config_dir_with_node(&base_url, "default");
 
     // Create a task and publish events for tail to pick up
     let task = engine
@@ -1700,7 +1700,7 @@ async fn run_logs_direct_call_completed_task() {
     let engine = make_engine();
     let base_url = start_server(engine.clone()).await;
 
-    let config_dir = setup_config_dir_with_node(&base_url, "default");
+    let _config_dir = setup_config_dir_with_node(&base_url, "default");
 
     // Create a task, publish an event, then complete it so the SSE stream ends
     let task = engine
@@ -1774,7 +1774,7 @@ async fn run_logs_with_filters() {
     let engine = make_engine();
     let base_url = start_server(engine.clone()).await;
 
-    let config_dir = setup_config_dir_with_node(&base_url, "default");
+    let _config_dir = setup_config_dir_with_node(&base_url, "default");
 
     let task = engine
         .create_task(CreateTaskInput {

@@ -952,7 +952,7 @@ async fn run_list_via_node_config_happy_path() {
     let engine = make_engine();
     let base_url = start_server(engine.clone()).await;
 
-    let config_dir = setup_config_dir_with_node(&base_url, "test-node");
+    let _config_dir = setup_config_dir_with_node(&base_url, "test-node");
 
     // Create tasks
     engine
@@ -993,7 +993,7 @@ async fn run_list_with_status_filter_via_run() {
     let engine = make_engine();
     let base_url = start_server(engine.clone()).await;
 
-    let config_dir = setup_config_dir_with_node(&base_url, "default");
+    let _config_dir = setup_config_dir_with_node(&base_url, "default");
 
     let t1 = engine
         .create_task(CreateTaskInput {
@@ -1029,7 +1029,7 @@ async fn run_list_with_type_filter_via_run() {
     let engine = make_engine();
     let base_url = start_server(engine.clone()).await;
 
-    let config_dir = setup_config_dir_with_node(&base_url, "default");
+    let _config_dir = setup_config_dir_with_node(&base_url, "default");
 
     engine
         .create_task(CreateTaskInput {
@@ -1061,7 +1061,7 @@ async fn run_list_with_limit_via_run() {
     let engine = make_engine();
     let base_url = start_server(engine.clone()).await;
 
-    let config_dir = setup_config_dir_with_node(&base_url, "default");
+    let _config_dir = setup_config_dir_with_node(&base_url, "default");
 
     for i in 0..5 {
         engine
@@ -1095,7 +1095,7 @@ async fn run_list_empty_server_via_run() {
     let engine = make_engine();
     let base_url = start_server(engine.clone()).await;
 
-    let config_dir = setup_config_dir_with_node(&base_url, "default");
+    let _config_dir = setup_config_dir_with_node(&base_url, "default");
 
     let result = run(TasksArgs {
         command: TasksCommands::List {
@@ -1119,7 +1119,7 @@ async fn run_inspect_via_run_happy_path() {
     let engine = make_engine();
     let base_url = start_server(engine.clone()).await;
 
-    let config_dir = setup_config_dir_with_node(&base_url, "default");
+    let _config_dir = setup_config_dir_with_node(&base_url, "default");
 
     let task = engine
         .create_task(CreateTaskInput {
@@ -1150,7 +1150,7 @@ async fn run_inspect_with_events_via_run() {
     let engine = make_engine();
     let base_url = start_server(engine.clone()).await;
 
-    let config_dir = setup_config_dir_with_node(&base_url, "default");
+    let _config_dir = setup_config_dir_with_node(&base_url, "default");
 
     let task = engine
         .create_task(CreateTaskInput {
@@ -1279,7 +1279,7 @@ async fn run_list_node_config_lookup_path() {
     let engine = make_engine();
     let base_url = start_server(engine.clone()).await;
 
-    let config_dir = setup_config_dir_with_node(&base_url, "default");
+    let _config_dir = setup_config_dir_with_node(&base_url, "default");
 
     // Replicate run_list lines 176-193: node lookup + client creation
     let home = taskcast_cli::config_dir::taskcast_config_dir().unwrap();
@@ -1318,7 +1318,7 @@ async fn run_inspect_node_config_lookup_path() {
     let engine = make_engine();
     let base_url = start_server(engine.clone()).await;
 
-    let config_dir = setup_config_dir_with_node(&base_url, "default");
+    let _config_dir = setup_config_dir_with_node(&base_url, "default");
 
     let task = engine
         .create_task(CreateTaskInput {
@@ -1381,7 +1381,7 @@ async fn run_inspect_events_history_non_success_fallback() {
     let engine = make_engine();
     let base_url = start_server(engine.clone()).await;
 
-    let config_dir = setup_config_dir_with_node(&base_url, "default");
+    let _config_dir = setup_config_dir_with_node(&base_url, "default");
 
     let task = engine
         .create_task(CreateTaskInput {
@@ -1434,7 +1434,7 @@ async fn run_inspect_http_error_path() {
     let engine = make_engine();
     let base_url = start_server(engine.clone()).await;
 
-    let config_dir = setup_config_dir_with_node(&base_url, "default");
+    let _config_dir = setup_config_dir_with_node(&base_url, "default");
 
     // Replicate run_inspect error path (lines 259-263)
     let home = taskcast_cli::config_dir::taskcast_config_dir().unwrap();
@@ -1515,7 +1515,7 @@ async fn run_list_http_error_returns_error() {
         axum::serve(listener, app).await.unwrap();
     });
 
-    let config_dir = setup_config_dir_with_node(&mock_url, "mock-500");
+    let _config_dir = setup_config_dir_with_node(&mock_url, "mock-500");
 
     let result = run(TasksArgs {
         command: TasksCommands::List {
@@ -1540,7 +1540,7 @@ async fn run_inspect_http_error_returns_error() {
     let engine = make_engine();
     let base_url = start_server(engine.clone()).await;
 
-    let config_dir = setup_config_dir_with_node(&base_url, "default");
+    let _config_dir = setup_config_dir_with_node(&base_url, "default");
 
     // Inspect a nonexistent task — server returns 404
     let result = run(TasksArgs {
