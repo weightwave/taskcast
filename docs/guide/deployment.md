@@ -269,12 +269,15 @@ All configuration options can be overridden via environment variables:
 
 For the CLI server, short-term/broadcast storage resolves in this order: CLI
 `--storage`, `TASKCAST_STORAGE`, the configured short-term/broadcast provider,
-a non-empty Redis URL, then `memory`. If both short-term and broadcast providers
-are configured, they must be the same provider. An explicit `memory` or `sqlite`
-selection does not activate Redis just because a Redis URL is present.
+a non-empty Redis URL, then `memory`. When resolution reaches the configured
+provider (with no higher-priority `--storage` or `TASKCAST_STORAGE` selection),
+configured short-term and broadcast providers must match or startup is rejected.
+An explicit `memory` or `sqlite` selection does not activate Redis just because
+a Redis URL is present.
 
-PostgreSQL long-term storage is resolved independently. SQLite leaves PostgreSQL
-inactive. When `adapters.longTermStore.provider` is explicitly `postgres`, a
+PostgreSQL long-term storage is resolved independently. When resolved storage
+is `sqlite`, PostgreSQL is disabled before its provider or URL is evaluated.
+Otherwise, when `adapters.longTermStore.provider` is explicitly `postgres`, a
 non-empty `TASKCAST_POSTGRES_URL` or `adapters.longTermStore.url` is required.
 Without a configured long-term provider, a non-empty `TASKCAST_POSTGRES_URL`
 activates PostgreSQL; configuring another long-term provider leaves it inactive.

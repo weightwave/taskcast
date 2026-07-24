@@ -441,13 +441,16 @@ cleanup:
 
 For the CLI server, short-term/broadcast storage is selected in this order:
 `--storage`, `TASKCAST_STORAGE`, the configured short-term/broadcast provider,
-a non-empty Redis URL, then `memory`. Configured short-term and broadcast
-providers must match. An explicit `memory` or `sqlite` selection prevents a
+a non-empty Redis URL, then `memory`. When resolution reaches the configured
+provider (with no higher-priority `--storage` or `TASKCAST_STORAGE` selection),
+the configured short-term and broadcast providers must match or startup is
+rejected. An explicit `memory` or `sqlite` selection prevents a
 Redis URL from auto-selecting Redis. PostgreSQL long-term storage is resolved
-separately: an explicitly configured PostgreSQL provider requires a non-empty
-`TASKCAST_POSTGRES_URL` or configured long-term-store URL; without a configured
-long-term provider, a non-empty `TASKCAST_POSTGRES_URL` activates PostgreSQL.
-SQLite does not activate PostgreSQL storage.
+separately: when resolved storage is `sqlite`, PostgreSQL is disabled before
+its provider or URL is evaluated. Otherwise, an explicitly configured
+PostgreSQL provider requires a non-empty `TASKCAST_POSTGRES_URL` or configured
+long-term-store URL; without a configured long-term provider, a non-empty
+`TASKCAST_POSTGRES_URL` activates PostgreSQL.
 
 Active Redis and PostgreSQL dependencies must be reachable before the server
 binds HTTP. See the [deployment guide](./docs/guide/deployment.md) for readiness,

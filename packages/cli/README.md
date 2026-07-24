@@ -68,14 +68,17 @@ Taskcast searches for config files in the current directory:
 
 The short-term/broadcast storage priority is `--storage`, `TASKCAST_STORAGE`,
 the configured short-term/broadcast provider, a non-empty Redis URL, then
-`memory`. Configured short-term and broadcast providers must match. Explicit
+`memory`. When resolution reaches the configured provider (with no
+higher-priority `--storage` or `TASKCAST_STORAGE` selection), the configured
+short-term and broadcast providers must match or startup is rejected. Explicit
 `memory` and `sqlite` do not activate Redis merely because a Redis URL exists.
 
-PostgreSQL long-term storage is separate: a configured PostgreSQL provider
-requires a non-empty `TASKCAST_POSTGRES_URL` or configured long-term-store URL.
-Without a configured long-term provider, a non-empty `TASKCAST_POSTGRES_URL`
-activates PostgreSQL; a different configured provider does not. SQLite disables
-PostgreSQL activation.
+PostgreSQL long-term storage is separate. When resolved storage is `sqlite`,
+PostgreSQL is disabled before its provider or URL is evaluated. Otherwise, a
+configured PostgreSQL provider requires a non-empty `TASKCAST_POSTGRES_URL` or
+configured long-term-store URL. Without a configured long-term provider, a
+non-empty `TASKCAST_POSTGRES_URL` activates PostgreSQL; a different configured
+provider does not.
 
 ### Dependency Availability and Recovery
 

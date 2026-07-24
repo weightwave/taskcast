@@ -268,12 +268,13 @@ cleanup:
 ### 存储选择与 PostgreSQL 启用
 
 对于 CLI 服务端，短期存储/广播存储按以下顺序解析：CLI `--storage`、
-`TASKCAST_STORAGE`、已配置的短期存储/广播 provider、非空 Redis URL，然后是 `memory`。如果同时配置了短期存储
-和广播 provider，它们必须是同一 provider。显式选择 `memory` 或 `sqlite` 时，不会仅因存在 Redis URL
-就启用 Redis。
+`TASKCAST_STORAGE`、已配置的短期存储/广播 provider、非空 Redis URL，然后是 `memory`。当解析落到已配置的
+provider（即没有更高优先级的 `--storage` 或 `TASKCAST_STORAGE` 选择）时，如果同时配置了短期存储和
+广播 provider，它们必须一致，否则启动会被拒绝。显式选择 `memory` 或 `sqlite` 时，不会仅因存在
+Redis URL 就启用 Redis。
 
-PostgreSQL 长期存储单独解析。SQLite 会使 PostgreSQL 保持未启用。当
-`adapters.longTermStore.provider` 显式为 `postgres` 时，必须提供非空的
+PostgreSQL 长期存储单独解析。当解析后的存储模式为 `sqlite` 时，会在检查 PostgreSQL provider 或 URL 之前
+禁用 PostgreSQL。否则，当 `adapters.longTermStore.provider` 显式为 `postgres` 时，必须提供非空的
 `TASKCAST_POSTGRES_URL` 或 `adapters.longTermStore.url`。未配置长期 provider 时，非空的
 `TASKCAST_POSTGRES_URL` 会启用 PostgreSQL；配置其他长期 provider 则会使其保持未启用。
 
