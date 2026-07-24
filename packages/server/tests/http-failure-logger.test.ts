@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { Hono } from 'hono'
+import { HTTPException } from 'hono/http-exception'
 import {
   createHttpFailureLogger,
   createTaskcastApp,
@@ -189,10 +190,13 @@ describe('HTTP failure logging', () => {
   it('is installed by createTaskcastApp', async () => {
     class BrokenStore extends MemoryShortTermStore {
       override async listTasks(): Promise<never> {
-        throw new Error('broken pipe')
+        throw new Error(
+          'redis://admin:secret@redis.example.com:6379 broken pipe',
+        )
       }
     }
 
+    const stderr = vi.spyOn(console, 'error').mockImplementation(() => {})
     const records: HttpFailureLog[] = []
     const shortTermStore = new BrokenStore()
     const engine = new TaskEngine({
@@ -205,18 +209,31 @@ describe('HTTP failure logging', () => {
       auth: { mode: 'none' },
       errorLogger: (record) => records.push(record),
     })
-
-    const response = await taskcast.app.request('/tasks')
-
-    expect(response.status).toBe(500)
-    expect(records).toHaveLength(1)
-    expect(records[0]).toMatchObject({
-      method: 'GET',
-      path: '/tasks',
-      status: 500,
-      errorKind: 'store',
-      error: 'broken pipe',
+    taskcast.app.get('/teapot', () => {
+      throw new HTTPException(418, { message: 'teapot' })
     })
-    taskcast.stop()
+
+    try {
+      const response = await taskcast.app.request('/tasks')
+
+      expect(response.status).toBe(500)
+      expect(records).toHaveLength(1)
+      expect(records[0]).toMatchObject({
+        method: 'GET',
+        path: '/tasks',
+        status: 500,
+        errorKind: 'store',
+        error: 'redis://***@redis.example.com:6379 broken pipe',
+      })
+
+      const teapot = await taskcast.app.request('/teapot')
+      expect(teapot.status).toBe(418)
+      expect(await teapot.text()).toBe('teapot')
+      expect(records).toHaveLength(1)
+      expect(stderr).not.toHaveBeenCalled()
+    } finally {
+      stderr.mockRestore()
+      taskcast.stop()
+    }
   })
 })

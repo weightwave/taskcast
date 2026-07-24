@@ -110,6 +110,17 @@ export function createTaskcastApp(opts: TaskcastServerOptions): TaskcastApp {
   const startTime = Date.now()
   const app = new OpenAPIHono()
 
+  // Hono's default handler writes the raw error to stderr before middleware
+  // can sanitize it. Preserve its response behavior while leaving the single
+  // structured emission to the failure logger below.
+  app.onError((error, c) => {
+    if ('getResponse' in error && typeof error.getResponse === 'function') {
+      const response = error.getResponse()
+      return c.newResponse(response.body, response)
+    }
+    return c.text('Internal Server Error', 500)
+  })
+
   app.use('*', createHttpFailureLogger({
     logLevel: opts.logLevel ?? 'info',
     ...(opts.errorLogger ? { logger: opts.errorLogger } : {}),
