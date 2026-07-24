@@ -35,14 +35,13 @@ export function classifyPostgresConnectivity(
   const seen = new Set<unknown>()
   let current = error
 
-  while (
-    typeof current === 'object'
-    && current !== null
-    && !seen.has(current)
-  ) {
+  while (current instanceof Error && !seen.has(current)) {
     seen.add(current)
     const candidate = current as { code?: unknown, cause?: unknown }
-    if (typeof candidate.code === 'string') {
+    if (
+      Object.prototype.hasOwnProperty.call(candidate, 'code')
+      && typeof candidate.code === 'string'
+    ) {
       const kind = classifyPostgresCode(candidate.code)
       if (kind) return kind
     }

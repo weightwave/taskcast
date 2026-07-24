@@ -66,6 +66,23 @@ describe('classifyPostgresConnectivity', () => {
       .toBe('connection_reset')
   })
 
+  it('does not classify a plain object with a connectivity code', () => {
+    expect(classifyPostgresConnectivity({
+      code: 'ECONNREFUSED',
+    })).toBeUndefined()
+  })
+
+  it('does not classify an Error with an inherited connectivity code', () => {
+    const prototype = Object.assign(Object.create(Error.prototype) as Error, {
+      code: 'ECONNREFUSED',
+    })
+    const error = new Error('database operation failed')
+    Object.setPrototypeOf(error, prototype)
+    expect(error).toBeInstanceOf(Error)
+
+    expect(classifyPostgresConnectivity(error)).toBeUndefined()
+  })
+
   it.each([
     '23505',
     '23503',
