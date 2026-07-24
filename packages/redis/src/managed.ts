@@ -12,6 +12,7 @@ import { RedisShortTermStore } from './short-term.js'
 export interface ManagedRedisOptions extends RedisAdapterOptions {
   observer?: DependencyObserver
   startupTimeoutMs?: number
+  readinessTimeoutMs?: number
   random?: () => number
 }
 
@@ -30,6 +31,8 @@ export interface ManagedRedisAdapters {
   pubSubCheck(): Promise<void>
   close(): Promise<void>
 }
+
+const REDIS_READINESS_TIMEOUT_MS = 2_000
 
 async function withDeadline<T>(
   operation: () => Promise<T>,
@@ -147,16 +150,39 @@ export async function createManagedRedisCommandClient(
 
     const generation = commandGeneration
     const pending = (async () => {
+      let timer: ReturnType<typeof setTimeout> | undefined
       try {
-        await commandClient.ping()
-        if (!closed && generation === commandGeneration) {
-          options.observer?.observe({
-            dependency: 'redisCommand',
-            state: 'healthy',
-          })
+        await Promise.race([
+          commandClient.ping(),
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(() => {
+              if (!closed && generation === commandGeneration) {
+                commandClient.disconnect(true)
+              }
+              reject(new DependencyUnavailableError(
+                'redisCommand',
+                'timeout',
+                new Error('Redis readiness timed out'),
+              ))
+            }, options.readinessTimeoutMs ?? REDIS_READINESS_TIMEOUT_MS)
+          }),
+        ])
+        if (closed || generation !== commandGeneration) {
+          throw new DependencyUnavailableError(
+            'redisCommand',
+            'connection_closed',
+          )
         }
+        options.observer?.observe({
+          dependency: 'redisCommand',
+          state: 'healthy',
+        })
       } catch (error) {
         throw unavailable(error) ?? error
+      } finally {
+        if (timer !== undefined) {
+          clearTimeout(timer)
+        }
       }
     })()
     readinessCheck = pending
