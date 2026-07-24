@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { TaskEngine, MemoryBroadcastProvider, MemoryShortTermStore } from '@taskcast/core'
-import { createTaskcastApp } from '../src/index.js'
+import { createTaskcastApp, DependencyHealthRegistry } from '../src/index.js'
 
 describe('GET /health/detail', () => {
   it('GET / returns public server info with version links', async () => {
@@ -19,6 +19,7 @@ describe('GET /health/detail', () => {
       apiVersion: 'v1',
       links: {
         health: '/health',
+        healthReady: '/health/ready',
         healthDetail: '/health/detail',
         openapi: '/openapi.json',
         docs: '/docs',
@@ -54,6 +55,7 @@ describe('GET /health/detail', () => {
 
     expect((await app.request('/')).status).toBe(200)
     expect((await app.request('/health')).status).toBe(200)
+    expect((await app.request('/health/ready')).status).toBe(200)
     expect((await app.request('/health/detail')).status).toBe(200)
   })
 
@@ -161,5 +163,84 @@ describe('GET /health/detail', () => {
     const body = await res.json()
     expect(body.ok).toBe(true)
     expect(body.auth.mode).toBe('jwt')
+  })
+
+  it('keeps liveness healthy while readiness and detail reflect dependency recovery', async () => {
+    let pubSubHealthy = false
+    const dependencyHealth = new DependencyHealthRegistry({ logger: () => {} })
+    dependencyHealth.register('redisCommand', async () => {})
+    dependencyHealth.register('redisPubSub', async () => {
+      if (!pubSubHealthy) throw new Error('private Redis endpoint')
+    })
+    const engine = new TaskEngine({
+      broadcast: new MemoryBroadcastProvider(),
+      shortTermStore: new MemoryShortTermStore(),
+    })
+    const { app } = createTaskcastApp({
+      engine,
+      auth: { mode: 'jwt', jwt: { secret: 'test-secret', algorithm: 'HS256' } },
+      config: {
+        adapters: {
+          broadcast: { provider: 'redis' },
+          shortTermStore: { provider: 'redis' },
+        },
+      },
+      dependencyHealth,
+      errorLogger: () => {},
+    })
+
+    expect((await app.request('/health')).status).toBe(200)
+    const unavailable = await app.request('/health/ready')
+    expect(unavailable.status).toBe(503)
+    expect(await unavailable.json()).toEqual({
+      ok: false,
+      dependencies: {
+        redisCommand: { state: 'healthy' },
+        redisPubSub: { state: 'unhealthy', errorKind: 'unavailable' },
+      },
+    })
+
+    const degradedDetail = await (await app.request('/health/detail')).json()
+    expect(degradedDetail).toMatchObject({
+      ok: false,
+      auth: { mode: 'jwt' },
+      adapters: {
+        broadcast: { provider: 'redis', status: 'error' },
+        shortTermStore: { provider: 'redis', status: 'ok' },
+      },
+      dependencies: {
+        redisCommand: { configured: true, state: 'healthy' },
+        redisPubSub: {
+          configured: true,
+          state: 'unhealthy',
+          lastErrorKind: 'unavailable',
+        },
+      },
+    })
+
+    pubSubHealthy = true
+    const recovered = await app.request('/health/ready')
+    expect(recovered.status).toBe(200)
+    expect((await recovered.json()).ok).toBe(true)
+    const healthyDetail = await (await app.request('/health/detail')).json()
+    expect(healthyDetail.ok).toBe(true)
+    expect(healthyDetail.adapters.broadcast.status).toBe('ok')
+  })
+
+  it('keeps the default detail response unchanged when no registry is supplied', async () => {
+    const engine = new TaskEngine({
+      broadcast: new MemoryBroadcastProvider(),
+      shortTermStore: new MemoryShortTermStore(),
+    })
+    const { app } = createTaskcastApp({ engine, auth: { mode: 'none' } })
+
+    const body = await (await app.request('/health/detail')).json()
+
+    expect(body).not.toHaveProperty('dependencies')
+    expect(body.ok).toBe(true)
+    expect(body.adapters).toEqual({
+      broadcast: { provider: 'memory', status: 'ok' },
+      shortTermStore: { provider: 'memory', status: 'ok' },
+    })
   })
 })

@@ -21,6 +21,13 @@ export type { WSLike, TaskSummary } from './routes/workers.js'
 export { createAdminRouter } from './routes/admin.js'
 export type { AdminRouteOptions } from './routes/admin.js'
 export { WebhookDelivery } from './webhook.js'
+export { DependencyHealthRegistry } from './dependency-health.js'
+export type {
+  DependencyCheck,
+  DependencyHealthLogger,
+  DependencySnapshot,
+  ReadinessResult,
+} from './dependency-health.js'
 export {
   TaskSchema, TaskEventSchema, WorkerSchema, ErrorSchema,
   CreateTaskSchema, TransitionSchema, PublishEventSchema,
@@ -62,6 +69,10 @@ import type {
 } from '@taskcast/core'
 import { TaskScheduler } from '@taskcast/core'
 import { HeartbeatMonitor } from '@taskcast/core'
+import {
+  DependencyHealthRegistry,
+  type DependencySnapshot,
+} from './dependency-health.js'
 
 export interface TaskcastServerOptions {
   engine: TaskEngine
@@ -77,6 +88,7 @@ export interface TaskcastServerOptions {
   logLevel?: LogLevel
   /** Structured 5xx log sink. Defaults to one JSON line on stderr. */
   errorLogger?: HttpFailureLogger
+  dependencyHealth?: DependencyHealthRegistry
   cors?: boolean | { origin: string | string[] }
   scheduler?: {
     enabled?: boolean
@@ -141,6 +153,7 @@ export function createTaskcastApp(opts: TaskcastServerOptions): TaskcastApp {
     ...serverInfo(),
     links: {
       health: '/health',
+      healthReady: '/health/ready',
       healthDetail: '/health/detail',
       openapi: '/openapi.json',
       docs: '/docs',
@@ -148,6 +161,13 @@ export function createTaskcastApp(opts: TaskcastServerOptions): TaskcastApp {
   }))
 
   app.get('/health', (c) => c.json({ ok: true, ...serverInfo() }))
+
+  app.get('/health/ready', async (c) => {
+    const result = opts.dependencyHealth
+      ? await opts.dependencyHealth.checkReadiness(2_000)
+      : { ok: true, dependencies: {} }
+    return c.json(result, result.ok ? 200 : 503)
+  })
 
   app.get('/health/detail', (c) => {
     const uptime = Math.floor((Date.now() - startTime) / 1000)
@@ -165,12 +185,47 @@ export function createTaskcastApp(opts: TaskcastServerOptions): TaskcastApp {
       adapters.longTermStore = { provider: longTermProvider, status: 'ok' }
     }
 
+    if (!opts.dependencyHealth) {
+      return c.json({
+        ok: true,
+        ...serverInfo(),
+        uptime,
+        auth: { mode: authMode },
+        adapters,
+      })
+    }
+
+    const dependencies = opts.dependencyHealth.snapshot()
+    const dependencyHealthy = (
+      name: keyof typeof dependencies,
+    ): boolean => dependencies[name]?.state === 'healthy'
+    if (broadcastProvider === 'redis') {
+      adapters.broadcast!.status = dependencyHealthy('redisCommand')
+        && dependencyHealthy('redisPubSub')
+        ? 'ok'
+        : 'error'
+    }
+    if (shortTermProvider === 'redis') {
+      adapters.shortTermStore!.status = dependencyHealthy('redisCommand')
+        ? 'ok'
+        : 'error'
+    }
+    if (longTermProvider === 'postgres' && adapters.longTermStore) {
+      adapters.longTermStore.status = dependencyHealthy('postgres')
+        ? 'ok'
+        : 'error'
+    }
+
     return c.json({
-      ok: true,
+      ok: Object.values(dependencies).every(
+        (dependency: DependencySnapshot | undefined) =>
+          dependency?.state === 'healthy',
+      ),
       ...serverInfo(),
       uptime,
       auth: { mode: authMode },
       adapters,
+      dependencies,
     })
   })
 

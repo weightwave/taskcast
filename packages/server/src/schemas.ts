@@ -108,6 +108,7 @@ export const ServerInfoSchema = z
     links: z
       .object({
         health: z.string(),
+        healthReady: z.string(),
         healthDetail: z.string(),
         openapi: z.string(),
         docs: z.string(),

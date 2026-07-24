@@ -1,8 +1,14 @@
 use std::sync::Arc;
 
 use axum_test::TestServer;
+use std::future::Future;
+use std::pin::Pin;
+use taskcast_core::{DependencyName, DependencyUnavailableError};
 use taskcast_core::{MemoryBroadcastProvider, MemoryShortTermStore, TaskEngine, TaskEngineOptions};
-use taskcast_server::{create_app, AuthMode, CorsConfig, JwtConfig};
+use taskcast_server::{
+    create_app, create_app_with_runtime_health_and_routes, AuthMode, CorsConfig, DependencyCheck,
+    DependencyHealthRegistry, JwtConfig, RuntimeHealth, StderrHttpFailureLogger,
+};
 
 fn make_server() -> TestServer {
     let engine = Arc::new(TaskEngine::new(TaskEngineOptions {
@@ -25,6 +31,7 @@ async fn root_returns_server_info_and_links() {
     assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(body["apiVersion"], "v1");
     assert_eq!(body["links"]["health"], "/health");
+    assert_eq!(body["links"]["healthReady"], "/health/ready");
     assert_eq!(body["links"]["healthDetail"], "/health/detail");
     assert_eq!(body["links"]["openapi"], "/openapi.json");
     assert_eq!(body["links"]["docs"], "/docs");
@@ -116,6 +123,14 @@ async fn health_detail_bypasses_jwt_auth() {
     assert_eq!(body["ok"], true);
     assert!(body["uptime"].is_number());
     assert_eq!(body["auth"]["mode"], "jwt");
+}
+
+#[tokio::test]
+async fn health_ready_bypasses_jwt_auth() {
+    let server = make_jwt_server();
+    let res = server.get("/health/ready").await;
+    res.assert_status_ok();
+    assert_eq!(res.json::<serde_json::Value>()["ok"], true);
 }
 
 #[tokio::test]
@@ -291,4 +306,133 @@ async fn health_detail_with_config_empty_adapters() {
     assert_eq!(body["adapters"]["broadcast"]["provider"], "memory");
     assert_eq!(body["adapters"]["shortTermStore"]["provider"], "memory");
     assert!(body["adapters"]["longTermStore"].is_null());
+}
+
+fn runtime_check<F, Fut>(function: F) -> DependencyCheck
+where
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<(), DependencyUnavailableError>> + Send + 'static,
+{
+    Arc::new(move || {
+        let future: Pin<Box<dyn Future<Output = Result<(), DependencyUnavailableError>> + Send>> =
+            Box::pin(function());
+        future
+    })
+}
+
+#[tokio::test]
+async fn liveness_stays_up_while_readiness_and_detail_track_recovery() {
+    let engine = Arc::new(TaskEngine::new(TaskEngineOptions {
+        short_term_store: Arc::new(MemoryShortTermStore::new()),
+        broadcast: Arc::new(MemoryBroadcastProvider::new()),
+        long_term_store: None,
+        hooks: None,
+    }));
+    let pubsub_healthy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let registry = Arc::new(DependencyHealthRegistry::new());
+    registry
+        .register(
+            DependencyName::RedisCommand,
+            runtime_check(|| async { Ok(()) }),
+        )
+        .unwrap();
+    registry
+        .register(
+            DependencyName::RedisPubSub,
+            runtime_check({
+                let healthy = pubsub_healthy.clone();
+                move || {
+                    let healthy = healthy.clone();
+                    async move {
+                        if healthy.load(std::sync::atomic::Ordering::SeqCst) {
+                            Ok(())
+                        } else {
+                            Err(DependencyUnavailableError::new(
+                                DependencyName::RedisPubSub,
+                                taskcast_core::DependencyErrorKind::ConnectionClosed,
+                                std::io::Error::other("private Redis endpoint"),
+                            ))
+                        }
+                    }
+                }
+            }),
+        )
+        .unwrap();
+    let config = TaskcastConfig {
+        adapters: Some(AdaptersConfig {
+            broadcast: Some(AdapterEntry {
+                provider: "redis".to_string(),
+                url: None,
+            }),
+            short_term_store: Some(AdapterEntry {
+                provider: "redis".to_string(),
+                url: None,
+            }),
+            long_term_store: None,
+        }),
+        ..Default::default()
+    };
+    let auth = AuthMode::Jwt(JwtConfig {
+        algorithm: jsonwebtoken::Algorithm::HS256,
+        secret: Some("test-secret-key-for-jwt-signing".to_string()),
+        public_key: None,
+        issuer: None,
+        audience: None,
+    });
+    let runtime_health = RuntimeHealth {
+        registry: Some(registry),
+    };
+    let (app, _) = create_app_with_runtime_health_and_routes(
+        engine,
+        auth,
+        None,
+        Some(config),
+        CorsConfig::default(),
+        Arc::new(StderrHttpFailureLogger::new(
+            taskcast_server::LogLevel::Info,
+        )),
+        runtime_health,
+        axum::Router::new(),
+    );
+    let server = TestServer::new(app);
+
+    server.get("/health").await.assert_status_ok();
+    let unavailable = server.get("/health/ready").await;
+    unavailable.assert_status(axum_test::http::StatusCode::SERVICE_UNAVAILABLE);
+    let unavailable_json: serde_json::Value = unavailable.json();
+    assert_eq!(unavailable_json["ok"], false);
+    assert_eq!(
+        unavailable_json["dependencies"]["redisPubSub"]["errorKind"],
+        "connection_closed"
+    );
+
+    let detail = server.get("/health/detail").await;
+    detail.assert_status_ok();
+    let detail_json: serde_json::Value = detail.json();
+    assert_eq!(detail_json["ok"], false);
+    assert_eq!(detail_json["adapters"]["broadcast"]["status"], "error");
+    assert_eq!(detail_json["adapters"]["shortTermStore"]["status"], "ok");
+    assert_eq!(
+        detail_json["dependencies"]["redisPubSub"]["lastErrorKind"],
+        "connection_closed"
+    );
+
+    pubsub_healthy.store(true, std::sync::atomic::Ordering::SeqCst);
+    let recovered = server.get("/health/ready").await;
+    recovered.assert_status_ok();
+    assert_eq!(recovered.json::<serde_json::Value>()["ok"], true);
+    assert_eq!(
+        server
+            .get("/health/detail")
+            .await
+            .json::<serde_json::Value>()["adapters"]["broadcast"]["status"],
+        "ok"
+    );
+}
+
+#[tokio::test]
+async fn default_detail_omits_dependencies() {
+    let server = make_server();
+    let body: serde_json::Value = server.get("/health/detail").await.json();
+    assert!(body["dependencies"].is_null());
 }

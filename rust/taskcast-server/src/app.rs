@@ -5,7 +5,8 @@ use axum::extract::State as AxumState;
 use axum::middleware;
 use axum::response::IntoResponse;
 use axum::routing::{get, patch, post};
-use axum::{Extension, Router};
+use axum::{Extension, Json, Router};
+use http::StatusCode;
 use taskcast_core::config::TaskcastConfig;
 use taskcast_core::heartbeat_monitor::{HeartbeatMonitor, HeartbeatMonitorOptions};
 use taskcast_core::scheduler::{TaskScheduler, TaskSchedulerOptions};
@@ -20,6 +21,7 @@ use utoipa::OpenApi;
 use utoipa_scalar::{Scalar, Servable};
 
 use crate::auth::{auth_middleware, AuthMode};
+use crate::dependency_health::{ReadinessResult, RuntimeHealth};
 use crate::openapi::ApiDoc;
 use crate::routes::sse::create_subscriber_counts;
 use crate::routes::worker_ws::{task_to_summary, WorkerCommand, WsRegistry};
@@ -32,6 +34,7 @@ pub struct AppState {
     pub auth_mode: Arc<AuthMode>,
     pub start_time: Instant,
     pub config: Option<Arc<TaskcastConfig>>,
+    pub runtime_health: RuntimeHealth,
 }
 
 /// Create the Axum router with all taskcast routes mounted.
@@ -97,6 +100,28 @@ pub fn create_app_with_failure_logger_and_routes(
     failure_logger: Arc<dyn crate::http_failure::HttpFailureLogger>,
     additional_routes: Router,
 ) -> (Router, Option<WsRegistry>) {
+    create_app_with_runtime_health_and_routes(
+        engine,
+        auth_mode,
+        worker_manager,
+        config,
+        cors_config,
+        failure_logger,
+        RuntimeHealth::default(),
+        additional_routes,
+    )
+}
+
+pub fn create_app_with_runtime_health_and_routes(
+    engine: Arc<TaskEngine>,
+    auth_mode: AuthMode,
+    worker_manager: Option<Arc<WorkerManager>>,
+    config: Option<TaskcastConfig>,
+    cors_config: CorsConfig,
+    failure_logger: Arc<dyn crate::http_failure::HttpFailureLogger>,
+    runtime_health: RuntimeHealth,
+    additional_routes: Router,
+) -> (Router, Option<WsRegistry>) {
     let auth_mode = Arc::new(auth_mode);
     let subscriber_counts = create_subscriber_counts();
 
@@ -105,6 +130,7 @@ pub fn create_app_with_failure_logger_and_routes(
         auth_mode: Arc::clone(&auth_mode),
         start_time: Instant::now(),
         config: config.as_ref().map(|c| Arc::new(c.clone())),
+        runtime_health,
     };
 
     let task_routes = Router::new()
@@ -134,6 +160,10 @@ pub fn create_app_with_failure_logger_and_routes(
     let public_routes = Router::new()
         .route("/", get(root))
         .route("/health", get(health))
+        .route(
+            "/health/ready",
+            get(health_ready).with_state(app_state.clone()),
+        )
         .route("/health/detail", get(health_detail).with_state(app_state))
         .route(
             "/openapi.json",
@@ -283,6 +313,7 @@ async fn root() -> impl IntoResponse {
         "apiVersion": API_VERSION,
         "links": {
             "health": "/health",
+            "healthReady": "/health/ready",
             "healthDetail": "/health/detail",
             "openapi": "/openapi.json",
             "docs": "/docs"
@@ -297,6 +328,25 @@ async fn health() -> impl IntoResponse {
         "version": SERVER_VERSION,
         "apiVersion": API_VERSION
     }))
+}
+
+async fn health_ready(AxumState(state): AxumState<AppState>) -> axum::response::Response {
+    let result = match state.runtime_health.registry {
+        Some(registry) => {
+            registry
+                .check_readiness(std::time::Duration::from_secs(2))
+                .await
+        }
+        None => ReadinessResult {
+            ok: true,
+            dependencies: std::collections::HashMap::new(),
+        },
+    };
+    if result.ok {
+        Json(result).into_response()
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, Json(result)).into_response()
+    }
 }
 
 async fn health_detail(AxumState(state): AxumState<AppState>) -> impl IntoResponse {
@@ -329,7 +379,7 @@ async fn health_detail(AxumState(state): AxumState<AppState>) -> impl IntoRespon
         }
     }
 
-    axum::Json(serde_json::json!({
+    let mut response = serde_json::json!({
         "ok": true,
         "name": SERVER_NAME,
         "version": SERVER_VERSION,
@@ -337,7 +387,50 @@ async fn health_detail(AxumState(state): AxumState<AppState>) -> impl IntoRespon
         "uptime": uptime,
         "auth": { "mode": auth_mode_str },
         "adapters": adapters
-    }))
+    });
+
+    if let Some(registry) = state.runtime_health.registry {
+        let dependencies = registry.snapshot();
+        let dependency_healthy = |name: &str| {
+            dependencies
+                .get(name)
+                .and_then(|entry| entry.get("state"))
+                .and_then(serde_json::Value::as_str)
+                == Some("healthy")
+        };
+        if response["adapters"]["broadcast"]["provider"] == "redis" {
+            response["adapters"]["broadcast"]["status"] =
+                serde_json::json!(if dependency_healthy("redisCommand")
+                    && dependency_healthy("redisPubSub")
+                {
+                    "ok"
+                } else {
+                    "error"
+                });
+        }
+        if response["adapters"]["shortTermStore"]["provider"] == "redis" {
+            response["adapters"]["shortTermStore"]["status"] =
+                serde_json::json!(if dependency_healthy("redisCommand") {
+                    "ok"
+                } else {
+                    "error"
+                });
+        }
+        if response["adapters"]["longTermStore"]["provider"] == "postgres" {
+            response["adapters"]["longTermStore"]["status"] =
+                serde_json::json!(if dependency_healthy("postgres") {
+                    "ok"
+                } else {
+                    "error"
+                });
+        }
+        response["ok"] = serde_json::json!(dependencies.as_object().is_none_or(|entries| entries
+            .values()
+            .all(|entry| { entry["state"].as_str() == Some("healthy") })));
+        response["dependencies"] = dependencies;
+    }
+
+    Json(response)
 }
 
 // ─── Extracted dispatch helpers (testable without closures) ─────────────────
