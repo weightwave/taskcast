@@ -1,5 +1,11 @@
 # @taskcast/postgres
 
+## 1.5.5
+
+### Patch Changes
+
+- @taskcast/core@1.5.5
+
 ## 1.5.4
 
 ### Patch Changes
