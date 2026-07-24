@@ -1,7 +1,9 @@
 pub mod broadcast;
+pub mod connection;
 pub mod short_term;
 
 pub use broadcast::RedisBroadcastProvider;
+pub use connection::{command_check, create_connection_manager, RedisCommandConnection};
 pub use short_term::RedisShortTermStore;
 
 use redis::aio::MultiplexedConnection;

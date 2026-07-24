@@ -1,5 +1,11 @@
 export { RedisBroadcastProvider } from './broadcast.js'
 export { RedisShortTermStore } from './short-term.js'
+export { equalJitterDelay } from './backoff.js'
+export { createManagedRedisCommandClient } from './managed.js'
+export type {
+  ManagedRedisCommand,
+  ManagedRedisOptions,
+} from './managed.js'
 
 import type { Redis } from 'ioredis'
 import { RedisBroadcastProvider } from './broadcast.js'

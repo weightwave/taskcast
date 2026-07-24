@@ -1,11 +1,22 @@
 use async_trait::async_trait;
 use redis::aio::MultiplexedConnection;
 use redis::AsyncCommands;
+use std::sync::Arc;
 
 use taskcast_core::types::{
     EventQueryOptions, ShortTermStore, Task, TaskEvent, TaskFilter, Worker, WorkerAssignment,
     WorkerFilter,
 };
+use taskcast_core::DependencyObserver;
+
+use crate::connection::RedisCommandConnection;
+
+macro_rules! redis_call {
+    ($connection:ident, $operation:expr) => {{
+        let result = $operation.await;
+        $connection.observe_result(result)?
+    }};
+}
 
 /// Helper to generate Redis key names for a given prefix.
 struct Keys {
@@ -75,7 +86,7 @@ impl Keys {
 /// Uses Redis data structures to persist tasks, events, series tracking,
 /// and atomic index counters.
 pub struct RedisShortTermStore {
-    conn: MultiplexedConnection,
+    conn: RedisCommandConnection,
     keys: Keys,
 }
 
@@ -85,6 +96,19 @@ impl RedisShortTermStore {
     /// - `conn`: a multiplexed Redis connection for all read/write operations.
     /// - `prefix`: key prefix (defaults to `"taskcast"`).
     pub fn new(conn: MultiplexedConnection, prefix: Option<&str>) -> Self {
+        Self::with_command_connection(conn.into(), prefix)
+    }
+
+    #[allow(dead_code)] // Used by the managed adapter composition added in Task 4.
+    pub(crate) fn new_managed(
+        manager: redis::aio::ConnectionManager,
+        prefix: Option<&str>,
+        observer: Option<Arc<dyn DependencyObserver>>,
+    ) -> Self {
+        Self::with_command_connection(RedisCommandConnection::managed(manager, observer), prefix)
+    }
+
+    fn with_command_connection(conn: RedisCommandConnection, prefix: Option<&str>) -> Self {
         let resolved_prefix = prefix.unwrap_or("taskcast");
         Self {
             conn,
@@ -108,8 +132,8 @@ impl ShortTermStore for RedisShortTermStore {
         let tasks_set_key = self.keys.tasks_set();
         let json = serde_json::to_string(&task)?;
         let mut conn = self.conn.clone();
-        conn.set::<_, _, ()>(&key, &json).await?;
-        conn.sadd::<_, _, ()>(&tasks_set_key, &task.id).await?;
+        redis_call!(conn, conn.set::<_, _, ()>(&key, &json));
+        redis_call!(conn, conn.sadd::<_, _, ()>(&tasks_set_key, &task.id));
         Ok(())
     }
 
@@ -119,7 +143,7 @@ impl ShortTermStore for RedisShortTermStore {
     ) -> Result<Option<Task>, Box<dyn std::error::Error + Send + Sync>> {
         let key = self.keys.task(task_id);
         let mut conn = self.conn.clone();
-        let result: Option<String> = conn.get(&key).await?;
+        let result: Option<String> = redis_call!(conn, conn.get(&key));
         match result {
             Some(json) => Ok(Some(serde_json::from_str(&json)?)),
             None => Ok(None),
@@ -134,7 +158,7 @@ impl ShortTermStore for RedisShortTermStore {
         let key = self.keys.events(task_id);
         let json = serde_json::to_string(&event)?;
         let mut conn = self.conn.clone();
-        conn.rpush::<_, _, ()>(&key, &json).await?;
+        redis_call!(conn, conn.rpush::<_, _, ()>(&key, &json));
         Ok(())
     }
 
@@ -145,7 +169,7 @@ impl ShortTermStore for RedisShortTermStore {
     ) -> Result<Vec<TaskEvent>, Box<dyn std::error::Error + Send + Sync>> {
         let key = self.keys.events(task_id);
         let mut conn = self.conn.clone();
-        let raw: Vec<String> = conn.lrange(&key, 0, -1).await?;
+        let raw: Vec<String> = redis_call!(conn, conn.lrange(&key, 0, -1));
 
         let all: Vec<TaskEvent> = raw
             .into_iter()
@@ -186,25 +210,39 @@ impl ShortTermStore for RedisShortTermStore {
         let ttl_secs = ttl_seconds as i64;
 
         // Expire task key
-        conn.expire::<_, ()>(&self.keys.task(task_id), ttl_secs)
-            .await?;
+        redis_call!(
+            conn,
+            conn.expire::<_, ()>(&self.keys.task(task_id), ttl_secs)
+        );
 
         // Expire events list
-        conn.expire::<_, ()>(&self.keys.events(task_id), ttl_secs)
-            .await?;
+        redis_call!(
+            conn,
+            conn.expire::<_, ()>(&self.keys.events(task_id), ttl_secs)
+        );
 
         // Expire index counter
-        conn.expire::<_, ()>(&self.keys.idx(task_id), ttl_secs)
-            .await?;
+        redis_call!(
+            conn,
+            conn.expire::<_, ()>(&self.keys.idx(task_id), ttl_secs)
+        );
 
         // Expire series IDs set and each series latest key
         let series_ids_key = self.keys.series_ids(task_id);
-        let series_ids: Vec<String> = conn.smembers(&series_ids_key).await.unwrap_or_default();
+        let series_ids_result = conn.smembers(&series_ids_key).await;
+        let series_ids: Vec<String> = if conn.is_managed() {
+            conn.observe_result(series_ids_result)?
+        } else {
+            // Preserve the raw adapter's historical best-effort behavior.
+            series_ids_result.unwrap_or_default()
+        };
         for sid in &series_ids {
-            conn.expire::<_, ()>(&self.keys.series_latest(task_id, sid), ttl_secs)
-                .await?;
+            redis_call!(
+                conn,
+                conn.expire::<_, ()>(&self.keys.series_latest(task_id, sid), ttl_secs)
+            );
         }
-        conn.expire::<_, ()>(&series_ids_key, ttl_secs).await?;
+        redis_call!(conn, conn.expire::<_, ()>(&series_ids_key, ttl_secs));
 
         Ok(())
     }
@@ -216,7 +254,7 @@ impl ShortTermStore for RedisShortTermStore {
     ) -> Result<Option<TaskEvent>, Box<dyn std::error::Error + Send + Sync>> {
         let key = self.keys.series_latest(task_id, series_id);
         let mut conn = self.conn.clone();
-        let result: Option<String> = conn.get(&key).await?;
+        let result: Option<String> = redis_call!(conn, conn.get(&key));
         match result {
             Some(json) => Ok(Some(serde_json::from_str(&json)?)),
             None => Ok(None),
@@ -232,10 +270,12 @@ impl ShortTermStore for RedisShortTermStore {
         let key = self.keys.series_latest(task_id, series_id);
         let json = serde_json::to_string(&event)?;
         let mut conn = self.conn.clone();
-        conn.set::<_, _, ()>(&key, &json).await?;
+        redis_call!(conn, conn.set::<_, _, ()>(&key, &json));
         // Track series ID
-        conn.sadd::<_, _, ()>(&self.keys.series_ids(task_id), series_id)
-            .await?;
+        redis_call!(
+            conn,
+            conn.sadd::<_, _, ()>(&self.keys.series_ids(task_id), series_id)
+        );
         Ok(())
     }
 
@@ -277,14 +317,16 @@ impl ShortTermStore for RedisShortTermStore {
 
         let script = redis::Script::new(lua);
         let mut conn = self.conn.clone();
-        let result_json: String = script
-            .key(&series_latest_key)
-            .key(&series_ids_key)
-            .arg(&event_json)
-            .arg(field)
-            .arg(series_id)
-            .invoke_async(&mut conn)
-            .await?;
+        let result_json: String = redis_call!(
+            conn,
+            script
+                .key(&series_latest_key)
+                .key(&series_ids_key)
+                .arg(&event_json)
+                .arg(field)
+                .arg(series_id)
+                .invoke_async(&mut conn)
+        );
 
         let accumulated: TaskEvent = serde_json::from_str(&result_json)?;
         Ok(accumulated)
@@ -301,21 +343,23 @@ impl ShortTermStore for RedisShortTermStore {
         let mut conn = self.conn.clone();
 
         // Get the previous series latest
-        let prev_json: Option<String> = conn.get(&series_key).await?;
+        let prev_json: Option<String> = redis_call!(conn, conn.get(&series_key));
 
         if let Some(prev_json) = prev_json {
             let prev: TaskEvent = serde_json::from_str(&prev_json)?;
 
             // Find and replace the event in the list
-            let raw: Vec<String> = conn.lrange(&events_key, 0, -1).await?;
+            let raw: Vec<String> = redis_call!(conn, conn.lrange(&events_key, 0, -1));
             let new_event_json = serde_json::to_string(&event)?;
 
             // Search from the end (rposition equivalent)
             for (i, item) in raw.iter().enumerate().rev() {
                 if let Ok(e) = serde_json::from_str::<TaskEvent>(item) {
                     if e.id == prev.id {
-                        conn.lset::<_, _, ()>(&events_key, i as isize, &new_event_json)
-                            .await?;
+                        redis_call!(
+                            conn,
+                            conn.lset::<_, _, ()>(&events_key, i as isize, &new_event_json)
+                        );
                         break;
                     }
                 }
@@ -327,9 +371,11 @@ impl ShortTermStore for RedisShortTermStore {
 
         // Update series latest
         let json = serde_json::to_string(&event)?;
-        conn.set::<_, _, ()>(&series_key, &json).await?;
-        conn.sadd::<_, _, ()>(&self.keys.series_ids(task_id), series_id)
-            .await?;
+        redis_call!(conn, conn.set::<_, _, ()>(&series_key, &json));
+        redis_call!(
+            conn,
+            conn.sadd::<_, _, ()>(&self.keys.series_ids(task_id), series_id)
+        );
 
         Ok(())
     }
@@ -342,7 +388,7 @@ impl ShortTermStore for RedisShortTermStore {
         let mut conn = self.conn.clone();
         // INCR is atomic -- safe across multiple instances sharing the same Redis.
         // Returns 1-based, so subtract 1 to get 0-based index.
-        let val: i64 = conn.incr(&key, 1).await?;
+        let val: i64 = redis_call!(conn, conn.incr(&key, 1));
         Ok((val - 1) as u64)
     }
 
@@ -355,14 +401,14 @@ impl ShortTermStore for RedisShortTermStore {
         let tasks_set_key = self.keys.tasks_set();
         let mut conn = self.conn.clone();
 
-        let task_ids: Vec<String> = conn.smembers(&tasks_set_key).await?;
+        let task_ids: Vec<String> = redis_call!(conn, conn.smembers(&tasks_set_key));
         if task_ids.is_empty() {
             return Ok(Vec::new());
         }
 
         // Build task keys for MGET
         let task_keys: Vec<String> = task_ids.iter().map(|id| self.keys.task(id)).collect();
-        let raw: Vec<Option<String>> = conn.mget(&task_keys).await?;
+        let raw: Vec<Option<String>> = redis_call!(conn, conn.mget(&task_keys));
 
         // Collect stale IDs (task expired but ID still in SET) for passive cleanup
         let stale_ids: Vec<&str> = raw
@@ -371,7 +417,7 @@ impl ShortTermStore for RedisShortTermStore {
             .filter_map(|(i, opt)| if opt.is_none() { Some(task_ids[i].as_str()) } else { None })
             .collect();
         if !stale_ids.is_empty() {
-            conn.srem::<_, _, ()>(&tasks_set_key, &stale_ids).await?;
+            redis_call!(conn, conn.srem::<_, _, ()>(&tasks_set_key, &stale_ids));
         }
 
         let mut tasks: Vec<Task> = raw
@@ -439,8 +485,8 @@ impl ShortTermStore for RedisShortTermStore {
         let workers_set_key = self.keys.workers_set();
         let json = serde_json::to_string(&worker)?;
         let mut conn = self.conn.clone();
-        conn.set::<_, _, ()>(&key, &json).await?;
-        conn.sadd::<_, _, ()>(&workers_set_key, &worker.id).await?;
+        redis_call!(conn, conn.set::<_, _, ()>(&key, &json));
+        redis_call!(conn, conn.sadd::<_, _, ()>(&workers_set_key, &worker.id));
         Ok(())
     }
 
@@ -450,7 +496,7 @@ impl ShortTermStore for RedisShortTermStore {
     ) -> Result<Option<Worker>, Box<dyn std::error::Error + Send + Sync>> {
         let key = self.keys.worker(worker_id);
         let mut conn = self.conn.clone();
-        let result: Option<String> = conn.get(&key).await?;
+        let result: Option<String> = redis_call!(conn, conn.get(&key));
         match result {
             Some(json) => Ok(Some(serde_json::from_str(&json)?)),
             None => Ok(None),
@@ -464,13 +510,13 @@ impl ShortTermStore for RedisShortTermStore {
         let workers_set_key = self.keys.workers_set();
         let mut conn = self.conn.clone();
 
-        let worker_ids: Vec<String> = conn.smembers(&workers_set_key).await?;
+        let worker_ids: Vec<String> = redis_call!(conn, conn.smembers(&workers_set_key));
         if worker_ids.is_empty() {
             return Ok(Vec::new());
         }
 
         let worker_keys: Vec<String> = worker_ids.iter().map(|id| self.keys.worker(id)).collect();
-        let raw: Vec<Option<String>> = conn.mget(&worker_keys).await?;
+        let raw: Vec<Option<String>> = redis_call!(conn, conn.mget(&worker_keys));
 
         let mut workers: Vec<Worker> = raw
             .into_iter()
@@ -497,8 +543,8 @@ impl ShortTermStore for RedisShortTermStore {
         let key = self.keys.worker(worker_id);
         let workers_set_key = self.keys.workers_set();
         let mut conn = self.conn.clone();
-        conn.del::<_, ()>(&key).await?;
-        conn.srem::<_, _, ()>(&workers_set_key, worker_id).await?;
+        redis_call!(conn, conn.del::<_, ()>(&key));
+        redis_call!(conn, conn.srem::<_, _, ()>(&workers_set_key, worker_id));
         Ok(())
     }
 
@@ -544,14 +590,16 @@ impl ShortTermStore for RedisShortTermStore {
 
         let script = redis::Script::new(lua);
         let mut conn = self.conn.clone();
-        let result: i32 = script
-            .key(&task_key)
-            .key(&worker_key)
-            .arg(cost)
-            .arg(worker_id)
-            .arg(timestamp_ms)
-            .invoke_async(&mut conn)
-            .await?;
+        let result: i32 = redis_call!(
+            conn,
+            script
+                .key(&task_key)
+                .key(&worker_key)
+                .arg(cost)
+                .arg(worker_id)
+                .arg(timestamp_ms)
+                .invoke_async(&mut conn)
+        );
 
         Ok(result == 1)
     }
@@ -566,9 +614,11 @@ impl ShortTermStore for RedisShortTermStore {
         let worker_assignments_key = self.keys.worker_assignments(&assignment.worker_id);
         let json = serde_json::to_string(&assignment)?;
         let mut conn = self.conn.clone();
-        conn.set::<_, _, ()>(&assignment_key, &json).await?;
-        conn.sadd::<_, _, ()>(&worker_assignments_key, &assignment.task_id)
-            .await?;
+        redis_call!(conn, conn.set::<_, _, ()>(&assignment_key, &json));
+        redis_call!(
+            conn,
+            conn.sadd::<_, _, ()>(&worker_assignments_key, &assignment.task_id)
+        );
         Ok(())
     }
 
@@ -580,15 +630,17 @@ impl ShortTermStore for RedisShortTermStore {
         let mut conn = self.conn.clone();
 
         // First, get the assignment to find the worker ID
-        let result: Option<String> = conn.get(&assignment_key).await?;
+        let result: Option<String> = redis_call!(conn, conn.get(&assignment_key));
         if let Some(json) = result {
             let assignment: WorkerAssignment = serde_json::from_str(&json)?;
             let worker_assignments_key = self.keys.worker_assignments(&assignment.worker_id);
-            conn.srem::<_, _, ()>(&worker_assignments_key, task_id)
-                .await?;
+            redis_call!(
+                conn,
+                conn.srem::<_, _, ()>(&worker_assignments_key, task_id)
+            );
         }
 
-        conn.del::<_, ()>(&assignment_key).await?;
+        redis_call!(conn, conn.del::<_, ()>(&assignment_key));
         Ok(())
     }
 
@@ -599,14 +651,14 @@ impl ShortTermStore for RedisShortTermStore {
         let worker_assignments_key = self.keys.worker_assignments(worker_id);
         let mut conn = self.conn.clone();
 
-        let task_ids: Vec<String> = conn.smembers(&worker_assignments_key).await?;
+        let task_ids: Vec<String> = redis_call!(conn, conn.smembers(&worker_assignments_key));
         if task_ids.is_empty() {
             return Ok(Vec::new());
         }
 
         let assignment_keys: Vec<String> =
             task_ids.iter().map(|id| self.keys.assignment(id)).collect();
-        let raw: Vec<Option<String>> = conn.mget(&assignment_keys).await?;
+        let raw: Vec<Option<String>> = redis_call!(conn, conn.mget(&assignment_keys));
 
         let assignments: Vec<WorkerAssignment> = raw
             .into_iter()
@@ -622,7 +674,7 @@ impl ShortTermStore for RedisShortTermStore {
     ) -> Result<Option<WorkerAssignment>, Box<dyn std::error::Error + Send + Sync>> {
         let key = self.keys.assignment(task_id);
         let mut conn = self.conn.clone();
-        let result: Option<String> = conn.get(&key).await?;
+        let result: Option<String> = redis_call!(conn, conn.get(&key));
         match result {
             Some(json) => Ok(Some(serde_json::from_str(&json)?)),
             None => Ok(None),

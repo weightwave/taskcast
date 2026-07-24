@@ -7,6 +7,9 @@ use redis::aio::MultiplexedConnection;
 use tokio::sync::RwLock;
 
 use taskcast_core::types::{BroadcastProvider, TaskEvent};
+use taskcast_core::DependencyObserver;
+
+use crate::connection::RedisCommandConnection;
 
 type Handler = Arc<dyn Fn(TaskEvent) + Send + Sync>;
 
@@ -16,7 +19,7 @@ type Handler = Arc<dyn Fn(TaskEvent) + Send + Sync>;
 /// subscriber connection listens for messages and fans them out to
 /// locally-registered handlers.
 pub struct RedisBroadcastProvider {
-    pub_conn: MultiplexedConnection,
+    pub_conn: RedisCommandConnection,
     handlers: Arc<RwLock<HashMap<String, Vec<Handler>>>>,
     channel_prefix: String,
 }
@@ -29,6 +32,28 @@ impl RedisBroadcastProvider {
     /// - `prefix`: key/channel prefix (defaults to `"taskcast"`).
     pub fn new(
         pub_conn: MultiplexedConnection,
+        sub_conn: redis::aio::PubSub,
+        prefix: Option<&str>,
+    ) -> Self {
+        Self::with_command_connection(pub_conn.into(), sub_conn, prefix)
+    }
+
+    #[allow(dead_code)] // Used by the managed adapter composition added in Task 4.
+    pub(crate) fn new_managed(
+        manager: redis::aio::ConnectionManager,
+        sub_conn: redis::aio::PubSub,
+        prefix: Option<&str>,
+        observer: Option<Arc<dyn DependencyObserver>>,
+    ) -> Self {
+        Self::with_command_connection(
+            RedisCommandConnection::managed(manager, observer),
+            sub_conn,
+            prefix,
+        )
+    }
+
+    fn with_command_connection(
+        pub_conn: RedisCommandConnection,
         mut sub_conn: redis::aio::PubSub,
         prefix: Option<&str>,
     ) -> Self {
@@ -107,11 +132,12 @@ impl BroadcastProvider for RedisBroadcastProvider {
         let full_channel = format!("{}{}", self.channel_prefix, channel);
         let payload = serde_json::to_string(&event)?;
         let mut conn = self.pub_conn.clone();
-        redis::cmd("PUBLISH")
+        let result = redis::cmd("PUBLISH")
             .arg(&full_channel)
             .arg(&payload)
             .query_async::<i64>(&mut conn)
-            .await?;
+            .await;
+        conn.observe_result(result)?;
         Ok(())
     }
 
