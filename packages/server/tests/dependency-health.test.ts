@@ -7,6 +7,90 @@ afterEach(() => {
 })
 
 describe('DependencyHealthRegistry', () => {
+  it('returns per-call outcomes while only the newest overlapping readiness mutates state', async () => {
+    const records: Array<Record<string, unknown>> = []
+    const releases: Array<{
+      resolve: () => void
+      reject: (error: unknown) => void
+    }> = []
+    const health = new DependencyHealthRegistry({
+      logger: (record) => records.push(record),
+    })
+    health.register('redisCommand', () => new Promise<void>((resolve, reject) => {
+      releases.push({ resolve, reject })
+    }))
+
+    const older = health.checkReadiness()
+    await vi.waitFor(() => expect(releases).toHaveLength(1))
+    const newer = health.checkReadiness()
+    await vi.waitFor(() => expect(releases).toHaveLength(2))
+
+    releases[1]!.reject(new DependencyUnavailableError(
+      'redisCommand',
+      'connection_closed',
+    ))
+    await expect(newer).resolves.toEqual({
+      ok: false,
+      dependencies: {
+        redisCommand: {
+          state: 'unhealthy',
+          errorKind: 'connection_closed',
+        },
+      },
+    })
+    releases[0]!.resolve()
+    await expect(older).resolves.toEqual({
+      ok: true,
+      dependencies: {
+        redisCommand: { state: 'healthy' },
+      },
+    })
+
+    expect(health.snapshot().redisCommand).toMatchObject({
+      state: 'unhealthy',
+      lastErrorKind: 'connection_closed',
+    })
+    expect(records.map((record) => [
+      record.event,
+      record.from,
+      record.to,
+    ])).toEqual([
+      ['dependency_state_change', 'starting', 'unhealthy'],
+    ])
+  })
+
+  it('returns a stale check outcome without overwriting a newer observation', async () => {
+    const records: Array<Record<string, unknown>> = []
+    let release!: () => void
+    const health = new DependencyHealthRegistry({
+      logger: (record) => records.push(record),
+    })
+    health.register('postgres', () => new Promise<void>((resolve) => {
+      release = resolve
+    }))
+
+    const readiness = health.checkReadiness()
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'))
+    health.observe({
+      dependency: 'postgres',
+      state: 'unhealthy',
+      errorKind: 'connection_reset',
+    })
+    release()
+
+    await expect(readiness).resolves.toEqual({
+      ok: true,
+      dependencies: {
+        postgres: { state: 'healthy' },
+      },
+    })
+    expect(health.snapshot().postgres).toMatchObject({
+      state: 'unhealthy',
+      lastErrorKind: 'connection_reset',
+    })
+    expect(records.map((record) => record.to)).toEqual(['unhealthy'])
+  })
+
   it('checks only registered dependencies and sanitizes failures', async () => {
     const now = { value: 1_000 }
     const records: unknown[] = []
@@ -68,9 +152,17 @@ describe('DependencyHealthRegistry', () => {
 
   it('applies one overall deadline and marks every unfinished check timed out', async () => {
     vi.useFakeTimers()
-    const health = new DependencyHealthRegistry({ logger: () => {} })
-    health.register('redisCommand', () => new Promise<void>(() => {}))
-    health.register('postgres', () => new Promise<void>(() => {}))
+    const records: Array<Record<string, unknown>> = []
+    const releases: Array<() => void> = []
+    const health = new DependencyHealthRegistry({
+      logger: (record) => records.push(record),
+    })
+    health.register('redisCommand', () => new Promise<void>((resolve) => {
+      releases.push(resolve)
+    }))
+    health.register('postgres', () => new Promise<void>((resolve) => {
+      releases.push(resolve)
+    }))
 
     const readiness = health.checkReadiness(2_000)
     let settled = false
@@ -89,6 +181,21 @@ describe('DependencyHealthRegistry', () => {
         postgres: { state: 'unhealthy', errorKind: 'timeout' },
       },
     })
+    for (const release of releases) release()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(health.snapshot().redisCommand).toMatchObject({
+      state: 'unhealthy',
+      lastErrorKind: 'timeout',
+    })
+    expect(health.snapshot().postgres).toMatchObject({
+      state: 'unhealthy',
+      lastErrorKind: 'timeout',
+    })
+    expect(records.map((record) => record.to)).toEqual([
+      'unhealthy',
+      'unhealthy',
+    ])
   })
 
   it('rejects duplicate dependency registrations', () => {

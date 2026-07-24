@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
@@ -63,6 +63,7 @@ struct RegistryState {
 }
 
 struct DependencyEntry {
+    generation: u64,
     state: DependencyState,
     last_transition_at: u64,
     last_error_kind: Option<DependencyErrorKind>,
@@ -100,6 +101,7 @@ impl DependencyHealthRegistry {
         state.entries.insert(
             name,
             DependencyEntry {
+                generation: 0,
                 state: DependencyState::Starting,
                 last_transition_at: now,
                 last_error_kind: None,
@@ -149,43 +151,48 @@ impl DependencyHealthRegistry {
 
     pub async fn check_readiness(&self, timeout: Duration) -> ReadinessResult {
         let checks: Vec<_> = {
-            let state = self.state.read().expect("dependency health lock poisoned");
-            state
+            let mut state = self.state.write().expect("dependency health lock poisoned");
+            let checks = state
                 .checks
                 .iter()
                 .map(|(name, check)| (*name, Arc::clone(check)))
+                .collect::<Vec<_>>();
+            checks
+                .into_iter()
+                .map(|(name, check)| {
+                    let entry = state
+                        .entries
+                        .get_mut(&name)
+                        .expect("registered dependency has a health entry");
+                    entry.generation = entry.generation.saturating_add(1);
+                    (name, check, entry.generation)
+                })
                 .collect()
         };
-        let pending = Arc::new(std::sync::Mutex::new(
-            checks.iter().map(|(name, _)| *name).collect::<HashSet<_>>(),
-        ));
-        let futures = checks.into_iter().map(|(name, check)| {
+        let outcomes = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let futures = checks.iter().cloned().map(|(name, check, generation)| {
             let registry = self.clone();
-            let pending = Arc::clone(&pending);
+            let outcomes = Arc::clone(&outcomes);
             async move {
-                let result = check().await;
-                let was_pending = pending
+                let outcome = match check().await {
+                    Ok(()) => DependencyReadiness {
+                        state: DependencyState::Healthy,
+                        error_kind: None,
+                    },
+                    Err(error) => DependencyReadiness {
+                        state: DependencyState::Unhealthy,
+                        error_kind: Some(error.kind()),
+                    },
+                };
+                outcomes
                     .lock()
                     .expect("dependency readiness lock poisoned")
-                    .remove(&name);
-                if was_pending {
-                    registry.observe(match result {
-                        Ok(()) => DependencyObservation {
-                            dependency: name,
-                            state: DependencyObservationState::Healthy,
-                            error_kind: None,
-                            attempt: None,
-                            next_retry_ms: None,
-                        },
-                        Err(error) => DependencyObservation {
-                            dependency: name,
-                            state: DependencyObservationState::Unhealthy,
-                            error_kind: Some(error.kind()),
-                            attempt: None,
-                            next_retry_ms: None,
-                        },
-                    });
-                }
+                    .insert(name, outcome.clone());
+                registry.record_readiness_at(
+                    readiness_observation(name, &outcome),
+                    (registry.clock)(),
+                    generation,
+                );
             }
         });
 
@@ -193,36 +200,37 @@ impl DependencyHealthRegistry {
             .await
             .is_err()
         {
-            let unfinished: Vec<_> = pending
-                .lock()
-                .expect("dependency readiness lock poisoned")
-                .drain()
-                .collect();
-            for name in unfinished {
-                self.observe(DependencyObservation {
-                    dependency: name,
-                    state: DependencyObservationState::Unhealthy,
+            let unfinished = checks
+                .iter()
+                .filter(|(name, _, _)| {
+                    !outcomes
+                        .lock()
+                        .expect("dependency readiness lock poisoned")
+                        .contains_key(name)
+                })
+                .map(|(name, _, generation)| (*name, *generation))
+                .collect::<Vec<_>>();
+            for (name, generation) in unfinished {
+                let outcome = DependencyReadiness {
+                    state: DependencyState::Unhealthy,
                     error_kind: Some(DependencyErrorKind::Timeout),
-                    attempt: None,
-                    next_retry_ms: None,
-                });
+                };
+                outcomes
+                    .lock()
+                    .expect("dependency readiness lock poisoned")
+                    .insert(name, outcome.clone());
+                self.record_readiness_at(
+                    readiness_observation(name, &outcome),
+                    (self.clock)(),
+                    generation,
+                );
             }
         }
 
-        let state = self.state.read().expect("dependency health lock poisoned");
-        let dependencies = state
-            .entries
-            .iter()
-            .map(|(name, entry)| {
-                (
-                    *name,
-                    DependencyReadiness {
-                        state: entry.state,
-                        error_kind: entry.last_error_kind,
-                    },
-                )
-            })
-            .collect::<HashMap<_, _>>();
+        let dependencies = outcomes
+            .lock()
+            .expect("dependency readiness lock poisoned")
+            .clone();
         let ok = dependencies
             .values()
             .all(|dependency| dependency.state == DependencyState::Healthy);
@@ -230,11 +238,36 @@ impl DependencyHealthRegistry {
     }
 
     pub(crate) fn record_at(&self, observation: DependencyObservation, now_ms: u64) {
+        self.record_at_inner(observation, now_ms, None);
+    }
+
+    fn record_readiness_at(
+        &self,
+        observation: DependencyObservation,
+        now_ms: u64,
+        generation: u64,
+    ) {
+        self.record_at_inner(observation, now_ms, Some(generation));
+    }
+
+    fn record_at_inner(
+        &self,
+        observation: DependencyObservation,
+        now_ms: u64,
+        expected_generation: Option<u64>,
+    ) {
         let record = {
             let mut state = self.state.write().expect("dependency health lock poisoned");
             let Some(entry) = state.entries.get_mut(&observation.dependency) else {
                 return;
             };
+            if let Some(generation) = expected_generation {
+                if entry.generation != generation {
+                    return;
+                }
+            } else {
+                entry.generation = entry.generation.saturating_add(1);
+            }
             let previous = entry.state;
             let next = observation_state(observation.state);
             let was_degraded = is_degraded(previous);
@@ -273,7 +306,7 @@ impl DependencyHealthRegistry {
                     "from": dependency_state(previous),
                     "to": dependency_state(next)
                 });
-                add_observation_fields(&mut record, &observation, entry.last_error_kind);
+                add_observation_fields(&mut record, &observation, observation.error_kind);
                 if !degraded && was_degraded {
                     if let Some(started_at) = entry.outage_started_at {
                         record["downtimeMs"] = serde_json::json!(now_ms.saturating_sub(started_at));
@@ -332,6 +365,25 @@ fn add_observation_fields(
     }
     if let Some(kind) = error_kind {
         record["errorKind"] = serde_json::to_value(kind).expect("dependency error kind serializes");
+    }
+}
+
+fn readiness_observation(
+    dependency: DependencyName,
+    outcome: &DependencyReadiness,
+) -> DependencyObservation {
+    DependencyObservation {
+        dependency,
+        state: match outcome.state {
+            DependencyState::Healthy => DependencyObservationState::Healthy,
+            DependencyState::Unhealthy => DependencyObservationState::Unhealthy,
+            DependencyState::Starting | DependencyState::Reconnecting => {
+                unreachable!("readiness checks only produce healthy or unhealthy outcomes")
+            }
+        },
+        error_kind: outcome.error_kind,
+        attempt: None,
+        next_retry_ms: None,
     }
 }
 

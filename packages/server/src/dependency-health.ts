@@ -29,6 +29,7 @@ export interface ReadinessResult {
 }
 
 interface DependencyEntry {
+  generation: number
   state: DependencyState
   lastTransitionAt: number
   lastErrorKind?: DependencyErrorKind
@@ -67,6 +68,7 @@ export class DependencyHealthRegistry implements DependencyObserver {
     const now = this.now()
     this.checks.set(name, check)
     this.entries.set(name, {
+      generation: 0,
       state: 'starting',
       lastTransitionAt: now,
       consecutiveFailures: 0,
@@ -75,6 +77,9 @@ export class DependencyHealthRegistry implements DependencyObserver {
   }
 
   observe(observation: DependencyObservation): void {
+    const entry = this.entries.get(observation.dependency)
+    if (!entry) return
+    entry.generation += 1
     this.recordAt(observation, this.now())
   }
 
@@ -98,21 +103,47 @@ export class DependencyHealthRegistry implements DependencyObserver {
   }
 
   async checkReadiness(timeoutMs = 2_000): Promise<ReadinessResult> {
-    const pending = new Set(this.checks.keys())
-    const checks = [...this.checks.entries()].map(([name, check]) => (
+    const outcomes: ReadinessResult['dependencies'] = {}
+    const pending = new Set<DependencyName>()
+    const reserved = [...this.checks.entries()].map(([name, check]) => {
+      const entry = this.entries.get(name)
+      if (!entry) throw new Error(`dependency entry missing: ${name}`)
+      entry.generation += 1
+      pending.add(name)
+      return { name, check, generation: entry.generation }
+    })
+    const commit = (
+      name: DependencyName,
+      generation: number,
+      outcome: {
+        state: 'healthy' | 'unhealthy'
+        errorKind?: DependencyErrorKind
+      },
+    ) => {
+      outcomes[name] = outcome
+      const entry = this.entries.get(name)
+      if (entry?.generation !== generation) return
+      this.recordAt({
+        dependency: name,
+        state: outcome.state,
+        ...(outcome.errorKind !== undefined
+          ? { errorKind: outcome.errorKind }
+          : {}),
+      }, this.now())
+    }
+    const checks = reserved.map(({ name, check, generation }) => (
       (async () => {
         try {
           await check()
           if (pending.delete(name)) {
-            this.observe({ dependency: name, state: 'healthy' })
+            commit(name, generation, { state: 'healthy' })
           }
         } catch (error) {
           if (!pending.delete(name)) return
           const dependencyError = error instanceof DependencyUnavailableError
             ? error
             : findDependencyUnavailableError(error)
-          this.observe({
-            dependency: name,
+          commit(name, generation, {
             state: 'unhealthy',
             errorKind: dependencyError?.kind ?? 'unavailable',
           })
@@ -134,28 +165,20 @@ export class DependencyHealthRegistry implements DependencyObserver {
     } else {
       for (const name of pending) {
         pending.delete(name)
-        this.observe({
-          dependency: name,
+        const reservation = reserved.find((item) => item.name === name)
+        if (!reservation) continue
+        commit(name, reservation.generation, {
           state: 'unhealthy',
           errorKind: 'timeout',
         })
       }
     }
 
-    const dependencies: ReadinessResult['dependencies'] = {}
-    for (const [name, entry] of this.entries) {
-      dependencies[name] = {
-        state: entry.state,
-        ...(entry.lastErrorKind !== undefined
-          ? { errorKind: entry.lastErrorKind }
-          : {}),
-      }
-    }
     return {
-      ok: Object.values(dependencies).every(
+      ok: Object.values(outcomes).every(
         (dependency) => dependency?.state === 'healthy',
       ),
-      dependencies,
+      dependencies: outcomes,
     }
   }
 

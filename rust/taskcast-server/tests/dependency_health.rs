@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -31,6 +32,136 @@ where
             Box::pin(function());
         future
     })
+}
+
+#[tokio::test]
+async fn overlapping_readiness_returns_local_outcomes_and_only_newest_mutates_state() {
+    let logger = Arc::new(CollectingLogger::default());
+    let health = DependencyHealthRegistry::with_logger(logger.clone());
+    let (older_tx, older_rx) = tokio::sync::oneshot::channel();
+    let (newer_tx, newer_rx) = tokio::sync::oneshot::channel();
+    let receivers = Arc::new(Mutex::new(VecDeque::from([older_rx, newer_rx])));
+    health
+        .register(
+            DependencyName::RedisCommand,
+            check({
+                let receivers = receivers.clone();
+                move || {
+                    let receiver = receivers.lock().unwrap().pop_front().unwrap();
+                    async move { receiver.await.unwrap() }
+                }
+            }),
+        )
+        .unwrap();
+
+    let older = {
+        let health = health.clone();
+        tokio::spawn(async move { health.check_readiness(Duration::from_secs(2)).await })
+    };
+    loop {
+        let remaining = receivers.lock().unwrap().len();
+        if remaining == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let newer = {
+        let health = health.clone();
+        tokio::spawn(async move { health.check_readiness(Duration::from_secs(2)).await })
+    };
+    loop {
+        let empty = receivers.lock().unwrap().is_empty();
+        if empty {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+
+    newer_tx
+        .send(Err(DependencyUnavailableError::new(
+            DependencyName::RedisCommand,
+            DependencyErrorKind::ConnectionClosed,
+            std::io::Error::other("newest readiness"),
+        )))
+        .unwrap();
+    let newer_json = serde_json::to_value(newer.await.unwrap()).unwrap();
+    older_tx.send(Ok(())).unwrap();
+    let older_json = serde_json::to_value(older.await.unwrap()).unwrap();
+
+    assert_eq!(
+        newer_json["dependencies"]["redisCommand"],
+        serde_json::json!({
+            "state": "unhealthy",
+            "errorKind": "connection_closed"
+        })
+    );
+    assert_eq!(
+        older_json["dependencies"]["redisCommand"],
+        serde_json::json!({ "state": "healthy" })
+    );
+    assert_eq!(health.snapshot()["redisCommand"]["state"], "unhealthy");
+    assert_eq!(
+        health.snapshot()["redisCommand"]["lastErrorKind"],
+        "connection_closed"
+    );
+    let records = logger.records.lock().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["from"], "starting");
+    assert_eq!(records[0]["to"], "unhealthy");
+}
+
+#[tokio::test]
+async fn external_observation_invalidates_an_in_flight_readiness_commit() {
+    let logger = Arc::new(CollectingLogger::default());
+    let health = DependencyHealthRegistry::with_logger(logger.clone());
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let receiver = Arc::new(Mutex::new(Some(release_rx)));
+    health
+        .register(
+            DependencyName::Postgres,
+            check({
+                let receiver = receiver.clone();
+                move || {
+                    let receiver = receiver.lock().unwrap().take().unwrap();
+                    async move { receiver.await.unwrap() }
+                }
+            }),
+        )
+        .unwrap();
+
+    let readiness = {
+        let health = health.clone();
+        tokio::spawn(async move { health.check_readiness(Duration::from_secs(2)).await })
+    };
+    loop {
+        let started = receiver.lock().unwrap().is_none();
+        if started {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    health.observe(DependencyObservation {
+        dependency: DependencyName::Postgres,
+        state: DependencyObservationState::Unhealthy,
+        error_kind: Some(DependencyErrorKind::ConnectionReset),
+        attempt: None,
+        next_retry_ms: None,
+    });
+    release_tx.send(Ok(())).unwrap();
+    let readiness_json = serde_json::to_value(readiness.await.unwrap()).unwrap();
+
+    assert_eq!(
+        readiness_json["dependencies"]["postgres"],
+        serde_json::json!({ "state": "healthy" })
+    );
+    assert_eq!(health.snapshot()["postgres"]["state"], "unhealthy");
+    assert_eq!(
+        health.snapshot()["postgres"]["lastErrorKind"],
+        "connection_reset"
+    );
+    let records = logger.records.lock().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["to"], "unhealthy");
 }
 
 #[tokio::test]
@@ -169,6 +300,36 @@ fn transitions_are_deduplicated_and_recovery_is_sanitized() {
     ] {
         assert!(!serialized.contains(secret_field));
     }
+}
+
+#[test]
+fn degraded_transition_log_uses_only_the_current_observation_error_kind() {
+    let logger = Arc::new(CollectingLogger::default());
+    let health = DependencyHealthRegistry::with_logger(logger.clone());
+    health
+        .register(DependencyName::RedisPubSub, check(|| async { Ok(()) }))
+        .unwrap();
+    health.observe(DependencyObservation {
+        dependency: DependencyName::RedisPubSub,
+        state: DependencyObservationState::Unhealthy,
+        error_kind: Some(DependencyErrorKind::ConnectionReset),
+        attempt: None,
+        next_retry_ms: None,
+    });
+    health.observe(DependencyObservation {
+        dependency: DependencyName::RedisPubSub,
+        state: DependencyObservationState::Reconnecting,
+        error_kind: None,
+        attempt: Some(2),
+        next_retry_ms: Some(500),
+    });
+
+    let snapshot = health.snapshot();
+    assert_eq!(snapshot["redisPubSub"]["lastErrorKind"], "connection_reset");
+    let records = logger.records.lock().unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0]["errorKind"], "connection_reset");
+    assert!(records[1]["errorKind"].is_null());
 }
 
 #[test]
