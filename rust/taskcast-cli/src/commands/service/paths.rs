@@ -1,6 +1,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use crate::config_dir::taskcast_config_dir;
+
 const DEFAULT_PORT: u16 = 3721;
 
 #[allow(dead_code)]
@@ -16,13 +19,28 @@ pub struct ServicePaths {
 
 impl ServicePaths {
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let home = dirs::home_dir().ok_or("cannot determine home directory")?;
-        let taskcast_dir = home.join(".taskcast");
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            let home = dirs::home_dir().ok_or("cannot determine home directory")?;
+            let taskcast_dir = taskcast_config_dir()?;
+            Self::from_roots(home, taskcast_dir)
+        }
 
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            Err("Service paths are not defined for this platform".into())
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn from_roots(
+        home: PathBuf,
+        taskcast_dir: PathBuf,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         #[cfg(target_os = "macos")]
         {
             let log_dir = home.join("Library/Application Support/taskcast");
-            Ok(ServicePaths {
+            return Ok(ServicePaths {
                 service_file: home.join("Library/LaunchAgents/com.taskcast.daemon.plist"),
                 stdout_log: Some(log_dir.join("taskcast.log")),
                 stderr_log: Some(log_dir.join("taskcast.err.log")),
@@ -30,7 +48,7 @@ impl ServicePaths {
                 default_config: taskcast_dir.join("taskcast.config.yaml"),
                 default_db: taskcast_dir.join("taskcast.db"),
                 state_file: taskcast_dir.join("service.state.json"),
-            })
+            });
         }
 
         #[cfg(target_os = "linux")]
@@ -45,11 +63,6 @@ impl ServicePaths {
                 state_file: taskcast_dir.join("service.state.json"),
             })
         }
-
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        {
-            Err("Service paths are not defined for this platform".into())
-        }
     }
 
     pub fn is_installed(&self) -> bool {
@@ -57,7 +70,10 @@ impl ServicePaths {
     }
 }
 
-pub fn ensure_config(paths: &ServicePaths, config_opt: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
+pub fn ensure_config(
+    paths: &ServicePaths,
+    config_opt: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
     if let Some(config) = config_opt {
         if !Path::new(config).exists() {
             return Err(format!("Config file not found: {config}").into());
@@ -89,7 +105,10 @@ pub fn ensure_config(paths: &ServicePaths, config_opt: Option<&str>) -> Result<S
     );
 
     fs::write(config_path, &content)?;
-    eprintln!("[taskcast] Created default config at {}", config_path.display());
+    eprintln!(
+        "[taskcast] Created default config at {}",
+        config_path.display()
+    );
     Ok(config_path.to_string_lossy().into_owned())
 }
 
@@ -156,6 +175,39 @@ mod tests {
         }
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn taskcast_owned_files_use_config_root_without_relocating_service_files() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let config = tmp.path().join("isolated-config");
+        let paths = ServicePaths::from_roots(home.clone(), config.clone()).unwrap();
+
+        assert_eq!(paths.default_config, config.join("taskcast.config.yaml"));
+        assert_eq!(paths.default_db, config.join("taskcast.db"));
+        assert_eq!(paths.state_file, config.join("service.state.json"));
+
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(
+                paths.service_file,
+                home.join("Library/LaunchAgents/com.taskcast.daemon.plist")
+            );
+            assert_eq!(
+                paths.stdout_log.unwrap(),
+                home.join("Library/Application Support/taskcast/taskcast.log")
+            );
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(
+                paths.service_file,
+                home.join(".config/systemd/user/taskcast.service")
+            );
+        }
+    }
+
     #[test]
     fn is_installed_false_when_no_file() {
         let tmp = TempDir::new().unwrap();
@@ -197,7 +249,10 @@ mod tests {
         fs::write(&paths.default_config, "existing content").unwrap();
         let result = ensure_config(&paths, None).unwrap();
         assert_eq!(result, paths.default_config.to_string_lossy());
-        assert_eq!(fs::read_to_string(&paths.default_config).unwrap(), "existing content");
+        assert_eq!(
+            fs::read_to_string(&paths.default_config).unwrap(),
+            "existing content"
+        );
     }
 
     #[test]
@@ -297,9 +352,18 @@ mod tests {
     fn macos_paths_are_correct() {
         let paths = ServicePaths::new().unwrap();
         let home = dirs::home_dir().unwrap();
-        assert_eq!(paths.service_file, home.join("Library/LaunchAgents/com.taskcast.daemon.plist"));
-        assert_eq!(paths.stdout_log.unwrap(), home.join("Library/Application Support/taskcast/taskcast.log"));
-        assert_eq!(paths.stderr_log.unwrap(), home.join("Library/Application Support/taskcast/taskcast.err.log"));
+        assert_eq!(
+            paths.service_file,
+            home.join("Library/LaunchAgents/com.taskcast.daemon.plist")
+        );
+        assert_eq!(
+            paths.stdout_log.unwrap(),
+            home.join("Library/Application Support/taskcast/taskcast.log")
+        );
+        assert_eq!(
+            paths.stderr_log.unwrap(),
+            home.join("Library/Application Support/taskcast/taskcast.err.log")
+        );
         assert!(paths.log_dir.is_some());
     }
 
@@ -308,7 +372,10 @@ mod tests {
     fn linux_paths_are_correct() {
         let paths = ServicePaths::new().unwrap();
         let home = dirs::home_dir().unwrap();
-        assert_eq!(paths.service_file, home.join(".config/systemd/user/taskcast.service"));
+        assert_eq!(
+            paths.service_file,
+            home.join(".config/systemd/user/taskcast.service")
+        );
         assert!(paths.log_dir.is_none());
         assert!(paths.stdout_log.is_none());
         assert!(paths.stderr_log.is_none());
