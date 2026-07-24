@@ -1,6 +1,7 @@
 use clap::Args;
 
 use crate::client::TaskcastClient;
+use crate::config_dir::taskcast_config_dir;
 use crate::node_config::NodeConfigManager;
 
 // ─── Args ─────────────────────────────────────────────────────────────────────
@@ -109,8 +110,7 @@ pub async fn consume_sse(
             } else if line.is_empty() {
                 // Empty line = end of event
                 if !current_data.is_empty() {
-                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&current_data)
-                    {
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&current_data) {
                         on_event(parsed, &current_event);
                         if current_event == "taskcast.done" {
                             if let Some(ref mut done_fn) = on_done {
@@ -131,10 +131,7 @@ pub async fn consume_sse(
 // ─── Commands ─────────────────────────────────────────────────────────────────
 
 pub async fn run_logs(args: LogsArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let config_dir = dirs::home_dir()
-        .expect("could not determine home directory")
-        .join(".taskcast");
-    let mgr = NodeConfigManager::new(config_dir);
+    let mgr = NodeConfigManager::new(taskcast_config_dir()?);
 
     let node = match args.node {
         Some(name) => match mgr.get(&name) {
@@ -160,11 +157,7 @@ pub async fn run_logs(args: LogsArgs) -> Result<(), Box<dyn std::error::Error>> 
     } else {
         format!("?{}", params.join("&"))
     };
-    let url = format!(
-        "{}/tasks/{}/events{qs}",
-        client.base_url(),
-        args.task_id
-    );
+    let url = format!("{}/tasks/{}/events{qs}", client.base_url(), args.task_id);
 
     consume_sse(
         &url,
@@ -196,12 +189,15 @@ pub async fn run_logs(args: LogsArgs) -> Result<(), Box<dyn std::error::Error>> 
                     .get("level")
                     .and_then(|v| v.as_str())
                     .unwrap_or("info");
-                let timestamp = event
-                    .get("timestamp")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0);
-                let data = event.get("data").cloned().unwrap_or(serde_json::Value::Null);
-                println!("{}", format_event(event_type, level, timestamp, &data, None));
+                let timestamp = event.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0);
+                let data = event
+                    .get("data")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                println!(
+                    "{}",
+                    format_event(event_type, level, timestamp, &data, None)
+                );
             }
         },
         None,
@@ -212,10 +208,7 @@ pub async fn run_logs(args: LogsArgs) -> Result<(), Box<dyn std::error::Error>> 
 }
 
 pub async fn run_tail(args: TailArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let config_dir = dirs::home_dir()
-        .expect("could not determine home directory")
-        .join(".taskcast");
-    let mgr = NodeConfigManager::new(config_dir);
+    let mgr = NodeConfigManager::new(taskcast_config_dir()?);
 
     let node = match args.node {
         Some(name) => match mgr.get(&name) {
@@ -256,11 +249,11 @@ pub async fn run_tail(args: TailArgs) -> Result<(), Box<dyn std::error::Error>> 
                     .get("level")
                     .and_then(|v| v.as_str())
                     .unwrap_or("info");
-                let timestamp = event
-                    .get("timestamp")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0);
-                let data = event.get("data").cloned().unwrap_or(serde_json::Value::Null);
+                let timestamp = event.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0);
+                let data = event
+                    .get("data")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
                 let task_id = event.get("taskId").and_then(|v| v.as_str());
                 println!(
                     "{}",
@@ -312,7 +305,10 @@ mod tests {
             None,
         );
         assert!(result.contains("[DONE] completed"), "got: {result}");
-        assert!(!result.contains("info "), "done events should not show level padding");
+        assert!(
+            !result.contains("info "),
+            "done events should not show level padding"
+        );
     }
 
     #[test]
@@ -343,13 +339,7 @@ mod tests {
 
     #[test]
     fn format_done_event_missing_reason() {
-        let result = format_event(
-            "taskcast.done",
-            "info",
-            1772975403000,
-            &json!({}),
-            None,
-        );
+        let result = format_event("taskcast.done", "info", 1772975403000, &json!({}), None);
         assert!(result.contains("[DONE] unknown"), "got: {result}");
     }
 
@@ -369,14 +359,20 @@ mod tests {
     fn format_event_pads_type() {
         let result = format_event("x", "warn", 0, &json!({}), None);
         // "x" should be padded to 16 characters
-        assert!(result.contains("x               "), "type should be padded, got: {result}");
+        assert!(
+            result.contains("x               "),
+            "type should be padded, got: {result}"
+        );
     }
 
     #[test]
     fn format_event_pads_level() {
         let result = format_event("llm.delta", "info", 0, &json!({}), None);
         // "info" should be padded to 5 characters
-        assert!(result.contains("info "), "level should be padded, got: {result}");
+        assert!(
+            result.contains("info "),
+            "level should be padded, got: {result}"
+        );
     }
 
     #[test]

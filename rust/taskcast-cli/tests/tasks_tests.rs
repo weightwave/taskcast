@@ -1,6 +1,9 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+mod common;
+
+use common::config_dir::IsolatedConfigDir;
 use serde_json::json;
 use tokio::net::TcpListener;
 
@@ -751,7 +754,10 @@ async fn run_inspect_event_history_fallback_on_error() {
     let events: Vec<EventItem> = vec![];
     let output = format_task_inspect(&detail, &events);
 
-    assert!(output.contains("No events."), "should show no events on fallback: {output}");
+    assert!(
+        output.contains("No events."),
+        "should show no events on fallback: {output}"
+    );
 }
 
 #[tokio::test]
@@ -923,19 +929,12 @@ fn format_timestamp_fractional_millis() {
 
 // ─── Integration: run_list / run_inspect via NodeConfigManager + real server ──
 
-use std::sync::Mutex;
+use taskcast_cli::commands::tasks::{run, TasksArgs, TasksCommands};
 use taskcast_cli::node_config::{NodeConfigManager, NodeEntry};
-use taskcast_cli::commands::tasks::{TasksArgs, TasksCommands, run};
 
-/// Mutex to serialize tests that modify HOME env var.
-static HOME_MUTEX: Mutex<()> = Mutex::new(());
-
-/// Helper: create a temp HOME with a node config pointing to the given base_url.
-fn setup_temp_home_with_node(base_url: &str, node_name: &str) -> tempfile::TempDir {
-    let temp_dir = tempfile::TempDir::new().unwrap();
-    let config_dir = temp_dir.path().join(".taskcast");
-    std::fs::create_dir_all(&config_dir).unwrap();
-    let mgr = NodeConfigManager::new(config_dir);
+fn setup_config_dir_with_node(base_url: &str, node_name: &str) -> IsolatedConfigDir {
+    let config_dir = IsolatedConfigDir::new();
+    let mgr = NodeConfigManager::new(config_dir.path().to_path_buf());
     mgr.add(
         node_name,
         NodeEntry {
@@ -945,17 +944,15 @@ fn setup_temp_home_with_node(base_url: &str, node_name: &str) -> tempfile::TempD
         },
     );
     mgr.set_current(node_name).unwrap();
-    temp_dir
+    config_dir
 }
 
 #[tokio::test]
 async fn run_list_via_node_config_happy_path() {
-    let _lock = HOME_MUTEX.lock().unwrap();
     let engine = make_engine();
     let base_url = start_server(engine.clone()).await;
 
-    let temp_dir = setup_temp_home_with_node(&base_url, "test-node");
-    unsafe { std::env::set_var("HOME", temp_dir.path()); }
+    let config_dir = setup_config_dir_with_node(&base_url, "test-node");
 
     // Create tasks
     engine
@@ -984,19 +981,19 @@ async fn run_list_via_node_config_happy_path() {
     })
     .await;
 
-    assert!(result.is_ok(), "run_list should succeed: {:?}", result.err());
-
-    unsafe { std::env::remove_var("HOME"); }
+    assert!(
+        result.is_ok(),
+        "run_list should succeed: {:?}",
+        result.err()
+    );
 }
 
 #[tokio::test]
 async fn run_list_with_status_filter_via_run() {
-    let _lock = HOME_MUTEX.lock().unwrap();
     let engine = make_engine();
     let base_url = start_server(engine.clone()).await;
 
-    let temp_dir = setup_temp_home_with_node(&base_url, "default");
-    unsafe { std::env::set_var("HOME", temp_dir.path()); }
+    let config_dir = setup_config_dir_with_node(&base_url, "default");
 
     let t1 = engine
         .create_task(CreateTaskInput {
@@ -1020,19 +1017,19 @@ async fn run_list_with_status_filter_via_run() {
     })
     .await;
 
-    assert!(result.is_ok(), "run_list with status filter should succeed: {:?}", result.err());
-
-    unsafe { std::env::remove_var("HOME"); }
+    assert!(
+        result.is_ok(),
+        "run_list with status filter should succeed: {:?}",
+        result.err()
+    );
 }
 
 #[tokio::test]
 async fn run_list_with_type_filter_via_run() {
-    let _lock = HOME_MUTEX.lock().unwrap();
     let engine = make_engine();
     let base_url = start_server(engine.clone()).await;
 
-    let temp_dir = setup_temp_home_with_node(&base_url, "default");
-    unsafe { std::env::set_var("HOME", temp_dir.path()); }
+    let config_dir = setup_config_dir_with_node(&base_url, "default");
 
     engine
         .create_task(CreateTaskInput {
@@ -1052,19 +1049,19 @@ async fn run_list_with_type_filter_via_run() {
     })
     .await;
 
-    assert!(result.is_ok(), "run_list with type filter should succeed: {:?}", result.err());
-
-    unsafe { std::env::remove_var("HOME"); }
+    assert!(
+        result.is_ok(),
+        "run_list with type filter should succeed: {:?}",
+        result.err()
+    );
 }
 
 #[tokio::test]
 async fn run_list_with_limit_via_run() {
-    let _lock = HOME_MUTEX.lock().unwrap();
     let engine = make_engine();
     let base_url = start_server(engine.clone()).await;
 
-    let temp_dir = setup_temp_home_with_node(&base_url, "default");
-    unsafe { std::env::set_var("HOME", temp_dir.path()); }
+    let config_dir = setup_config_dir_with_node(&base_url, "default");
 
     for i in 0..5 {
         engine
@@ -1086,19 +1083,19 @@ async fn run_list_with_limit_via_run() {
     })
     .await;
 
-    assert!(result.is_ok(), "run_list with limit should succeed: {:?}", result.err());
-
-    unsafe { std::env::remove_var("HOME"); }
+    assert!(
+        result.is_ok(),
+        "run_list with limit should succeed: {:?}",
+        result.err()
+    );
 }
 
 #[tokio::test]
 async fn run_list_empty_server_via_run() {
-    let _lock = HOME_MUTEX.lock().unwrap();
     let engine = make_engine();
     let base_url = start_server(engine.clone()).await;
 
-    let temp_dir = setup_temp_home_with_node(&base_url, "default");
-    unsafe { std::env::set_var("HOME", temp_dir.path()); }
+    let config_dir = setup_config_dir_with_node(&base_url, "default");
 
     let result = run(TasksArgs {
         command: TasksCommands::List {
@@ -1110,19 +1107,19 @@ async fn run_list_empty_server_via_run() {
     })
     .await;
 
-    assert!(result.is_ok(), "run_list on empty server should succeed: {:?}", result.err());
-
-    unsafe { std::env::remove_var("HOME"); }
+    assert!(
+        result.is_ok(),
+        "run_list on empty server should succeed: {:?}",
+        result.err()
+    );
 }
 
 #[tokio::test]
 async fn run_inspect_via_run_happy_path() {
-    let _lock = HOME_MUTEX.lock().unwrap();
     let engine = make_engine();
     let base_url = start_server(engine.clone()).await;
 
-    let temp_dir = setup_temp_home_with_node(&base_url, "default");
-    unsafe { std::env::set_var("HOME", temp_dir.path()); }
+    let config_dir = setup_config_dir_with_node(&base_url, "default");
 
     let task = engine
         .create_task(CreateTaskInput {
@@ -1141,19 +1138,19 @@ async fn run_inspect_via_run_happy_path() {
     })
     .await;
 
-    assert!(result.is_ok(), "run_inspect should succeed: {:?}", result.err());
-
-    unsafe { std::env::remove_var("HOME"); }
+    assert!(
+        result.is_ok(),
+        "run_inspect should succeed: {:?}",
+        result.err()
+    );
 }
 
 #[tokio::test]
 async fn run_inspect_with_events_via_run() {
-    let _lock = HOME_MUTEX.lock().unwrap();
     let engine = make_engine();
     let base_url = start_server(engine.clone()).await;
 
-    let temp_dir = setup_temp_home_with_node(&base_url, "default");
-    unsafe { std::env::set_var("HOME", temp_dir.path()); }
+    let config_dir = setup_config_dir_with_node(&base_url, "default");
 
     let task = engine
         .create_task(CreateTaskInput {
@@ -1189,21 +1186,20 @@ async fn run_inspect_with_events_via_run() {
     })
     .await;
 
-    assert!(result.is_ok(), "run_inspect with events should succeed: {:?}", result.err());
-
-    unsafe { std::env::remove_var("HOME"); }
+    assert!(
+        result.is_ok(),
+        "run_inspect with events should succeed: {:?}",
+        result.err()
+    );
 }
 
 #[tokio::test]
 async fn run_list_with_named_node_via_run() {
-    let _lock = HOME_MUTEX.lock().unwrap();
     let engine = make_engine();
     let base_url = start_server(engine.clone()).await;
 
-    let temp_dir = tempfile::TempDir::new().unwrap();
-    let config_dir = temp_dir.path().join(".taskcast");
-    std::fs::create_dir_all(&config_dir).unwrap();
-    let mgr = NodeConfigManager::new(config_dir);
+    let config_dir = IsolatedConfigDir::new();
+    let mgr = NodeConfigManager::new(config_dir.path().to_path_buf());
     mgr.add(
         "my-node",
         NodeEntry {
@@ -1213,7 +1209,6 @@ async fn run_list_with_named_node_via_run() {
         },
     );
     // Don't set as current -- test the named node path
-    unsafe { std::env::set_var("HOME", temp_dir.path()); }
 
     engine
         .create_task(CreateTaskInput {
@@ -1233,21 +1228,20 @@ async fn run_list_with_named_node_via_run() {
     })
     .await;
 
-    assert!(result.is_ok(), "run_list with named node should succeed: {:?}", result.err());
-
-    unsafe { std::env::remove_var("HOME"); }
+    assert!(
+        result.is_ok(),
+        "run_list with named node should succeed: {:?}",
+        result.err()
+    );
 }
 
 #[tokio::test]
 async fn run_inspect_with_named_node_via_run() {
-    let _lock = HOME_MUTEX.lock().unwrap();
     let engine = make_engine();
     let base_url = start_server(engine.clone()).await;
 
-    let temp_dir = tempfile::TempDir::new().unwrap();
-    let config_dir = temp_dir.path().join(".taskcast");
-    std::fs::create_dir_all(&config_dir).unwrap();
-    let mgr = NodeConfigManager::new(config_dir);
+    let config_dir = IsolatedConfigDir::new();
+    let mgr = NodeConfigManager::new(config_dir.path().to_path_buf());
     mgr.add(
         "my-node",
         NodeEntry {
@@ -1256,7 +1250,6 @@ async fn run_inspect_with_named_node_via_run() {
             token_type: None,
         },
     );
-    unsafe { std::env::set_var("HOME", temp_dir.path()); }
 
     let task = engine
         .create_task(CreateTaskInput {
@@ -1274,22 +1267,22 @@ async fn run_inspect_with_named_node_via_run() {
     })
     .await;
 
-    assert!(result.is_ok(), "run_inspect with named node should succeed: {:?}", result.err());
-
-    unsafe { std::env::remove_var("HOME"); }
+    assert!(
+        result.is_ok(),
+        "run_inspect with named node should succeed: {:?}",
+        result.err()
+    );
 }
 
 #[tokio::test]
 async fn run_list_node_config_lookup_path() {
-    let _lock = HOME_MUTEX.lock().unwrap();
     let engine = make_engine();
     let base_url = start_server(engine.clone()).await;
 
-    let temp_dir = setup_temp_home_with_node(&base_url, "default");
-    unsafe { std::env::set_var("HOME", temp_dir.path()); }
+    let config_dir = setup_config_dir_with_node(&base_url, "default");
 
     // Replicate run_list lines 176-193: node lookup + client creation
-    let home = dirs::home_dir().unwrap().join(".taskcast");
+    let home = taskcast_cli::config_dir::taskcast_config_dir().unwrap();
     let node_mgr = NodeConfigManager::new(home);
     let node = node_mgr.get_current();
     assert_eq!(node.url, base_url);
@@ -1318,18 +1311,14 @@ async fn run_list_node_config_lookup_path() {
     // Make actual HTTP request (line 209)
     let res = client.get(&path).await.unwrap();
     assert!(res.status().is_success());
-
-    unsafe { std::env::remove_var("HOME"); }
 }
 
 #[tokio::test]
 async fn run_inspect_node_config_lookup_path() {
-    let _lock = HOME_MUTEX.lock().unwrap();
     let engine = make_engine();
     let base_url = start_server(engine.clone()).await;
 
-    let temp_dir = setup_temp_home_with_node(&base_url, "default");
-    unsafe { std::env::set_var("HOME", temp_dir.path()); }
+    let config_dir = setup_config_dir_with_node(&base_url, "default");
 
     let task = engine
         .create_task(CreateTaskInput {
@@ -1358,7 +1347,7 @@ async fn run_inspect_node_config_lookup_path() {
         .unwrap();
 
     // Replicate run_inspect lines 238-277
-    let home = dirs::home_dir().unwrap().join(".taskcast");
+    let home = taskcast_cli::config_dir::taskcast_config_dir().unwrap();
     let node_mgr = NodeConfigManager::new(home);
     let node = node_mgr.get_current();
     let client = TaskcastClient::from_node(&node).await.unwrap();
@@ -1385,18 +1374,14 @@ async fn run_inspect_node_config_lookup_path() {
     let output = format_task_inspect(&task_detail, &events);
     assert!(output.contains(&task.id), "output: {output}");
     assert!(output.contains("running"), "output: {output}");
-
-    unsafe { std::env::remove_var("HOME"); }
 }
 
 #[tokio::test]
 async fn run_inspect_events_history_non_success_fallback() {
-    let _lock = HOME_MUTEX.lock().unwrap();
     let engine = make_engine();
     let base_url = start_server(engine.clone()).await;
 
-    let temp_dir = setup_temp_home_with_node(&base_url, "default");
-    unsafe { std::env::set_var("HOME", temp_dir.path()); }
+    let config_dir = setup_config_dir_with_node(&base_url, "default");
 
     let task = engine
         .create_task(CreateTaskInput {
@@ -1408,7 +1393,7 @@ async fn run_inspect_events_history_non_success_fallback() {
 
     // Replicate the fallback in run_inspect (lines 271-275):
     // if events endpoint returns non-success, use empty vec
-    let home = dirs::home_dir().unwrap().join(".taskcast");
+    let home = taskcast_cli::config_dir::taskcast_config_dir().unwrap();
     let node_mgr = NodeConfigManager::new(home);
     let node = node_mgr.get_current();
     let client = TaskcastClient::from_node(&node).await.unwrap();
@@ -1430,41 +1415,29 @@ async fn run_inspect_events_history_non_success_fallback() {
 
     let output = format_task_inspect(&task_detail, &events);
     assert!(output.contains(&task.id), "output: {output}");
-
-    unsafe { std::env::remove_var("HOME"); }
 }
 
 #[tokio::test]
 async fn run_list_named_node_not_found() {
-    let _lock = HOME_MUTEX.lock().unwrap();
-
-    let temp_dir = tempfile::TempDir::new().unwrap();
-    let config_dir = temp_dir.path().join(".taskcast");
-    std::fs::create_dir_all(&config_dir).unwrap();
-    let _mgr = NodeConfigManager::new(config_dir);
-
-    unsafe { std::env::set_var("HOME", temp_dir.path()); }
+    let config_dir = IsolatedConfigDir::new();
+    let _mgr = NodeConfigManager::new(config_dir.path().to_path_buf());
 
     // Replicate run_list named node lookup failure (lines 182-188)
-    let home = dirs::home_dir().unwrap().join(".taskcast");
+    let home = taskcast_cli::config_dir::taskcast_config_dir().unwrap();
     let node_mgr = NodeConfigManager::new(home);
     let result = node_mgr.get("nonexistent");
     assert!(result.is_none(), "should not find nonexistent node");
-
-    unsafe { std::env::remove_var("HOME"); }
 }
 
 #[tokio::test]
 async fn run_inspect_http_error_path() {
-    let _lock = HOME_MUTEX.lock().unwrap();
     let engine = make_engine();
     let base_url = start_server(engine.clone()).await;
 
-    let temp_dir = setup_temp_home_with_node(&base_url, "default");
-    unsafe { std::env::set_var("HOME", temp_dir.path()); }
+    let config_dir = setup_config_dir_with_node(&base_url, "default");
 
     // Replicate run_inspect error path (lines 259-263)
-    let home = dirs::home_dir().unwrap().join(".taskcast");
+    let home = taskcast_cli::config_dir::taskcast_config_dir().unwrap();
     let node_mgr = NodeConfigManager::new(home);
     let node = node_mgr.get_current();
     let client = TaskcastClient::from_node(&node).await.unwrap();
@@ -1475,21 +1448,14 @@ async fn run_inspect_http_error_path() {
     let body = task_res.text().await.unwrap_or_default();
     let error_msg = format!("Error: HTTP {} — {}", status_code.as_u16(), body);
     assert!(error_msg.contains("404"), "should be 404: {error_msg}");
-
-    unsafe { std::env::remove_var("HOME"); }
 }
 
 // ─── Direct run() error path tests ──────────────────────────────────────────
 
 #[tokio::test]
 async fn run_list_node_not_found_returns_error() {
-    let _lock = HOME_MUTEX.lock().unwrap();
-
-    let temp_dir = tempfile::TempDir::new().unwrap();
-    let config_dir = temp_dir.path().join(".taskcast");
-    std::fs::create_dir_all(&config_dir).unwrap();
-    let _mgr = NodeConfigManager::new(config_dir);
-    unsafe { std::env::set_var("HOME", temp_dir.path()); }
+    let config_dir = IsolatedConfigDir::new();
+    let _mgr = NodeConfigManager::new(config_dir.path().to_path_buf());
 
     let result = run(TasksArgs {
         command: TasksCommands::List {
@@ -1507,19 +1473,12 @@ async fn run_list_node_not_found_returns_error() {
         err.contains("ghost"),
         "error should mention the node name, got: {err}"
     );
-
-    unsafe { std::env::remove_var("HOME"); }
 }
 
 #[tokio::test]
 async fn run_inspect_node_not_found_returns_error() {
-    let _lock = HOME_MUTEX.lock().unwrap();
-
-    let temp_dir = tempfile::TempDir::new().unwrap();
-    let config_dir = temp_dir.path().join(".taskcast");
-    std::fs::create_dir_all(&config_dir).unwrap();
-    let _mgr = NodeConfigManager::new(config_dir);
-    unsafe { std::env::set_var("HOME", temp_dir.path()); }
+    let config_dir = IsolatedConfigDir::new();
+    let _mgr = NodeConfigManager::new(config_dir.path().to_path_buf());
 
     let result = run(TasksArgs {
         command: TasksCommands::Inspect {
@@ -1535,19 +1494,18 @@ async fn run_inspect_node_not_found_returns_error() {
         err.contains("ghost"),
         "error should mention the node name, got: {err}"
     );
-
-    unsafe { std::env::remove_var("HOME"); }
 }
 
 #[tokio::test]
 async fn run_list_http_error_returns_error() {
-    let _lock = HOME_MUTEX.lock().unwrap();
-
     // Start a mock server that returns 500 for /tasks
     let app = axum::Router::new().route(
         "/tasks",
         axum::routing::get(|| async {
-            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal Server Error",
+            )
         }),
     );
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1557,8 +1515,7 @@ async fn run_list_http_error_returns_error() {
         axum::serve(listener, app).await.unwrap();
     });
 
-    let temp_dir = setup_temp_home_with_node(&mock_url, "mock-500");
-    unsafe { std::env::set_var("HOME", temp_dir.path()); }
+    let config_dir = setup_config_dir_with_node(&mock_url, "mock-500");
 
     let result = run(TasksArgs {
         command: TasksCommands::List {
@@ -1576,19 +1533,14 @@ async fn run_list_http_error_returns_error() {
         err.contains("500"),
         "error should contain HTTP status code 500, got: {err}"
     );
-
-    unsafe { std::env::remove_var("HOME"); }
 }
 
 #[tokio::test]
 async fn run_inspect_http_error_returns_error() {
-    let _lock = HOME_MUTEX.lock().unwrap();
-
     let engine = make_engine();
     let base_url = start_server(engine.clone()).await;
 
-    let temp_dir = setup_temp_home_with_node(&base_url, "default");
-    unsafe { std::env::set_var("HOME", temp_dir.path()); }
+    let config_dir = setup_config_dir_with_node(&base_url, "default");
 
     // Inspect a nonexistent task — server returns 404
     let result = run(TasksArgs {
@@ -1605,6 +1557,4 @@ async fn run_inspect_http_error_returns_error() {
         err.contains("404"),
         "error should contain HTTP status code 404, got: {err}"
     );
-
-    unsafe { std::env::remove_var("HOME"); }
 }

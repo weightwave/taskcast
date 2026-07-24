@@ -2,9 +2,12 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+mod common;
+
 use axum::response::sse::{Event, Sse};
 use axum::routing::get;
 use axum::Router;
+use common::config_dir::IsolatedConfigDir;
 use futures_util::stream;
 use serde_json::json;
 use tokio::net::TcpListener;
@@ -73,10 +76,7 @@ fn format_event_regular_includes_all_fields() {
     );
     assert!(result.contains("llm.delta"), "got: {result}");
     assert!(result.contains("info"), "got: {result}");
-    assert!(
-        result.contains(r#""text":"hello""#),
-        "got: {result}"
-    );
+    assert!(result.contains(r#""text":"hello""#), "got: {result}");
 }
 
 #[test]
@@ -105,13 +105,7 @@ fn format_event_done_colon_variant() {
 
 #[test]
 fn format_event_done_missing_reason() {
-    let result = format_event(
-        "taskcast.done",
-        "info",
-        1741234567890,
-        &json!({}),
-        None,
-    );
+    let result = format_event("taskcast.done", "info", 1741234567890, &json!({}), None);
     assert!(result.contains("[DONE] unknown"), "got: {result}");
 }
 
@@ -251,13 +245,11 @@ async fn consume_sse_without_done_callback() {
     let app = Router::new().route(
         "/sse",
         get(|| async {
-            let events = vec![
-                Ok::<_, Infallible>(
-                    Event::default()
-                        .event("taskcast.event")
-                        .data(r#"{"type":"test","level":"info","data":{}}"#),
-                ),
-            ];
+            let events = vec![Ok::<_, Infallible>(
+                Event::default()
+                    .event("taskcast.event")
+                    .data(r#"{"type":"test","level":"info","data":{}}"#),
+            )];
             Sse::new(stream::iter(events))
         }),
     );
@@ -293,10 +285,7 @@ async fn consume_sse_with_auth_token() {
             let events = vec![Ok::<_, Infallible>(
                 Event::default()
                     .event("taskcast.event")
-                    .data(
-                        serde_json::to_string(&json!({"auth_ok": auth_present}))
-                            .unwrap(),
-                    ),
+                    .data(serde_json::to_string(&json!({"auth_ok": auth_present})).unwrap()),
             )];
             Sse::new(stream::iter(events))
         }),
@@ -329,13 +318,7 @@ async fn consume_sse_http_error_returns_err() {
     );
     let base_url = start_mock_sse_server(app).await;
 
-    let result = consume_sse(
-        &format!("{base_url}/sse"),
-        None,
-        |_event, _name| {},
-        None,
-    )
-    .await;
+    let result = consume_sse(&format!("{base_url}/sse"), None, |_event, _name| {}, None).await;
 
     assert!(result.is_err(), "should return error for HTTP 403");
     let err = result.err().unwrap().to_string();
@@ -353,11 +336,9 @@ async fn consume_sse_invalid_json_is_silently_skipped() {
                         .event("taskcast.event")
                         .data("not valid json"),
                 ),
-                Ok(
-                    Event::default()
-                        .event("taskcast.event")
-                        .data(r#"{"type":"valid"}"#),
-                ),
+                Ok(Event::default()
+                    .event("taskcast.event")
+                    .data(r#"{"type":"valid"}"#)),
             ];
             Sse::new(stream::iter(events))
         }),
@@ -384,15 +365,12 @@ async fn consume_sse_invalid_json_is_silently_skipped() {
 
 #[tokio::test]
 async fn consume_sse_connection_refused() {
-    let result = consume_sse(
-        "http://127.0.0.1:19999/sse",
-        None,
-        |_event, _name| {},
-        None,
-    )
-    .await;
+    let result = consume_sse("http://127.0.0.1:19999/sse", None, |_event, _name| {}, None).await;
 
-    assert!(result.is_err(), "should return error for connection refused");
+    assert!(
+        result.is_err(),
+        "should return error for connection refused"
+    );
 }
 
 #[tokio::test]
@@ -407,11 +385,9 @@ async fn consume_sse_empty_data_lines_are_skipped() {
                         .data(r#"{"type":"first"}"#),
                 ),
                 // An event with empty data field won't produce a data line at all in SSE
-                Ok(
-                    Event::default()
-                        .event("taskcast.event")
-                        .data(r#"{"type":"second"}"#),
-                ),
+                Ok(Event::default()
+                    .event("taskcast.event")
+                    .data(r#"{"type":"second"}"#)),
             ];
             Sse::new(stream::iter(events))
         }),
@@ -449,17 +425,13 @@ async fn consume_sse_done_callback_only_on_done_event() {
                         .event("taskcast.event")
                         .data(r#"{"type":"llm.delta"}"#),
                 ),
-                Ok(
-                    Event::default()
-                        .event("taskcast.event")
-                        .data(r#"{"type":"llm.delta"}"#),
-                ),
+                Ok(Event::default()
+                    .event("taskcast.event")
+                    .data(r#"{"type":"llm.delta"}"#)),
                 // Only this one should trigger done callback
-                Ok(
-                    Event::default()
-                        .event("taskcast.done")
-                        .data(r#"{"reason":"completed"}"#),
-                ),
+                Ok(Event::default()
+                    .event("taskcast.done")
+                    .data(r#"{"reason":"completed"}"#)),
             ];
             Sse::new(stream::iter(events))
         }),
@@ -617,16 +589,12 @@ async fn consume_sse_multiple_events_in_sequence() {
                         .event("taskcast.event")
                         .data(r#"{"type":"step.0","level":"info","data":{"step":0}}"#),
                 ),
-                Ok(
-                    Event::default()
-                        .event("taskcast.event")
-                        .data(r#"{"type":"step.1","level":"info","data":{"step":1}}"#),
-                ),
-                Ok(
-                    Event::default()
-                        .event("taskcast.event")
-                        .data(r#"{"type":"step.2","level":"warn","data":{"step":2}}"#),
-                ),
+                Ok(Event::default()
+                    .event("taskcast.event")
+                    .data(r#"{"type":"step.1","level":"info","data":{"step":1}}"#)),
+                Ok(Event::default()
+                    .event("taskcast.event")
+                    .data(r#"{"type":"step.2","level":"warn","data":{"step":2}}"#)),
             ];
             Sse::new(stream::iter(events))
         }),
@@ -719,15 +687,13 @@ async fn consume_sse_from_real_server_task_events() {
     assert!(done, "should receive done signal for completed task");
 
     // Verify we received the llm.delta event
-    let has_delta = events
-        .iter()
-        .any(|(ev, name)| name == "taskcast.event" && ev.get("type").and_then(|t| t.as_str()) == Some("llm.delta"));
+    let has_delta = events.iter().any(|(ev, name)| {
+        name == "taskcast.event" && ev.get("type").and_then(|t| t.as_str()) == Some("llm.delta")
+    });
     assert!(has_delta, "should receive llm.delta event, got: {events:?}");
 
     // Verify we received the done event
-    let has_done = events
-        .iter()
-        .any(|(_, name)| name == "taskcast.done");
+    let has_done = events.iter().any(|(_, name)| name == "taskcast.done");
     assert!(has_done, "should receive taskcast.done event");
 }
 
@@ -814,11 +780,11 @@ async fn consume_sse_from_real_server_formats_events_correctly() {
                     .get("level")
                     .and_then(|v| v.as_str())
                     .unwrap_or("info");
-                let timestamp = event
-                    .get("timestamp")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0);
-                let data = event.get("data").cloned().unwrap_or(serde_json::Value::Null);
+                let timestamp = event.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0);
+                let data = event
+                    .get("data")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
                 formatted_outputs.push(format_event(event_type, level, timestamp, &data, None));
             }
         },
@@ -834,11 +800,17 @@ async fn consume_sse_from_real_server_formats_events_correctly() {
 
     // Should have at least one agent.step formatted line
     let has_step = formatted_outputs.iter().any(|s| s.contains("agent.step"));
-    assert!(has_step, "should format agent.step events, got: {formatted_outputs:?}");
+    assert!(
+        has_step,
+        "should format agent.step events, got: {formatted_outputs:?}"
+    );
 
     // Should have a done line
     let has_done = formatted_outputs.iter().any(|s| s.contains("[DONE]"));
-    assert!(has_done, "should format done event, got: {formatted_outputs:?}");
+    assert!(
+        has_done,
+        "should format done event, got: {formatted_outputs:?}"
+    );
 }
 
 #[tokio::test]
@@ -899,15 +871,14 @@ async fn consume_sse_from_real_server_tail_format() {
                     .get("level")
                     .and_then(|v| v.as_str())
                     .unwrap_or("info");
-                let timestamp = event
-                    .get("timestamp")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0);
-                let data = event.get("data").cloned().unwrap_or(serde_json::Value::Null);
+                let timestamp = event.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0);
+                let data = event
+                    .get("data")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
                 let task_id = event.get("taskId").and_then(|v| v.as_str());
-                formatted_with_task_id.push(format_event(
-                    event_type, level, timestamp, &data, task_id,
-                ));
+                formatted_with_task_id
+                    .push(format_event(event_type, level, timestamp, &data, task_id));
             }
         },
         Some(&mut || {}),
@@ -994,7 +965,10 @@ async fn consume_sse_query_string_construction() {
     let url = format!("{base_url}/tasks/{}/events{qs}", task.id);
 
     // The URL should contain the filter param
-    assert!(url.contains("types=llm.*"), "URL should contain types filter: {url}");
+    assert!(
+        url.contains("types=llm.*"),
+        "URL should contain types filter: {url}"
+    );
 
     let mut events: Vec<(serde_json::Value, String)> = Vec::new();
 
@@ -1011,9 +985,9 @@ async fn consume_sse_query_string_construction() {
 
     // When types=llm.* filter is applied, we should only get llm.delta events,
     // not agent.step events (plus status transitions and done)
-    let has_agent_step = events
-        .iter()
-        .any(|(ev, name)| name == "taskcast.event" && ev.get("type").and_then(|t| t.as_str()) == Some("agent.step"));
+    let has_agent_step = events.iter().any(|(ev, name)| {
+        name == "taskcast.event" && ev.get("type").and_then(|t| t.as_str()) == Some("agent.step")
+    });
     assert!(
         !has_agent_step,
         "filtered SSE should not include agent.step events"
@@ -1060,13 +1034,11 @@ async fn consume_sse_done_event_reason_extraction() {
     let app = Router::new().route(
         "/sse",
         get(|| async {
-            let events = vec![
-                Ok::<_, Infallible>(
-                    Event::default()
-                        .event("taskcast.done")
-                        .data(r#"{"reason":"timeout"}"#),
-                ),
-            ];
+            let events = vec![Ok::<_, Infallible>(
+                Event::default()
+                    .event("taskcast.done")
+                    .data(r#"{"reason":"timeout"}"#),
+            )];
             Sse::new(stream::iter(events))
         }),
     );
@@ -1111,13 +1083,9 @@ async fn consume_sse_event_field_extraction_defaults() {
     let app = Router::new().route(
         "/sse",
         get(|| async {
-            let events = vec![
-                Ok::<_, Infallible>(
-                    Event::default()
-                        .event("taskcast.event")
-                        .data(r#"{}"#), // no type, level, timestamp, or data fields
-                ),
-            ];
+            let events = vec![Ok::<_, Infallible>(
+                Event::default().event("taskcast.event").data(r#"{}"#), // no type, level, timestamp, or data fields
+            )];
             Sse::new(stream::iter(events))
         }),
     );
@@ -1138,11 +1106,11 @@ async fn consume_sse_event_field_extraction_defaults() {
                     .get("level")
                     .and_then(|v| v.as_str())
                     .unwrap_or("info");
-                let timestamp = event
-                    .get("timestamp")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0);
-                let data = event.get("data").cloned().unwrap_or(serde_json::Value::Null);
+                let timestamp = event.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0);
+                let data = event
+                    .get("data")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
                 formatted = format_event(event_type, level, timestamp, &data, None);
             }
         },
@@ -1151,9 +1119,18 @@ async fn consume_sse_event_field_extraction_defaults() {
     .await
     .unwrap();
 
-    assert!(formatted.contains("unknown"), "missing type should default to 'unknown', got: {formatted}");
-    assert!(formatted.contains("info"), "missing level should default to 'info', got: {formatted}");
-    assert!(formatted.contains("null"), "missing data should default to null, got: {formatted}");
+    assert!(
+        formatted.contains("unknown"),
+        "missing type should default to 'unknown', got: {formatted}"
+    );
+    assert!(
+        formatted.contains("info"),
+        "missing level should default to 'info', got: {formatted}"
+    );
+    assert!(
+        formatted.contains("null"),
+        "missing data should default to null, got: {formatted}"
+    );
 }
 
 #[tokio::test]
@@ -1169,11 +1146,9 @@ async fn consume_sse_ignores_non_taskcast_events() {
                         .event("other.event")
                         .data(r#"{"type":"ignored"}"#),
                 ),
-                Ok(
-                    Event::default()
-                        .event("taskcast.event")
-                        .data(r#"{"type":"included","level":"info","timestamp":0,"data":{}}"#),
-                ),
+                Ok(Event::default()
+                    .event("taskcast.event")
+                    .data(r#"{"type":"included","level":"info","timestamp":0,"data":{}}"#)),
             ];
             Sse::new(stream::iter(events))
         }),
@@ -1196,11 +1171,11 @@ async fn consume_sse_ignores_non_taskcast_events() {
                     .get("level")
                     .and_then(|v| v.as_str())
                     .unwrap_or("info");
-                let timestamp = event
-                    .get("timestamp")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0);
-                let data = event.get("data").cloned().unwrap_or(serde_json::Value::Null);
+                let timestamp = event.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0);
+                let data = event
+                    .get("data")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
                 formatted.push(format_event(event_type, level, timestamp, &data, None));
             }
         },
@@ -1219,27 +1194,25 @@ async fn consume_sse_ignores_non_taskcast_events() {
 
 // ─── Integration: run_logs / run_tail code paths via NodeConfigManager + real server ───
 
-use std::sync::Mutex;
 use taskcast_cli::node_config::{NodeConfigManager, NodeEntry};
 
-/// Mutex to serialize tests that modify HOME env var.
-static HOME_MUTEX: Mutex<()> = Mutex::new(());
-
-/// Helper: set up node config at an existing path.
-fn setup_temp_home_with_node_at(path: &std::path::Path, base_url: &str) {
-    let config_dir = path.join(".taskcast");
-    std::fs::create_dir_all(&config_dir).unwrap();
-    let mgr = NodeConfigManager::new(config_dir);
-    mgr.add("default", NodeEntry { url: base_url.to_string(), token: None, token_type: None });
+fn setup_config_dir_with_node_at(path: &std::path::Path, base_url: &str) {
+    std::fs::create_dir_all(path).unwrap();
+    let mgr = NodeConfigManager::new(path.to_path_buf());
+    mgr.add(
+        "default",
+        NodeEntry {
+            url: base_url.to_string(),
+            token: None,
+            token_type: None,
+        },
+    );
     mgr.set_current("default").unwrap();
 }
 
-/// Helper: create a temp HOME with a node config pointing to the given base_url.
-fn setup_temp_home_with_node(base_url: &str, node_name: &str) -> tempfile::TempDir {
-    let temp_dir = tempfile::TempDir::new().unwrap();
-    let config_dir = temp_dir.path().join(".taskcast");
-    std::fs::create_dir_all(&config_dir).unwrap();
-    let mgr = NodeConfigManager::new(config_dir);
+fn setup_config_dir_with_node(base_url: &str, node_name: &str) -> IsolatedConfigDir {
+    let config_dir = IsolatedConfigDir::new();
+    let mgr = NodeConfigManager::new(config_dir.path().to_path_buf());
     mgr.add(
         node_name,
         NodeEntry {
@@ -1249,17 +1222,15 @@ fn setup_temp_home_with_node(base_url: &str, node_name: &str) -> tempfile::TempD
         },
     );
     mgr.set_current(node_name).unwrap();
-    temp_dir
+    config_dir
 }
 
 #[tokio::test]
 async fn run_logs_node_lookup_client_creation_and_sse() {
-    let _lock = HOME_MUTEX.lock().unwrap();
     let engine = make_engine();
     let base_url = start_server(engine.clone()).await;
 
-    let temp_dir = setup_temp_home_with_node(&base_url, "default");
-    unsafe { std::env::set_var("HOME", temp_dir.path()); }
+    let config_dir = setup_config_dir_with_node(&base_url, "default");
 
     // Create and complete a task with an event
     let task = engine
@@ -1293,7 +1264,7 @@ async fn run_logs_node_lookup_client_creation_and_sse() {
         .unwrap();
 
     // Replicate run_logs lines 134-168: node lookup + client creation + URL construction
-    let home = dirs::home_dir().unwrap().join(".taskcast");
+    let home = taskcast_cli::config_dir::taskcast_config_dir().unwrap();
     let node_mgr = NodeConfigManager::new(home);
     let node = node_mgr.get_current();
     assert_eq!(node.url, base_url);
@@ -1336,11 +1307,11 @@ async fn run_logs_node_lookup_client_creation_and_sse() {
                     .get("level")
                     .and_then(|v| v.as_str())
                     .unwrap_or("info");
-                let timestamp = event
-                    .get("timestamp")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0);
-                let data = event.get("data").cloned().unwrap_or(serde_json::Value::Null);
+                let timestamp = event.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0);
+                let data = event
+                    .get("data")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
                 formatted_outputs.push(format_event(event_type, level, timestamp, &data, None));
             }
         },
@@ -1352,21 +1323,23 @@ async fn run_logs_node_lookup_client_creation_and_sse() {
     .unwrap();
 
     assert!(done_called, "should complete via done callback");
-    assert!(!formatted_outputs.is_empty(), "should have formatted output");
+    assert!(
+        !formatted_outputs.is_empty(),
+        "should have formatted output"
+    );
     let has_done = formatted_outputs.iter().any(|s| s.contains("[DONE]"));
-    assert!(has_done, "should format done event, got: {formatted_outputs:?}");
-
-    unsafe { std::env::remove_var("HOME"); }
+    assert!(
+        has_done,
+        "should format done event, got: {formatted_outputs:?}"
+    );
 }
 
 #[tokio::test]
 async fn run_logs_with_types_and_levels_query_params() {
-    let _lock = HOME_MUTEX.lock().unwrap();
     let engine = make_engine();
     let base_url = start_server(engine.clone()).await;
 
-    let temp_dir = setup_temp_home_with_node(&base_url, "default");
-    unsafe { std::env::set_var("HOME", temp_dir.path()); }
+    let config_dir = setup_config_dir_with_node(&base_url, "default");
 
     let task = engine
         .create_task(CreateTaskInput {
@@ -1413,7 +1386,7 @@ async fn run_logs_with_types_and_levels_query_params() {
         .unwrap();
 
     // Replicate run_logs query string construction (lines 152-163)
-    let home = dirs::home_dir().unwrap().join(".taskcast");
+    let home = taskcast_cli::config_dir::taskcast_config_dir().unwrap();
     let node_mgr = NodeConfigManager::new(home);
     let node = node_mgr.get_current();
     let client = TaskcastClient::from_node(&node).await.unwrap();
@@ -1434,8 +1407,14 @@ async fn run_logs_with_types_and_levels_query_params() {
     };
     let url = format!("{}/tasks/{}/events{qs}", client.base_url(), task.id);
 
-    assert!(url.contains("types=llm.*"), "URL should contain types filter: {url}");
-    assert!(url.contains("levels=info"), "URL should contain levels filter: {url}");
+    assert!(
+        url.contains("types=llm.*"),
+        "URL should contain types filter: {url}"
+    );
+    assert!(
+        url.contains("levels=info"),
+        "URL should contain levels filter: {url}"
+    );
 
     let mut events: Vec<(serde_json::Value, String)> = Vec::new();
 
@@ -1451,27 +1430,22 @@ async fn run_logs_with_types_and_levels_query_params() {
     .unwrap();
 
     // With types=llm.* filter, should NOT get agent.step events
-    let has_agent = events
-        .iter()
-        .any(|(ev, name)| {
-            name == "taskcast.event"
-                && ev.get("type").and_then(|t| t.as_str()) == Some("agent.step")
-        });
-    assert!(!has_agent, "should not include agent.step with llm.* filter");
-
-    unsafe { std::env::remove_var("HOME"); }
+    let has_agent = events.iter().any(|(ev, name)| {
+        name == "taskcast.event" && ev.get("type").and_then(|t| t.as_str()) == Some("agent.step")
+    });
+    assert!(
+        !has_agent,
+        "should not include agent.step with llm.* filter"
+    );
 }
 
 #[tokio::test]
 async fn run_logs_with_named_node() {
-    let _lock = HOME_MUTEX.lock().unwrap();
     let engine = make_engine();
     let base_url = start_server(engine.clone()).await;
 
-    let temp_dir = tempfile::TempDir::new().unwrap();
-    let config_dir = temp_dir.path().join(".taskcast");
-    std::fs::create_dir_all(&config_dir).unwrap();
-    let mgr = NodeConfigManager::new(config_dir.clone());
+    let config_dir = IsolatedConfigDir::new();
+    let mgr = NodeConfigManager::new(config_dir.path().to_path_buf());
     mgr.add(
         "my-node",
         NodeEntry {
@@ -1481,7 +1455,6 @@ async fn run_logs_with_named_node() {
         },
     );
     // Don't set as current -- test named node lookup path
-    unsafe { std::env::set_var("HOME", temp_dir.path()); }
 
     let task = engine
         .create_task(CreateTaskInput {
@@ -1500,7 +1473,7 @@ async fn run_logs_with_named_node() {
         .unwrap();
 
     // Replicate run_logs named node lookup (lines 139-148)
-    let home = dirs::home_dir().unwrap().join(".taskcast");
+    let home = taskcast_cli::config_dir::taskcast_config_dir().unwrap();
     let node_mgr = NodeConfigManager::new(home);
     let node_name = Some("my-node".to_string());
     let node = match node_name {
@@ -1528,39 +1501,27 @@ async fn run_logs_with_named_node() {
     .unwrap();
 
     assert!(done, "should receive done for completed task");
-
-    unsafe { std::env::remove_var("HOME"); }
 }
 
 #[tokio::test]
 async fn run_logs_named_node_not_found() {
-    let _lock = HOME_MUTEX.lock().unwrap();
-
-    let temp_dir = tempfile::TempDir::new().unwrap();
-    let config_dir = temp_dir.path().join(".taskcast");
-    std::fs::create_dir_all(&config_dir).unwrap();
+    let config_dir = IsolatedConfigDir::new();
     // Create empty config -- no nodes
-    let _mgr = NodeConfigManager::new(config_dir);
-
-    unsafe { std::env::set_var("HOME", temp_dir.path()); }
+    let _mgr = NodeConfigManager::new(config_dir.path().to_path_buf());
 
     // Replicate run_logs named node lookup failure path (lines 140-145)
-    let home = dirs::home_dir().unwrap().join(".taskcast");
+    let home = taskcast_cli::config_dir::taskcast_config_dir().unwrap();
     let node_mgr = NodeConfigManager::new(home);
     let result = node_mgr.get("nonexistent");
     assert!(result.is_none(), "should not find nonexistent node");
-
-    unsafe { std::env::remove_var("HOME"); }
 }
 
 #[tokio::test]
 async fn run_tail_node_lookup_and_url_construction() {
-    let _lock = HOME_MUTEX.lock().unwrap();
     let engine = make_engine();
     let base_url = start_server(engine.clone()).await;
 
-    let temp_dir = setup_temp_home_with_node(&base_url, "default");
-    unsafe { std::env::set_var("HOME", temp_dir.path()); }
+    let config_dir = setup_config_dir_with_node(&base_url, "default");
 
     // Create a task and publish events for tail to pick up
     let task = engine
@@ -1590,7 +1551,7 @@ async fn run_tail_node_lookup_and_url_construction() {
         .unwrap();
 
     // Replicate run_tail lines 218-248: node lookup + URL construction
-    let home = dirs::home_dir().unwrap().join(".taskcast");
+    let home = taskcast_cli::config_dir::taskcast_config_dir().unwrap();
     let node_mgr = NodeConfigManager::new(home);
     let node = node_mgr.get_current();
     assert_eq!(node.url, base_url);
@@ -1614,10 +1575,14 @@ async fn run_tail_node_lookup_and_url_construction() {
     };
     let url = format!("{}/events{qs}", client.base_url());
 
-    assert!(url.contains("/events?types=test.*"), "tail URL should use global /events: {url}");
-    assert!(!url.contains("/tasks/"), "tail URL should not contain /tasks/: {url}");
-
-    unsafe { std::env::remove_var("HOME"); }
+    assert!(
+        url.contains("/events?types=test.*"),
+        "tail URL should use global /events: {url}"
+    );
+    assert!(
+        !url.contains("/tasks/"),
+        "tail URL should not contain /tasks/: {url}"
+    );
 }
 
 #[tokio::test]
@@ -1674,11 +1639,11 @@ async fn run_tail_callback_formats_with_task_id() {
                     .get("level")
                     .and_then(|v| v.as_str())
                     .unwrap_or("info");
-                let timestamp = event
-                    .get("timestamp")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0);
-                let data = event.get("data").cloned().unwrap_or(serde_json::Value::Null);
+                let timestamp = event.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0);
+                let data = event
+                    .get("data")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
                 let task_id = event.get("taskId").and_then(|v| v.as_str());
                 formatted.push(format_event(event_type, level, timestamp, &data, task_id));
             }
@@ -1688,7 +1653,10 @@ async fn run_tail_callback_formats_with_task_id() {
     .await
     .unwrap();
 
-    assert!(!formatted.is_empty(), "tail callback should produce formatted output");
+    assert!(
+        !formatted.is_empty(),
+        "tail callback should produce formatted output"
+    );
 }
 
 #[tokio::test]
@@ -1716,7 +1684,11 @@ async fn run_tail_no_query_params() {
     };
     let url = format!("{}/events{qs}", client.base_url());
 
-    assert_eq!(url, format!("{}/events", base_url), "URL should have no query string");
+    assert_eq!(
+        url,
+        format!("{}/events", base_url),
+        "URL should have no query string"
+    );
 }
 
 // ─── Direct run_logs / run_tail calls ────────────────────────────────────────
@@ -1725,12 +1697,10 @@ use taskcast_cli::commands::logs::{run_logs, run_tail, LogsArgs, TailArgs};
 
 #[tokio::test]
 async fn run_logs_direct_call_completed_task() {
-    let _lock = HOME_MUTEX.lock().unwrap();
     let engine = make_engine();
     let base_url = start_server(engine.clone()).await;
 
-    let temp_dir = setup_temp_home_with_node(&base_url, "default");
-    unsafe { std::env::set_var("HOME", temp_dir.path()); }
+    let config_dir = setup_config_dir_with_node(&base_url, "default");
 
     // Create a task, publish an event, then complete it so the SSE stream ends
     let task = engine
@@ -1771,20 +1741,17 @@ async fn run_logs_direct_call_completed_task() {
     })
     .await;
 
-    assert!(result.is_ok(), "run_logs should succeed for completed task: {:?}", result.err());
-
-    unsafe { std::env::remove_var("HOME"); }
+    assert!(
+        result.is_ok(),
+        "run_logs should succeed for completed task: {:?}",
+        result.err()
+    );
 }
 
 #[tokio::test]
 async fn run_logs_node_not_found_returns_error() {
-    let _lock = HOME_MUTEX.lock().unwrap();
-
-    let temp_dir = tempfile::TempDir::new().unwrap();
-    let config_dir = temp_dir.path().join(".taskcast");
-    std::fs::create_dir_all(&config_dir).unwrap();
-    let _mgr = NodeConfigManager::new(config_dir);
-    unsafe { std::env::set_var("HOME", temp_dir.path()); }
+    let config_dir = IsolatedConfigDir::new();
+    let _mgr = NodeConfigManager::new(config_dir.path().to_path_buf());
 
     let result = run_logs(LogsArgs {
         task_id: "some-task".to_string(),
@@ -1800,18 +1767,14 @@ async fn run_logs_node_not_found_returns_error() {
         err.contains("nonexistent"),
         "error should mention the node name, got: {err}"
     );
-
-    unsafe { std::env::remove_var("HOME"); }
 }
 
 #[tokio::test]
 async fn run_logs_with_filters() {
-    let _lock = HOME_MUTEX.lock().unwrap();
     let engine = make_engine();
     let base_url = start_server(engine.clone()).await;
 
-    let temp_dir = setup_temp_home_with_node(&base_url, "default");
-    unsafe { std::env::set_var("HOME", temp_dir.path()); }
+    let config_dir = setup_config_dir_with_node(&base_url, "default");
 
     let task = engine
         .create_task(CreateTaskInput {
@@ -1851,20 +1814,17 @@ async fn run_logs_with_filters() {
     })
     .await;
 
-    assert!(result.is_ok(), "run_logs with filters should succeed: {:?}", result.err());
-
-    unsafe { std::env::remove_var("HOME"); }
+    assert!(
+        result.is_ok(),
+        "run_logs with filters should succeed: {:?}",
+        result.err()
+    );
 }
 
 #[tokio::test]
 async fn run_tail_node_not_found_returns_error() {
-    let _lock = HOME_MUTEX.lock().unwrap();
-
-    let temp_dir = tempfile::TempDir::new().unwrap();
-    let config_dir = temp_dir.path().join(".taskcast");
-    std::fs::create_dir_all(&config_dir).unwrap();
-    let _mgr = NodeConfigManager::new(config_dir);
-    unsafe { std::env::set_var("HOME", temp_dir.path()); }
+    let config_dir = IsolatedConfigDir::new();
+    let _mgr = NodeConfigManager::new(config_dir.path().to_path_buf());
 
     let result = run_tail(TailArgs {
         types: None,
@@ -1879,123 +1839,117 @@ async fn run_tail_node_not_found_returns_error() {
         err.contains("nonexistent"),
         "error should mention the node name, got: {err}"
     );
-
-    unsafe { std::env::remove_var("HOME"); }
 }
 
 // ─── Direct run_tail happy path (spawn_local + abort) ────────────────────────
 
 #[tokio::test]
 async fn run_tail_direct_call_receives_events() {
-    let _lock = HOME_MUTEX.lock().unwrap();
     let engine = make_engine();
     let base_url = start_server(engine.clone()).await;
 
-    let temp_dir = tempfile::TempDir::new().unwrap();
-    setup_temp_home_with_node_at(temp_dir.path(), &base_url);
-    unsafe { std::env::set_var("HOME", temp_dir.path()); }
+    let config_dir = IsolatedConfigDir::new();
+    setup_config_dir_with_node_at(config_dir.path(), &base_url);
 
     let local = tokio::task::LocalSet::new();
     let engine_for_local = engine.clone();
-    local.run_until(async move {
-        // spawn_local for run_tail (its future is !Send due to FnMut callback)
-        let handle = tokio::task::spawn_local(async move {
-            let _ = run_tail(TailArgs {
-                types: None,
-                levels: None,
-                node: None,
-            })
-            .await;
-        });
+    local
+        .run_until(async move {
+            // spawn_local for run_tail (its future is !Send due to FnMut callback)
+            let handle = tokio::task::spawn_local(async move {
+                let _ = run_tail(TailArgs {
+                    types: None,
+                    levels: None,
+                    node: None,
+                })
+                .await;
+            });
 
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-        let task = engine_for_local
-            .create_task(CreateTaskInput {
-                r#type: Some("test".to_string()),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        engine_for_local
-            .transition_task(&task.id, TaskStatus::Running, None)
-            .await
-            .unwrap();
-        engine_for_local
-            .publish_event(
-                &task.id,
-                PublishEventInput {
-                    r#type: "llm.delta".to_string(),
-                    level: Level::Info,
-                    data: json!({"text": "hello from tail"}),
-                    series_id: None,
-                    series_mode: None,
-                    series_acc_field: None,
-                },
-            )
-            .await
-            .unwrap();
+            let task = engine_for_local
+                .create_task(CreateTaskInput {
+                    r#type: Some("test".to_string()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            engine_for_local
+                .transition_task(&task.id, TaskStatus::Running, None)
+                .await
+                .unwrap();
+            engine_for_local
+                .publish_event(
+                    &task.id,
+                    PublishEventInput {
+                        r#type: "llm.delta".to_string(),
+                        level: Level::Info,
+                        data: json!({"text": "hello from tail"}),
+                        series_id: None,
+                        series_mode: None,
+                        series_acc_field: None,
+                    },
+                )
+                .await
+                .unwrap();
 
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        handle.abort();
-    }).await;
-
-    unsafe { std::env::remove_var("HOME"); }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            handle.abort();
+        })
+        .await;
 }
 
 #[tokio::test]
 async fn run_tail_direct_call_with_filters() {
-    let _lock = HOME_MUTEX.lock().unwrap();
     let engine = make_engine();
     let base_url = start_server(engine.clone()).await;
 
-    let temp_dir = tempfile::TempDir::new().unwrap();
-    setup_temp_home_with_node_at(temp_dir.path(), &base_url);
-    unsafe { std::env::set_var("HOME", temp_dir.path()); }
+    let config_dir = IsolatedConfigDir::new();
+    setup_config_dir_with_node_at(config_dir.path(), &base_url);
 
     let local = tokio::task::LocalSet::new();
     let engine_for_local = engine.clone();
-    local.run_until(async move {
-        let handle = tokio::task::spawn_local(async move {
-            let _ = run_tail(TailArgs {
-                types: Some("llm.*".to_string()),
-                levels: Some("info,warn".to_string()),
-                node: None,
-            })
-            .await;
-        });
+    local
+        .run_until(async move {
+            let handle = tokio::task::spawn_local(async move {
+                let _ = run_tail(TailArgs {
+                    types: Some("llm.*".to_string()),
+                    levels: Some("info,warn".to_string()),
+                    node: None,
+                })
+                .await;
+            });
 
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-        let task = engine_for_local
-            .create_task(CreateTaskInput {
-                r#type: Some("test".to_string()),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        engine_for_local
-            .transition_task(&task.id, TaskStatus::Running, None)
-            .await
-            .unwrap();
-        engine_for_local
-            .publish_event(
-                &task.id,
-                PublishEventInput {
-                    r#type: "llm.delta".to_string(),
-                    level: Level::Info,
-                    data: json!({"text": "filtered tail"}),
-                    series_id: None,
-                    series_mode: None,
-                    series_acc_field: None,
-                },
-            )
-            .await
-            .unwrap();
+            let task = engine_for_local
+                .create_task(CreateTaskInput {
+                    r#type: Some("test".to_string()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            engine_for_local
+                .transition_task(&task.id, TaskStatus::Running, None)
+                .await
+                .unwrap();
+            engine_for_local
+                .publish_event(
+                    &task.id,
+                    PublishEventInput {
+                        r#type: "llm.delta".to_string(),
+                        level: Level::Info,
+                        data: json!({"text": "filtered tail"}),
+                        series_id: None,
+                        series_mode: None,
+                        series_acc_field: None,
+                    },
+                )
+                .await
+                .unwrap();
 
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        handle.abort();
-    }).await;
-
-    unsafe { std::env::remove_var("HOME"); }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            handle.abort();
+        })
+        .await;
 }

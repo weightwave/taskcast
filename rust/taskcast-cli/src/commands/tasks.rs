@@ -1,6 +1,7 @@
 use clap::{Args, Subcommand};
 
 use crate::client::TaskcastClient;
+use crate::config_dir::taskcast_config_dir;
 use crate::node_config::NodeConfigManager;
 
 #[derive(Args, Debug)]
@@ -77,10 +78,7 @@ pub fn format_task_list(tasks: &[TaskListItem]) -> String {
         return "No tasks found.".to_string();
     }
 
-    let header = format!(
-        "{:<28}{:<13}{:<11}CREATED",
-        "ID", "TYPE", "STATUS"
-    );
+    let header = format!("{:<28}{:<13}{:<11}CREATED", "ID", "TYPE", "STATUS");
 
     let mut lines = vec![header];
     for t in tasks {
@@ -111,16 +109,20 @@ pub fn format_task_inspect(task: &TaskDetail, events: &[EventItem]) -> String {
         _ => String::new(),
     };
     lines.push(format!("  Params:  {}", params_str));
-    lines.push(format!(
-        "  Created: {}",
-        format_timestamp(task.created_at)
-    ));
+    lines.push(format!("  Created: {}", format_timestamp(task.created_at)));
 
     if events.is_empty() {
         lines.push(String::new());
         lines.push("No events.".to_string());
     } else {
-        let last5: Vec<&EventItem> = events.iter().rev().take(5).collect::<Vec<_>>().into_iter().rev().collect();
+        let last5: Vec<&EventItem> = events
+            .iter()
+            .rev()
+            .take(5)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
         lines.push(String::new());
         lines.push(format!("Recent Events (last {}):", last5.len()));
         for (i, e) in last5.iter().enumerate() {
@@ -173,10 +175,7 @@ async fn run_list(
     limit: u32,
     node_name: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let config_dir = dirs::home_dir()
-        .expect("could not determine home directory")
-        .join(".taskcast");
-    let mgr = NodeConfigManager::new(config_dir);
+    let mgr = NodeConfigManager::new(taskcast_config_dir()?);
 
     let node = if let Some(ref name) = node_name {
         match mgr.get(name) {
@@ -233,10 +232,7 @@ async fn run_inspect(
     task_id: String,
     node_name: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let config_dir = dirs::home_dir()
-        .expect("could not determine home directory")
-        .join(".taskcast");
-    let mgr = NodeConfigManager::new(config_dir);
+    let mgr = NodeConfigManager::new(taskcast_config_dir()?);
 
     let node = if let Some(ref name) = node_name {
         match mgr.get(name) {
