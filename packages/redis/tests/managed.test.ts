@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import { Redis } from 'ioredis'
 import { GenericContainer, type StartedTestContainer } from 'testcontainers'
-import type { DependencyObservation, TaskEvent } from '@taskcast/core'
+import type { DependencyObservation, Task, TaskEvent } from '@taskcast/core'
 import { equalJitterDelay } from '../src/backoff.js'
 import {
   createManagedRedisAdapters,
@@ -12,7 +12,10 @@ import {
   RedisBroadcastProvider,
   RedisShortTermStore,
 } from '../src/index.js'
-import { TcpFaultProxy } from './helpers/tcp-fault-proxy.js'
+import {
+  redisCommandMatcher,
+  TcpFaultProxy,
+} from './helpers/tcp-fault-proxy.js'
 
 let container: StartedTestContainer
 let proxy: TcpFaultProxy
@@ -28,8 +31,16 @@ const makeEvent = (): TaskEvent => ({
   data: { text: 'managed' },
 })
 
+const makeTask = (id: string): Task => ({
+  id,
+  status: 'pending',
+  params: { prompt: 'managed recovery' },
+  createdAt: Date.now(),
+  updatedAt: Date.now(),
+})
+
 async function eventually(
-  operation: () => Promise<void>,
+  operation: () => void | Promise<void>,
   timeoutMs = 10_000,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs
@@ -44,6 +55,39 @@ async function eventually(
     }
   }
   throw lastError
+}
+
+async function withDeadline<T>(
+  operation: Promise<T>,
+  timeoutMs: number,
+  message: string,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), timeoutMs)
+      }),
+    ])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
+}
+
+async function settleBeforeDeadline<T>(
+  operation: Promise<T>,
+  timeoutMs: number,
+  message: string,
+): Promise<PromiseSettledResult<T>> {
+  return withDeadline(
+    operation.then(
+      (value): PromiseFulfilledResult<T> => ({ status: 'fulfilled', value }),
+      (reason): PromiseRejectedResult => ({ status: 'rejected', reason }),
+    ),
+    timeoutMs,
+    message,
+  )
 }
 
 async function expectConnectionCountStable(
@@ -70,6 +114,29 @@ function patternSubscriptions(client: Redis): string[] {
   ).condition.subscriber.channels('psubscribe')
 }
 
+describe('TcpFaultProxy request matcher', () => {
+  it('matches an exact RESP command across fragmentation and coalescing', () => {
+    const ping = Buffer.from('*1\r\n$4\r\nPING\r\n')
+    const increment = Buffer.from(
+      '*2\r\n$4\r\nINCR\r\n$23\r\ntaskcast:test:no-replay\r\n',
+    )
+    const matcher = redisCommandMatcher(
+      'INCR',
+      'taskcast:test:no-replay',
+    )
+    const coalesced = Buffer.concat([increment, ping])
+
+    expect(matcher(increment.subarray(0, increment.length - 3))).toBe(false)
+    expect(matcher(coalesced)).toBe(true)
+    expect(matcher(Buffer.concat([ping, increment]))).toBe(false)
+    expect(
+      matcher(Buffer.from(
+        '*2\r\n$4\r\nINCR\r\n$14\r\ntaskcast:other\r\n',
+      )),
+    ).toBe(false)
+  })
+})
+
 describe('equalJitterDelay', () => {
   it('uses the lower, upper, and capped equal-jitter bounds', () => {
     expect(equalJitterDelay(500, 5_000, 0, () => 0)).toBe(250)
@@ -91,8 +158,11 @@ describe('managed Redis command client', () => {
   }, 60_000)
 
   afterAll(async () => {
-    await proxy?.stop()
-    await container?.stop()
+    try {
+      await proxy?.stop()
+    } finally {
+      await container?.stop()
+    }
   })
 
   it('configures one shared client, checks readiness, and closes without QUIT', async () => {
@@ -159,6 +229,48 @@ describe('managed Redis command client', () => {
     await eventually(() => managed.check())
     await expect(managed.client.get('taskcast:managed:replay')).resolves.toBe('0')
     await managed.close()
+  }, 20_000)
+
+  it('does not replay an INCR whose upstream response is dropped', async () => {
+    await proxy.open()
+    const key = 'taskcast:test:no-replay'
+    const direct = new Redis(
+      `redis://127.0.0.1:${container.getMappedPort(6379)}`,
+    )
+    let managed:
+      | Awaited<ReturnType<typeof createManagedRedisCommandClient>>
+      | undefined
+    const matchedBefore = proxy.matchedCommands
+
+    try {
+      managed = await createManagedRedisCommandClient(redisUrl, {
+        random: () => 0,
+      })
+      await direct.set(key, '0')
+      proxy.dropNextResponse(redisCommandMatcher('INCR', key))
+
+      const outcome = await settleBeforeDeadline(
+        managed.client.incr(key),
+        5_000,
+        'ambiguous INCR did not fail before the deadline',
+      )
+      expect(outcome.status).toBe('rejected')
+
+      await proxy.open()
+      await eventually(() => managed.check())
+      await expect(direct.get(key)).resolves.toBe('1')
+      expect(proxy.matchedCommands - matchedBefore).toBe(1)
+    } finally {
+      try {
+        direct.disconnect(false)
+      } finally {
+        try {
+          await managed?.close()
+        } finally {
+          await proxy.open()
+        }
+      }
+    }
   }, 20_000)
 
   it('returns only after one pattern subscription and shares the command client', async () => {
@@ -243,6 +355,171 @@ describe('managed Redis command client', () => {
 
     await second.close()
     await first.close()
+  }, 20_000)
+
+  it('recovers commands, store, and new PubSub messages after a long outage', async () => {
+    await proxy.open()
+    const observations: DependencyObservation[] = []
+    let managed:
+      | Awaited<ReturnType<typeof createManagedRedisAdapters>>
+      | undefined
+    const received: string[] = []
+    let unsubscribe: (() => void) | undefined
+
+    try {
+      managed = await createManagedRedisAdapters(redisUrl, {
+        prefix: 'managed-long-outage',
+        random: () => 0,
+        observer: {
+          observe: (observation) => observations.push(observation),
+        },
+      })
+      unsubscribe = managed.broadcast.subscribe(
+        'task-long-outage',
+        (event) => received.push(event.id),
+      )
+      await managed.broadcast.publish('task-long-outage', {
+        ...makeEvent(),
+        id: 'before-long-outage',
+      })
+      await eventually(() =>
+        expect(received).toEqual(['before-long-outage']),
+      )
+
+      const acceptedBeforeOutage = proxy.acceptedConnections
+      await proxy.blackhole()
+      await eventually(() =>
+        expect(managed.commandClient.status).toBe('ready'),
+      )
+
+      const interrupted = managed.commandClient.get(
+        'taskcast:managed:interrupted',
+      )
+      await eventually(async () => {
+        const queue = managed.commandClient as unknown as {
+          commandQueue: { length: number }
+        }
+        expect(queue.commandQueue.length).toBeGreaterThan(0)
+      })
+      await proxy.refuse()
+      const interruptedOutcome = await settleBeforeDeadline(
+        interrupted,
+        5_000,
+        'blackholed command did not fail after sockets were refused',
+      )
+      expect(interruptedOutcome.status).toBe('rejected')
+
+      await eventually(() =>
+        expect(
+          observations.some(
+            ({ dependency, attempt }) =>
+              dependency === 'redisCommand' && (attempt ?? 0) >= 2,
+          ),
+        ).toBe(true),
+      )
+      await eventually(() =>
+        expect(
+          observations.some(
+            ({ dependency, attempt }) =>
+              dependency === 'redisPubSub' && (attempt ?? 0) >= 2,
+          ),
+        ).toBe(true),
+      )
+      await proxy.open()
+      try {
+        await eventually(() => managed.commandCheck())
+      } catch (error) {
+        throw new Error(
+          `command recovery timed out: status=${managed.commandClient.status}, `
+          + `acceptedDelta=${proxy.acceptedConnections - acceptedBeforeOutage}, `
+          + `pubSubSubscribed=${managed.broadcast.isPatternSubscribed()}, `
+          + `observations=${JSON.stringify(observations.slice(-20))}`,
+          { cause: error },
+        )
+      }
+      try {
+        await eventually(() => managed.pubSubCheck())
+      } catch (error) {
+        throw new Error(
+          `PubSub recovery timed out: status=${managed.subscriberClient.status}, `
+          + `acceptedDelta=${proxy.acceptedConnections - acceptedBeforeOutage}`,
+          { cause: error },
+        )
+      }
+
+      const recoveredTask = makeTask('task-managed-recovered')
+      await managed.shortTermStore.saveTask(recoveredTask)
+      await expect(
+        managed.shortTermStore.getTask(recoveredTask.id),
+      ).resolves.toEqual(recoveredTask)
+
+      await managed.broadcast.publish('task-long-outage', {
+        ...makeEvent(),
+        id: 'after-long-outage',
+      })
+      await eventually(() =>
+        expect(received).toEqual([
+          'before-long-outage',
+          'after-long-outage',
+        ]),
+      )
+
+      // The command manager and PubSub supervisor may each have one
+      // transition-race connection plus their successful recovery.
+      const reconnectConnections =
+        proxy.acceptedConnections - acceptedBeforeOutage
+      expect(reconnectConnections).toBeLessThanOrEqual(4)
+    } finally {
+      unsubscribe?.()
+      try {
+        await managed?.close()
+      } finally {
+        await proxy.open()
+      }
+    }
+  }, 20_000)
+
+  it('keeps 50 concurrent callers within the two coordinated reconnect paths', async () => {
+    await proxy.open()
+    let managed:
+      | Awaited<ReturnType<typeof createManagedRedisAdapters>>
+      | undefined
+
+    try {
+      managed = await createManagedRedisAdapters(redisUrl, {
+        prefix: 'managed-connection-bound',
+        random: () => 0,
+      })
+      const acceptedBeforeDrop = proxy.acceptedConnections
+      proxy.closeSockets()
+      await eventually(() =>
+        expect(managed.commandClient.status).not.toBe('ready'),
+      )
+
+      const results = await withDeadline(
+        Promise.allSettled(
+          Array.from({ length: 50 }, () => managed.commandClient.ping()),
+        ),
+        5_000,
+        '50 commands did not settle before the reconnect deadline',
+      )
+      expect(results.every(({ status }) => status === 'rejected')).toBe(true)
+
+      await eventually(() => managed.commandCheck())
+      await eventually(() => managed.pubSubCheck())
+
+      // One command manager and one PubSub supervisor may each have one
+      // transition-race attempt plus their successful reconnect.
+      expect(
+        proxy.acceptedConnections - acceptedBeforeDrop,
+      ).toBeLessThanOrEqual(4)
+    } finally {
+      try {
+        await managed?.close()
+      } finally {
+        await proxy.open()
+      }
+    }
   }, 20_000)
 
   it('cancels a pending subscriber retry when closed', async () => {

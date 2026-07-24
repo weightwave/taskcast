@@ -1,15 +1,19 @@
+#[path = "../../taskcast-redis/tests/support/mod.rs"]
+mod support;
+
 use std::borrow::Cow;
 use std::error::Error;
 use std::fmt;
 use std::io;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sqlx::error::{DatabaseError, ErrorKind};
 use sqlx::postgres::PgPoolOptions;
+use support::TcpFaultProxy;
 use taskcast_core::{
     DependencyErrorKind, DependencyName, DependencyObservation, DependencyObservationState,
-    DependencyObserver, DependencyUnavailableError, LongTermStore,
+    DependencyObserver, DependencyUnavailableError, LongTermStore, Task, TaskStatus,
 };
 use taskcast_postgres::{classify_postgres_connectivity, postgres_check, PostgresLongTermStore};
 use testcontainers::{runners::AsyncRunner, ImageExt};
@@ -83,6 +87,47 @@ impl fmt::Display for WrappedSqlxError {
 impl Error for WrappedSqlxError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         Some(&self.0)
+    }
+}
+
+fn make_recovery_task() -> Task {
+    Task {
+        id: "task-postgres-recovered".to_string(),
+        r#type: None,
+        status: TaskStatus::Pending,
+        params: None,
+        result: None,
+        error: None,
+        metadata: None,
+        auth_config: None,
+        webhooks: None,
+        cleanup: None,
+        tags: None,
+        assign_mode: None,
+        cost: None,
+        assigned_worker: None,
+        disconnect_policy: None,
+        reason: None,
+        resume_at: None,
+        blocked_request: None,
+        created_at: 1_000.0,
+        updated_at: 1_000.0,
+        completed_at: None,
+        ttl: None,
+    }
+}
+
+async fn eventually_postgres(pool: &sqlx::PgPool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if postgres_check(pool).await.is_ok() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "PostgreSQL pool did not recover before the deadline"
+        );
+        tokio::task::yield_now().await;
     }
 }
 
@@ -242,4 +287,102 @@ async fn public_operation_is_observed_once_and_reports_healthy_recovery() {
         Some("42P01")
     );
     assert!(ordinary_observer.observations().is_empty());
+}
+
+#[tokio::test]
+async fn same_pool_recovers_readiness_and_store_without_replaying_statement() {
+    let container = Postgres::default()
+        .with_tag("16-alpine")
+        .start()
+        .await
+        .unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let upstream = format!("127.0.0.1:{port}").parse().unwrap();
+    let proxy = TcpFaultProxy::start(upstream).await.unwrap();
+    let database_url = format!("postgres://postgres:postgres@{}/postgres", proxy.address());
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_secs(2))
+        .connect(&database_url)
+        .await
+        .unwrap();
+    let store = PostgresLongTermStore::new(pool.clone());
+    store.migrate().await.unwrap();
+    postgres_check(&pool).await.unwrap();
+
+    let marker = "taskcast_pg_no_replay_rust";
+    sqlx::query(
+        "CREATE TABLE taskcast_test_no_replay (
+            marker TEXT PRIMARY KEY,
+            executions INTEGER NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO taskcast_test_no_replay (marker, executions)
+         VALUES ($1, 0)",
+    )
+    .bind(marker)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let marker_bytes = marker.as_bytes().to_vec();
+    let matched_before = proxy.matched_commands();
+    proxy
+        .drop_next_response(move |request| {
+            request
+                .windows(marker_bytes.len())
+                .any(|window| window == marker_bytes)
+        })
+        .await;
+    let statement = format!(
+        "UPDATE taskcast_test_no_replay
+         SET executions = executions + 1
+         WHERE marker = '{marker}'
+         /* {marker} */
+         RETURNING executions"
+    );
+    let interrupted = tokio::time::timeout(
+        Duration::from_secs(5),
+        sqlx::raw_sql(&statement).execute(&pool),
+    )
+    .await
+    .expect("in-flight PostgreSQL statement did not settle before the deadline");
+    assert!(
+        interrupted.is_err(),
+        "the statement whose response was dropped must fail"
+    );
+    assert_eq!(proxy.matched_commands() - matched_before, 1);
+
+    proxy.refuse().await;
+    let readiness = tokio::time::timeout(Duration::from_secs(5), postgres_check(&pool))
+        .await
+        .expect("PostgreSQL readiness did not settle during refusal");
+    assert!(readiness.is_err(), "readiness must fail during refusal");
+
+    proxy.open().await;
+    eventually_postgres(&pool).await;
+    let executions: i32 =
+        sqlx::query_scalar("SELECT executions FROM taskcast_test_no_replay WHERE marker = $1")
+            .bind(marker)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(executions, 1, "the interrupted statement was replayed");
+    let recovered_task = make_recovery_task();
+    store.save_task(recovered_task.clone()).await.unwrap();
+    assert_eq!(
+        store.get_task(&recovered_task.id).await.unwrap(),
+        Some(recovered_task)
+    );
+    assert_eq!(
+        proxy.matched_commands() - matched_before,
+        1,
+        "the interrupted statement must not be replayed"
+    );
+
+    pool.close().await;
+    proxy.stop().await;
 }
