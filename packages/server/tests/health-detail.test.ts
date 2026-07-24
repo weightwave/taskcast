@@ -192,12 +192,19 @@ describe('GET /health/detail', () => {
     })
   })
 
-  it('keeps liveness healthy while readiness and detail reflect dependency recovery', async () => {
-    let pubSubHealthy = false
+  it('keeps readiness degraded until PubSub restoration is acknowledged', async () => {
+    let acknowledgeRestoration!: () => void
+    let pubSubAcknowledged = false
+    const restoration = new Promise<void>((resolve) => {
+      acknowledgeRestoration = () => {
+        pubSubAcknowledged = true
+        resolve()
+      }
+    })
     const dependencyHealth = new DependencyHealthRegistry({ logger: () => {} })
     dependencyHealth.register('redisCommand', async () => {})
     dependencyHealth.register('redisPubSub', async () => {
-      if (!pubSubHealthy) throw new Error('private Redis endpoint')
+      if (!pubSubAcknowledged) throw new Error('private Redis endpoint')
     })
     const engine = new TaskEngine({
       broadcast: new MemoryBroadcastProvider(),
@@ -245,7 +252,8 @@ describe('GET /health/detail', () => {
       },
     })
 
-    pubSubHealthy = true
+    acknowledgeRestoration()
+    await restoration
     const recovered = await app.request('/health/ready')
     expect(recovered.status).toBe(200)
     expect((await recovered.json()).ok).toBe(true)

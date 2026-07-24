@@ -120,6 +120,14 @@ describe('classifyPostgresConnectivity', () => {
     expect(classifyPostgresConnectivity(error)).toBe(expected)
   })
 
+  it('classifies postgres.js CONNECT_TIMEOUT exactly as timeout', () => {
+    const error = Object.assign(new Error('database operation failed'), {
+      code: 'CONNECT_TIMEOUT',
+    })
+
+    expect(classifyPostgresConnectivity(error)).toBe('timeout')
+  })
+
   it('classifies connectivity errors through their cause chain', () => {
     const source = Object.assign(new Error('socket reset'), { code: 'ECONNRESET' })
     expect(classifyPostgresConnectivity(new Error('query failed', { cause: source })))

@@ -63,7 +63,9 @@ export async function createManagedRedisCommandClient(
   options: ManagedRedisOptions = {},
 ): Promise<ManagedRedisCommand> {
   let reconnectAttempt = 0
+  let commandGeneration = 0
   let closed = false
+  let readinessCheck: Promise<void> | undefined
   const retryDelay = (times: number) =>
     equalJitterDelay(500, 5_000, times - 1, options.random)
   const commandClient = new Redis(url, {
@@ -76,6 +78,7 @@ export async function createManagedRedisCommandClient(
   })
 
   const onReady = () => {
+    commandGeneration += 1
     reconnectAttempt = 0
     options.observer?.observe({
       dependency: 'redisCommand',
@@ -83,6 +86,7 @@ export async function createManagedRedisCommandClient(
     })
   }
   const onReconnecting = (delay: number) => {
+    commandGeneration += 1
     reconnectAttempt++
     options.observer?.observe({
       dependency: 'redisCommand',
@@ -93,6 +97,7 @@ export async function createManagedRedisCommandClient(
   }
   const onUnavailable = (error?: unknown) => {
     if (closed) return
+    commandGeneration += 1
     const kind =
       error === undefined ? 'connection_closed' : classifyRedisError(error)
     if (kind === undefined) return
@@ -137,19 +142,38 @@ export async function createManagedRedisCommandClient(
     throw unavailable(error) ?? error
   }
 
-  return {
-    client: commandClient,
-    async check() {
+  const check = (): Promise<void> => {
+    if (readinessCheck !== undefined) return readinessCheck
+
+    const generation = commandGeneration
+    const pending = (async () => {
       try {
         await commandClient.ping()
-        options.observer?.observe({
-          dependency: 'redisCommand',
-          state: 'healthy',
-        })
+        if (!closed && generation === commandGeneration) {
+          options.observer?.observe({
+            dependency: 'redisCommand',
+            state: 'healthy',
+          })
+        }
       } catch (error) {
         throw unavailable(error) ?? error
       }
-    },
+    })()
+    readinessCheck = pending
+    void pending.then(
+      () => {
+        if (readinessCheck === pending) readinessCheck = undefined
+      },
+      () => {
+        if (readinessCheck === pending) readinessCheck = undefined
+      },
+    )
+    return pending
+  }
+
+  return {
+    client: commandClient,
+    check,
     close,
   }
 }
@@ -173,7 +197,7 @@ export async function createManagedRedisAdapters(
     let reconnectAttempt = 0
     subscriberClient = new Redis(url, {
       lazyConnect: true,
-      autoResubscribe: true,
+      autoResubscribe: false,
       enableOfflineQueue: false,
       maxRetriesPerRequest: 0,
       retryStrategy: (times) =>
@@ -196,14 +220,113 @@ export async function createManagedRedisAdapters(
       managed: true,
     })
 
+    let restorationGeneration = 0
+    let restoration:
+      | { generation: number; promise: Promise<void> }
+      | undefined
+    let cancelRetryWait: (() => void) | undefined
+
+    const cancelSubscriptionRestoration = () => {
+      restorationGeneration += 1
+      broadcast.markPatternSubscriptionUnavailable()
+      cancelRetryWait?.()
+      cancelRetryWait = undefined
+    }
+    const waitForRetry = (
+      delay: number,
+      generation: number,
+    ): Promise<void> =>
+      new Promise((resolve) => {
+        const cancel = () => {
+          clearTimeout(timer)
+          resolve()
+        }
+        const timer = setTimeout(() => {
+          if (cancelRetryWait === cancel) cancelRetryWait = undefined
+          resolve()
+        }, delay)
+        cancelRetryWait = cancel
+        if (closed || generation !== restorationGeneration) cancel()
+      })
+    const restoreSubscription = async (generation: number) => {
+      let attempt = 0
+      while (
+        !closed
+        && generation === restorationGeneration
+        && subscriberClient?.status === 'ready'
+      ) {
+        try {
+          await broadcast.startPatternSubscription()
+          if (
+            closed
+            || generation !== restorationGeneration
+            || subscriberClient?.status !== 'ready'
+            || !broadcast.isPatternSubscribed()
+          ) {
+            return
+          }
+          reconnectAttempt = 0
+          options.observer?.observe({
+            dependency: 'redisPubSub',
+            state: 'healthy',
+          })
+          return
+        } catch (error) {
+          if (
+            closed
+            || generation !== restorationGeneration
+            || subscriberClient?.status !== 'ready'
+          ) {
+            return
+          }
+          attempt += 1
+          const delay = equalJitterDelay(
+            500,
+            10_000,
+            attempt - 1,
+            options.random,
+          )
+          options.observer?.observe({
+            dependency: 'redisPubSub',
+            state: 'reconnecting',
+            errorKind: classifyRedisError(error) ?? 'unavailable',
+            attempt,
+            nextRetryMs: delay,
+          })
+          await waitForRetry(delay, generation)
+        }
+      }
+    }
+    const beginSubscriptionRestoration = (): Promise<void> => {
+      if (
+        restoration !== undefined
+        && restoration.generation === restorationGeneration
+      ) {
+        return restoration.promise
+      }
+      broadcast.markPatternSubscriptionUnavailable()
+      restorationGeneration += 1
+      const generation = restorationGeneration
+      const promise = restoreSubscription(generation)
+      restoration = { generation, promise }
+      void promise.then(
+        () => {
+          if (restoration?.promise === promise) restoration = undefined
+        },
+        () => {
+          if (restoration?.promise === promise) restoration = undefined
+        },
+      )
+      return promise
+    }
     const onReady = () => {
-      reconnectAttempt = 0
-      options.observer?.observe({
-        dependency: 'redisPubSub',
-        state: 'healthy',
+      void beginSubscriptionRestoration().catch(() => {
+        // The restoration loop observes failures and keeps retrying while this
+        // socket generation remains ready.
       })
     }
     const onReconnecting = (delay: number) => {
+      cancelSubscriptionRestoration()
       reconnectAttempt++
       options.observer?.observe({
         dependency: 'redisPubSub',
@@ -214,6 +337,7 @@ export async function createManagedRedisAdapters(
     }
     const onUnavailable = (error?: unknown) => {
       if (closed) return
+      cancelSubscriptionRestoration()
       options.observer?.observe({
         dependency: 'redisPubSub',
         state: 'reconnecting',
@@ -223,23 +347,28 @@ export async function createManagedRedisAdapters(
             : (classifyRedisError(error) ?? 'unavailable'),
       })
     }
+    const onClose = () => onUnavailable()
     const onEnd = () => onUnavailable()
     const onError = (error: Error) => onUnavailable(error)
     subscriberClient.on('ready', onReady)
     subscriberClient.on('reconnecting', onReconnecting)
+    subscriberClient.on('close', onClose)
     subscriberClient.on('end', onEnd)
     subscriberClient.on('error', onError)
 
     const removeSubscriberListeners = () => {
       subscriberClient?.off('ready', onReady)
       subscriberClient?.off('reconnecting', onReconnecting)
+      subscriberClient?.off('close', onClose)
       subscriberClient?.off('end', onEnd)
       subscriberClient?.off('error', onError)
     }
     const close = async () => {
       if (closed) return
       closed = true
+      cancelSubscriptionRestoration()
       removeSubscriberListeners()
+      broadcast.dispose()
       subscriberClient?.disconnect(false)
       await command?.close()
     }
@@ -247,9 +376,10 @@ export async function createManagedRedisAdapters(
     try {
       await withDeadline(async () => {
         await subscriberClient!.connect()
-        await broadcast.startPatternSubscription()
+        await beginSubscriptionRestoration()
       }, remainingStartupMs())
     } catch (error) {
+      await close()
       throw new DependencyUnavailableError(
         'redisPubSub',
         classifyRedisError(error) ?? 'unavailable',
@@ -274,9 +404,11 @@ export async function createManagedRedisAdapters(
       close,
     }
   } catch (error) {
-    closed = true
-    subscriberClient?.disconnect(false)
-    await command?.close()
+    if (!closed) {
+      closed = true
+      subscriberClient?.disconnect(false)
+      await command?.close()
+    }
     throw error
   }
 }

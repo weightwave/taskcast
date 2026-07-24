@@ -10,17 +10,21 @@ import {
   resolveAdminToken,
   MemoryBroadcastProvider,
   MemoryShortTermStore,
+  DependencyUnavailableError,
 } from '@taskcast/core'
 import type { BroadcastProvider, ShortTermStore, LongTermStore, TaskcastConfig } from '@taskcast/core'
 import { createTaskcastApp, DependencyHealthRegistry, parseLogLevel } from '@taskcast/server'
 import type { AuthConfig, JWTConfig, RuntimeAdapterDescriptors } from '@taskcast/server'
 import { createManagedRedisAdapters } from '@taskcast/redis'
 import type { ManagedRedisAdapters } from '@taskcast/redis'
-import { PostgresLongTermStore, postgresCheck } from '@taskcast/postgres'
+import {
+  classifyPostgresConnectivity,
+  PostgresLongTermStore,
+  postgresCheck,
+} from '@taskcast/postgres'
 import { createSqliteAdapters } from '@taskcast/sqlite'
 import { promptCreateGlobalConfig, createDefaultGlobalConfig } from '../utils.js'
 import { performAutoMigrateIfEnabled } from '../auto-migrate.js'
-import { formatDisplayUrl } from '../migrate-helpers.js'
 
 /**
  * Strip credentials from a connection URL (Redis/Postgres/etc.) for logging.
@@ -47,6 +51,43 @@ function envNonEmpty(key: string): string | undefined {
 }
 
 type StorageMode = 'memory' | 'redis' | 'sqlite'
+const POSTGRES_STARTUP_TIMEOUT_MS = 5_000
+
+function postgresUnavailable(
+  error: unknown,
+  fallbackKind: 'timeout' | 'unavailable' = 'unavailable',
+): DependencyUnavailableError {
+  if (error instanceof DependencyUnavailableError) return error
+  return new DependencyUnavailableError(
+    'postgres',
+    classifyPostgresConnectivity(error) ?? fallbackKind,
+    error,
+  )
+}
+
+export async function validatePostgresStartup(
+  sql: ReturnType<typeof postgres>,
+  timeoutMs = POSTGRES_STARTUP_TIMEOUT_MS,
+): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    await Promise.race([
+      postgresCheck(sql),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          reject(postgresUnavailable(
+            new Error('PostgreSQL startup validation timed out'),
+            'timeout',
+          ))
+        }, timeoutMs)
+      }),
+    ])
+  } catch (error) {
+    throw postgresUnavailable(error)
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
+}
 
 export function resolveStorageMode(options: {
   cli?: string
@@ -101,9 +142,31 @@ function configuredStorageProvider(config: TaskcastConfig): string | undefined {
 }
 
 function configuredRedisUrl(config: TaskcastConfig): string | undefined {
-  const broadcast = config.adapters?.broadcast?.url
-  const shortTerm = config.adapters?.shortTermStore?.url
+  const broadcastAdapter = config.adapters?.broadcast
+  const shortTermAdapter = config.adapters?.shortTermStore
+  const broadcast = broadcastAdapter?.url
+  const shortTerm = shortTermAdapter?.url
   return [broadcast, shortTerm].find((value): value is string => value !== undefined && value !== '')
+}
+
+function validateConfiguredRedisUrls(config: TaskcastConfig): void {
+  const broadcastAdapter = config.adapters?.broadcast
+  const shortTermAdapter = config.adapters?.shortTermStore
+  const broadcast = broadcastAdapter?.url
+  const shortTerm = shortTermAdapter?.url
+  if (
+    broadcastAdapter?.provider === 'redis'
+    && shortTermAdapter?.provider === 'redis'
+    && broadcast !== undefined
+    && broadcast !== ''
+    && shortTerm !== undefined
+    && shortTerm !== ''
+    && broadcast !== shortTerm
+  ) {
+    throw new Error(
+      'configured Redis broadcast and short-term URLs must match',
+    )
+  }
 }
 
 function postgresActivation(options: {
@@ -344,7 +407,16 @@ async function runStartWithLifecycle(options: RunStartOptions, lifecycle: StartL
 
   // The startup SELECT is performed before entering runStart. Auto-migration
   // therefore cannot run before dependency readiness has been established.
-  await performAutoMigrateIfEnabled(options.postgres, options.postgresUrl, options.env)
+  try {
+    await performAutoMigrateIfEnabled(
+      options.postgres,
+      options.postgresUrl,
+      options.env,
+    )
+  } catch (error) {
+    if (options.postgres === undefined) throw error
+    throw postgresUnavailable(error)
+  }
   lifecycle.checkpoint()
 
   const engineOpts: ConstructorParameters<typeof TaskEngine>[0] = {
@@ -525,6 +597,9 @@ export function registerStartCommand(program: Command): void {
             ...(configuredProvider === undefined ? {} : { configuredProvider }),
             hasRedisUrl: redisUrl !== undefined,
           })
+          if (storageMode === 'redis' && envRedisUrl === undefined) {
+            validateConfiguredRedisUrls(fileConfig)
+          }
           if (storageMode === 'redis' && redisUrl === undefined) {
             throw new Error('storage mode redis requires TASKCAST_REDIS_URL or a configured Redis URL')
           }
@@ -584,11 +659,11 @@ export function registerStartCommand(program: Command): void {
               max,
               connect_timeout: 5,
             })
-            await postgresCheck(postgres_)
+            await validatePostgresStartup(postgres_)
             lifecycle.checkpoint()
             dependencyHealth.register('postgres', () => postgresCheck(postgres_!))
             longTermStore = new PostgresLongTermStore(postgres_, dependencyHealth)
-            longTermLabel = `postgres @ ${formatDisplayUrl(postgresUrl)}`
+            longTermLabel = 'postgres'
           }
 
           // Print startup configuration summary

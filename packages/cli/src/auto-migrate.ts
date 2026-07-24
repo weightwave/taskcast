@@ -2,7 +2,6 @@ import type postgres from 'postgres'
 import { buildMigrationFiles, runMigrations } from '@taskcast/postgres'
 import { parseBooleanEnv } from './helpers.js'
 import { EMBEDDED_MIGRATIONS } from './generated-migrations.js'
-import { formatDisplayUrl } from './migrate-helpers.js'
 
 /**
  * Automatically run database migrations if enabled.
@@ -24,13 +23,13 @@ import { formatDisplayUrl } from './migrate-helpers.js'
  * implementation's convention and keep stdout clean for machine-readable output.
  *
  * @param sql - Postgres connection instance, or undefined if Postgres is not configured
- * @param postgresUrl - Resolved Postgres URL (for log banner), or undefined
+ * @param postgresUrl - Retained for API compatibility; never logged
  * @param env - Environment variables (defaults to process.env for testability)
  * @throws Error with message "Auto-migration failed: <original_error>" if migration fails
  */
 export async function performAutoMigrateIfEnabled(
   sql: ReturnType<typeof postgres> | undefined,
-  postgresUrl: string | undefined,
+  _postgresUrl: string | undefined,
   env: Record<string, string | undefined> = process.env,
 ): Promise<void> {
   // Check if auto-migrate is enabled
@@ -47,11 +46,9 @@ export async function performAutoMigrateIfEnabled(
     return
   }
 
-  // Log banner with display URL (credentials stripped).
-  // The raw postgresUrl may contain a password (e.g. postgres://user:pass@host/db)
-  // which must not be emitted to stderr where it could leak into log aggregators.
-  const urlDisplay = postgresUrl ? formatDisplayUrl(postgresUrl) : '<postgres>'
-  console.error(`[taskcast] TASKCAST_AUTO_MIGRATE enabled — running Postgres migrations on ${urlDisplay}`)
+  // Keep the banner low-cardinality: even a credential-stripped URL exposes
+  // host, port, and database details when a migration subsequently fails.
+  console.error('[taskcast] TASKCAST_AUTO_MIGRATE enabled — running Postgres migrations on <postgres>')
 
   // Run migrations
   try {

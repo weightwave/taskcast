@@ -104,10 +104,7 @@ describe('performAutoMigrateIfEnabled', () => {
 
   // ─── Banner log (before running) ───────────────────────────────────────
 
-  it('logs banner with display URL (credentials stripped) before running migrations', async () => {
-    // Regression test: the banner must not print raw credentials. A URL with
-    // user:password must be formatted into host:port/db form via
-    // formatDisplayUrl() to avoid leaking secrets into stderr/log aggregators.
+  it('logs a low-cardinality banner without connection details', async () => {
     const env = { TASKCAST_AUTO_MIGRATE: 'true' }
     const mockError = vi.spyOn(console, 'error').mockImplementation(() => {})
     vi.mocked(runMigrations).mockResolvedValueOnce({ applied: [], skipped: [] })
@@ -118,17 +115,22 @@ describe('performAutoMigrateIfEnabled', () => {
       env,
     )
 
-    // Assert the banner line was emitted and the password does NOT appear
     const bannerCalls = mockError.mock.calls.filter((call) =>
       String(call[0]).includes('TASKCAST_AUTO_MIGRATE enabled'),
     )
     expect(bannerCalls).toHaveLength(1)
     const bannerLine = String(bannerCalls[0]?.[0])
     expect(bannerLine).toBe(
-      '[taskcast] TASKCAST_AUTO_MIGRATE enabled — running Postgres migrations on db.example.com:5432/taskcast',
+      '[taskcast] TASKCAST_AUTO_MIGRATE enabled — running Postgres migrations on <postgres>',
     )
-    expect(bannerLine).not.toContain('secretpass')
-    expect(bannerLine).not.toContain('user:')
+    for (const sensitive of [
+      'user',
+      'secretpass',
+      'db.example.com',
+      '5432',
+    ]) {
+      expect(bannerLine).not.toContain(sensitive)
+    }
 
     mockError.mockRestore()
   })
@@ -189,7 +191,7 @@ describe('performAutoMigrateIfEnabled', () => {
 
   // ─── Error handling ────────────────────────────────────────────────────
 
-  it('re-throws wrapped error without logging a failure line (caller logs)', async () => {
+  it('re-throws wrapped error without logging failure or endpoint details', async () => {
     // The helper must NOT log its own failure line. The caller is responsible
     // for the single "[taskcast] Auto-migration failed: ..." output. Logging
     // here would produce a duplicate when the error propagates up.
@@ -198,9 +200,11 @@ describe('performAutoMigrateIfEnabled', () => {
     const testError = new Error('Checksum mismatch detected')
     vi.mocked(runMigrations).mockRejectedValueOnce(testError)
 
-    await expect(performAutoMigrateIfEnabled(mockSql, testUrl, env)).rejects.toThrow(
-      'Auto-migration failed: Checksum mismatch detected',
-    )
+    await expect(performAutoMigrateIfEnabled(
+      mockSql,
+      'postgres://migration-user:migration-secret@private-migration.internal:6432/secret_database',
+      env,
+    )).rejects.toThrow('Auto-migration failed: Checksum mismatch detected')
 
     // Exactly one call expected: the "banner" log before runMigrations ran.
     // No "Auto-migration failed" line should have been emitted by the helper.
@@ -208,6 +212,18 @@ describe('performAutoMigrateIfEnabled', () => {
       String(call[0]).includes('Auto-migration failed'),
     )
     expect(failureCalls).toHaveLength(0)
+    const stderr = mockError.mock.calls
+      .map(([message]) => String(message))
+      .join('\n')
+    for (const sensitive of [
+      'migration-user',
+      'migration-secret',
+      'private-migration.internal',
+      '6432',
+      'secret_database',
+    ]) {
+      expect(stderr).not.toContain(sensitive)
+    }
 
     mockError.mockRestore()
   })

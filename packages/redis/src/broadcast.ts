@@ -11,6 +11,35 @@ export class RedisBroadcastProvider implements BroadcastProvider {
   private handlers = new Map<string, Set<(event: TaskEvent) => void>>()
   private channelPrefix: string
   private patternSubscribed = false
+  private patternGeneration = 0
+  private patternSubscription: Promise<void> | undefined
+  private disposed = false
+
+  private readonly dispatch = (channel: string, message: string): void => {
+    const taskId = channel.startsWith(this.channelPrefix)
+      ? channel.slice(this.channelPrefix.length)
+      : channel
+    const handlers = this.handlers.get(taskId)
+    if (!handlers) return
+    try {
+      const event = JSON.parse(message) as TaskEvent
+      for (const handler of handlers) handler(event)
+    } catch {
+      // Malformed messages are ignored.
+    }
+  }
+
+  private readonly dispatchPattern = (
+    _pattern: string,
+    channel: string,
+    message: string,
+  ): void => {
+    this.dispatch(channel, message)
+  }
+
+  private readonly markPatternUnavailable = (): void => {
+    this.markPatternSubscriptionUnavailable()
+  }
 
   constructor(
     private pub: Redis,
@@ -25,37 +54,13 @@ export class RedisBroadcastProvider implements BroadcastProvider {
       prefix ?? process.env['TASKCAST_REDIS_PREFIX'] ?? 'taskcast'
     this.channelPrefix = `${resolvedPrefix}:task:`
 
-    const dispatch = (channel: string, message: string) => {
-      const taskId = channel.startsWith(this.channelPrefix)
-        ? channel.slice(this.channelPrefix.length)
-        : channel
-      const handlers = this.handlers.get(taskId)
-      if (!handlers) return
-      try {
-        const event = JSON.parse(message) as TaskEvent
-        for (const handler of handlers) handler(event)
-      } catch {
-        // Malformed messages are ignored.
-      }
-    }
-
-    this.sub.on('message', dispatch)
-    this.sub.on(
-      'pmessage',
-      (_pattern: string, channel: string, message: string) =>
-        dispatch(channel, message),
-    )
+    this.sub.on('message', this.dispatch)
+    this.sub.on('pmessage', this.dispatchPattern)
 
     if (subscriptionMode === 'pattern') {
-      this.sub.on('ready', () => {
-        this.patternSubscribed = true
-      })
-      this.sub.on('reconnecting', () => {
-        this.patternSubscribed = false
-      })
-      this.sub.on('end', () => {
-        this.patternSubscribed = false
-      })
+      this.sub.on('close', this.markPatternUnavailable)
+      this.sub.on('reconnecting', this.markPatternUnavailable)
+      this.sub.on('end', this.markPatternUnavailable)
     }
   }
 
@@ -63,12 +68,45 @@ export class RedisBroadcastProvider implements BroadcastProvider {
     if ((this.options.subscriptionMode ?? 'channels') !== 'pattern') {
       throw new Error('Redis pattern subscription mode is not enabled')
     }
-    await this.sub.psubscribe(`${this.channelPrefix}*`)
-    this.patternSubscribed = true
+    if (this.patternSubscribed) return
+
+    const generation = this.patternGeneration
+    const pending = this.patternSubscription ??=
+      this.sub.psubscribe(`${this.channelPrefix}*`).then(() => {
+        if (generation === this.patternGeneration) {
+          this.patternSubscribed = true
+        }
+      })
+    try {
+      await pending
+    } finally {
+      if (this.patternSubscription === pending) {
+        this.patternSubscription = undefined
+      }
+    }
+  }
+
+  markPatternSubscriptionUnavailable(): void {
+    this.patternSubscribed = false
+    this.patternGeneration += 1
   }
 
   isPatternSubscribed(): boolean {
     return this.patternSubscribed
+  }
+
+  dispose(): void {
+    if (this.disposed) return
+    this.disposed = true
+    this.markPatternSubscriptionUnavailable()
+    this.handlers.clear()
+    this.sub.off('message', this.dispatch)
+    this.sub.off('pmessage', this.dispatchPattern)
+    if ((this.options.subscriptionMode ?? 'channels') === 'pattern') {
+      this.sub.off('close', this.markPatternUnavailable)
+      this.sub.off('reconnecting', this.markPatternUnavailable)
+      this.sub.off('end', this.markPatternUnavailable)
+    }
   }
 
   async publish(channel: string, event: TaskEvent): Promise<void> {

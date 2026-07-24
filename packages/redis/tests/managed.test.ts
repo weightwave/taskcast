@@ -13,6 +13,7 @@ import {
   RedisShortTermStore,
 } from '../src/index.js'
 import {
+  redisAnyCommandMatcher,
   redisCommandMatcher,
   TcpFaultProxy,
 } from './helpers/tcp-fault-proxy.js'
@@ -315,6 +316,50 @@ describe('managed Redis command client', () => {
     }
   }, 20_000)
 
+  it('keeps repeated readiness checks to one blackholed PING', async () => {
+    await proxy.open()
+    let managed:
+      | Awaited<ReturnType<typeof createManagedRedisCommandClient>>
+      | undefined
+
+    try {
+      managed = await createManagedRedisCommandClient(redisUrl, {
+        random: () => 0,
+      })
+      const commandQueue = () =>
+        (managed!.client as unknown as {
+          commandQueue: { length: number }
+        }).commandQueue.length
+      const queuedBefore = commandQueue()
+
+      await proxy.blackhole()
+      const checks = Array.from({ length: 8 }, () => managed!.check())
+      await eventually(() => {
+        expect(commandQueue() - queuedBefore).toBe(1)
+      })
+      expect(commandQueue() - queuedBefore).toBe(1)
+
+      await proxy.refuse()
+      const interrupted = await withDeadline(
+        Promise.allSettled(checks),
+        5_000,
+        'blackholed readiness checks did not settle after disconnect',
+      )
+      expect(
+        interrupted.every(({ status }) => status === 'rejected'),
+      ).toBe(true)
+
+      await proxy.open()
+      await eventually(() => managed!.check())
+    } finally {
+      try {
+        await managed?.close()
+      } finally {
+        await proxy.open()
+      }
+    }
+  }, 20_000)
+
   it('returns only after one pattern subscription and shares the command client', async () => {
     await proxy.open()
     proxy.resumeNewConnections()
@@ -335,7 +380,22 @@ describe('managed Redis command client', () => {
     await expect(managed.commandCheck()).resolves.toBeUndefined()
     await expect(managed.pubSubCheck()).resolves.toBeUndefined()
 
+    const subscriberEvents = [
+      'message',
+      'pmessage',
+      'ready',
+      'reconnecting',
+      'close',
+      'end',
+      'error',
+    ] as const
     await managed.close()
+    await managed.close()
+    expect(
+      subscriberEvents.every(
+        (event) => managed.subscriberClient.listenerCount(event) === 0,
+      ),
+    ).toBe(true)
   })
 
   it('keeps handlers and the single pattern after a forced subscriber reconnect', async () => {
@@ -397,6 +457,42 @@ describe('managed Redis command client', () => {
 
     await second.close()
     await first.close()
+  }, 20_000)
+
+  it('keeps PubSub readiness degraded until reconnect PSUBSCRIBE is acknowledged', async () => {
+    await proxy.open()
+    proxy.resumeNewConnections()
+    const prefix = 'managed-delayed-resubscribe'
+    const managed = await createManagedRedisAdapters(redisUrl, {
+      prefix,
+      random: () => 0,
+    })
+    const matchedBefore = proxy.matchedCommands
+
+    try {
+      proxy.holdNextResponse(
+        redisAnyCommandMatcher('PSUBSCRIBE', `${prefix}:task:*`),
+      )
+      proxy.closeLatestConnection()
+
+      await eventually(() => {
+        expect(proxy.matchedCommands - matchedBefore).toBe(1)
+        expect(managed.subscriberClient.status).toBe('ready')
+      })
+
+      await expect(managed.pubSubCheck()).rejects.toMatchObject({
+        dependency: 'redisPubSub',
+      })
+
+      proxy.releaseHeldResponse()
+      await eventually(() => managed.pubSubCheck())
+      expect(patternSubscriptions(managed.subscriberClient)).toEqual([
+        `${prefix}:task:*`,
+      ])
+    } finally {
+      await managed.close()
+      await proxy.open()
+    }
   }, 20_000)
 
   it('recovers commands, store, and new PubSub messages after a long outage', async () => {
@@ -582,6 +678,41 @@ describe('managed Redis command client', () => {
 
     proxy.resumeNewConnections()
     await expectConnectionCountStable(proxy, acceptedAfterClose, 750)
+  })
+
+  it('disconnects each client once when subscriber startup times out', async () => {
+    await proxy.open()
+    const keeper = new Redis(redisUrl)
+    await keeper.ping()
+    const prefix = 'managed-startup-cleanup'
+    proxy.holdNextResponse(
+      redisAnyCommandMatcher('PSUBSCRIBE', `${prefix}:task:*`),
+    )
+    const disconnect = vi.spyOn(Redis.prototype, 'disconnect')
+
+    try {
+      await expect(
+        createManagedRedisAdapters(redisUrl, {
+          prefix,
+          startupTimeoutMs: 250,
+          random: () => 0,
+        }),
+      ).rejects.toMatchObject({
+        dependency: 'redisPubSub',
+      })
+
+      expect(disconnect).toHaveBeenCalledTimes(2)
+      expect(
+        new Set(disconnect.mock.contexts).size,
+      ).toBe(2)
+      expect(
+        disconnect.mock.calls.every(([reconnect]) => reconnect === false),
+      ).toBe(true)
+    } finally {
+      disconnect.mockRestore()
+      keeper.disconnect(false)
+      await proxy.open()
+    }
   })
 
   it('bounds unreachable startup by one overall deadline', async () => {

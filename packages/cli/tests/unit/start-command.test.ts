@@ -11,14 +11,18 @@ class ExitError extends Error {
 }
 
 // Mock @taskcast/core
-vi.mock('@taskcast/core', () => ({
-  TaskEngine: vi.fn().mockImplementation(() => ({})),
-  WorkerManager: vi.fn().mockImplementation(() => ({})),
-  loadConfigFile: vi.fn().mockResolvedValue({ config: { port: 3721 }, source: 'none', path: undefined }),
-  resolveAdminToken: vi.fn(),
-  MemoryBroadcastProvider: vi.fn(),
-  MemoryShortTermStore: vi.fn(),
-}))
+vi.mock('@taskcast/core', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@taskcast/core')>()
+  return {
+    ...actual,
+    TaskEngine: vi.fn().mockImplementation(() => ({})),
+    WorkerManager: vi.fn().mockImplementation(() => ({})),
+    loadConfigFile: vi.fn().mockResolvedValue({ config: { port: 3721 }, source: 'none', path: undefined }),
+    resolveAdminToken: vi.fn(),
+    MemoryBroadcastProvider: vi.fn(),
+    MemoryShortTermStore: vi.fn(),
+  }
+})
 
 // Mock @taskcast/server — use inline object, no top-level refs
 vi.mock('@taskcast/server', () => ({
@@ -52,6 +56,7 @@ vi.mock('@taskcast/redis', () => ({
 // Mock @taskcast/postgres
 vi.mock('@taskcast/postgres', () => ({
   PostgresLongTermStore: vi.fn().mockImplementation(() => ({})),
+  classifyPostgresConnectivity: vi.fn().mockReturnValue(undefined),
   postgresCheck: vi.fn().mockResolvedValue(undefined),
 }))
 
@@ -358,7 +363,7 @@ describe('registerStartCommand', () => {
 
     // The log line must contain host:port/db (display format), not the raw URL
     // with credentials.
-    expect(logSpy).toHaveBeenCalledWith('[taskcast] Long-term store:  postgres @ localhost:5432/taskcast')
+    expect(logSpy).toHaveBeenCalledWith('[taskcast] Long-term store:  postgres')
 
     // Belt-and-suspenders: assert no log call includes the password
     const allCalls = logSpy.mock.calls.map((c) => String(c[0]))
@@ -491,6 +496,158 @@ describe('registerStartCommand', () => {
     expect(createManagedRedisAdapters).not.toHaveBeenCalled()
   })
 
+  it('rejects conflicting configured Redis URLs before connecting', async () => {
+    const { loadConfigFile } = await import('@taskcast/core')
+    ;(loadConfigFile as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      config: {
+        adapters: {
+          broadcast: {
+            provider: 'redis',
+            url: 'redis://broadcast-user:broadcast-secret@broadcast.internal:6379',
+          },
+          shortTermStore: {
+            provider: 'redis',
+            url: 'redis://store-user:store-secret@store.internal:6380',
+          },
+        },
+      },
+      source: 'file',
+      path: '/fake/taskcast.config.yaml',
+    })
+    const originalRedis = process.env['TASKCAST_REDIS_URL']
+    const originalStorage = process.env['TASKCAST_STORAGE']
+    delete process.env['TASKCAST_REDIS_URL']
+    delete process.env['TASKCAST_STORAGE']
+    const program = new Command()
+    program.exitOverride()
+    registerStartCommand(program)
+
+    try {
+      await expect(
+        program.parseAsync(['node', 'test', 'start']),
+      ).rejects.toMatchObject({ code: 1 })
+    } finally {
+      if (originalRedis === undefined) delete process.env['TASKCAST_REDIS_URL']
+      else process.env['TASKCAST_REDIS_URL'] = originalRedis
+      if (originalStorage === undefined) delete process.env['TASKCAST_STORAGE']
+      else process.env['TASKCAST_STORAGE'] = originalStorage
+    }
+
+    expect(errorSpy).toHaveBeenCalledWith(
+      '[taskcast] configured Redis broadcast and short-term URLs must match',
+    )
+    const stderr = errorSpy.mock.calls
+      .map(([message]) => String(message))
+      .join('\n')
+    expect(stderr).not.toContain('broadcast.internal')
+    expect(stderr).not.toContain('store.internal')
+    expect(stderr).not.toContain('broadcast-secret')
+    expect(stderr).not.toContain('store-secret')
+    const { createManagedRedisAdapters } = await import('@taskcast/redis')
+    expect(createManagedRedisAdapters).not.toHaveBeenCalled()
+  })
+
+  it('ignores conflicting configured Redis URLs when memory is explicitly active', async () => {
+    const { loadConfigFile } = await import('@taskcast/core')
+    ;(loadConfigFile as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      config: {
+        adapters: {
+          broadcast: {
+            provider: 'redis',
+            url: 'redis://broadcast.internal:6379',
+          },
+          shortTermStore: {
+            provider: 'redis',
+            url: 'redis://store.internal:6380',
+          },
+        },
+      },
+      source: 'file',
+      path: '/fake/taskcast.config.yaml',
+    })
+    const originalRedis = process.env['TASKCAST_REDIS_URL']
+    const originalStorage = process.env['TASKCAST_STORAGE']
+    delete process.env['TASKCAST_REDIS_URL']
+    delete process.env['TASKCAST_STORAGE']
+    const program = new Command()
+    program.exitOverride()
+    registerStartCommand(program)
+
+    try {
+      await program.parseAsync([
+        'node',
+        'test',
+        'start',
+        '--storage',
+        'memory',
+      ])
+    } finally {
+      if (originalRedis === undefined) delete process.env['TASKCAST_REDIS_URL']
+      else process.env['TASKCAST_REDIS_URL'] = originalRedis
+      if (originalStorage === undefined) delete process.env['TASKCAST_STORAGE']
+      else process.env['TASKCAST_STORAGE'] = originalStorage
+    }
+
+    const { createManagedRedisAdapters } = await import('@taskcast/redis')
+    expect(createManagedRedisAdapters).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    {
+      name: 'equal',
+      broadcastUrl: 'redis://shared.internal:6379',
+      shortTermUrl: 'redis://shared.internal:6379',
+      expected: 'redis://shared.internal:6379',
+    },
+    {
+      name: 'single',
+      broadcastUrl: 'redis://single.internal:6379',
+      shortTermUrl: undefined,
+      expected: 'redis://single.internal:6379',
+    },
+  ])('accepts $name configured Redis URL selection', async ({
+    broadcastUrl,
+    shortTermUrl,
+    expected,
+  }) => {
+    const { loadConfigFile } = await import('@taskcast/core')
+    ;(loadConfigFile as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      config: {
+        adapters: {
+          broadcast: { provider: 'redis', url: broadcastUrl },
+          shortTermStore: {
+            provider: 'redis',
+            ...(shortTermUrl === undefined ? {} : { url: shortTermUrl }),
+          },
+        },
+      },
+      source: 'file',
+      path: '/fake/taskcast.config.yaml',
+    })
+    const originalRedis = process.env['TASKCAST_REDIS_URL']
+    const originalStorage = process.env['TASKCAST_STORAGE']
+    delete process.env['TASKCAST_REDIS_URL']
+    delete process.env['TASKCAST_STORAGE']
+    const program = new Command()
+    program.exitOverride()
+    registerStartCommand(program)
+
+    try {
+      await program.parseAsync(['node', 'test', 'start'])
+    } finally {
+      if (originalRedis === undefined) delete process.env['TASKCAST_REDIS_URL']
+      else process.env['TASKCAST_REDIS_URL'] = originalRedis
+      if (originalStorage === undefined) delete process.env['TASKCAST_STORAGE']
+      else process.env['TASKCAST_STORAGE'] = originalStorage
+    }
+
+    const { createManagedRedisAdapters } = await import('@taskcast/redis')
+    expect(createManagedRedisAdapters).toHaveBeenCalledWith(
+      expected,
+      expect.any(Object),
+    )
+  })
+
   it('rejects an explicit PostgreSQL provider without a resolved URL', async () => {
     const { loadConfigFile } = await import('@taskcast/core')
     ;(loadConfigFile as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
@@ -604,7 +761,10 @@ describe('registerStartCommand', () => {
     ;(postgresModule.default as ReturnType<typeof vi.fn>).mockReturnValueOnce(sql)
     const { postgresCheck } = await import('@taskcast/postgres')
     ;(postgresCheck as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
-      new Error('PostgreSQL unavailable'),
+      new Error(
+        'startup failed at postgres://startup-user:startup-secret@'
+        + 'private-startup.internal:6432/secret_database',
+      ),
     )
     const origPg = process.env['TASKCAST_POSTGRES_URL']
     process.env['TASKCAST_POSTGRES_URL'] = 'postgres://127.0.0.1:1/taskcast'
@@ -625,6 +785,139 @@ describe('registerStartCommand', () => {
     expect(serve).not.toHaveBeenCalled()
     expect(sql.end).toHaveBeenCalledTimes(1)
     expect(sql.end).toHaveBeenCalledWith({ timeout: 5 })
+    expect(errorSpy).toHaveBeenCalledWith(
+      '[taskcast] postgres unavailable (unavailable)',
+    )
+    const stderr = errorSpy.mock.calls
+      .map(([message]) => String(message))
+      .join('\n')
+    expect(stderr).not.toContain('startup-secret')
+    expect(stderr).not.toContain('private-startup.internal')
+    expect(stderr).not.toContain('secret_database')
+  })
+
+  it('times out a blackholed PostgreSQL startup check before bind and closes once', async () => {
+    vi.useFakeTimers()
+    const validation = deferred<void>()
+    const sql = Object.assign(vi.fn(), {
+      end: vi.fn().mockResolvedValue(undefined),
+    })
+    const postgresModule = await import('postgres')
+    ;(postgresModule.default as ReturnType<typeof vi.fn>).mockReturnValueOnce(sql)
+    const { postgresCheck } = await import('@taskcast/postgres')
+    ;(postgresCheck as ReturnType<typeof vi.fn>).mockReturnValueOnce(
+      validation.promise,
+    )
+    const original = process.env['TASKCAST_POSTGRES_URL']
+    process.env['TASKCAST_POSTGRES_URL'] =
+      'postgres://startup-user:startup-secret@private-db.internal:5544/taskcast'
+    const program = new Command()
+    program.exitOverride()
+    registerStartCommand(program)
+    let settled = false
+    const startup = program
+      .parseAsync(['node', 'test', 'start'])
+      .then(
+        () => ({ status: 'fulfilled' as const }),
+        (reason: unknown) => ({ status: 'rejected' as const, reason }),
+      )
+    void startup.then(() => {
+      settled = true
+    })
+
+    try {
+      await vi.waitFor(() => {
+        expect(postgresCheck).toHaveBeenCalledTimes(1)
+      })
+      const { serve } = await import('@hono/node-server')
+      expect(serve).not.toHaveBeenCalled()
+
+      await vi.advanceTimersByTimeAsync(5_000)
+      expect(settled).toBe(true)
+
+      const outcome = await startup
+      expect(outcome).toMatchObject({
+        status: 'rejected',
+        reason: { code: 1 },
+      })
+      expect(serve).not.toHaveBeenCalled()
+      expect(sql.end).toHaveBeenCalledTimes(1)
+      expect(sql.end).toHaveBeenCalledWith({ timeout: 5 })
+      expect(errorSpy).toHaveBeenCalledWith(
+        '[taskcast] postgres unavailable (timeout)',
+      )
+      const stderr = errorSpy.mock.calls
+        .map(([message]) => String(message))
+        .join('\n')
+      expect(stderr).not.toContain('startup-secret')
+      expect(stderr).not.toContain('private-db.internal')
+      expect(stderr).not.toContain('5544')
+    } finally {
+      validation.reject(new Error('release test validation'))
+      await startup
+      if (original === undefined) delete process.env['TASKCAST_POSTGRES_URL']
+      else process.env['TASKCAST_POSTGRES_URL'] = original
+      vi.useRealTimers()
+    }
+  })
+
+  it('sanitizes secret-bearing PostgreSQL migration failures', async () => {
+    const sql = Object.assign(vi.fn(), {
+      end: vi.fn().mockResolvedValue(undefined),
+    })
+    const postgresModule = await import('postgres')
+    ;(postgresModule.default as ReturnType<typeof vi.fn>).mockReturnValueOnce(sql)
+    const { performAutoMigrateIfEnabled } = await import(
+      '../../src/auto-migrate.js'
+    )
+    ;(performAutoMigrateIfEnabled as ReturnType<typeof vi.fn>)
+      .mockRejectedValueOnce(new Error(
+        'migration failed at postgres://migration-user:migration-secret@'
+        + 'private-migration.internal:6432/secret_database',
+      ))
+    const original = process.env['TASKCAST_POSTGRES_URL']
+    process.env['TASKCAST_POSTGRES_URL'] =
+      'postgres://configured-user:configured-secret@configured-db.internal:5432/configured_database'
+    const program = new Command()
+    program.exitOverride()
+    registerStartCommand(program)
+
+    try {
+      await expect(
+        program.parseAsync(['node', 'test', 'start']),
+      ).rejects.toMatchObject({ code: 1 })
+    } finally {
+      if (original === undefined) delete process.env['TASKCAST_POSTGRES_URL']
+      else process.env['TASKCAST_POSTGRES_URL'] = original
+    }
+
+    expect(errorSpy).toHaveBeenCalledWith(
+      '[taskcast] postgres unavailable (unavailable)',
+    )
+    const stderr = errorSpy.mock.calls
+      .map(([message]) => String(message))
+      .join('\n')
+    for (const sensitive of [
+      'migration-secret',
+      'private-migration.internal',
+      '6432',
+      'secret_database',
+      'configured-secret',
+      'configured-db.internal',
+    ]) {
+      expect(stderr).not.toContain(sensitive)
+    }
+    const stdout = logSpy.mock.calls
+      .map(([message]) => String(message))
+      .join('\n')
+    for (const sensitive of [
+      'configured-db.internal',
+      '5432',
+      'configured_database',
+    ]) {
+      expect(stdout).not.toContain(sensitive)
+    }
+    expect(sql.end).toHaveBeenCalledTimes(1)
   })
 
   it('starts server with playground flag', async () => {
@@ -922,10 +1215,13 @@ describe('runStart', () => {
     expect(performAutoMigrateIfEnabled).toHaveBeenCalledWith(undefined, undefined, undefined)
   })
 
-  it('blocks server startup if auto-migrate fails', async () => {
+  it('blocks server startup with a sanitized dependency error if auto-migrate fails', async () => {
     const { performAutoMigrateIfEnabled } = await import('../../src/auto-migrate.js')
+    const migrationError = new Error(
+      'Auto-migration failed: Checksum mismatch',
+    )
     ;(performAutoMigrateIfEnabled as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
-      new Error('Auto-migration failed: Checksum mismatch'),
+      migrationError,
     )
 
     const mockPostgres = {} as ReturnType<typeof import('postgres').default>
@@ -940,7 +1236,16 @@ describe('runStart', () => {
       playground: false,
     }
 
-    await expect(runStart(options)).rejects.toThrow('Auto-migration failed: Checksum mismatch')
+    const startup = runStart(options)
+    await expect(startup).rejects.toMatchObject({
+      name: 'DependencyUnavailableError',
+      dependency: 'postgres',
+      kind: 'unavailable',
+      message: 'postgres unavailable (unavailable)',
+    })
+    await startup.catch((error: unknown) => {
+      expect((error as Error & { cause?: unknown }).cause).toBe(migrationError)
+    })
 
     const { serve } = await import('@hono/node-server')
     expect(serve).not.toHaveBeenCalled()
@@ -1374,6 +1679,53 @@ describe('startup signal lifecycle', () => {
     expect(exitSpy).not.toHaveBeenCalled()
     expect(process.listeners('SIGINT')).toHaveLength(beforeInt.size)
     expect(process.listeners('SIGTERM')).toHaveLength(beforeTerm.size)
+  })
+
+  it('bounds signal cleanup behind a blackholed PostgreSQL validation query', async () => {
+    vi.useFakeTimers()
+    const validation = deferred<void>()
+    const sql = Object.assign(vi.fn(), {
+      end: vi.fn().mockResolvedValue(undefined),
+    })
+    const postgresModule = await import('postgres')
+    ;(postgresModule.default as ReturnType<typeof vi.fn>).mockReturnValueOnce(sql)
+    const { postgresCheck } = await import('@taskcast/postgres')
+    ;(postgresCheck as ReturnType<typeof vi.fn>).mockReturnValueOnce(
+      validation.promise,
+    )
+    process.env['TASKCAST_POSTGRES_URL'] =
+      'postgres://127.0.0.1:5432/taskcast'
+    const { serve } = await import('@hono/node-server')
+    const program = new Command()
+    program.exitOverride()
+    registerStartCommand(program)
+    const startup = program.parseAsync(['node', 'test', 'start'])
+
+    try {
+      await vi.waitFor(() => {
+        expect(postgresCheck).toHaveBeenCalledTimes(1)
+      })
+      const terminate = addedSignalHandler('SIGTERM', beforeTerm)
+      expect(terminate).toBeDefined()
+      const shutdown = terminate!()
+
+      expect(serve).not.toHaveBeenCalled()
+      expect(sql.end).not.toHaveBeenCalled()
+      await vi.advanceTimersByTimeAsync(5_000)
+      await startup
+      await shutdown
+
+      expect(serve).not.toHaveBeenCalled()
+      expect(sql.end).toHaveBeenCalledTimes(1)
+      expect(sql.end).toHaveBeenCalledWith({ timeout: 5 })
+      expect(exitSpy).not.toHaveBeenCalled()
+      expect(process.listeners('SIGINT')).toHaveLength(beforeInt.size)
+      expect(process.listeners('SIGTERM')).toHaveLength(beforeTerm.size)
+    } finally {
+      validation.reject(new Error('release test validation'))
+      await startup.catch(() => {})
+      vi.useRealTimers()
+    }
   })
 
   it('cancels after an in-flight migration without binding HTTP', async () => {

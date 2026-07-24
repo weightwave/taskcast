@@ -14,11 +14,14 @@ interface ProxyConnection {
   upstream?: Socket
   requestBuffer: Buffer
   dropResponse: boolean
+  holdResponse: boolean
+  heldResponse: Buffer[]
 }
 
 interface ResponseDropRule {
   matcher: RequestMatcher
   eligibleConnections: Set<ProxyConnection>
+  action: 'drop' | 'hold'
 }
 
 const MAX_MATCHER_BUFFER_BYTES = 64 * 1024
@@ -29,6 +32,33 @@ export function redisCommandMatcher(
 ): RequestMatcher {
   const expected = [command, ...arguments_].map((part) => Buffer.from(part))
   return (request) => firstRespCommandMatches(request, expected)
+}
+
+export function redisAnyCommandMatcher(
+  command: string,
+  ...arguments_: string[]
+): RequestMatcher {
+  const expected = [command, ...arguments_].map((part) => Buffer.from(part))
+  return (request) => {
+    let offset = 0
+    while (offset < request.length) {
+      const parsed = parseRespCommand(request, offset)
+      if (parsed === undefined) return false
+      if (
+        parsed.parts.length === expected.length
+        && parsed.parts.every((part, index) =>
+          index === 0
+            ? part.toString('ascii').toUpperCase()
+              === expected[index]!.toString('ascii').toUpperCase()
+            : part.equals(expected[index]!),
+        )
+      ) {
+        return true
+      }
+      offset = parsed.end
+    }
+    return false
+  }
 }
 
 function firstRespCommandMatches(request: Buffer, expected: Buffer[]): boolean {
@@ -132,6 +162,8 @@ export class TcpFaultProxy {
         downstream,
         requestBuffer: Buffer.alloc(0),
         dropResponse: false,
+        holdResponse: false,
+        heldResponse: [],
       }
       this.connections.push(connection)
 
@@ -155,6 +187,10 @@ export class TcpFaultProxy {
         if (connection.dropResponse) {
           downstream.destroy()
           upstream.destroy()
+          return
+        }
+        if (connection.holdResponse) {
+          connection.heldResponse.push(chunk)
           return
         }
         if (this.mode === 'open' && !downstream.destroyed) {
@@ -187,6 +223,33 @@ export class TcpFaultProxy {
   }
 
   dropNextResponse(matcher: RequestMatcher): void {
+    this.armResponseRule(matcher, 'drop')
+  }
+
+  holdNextResponse(matcher: RequestMatcher): void {
+    this.armResponseRule(matcher, 'hold')
+  }
+
+  releaseHeldResponse(): void {
+    const connection = this.connections.find(({ holdResponse }) => holdResponse)
+    if (connection === undefined) {
+      throw new Error('no Redis response is currently held')
+    }
+    connection.holdResponse = false
+    if (
+      this.mode === 'open'
+      && !connection.downstream.destroyed
+      && connection.heldResponse.length > 0
+    ) {
+      connection.downstream.write(Buffer.concat(connection.heldResponse))
+    }
+    connection.heldResponse = []
+  }
+
+  private armResponseRule(
+    matcher: RequestMatcher,
+    action: 'drop' | 'hold',
+  ): void {
     if (this.responseDropRule !== undefined) {
       throw new Error('a response-drop matcher is already armed')
     }
@@ -200,7 +263,7 @@ export class TcpFaultProxy {
     if (eligibleConnections.size === 0) {
       throw new Error('response-drop matcher requires an established connection')
     }
-    this.responseDropRule = { matcher, eligibleConnections }
+    this.responseDropRule = { matcher, eligibleConnections, action }
     for (const connection of eligibleConnections) {
       connection.requestBuffer = Buffer.alloc(0)
     }
@@ -231,7 +294,12 @@ export class TcpFaultProxy {
 
   private inspectRequest(connection: ProxyConnection, chunk: Buffer): void {
     const rule = this.responseDropRule
-    if (rule === undefined || !rule.eligibleConnections.has(connection)) return
+    if (
+      rule === undefined
+      || (rule.action === 'drop' && !rule.eligibleConnections.has(connection))
+    ) {
+      return
+    }
 
     connection.requestBuffer = Buffer.concat([
       connection.requestBuffer,
@@ -246,7 +314,11 @@ export class TcpFaultProxy {
 
     connection.requestBuffer = Buffer.alloc(0)
     this.matched++
-    connection.dropResponse = true
+    if (rule.action === 'drop') {
+      connection.dropResponse = true
+    } else {
+      connection.holdResponse = true
+    }
     this.responseDropRule = undefined
     for (const trackedConnection of this.connections) {
       trackedConnection.requestBuffer = Buffer.alloc(0)

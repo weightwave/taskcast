@@ -12,6 +12,7 @@ function classifyPostgresCode(
       return 'connection_reset'
     case 'ETIMEDOUT':
     case 'ESOCKETTIMEDOUT':
+    case 'CONNECT_TIMEOUT':
       return 'timeout'
     case 'ENOTFOUND':
     case 'EAI_AGAIN':
