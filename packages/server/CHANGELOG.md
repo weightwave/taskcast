@@ -1,5 +1,13 @@
 # @taskcast/server
 
+## 1.5.5
+
+### Patch Changes
+
+- 8bbd598: Log every HTTP 5xx response once as sanitized structured JSON in both the
+  TypeScript and Rust servers, and validate `TASKCAST_LOG_LEVEL` at startup.
+  - @taskcast/core@1.5.5
+
 ## 1.5.4
 
 ### Patch Changes
