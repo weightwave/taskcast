@@ -17,7 +17,7 @@ pub use app::{
 pub use auth::{check_scope, AuthContext, AuthMode, JwtConfig, TaskIdAccess, TrustedServiceConfig};
 pub use dependency_health::{
     DependencyCheck, DependencyHealthLogger, DependencyHealthRegistry, DependencyReadiness,
-    ReadinessResult, RuntimeHealth,
+    ReadinessResult, RuntimeAdapterDescriptors, RuntimeHealth,
 };
 pub use error::AppError;
 pub use http_failure::{

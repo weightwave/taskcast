@@ -7,7 +7,8 @@ use taskcast_core::{DependencyName, DependencyUnavailableError};
 use taskcast_core::{MemoryBroadcastProvider, MemoryShortTermStore, TaskEngine, TaskEngineOptions};
 use taskcast_server::{
     create_app, create_app_with_runtime_health_and_routes, AuthMode, CorsConfig, DependencyCheck,
-    DependencyHealthRegistry, JwtConfig, RuntimeHealth, StderrHttpFailureLogger,
+    DependencyHealthRegistry, JwtConfig, RuntimeAdapterDescriptors, RuntimeHealth,
+    StderrHttpFailureLogger,
 };
 
 fn make_server() -> TestServer {
@@ -273,6 +274,58 @@ async fn health_detail_with_all_adapters_configured() {
 }
 
 #[tokio::test]
+async fn health_detail_uses_effective_runtime_adapters_over_file_config() {
+    let config = TaskcastConfig {
+        adapters: Some(AdaptersConfig {
+            broadcast: Some(AdapterEntry {
+                provider: "redis".to_string(),
+                url: None,
+            }),
+            short_term_store: Some(AdapterEntry {
+                provider: "redis".to_string(),
+                url: None,
+            }),
+            long_term_store: Some(AdapterEntry {
+                provider: "postgres".to_string(),
+                url: None,
+            }),
+        }),
+        ..Default::default()
+    };
+    let engine = Arc::new(TaskEngine::new(TaskEngineOptions {
+        short_term_store: Arc::new(MemoryShortTermStore::new()),
+        broadcast: Arc::new(MemoryBroadcastProvider::new()),
+        long_term_store: None,
+        hooks: None,
+    }));
+    let runtime_health = RuntimeHealth {
+        effective_adapters: Some(RuntimeAdapterDescriptors {
+            broadcast: "memory".to_string(),
+            short_term_store: "memory".to_string(),
+            long_term_store: None,
+        }),
+        ..Default::default()
+    };
+    let (app, _) = create_app_with_runtime_health_and_routes(
+        engine,
+        AuthMode::None,
+        None,
+        Some(config),
+        CorsConfig::default(),
+        Arc::new(StderrHttpFailureLogger::new(
+            taskcast_server::LogLevel::Info,
+        )),
+        runtime_health,
+        axum::Router::new(),
+    );
+    let body: serde_json::Value = TestServer::new(app).get("/health/detail").await.json();
+
+    assert_eq!(body["adapters"]["broadcast"]["provider"], "memory");
+    assert_eq!(body["adapters"]["shortTermStore"]["provider"], "memory");
+    assert!(body["adapters"]["longTermStore"].is_null());
+}
+
+#[tokio::test]
 async fn health_detail_with_config_but_no_adapters_section() {
     // Config exists but adapters is None -- defaults should be used
     let config = TaskcastConfig {
@@ -381,6 +434,7 @@ async fn liveness_stays_up_while_readiness_and_detail_track_recovery() {
     });
     let runtime_health = RuntimeHealth {
         registry: Some(registry),
+        ..Default::default()
     };
     let (app, _) = create_app_with_runtime_health_and_routes(
         engine,

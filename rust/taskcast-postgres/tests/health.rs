@@ -90,6 +90,21 @@ impl Error for WrappedSqlxError {
     }
 }
 
+#[derive(Debug)]
+struct CyclicError;
+
+impl fmt::Display for CyclicError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "cyclic error")
+    }
+}
+
+impl Error for CyclicError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(self)
+    }
+}
+
 fn make_recovery_task() -> Task {
     Task {
         id: "task-postgres-recovered".to_string(),
@@ -200,6 +215,13 @@ fn does_not_classify_database_or_application_errors() {
         let error = io::Error::new(io::ErrorKind::InvalidInput, message);
         assert_eq!(classify_postgres_connectivity(&error), None);
     }
+}
+
+#[test]
+fn classifier_returns_for_a_cyclic_source_chain() {
+    let error = CyclicError;
+
+    assert_eq!(classify_postgres_connectivity(&error), None);
 }
 
 #[tokio::test]

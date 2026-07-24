@@ -362,7 +362,16 @@ async fn health_detail(AxumState(state): AxumState<AppState>) -> impl IntoRespon
         "shortTermStore": { "provider": "memory", "status": "ok" }
     });
 
-    if let Some(ref config) = state.config {
+    if let Some(ref effective) = state.runtime_health.effective_adapters {
+        adapters["broadcast"]["provider"] = serde_json::json!(effective.broadcast);
+        adapters["shortTermStore"]["provider"] = serde_json::json!(effective.short_term_store);
+        if let Some(ref long_term_store) = effective.long_term_store {
+            adapters["longTermStore"] = serde_json::json!({
+                "provider": long_term_store,
+                "status": "ok"
+            });
+        }
+    } else if let Some(ref config) = state.config {
         if let Some(ref adp) = config.adapters {
             if let Some(ref b) = adp.broadcast {
                 adapters["broadcast"]["provider"] = serde_json::json!(b.provider);

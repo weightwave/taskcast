@@ -1,4 +1,5 @@
 use std::error::Error;
+use std::fmt;
 use std::io;
 
 use taskcast_core::{
@@ -13,7 +14,7 @@ fn finds_dependency_error_through_source_chain() {
         DependencyErrorKind::ConnectionReset,
         io::Error::new(io::ErrorKind::ConnectionReset, "secret raw error"),
     );
-    let outer = io::Error::new(io::ErrorKind::Other, unavailable);
+    let outer = io::Error::other(unavailable);
     let found = find_dependency_unavailable(&outer as &(dyn Error + 'static)).unwrap();
 
     assert_eq!(found.dependency(), DependencyName::RedisCommand);
@@ -22,6 +23,28 @@ fn finds_dependency_error_through_source_chain() {
         found.to_string(),
         "redisCommand unavailable (connection_reset)"
     );
+}
+
+#[derive(Debug)]
+struct CyclicError;
+
+impl fmt::Display for CyclicError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "cyclic error")
+    }
+}
+
+impl Error for CyclicError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(self)
+    }
+}
+
+#[test]
+fn does_not_loop_on_a_cyclic_source_chain() {
+    let error = CyclicError;
+
+    assert!(find_dependency_unavailable(&error).is_none());
 }
 
 #[test]

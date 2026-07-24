@@ -47,6 +47,16 @@ pub struct ReadinessResult {
 #[derive(Clone, Default)]
 pub struct RuntimeHealth {
     pub registry: Option<Arc<DependencyHealthRegistry>>,
+    /// Adapters selected by the running CLI after precedence resolution.
+    /// When absent, health detail retains its historical config-based fallback.
+    pub effective_adapters: Option<RuntimeAdapterDescriptors>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RuntimeAdapterDescriptors {
+    pub broadcast: String,
+    pub short_term_store: String,
+    pub long_term_store: Option<String>,
 }
 
 #[derive(Clone)]

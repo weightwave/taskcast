@@ -116,6 +116,24 @@ pub fn parse_postgres_max_connections(value: Option<&str>) -> Result<u32, String
     }
 }
 
+fn effective_runtime_adapters(
+    storage_mode: &str,
+    postgres_active: bool,
+) -> taskcast_server::RuntimeAdapterDescriptors {
+    if storage_mode == "sqlite" {
+        return taskcast_server::RuntimeAdapterDescriptors {
+            broadcast: "memory".to_string(),
+            short_term_store: "sqlite".to_string(),
+            long_term_store: Some("sqlite".to_string()),
+        };
+    }
+    taskcast_server::RuntimeAdapterDescriptors {
+        broadcast: storage_mode.to_string(),
+        short_term_store: storage_mode.to_string(),
+        long_term_store: postgres_active.then(|| "postgres".to_string()),
+    }
+}
+
 fn configured_storage_provider(
     config: &taskcast_core::config::TaskcastConfig,
 ) -> Result<Option<&str>, String> {
@@ -181,7 +199,7 @@ fn postgres_activation(
 mod log_level_tests {
     use taskcast_server::LogLevel;
 
-    use super::resolve_log_level;
+    use super::{effective_runtime_adapters, resolve_log_level};
 
     #[test]
     fn defaults_to_info() {
@@ -201,6 +219,24 @@ mod log_level_tests {
         assert!(resolve_log_level(Some("trace"))
             .unwrap_err()
             .contains("invalid TASKCAST_LOG_LEVEL"));
+    }
+
+    #[test]
+    fn runtime_adapters_follow_selected_storage_not_raw_config() {
+        let memory = effective_runtime_adapters("memory", false);
+        assert_eq!(memory.broadcast, "memory");
+        assert_eq!(memory.short_term_store, "memory");
+        assert_eq!(memory.long_term_store, None);
+
+        let redis = effective_runtime_adapters("redis", true);
+        assert_eq!(redis.broadcast, "redis");
+        assert_eq!(redis.short_term_store, "redis");
+        assert_eq!(redis.long_term_store.as_deref(), Some("postgres"));
+
+        let sqlite = effective_runtime_adapters("sqlite", true);
+        assert_eq!(sqlite.broadcast, "memory");
+        assert_eq!(sqlite.short_term_store, "sqlite");
+        assert_eq!(sqlite.long_term_store.as_deref(), Some("sqlite"));
     }
 }
 
@@ -576,8 +612,10 @@ pub async fn run(args: StartArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
     let failure_logger: Arc<dyn taskcast_server::HttpFailureLogger> =
         Arc::new(taskcast_server::StderrHttpFailureLogger::new(log_level));
+    let effective_adapters = effective_runtime_adapters(storage_mode, postgres_pool.is_some());
     let runtime_health = taskcast_server::RuntimeHealth {
         registry: Some(dependency_health),
+        effective_adapters: Some(effective_adapters),
     };
     let (app, _ws_registry) = taskcast_server::create_app_with_runtime_health_and_routes(
         engine,

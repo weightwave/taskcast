@@ -7,12 +7,15 @@ use taskcast_core::{DependencyErrorKind, DependencyName, DependencyUnavailableEr
 pub fn classify_postgres_connectivity(
     mut error: &(dyn Error + 'static),
 ) -> Option<DependencyErrorKind> {
-    loop {
+    // Third-party adapter errors can violate the usual acyclic source-chain
+    // convention. Bound the traversal so classification cannot hang.
+    for _ in 0..64 {
         if let Some(error) = error.downcast_ref::<sqlx::Error>() {
             return classify_sqlx_error(error);
         }
         error = error.source()?;
     }
+    None
 }
 
 fn classify_sqlx_error(error: &sqlx::Error) -> Option<DependencyErrorKind> {

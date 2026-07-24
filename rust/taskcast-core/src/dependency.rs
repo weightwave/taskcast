@@ -110,7 +110,10 @@ impl Error for DependencyUnavailableError {
 pub fn find_dependency_unavailable<'a>(
     mut error: &'a (dyn Error + 'static),
 ) -> Option<&'a DependencyUnavailableError> {
-    loop {
+    // Error::source chains are conventionally acyclic, but adapters can supply
+    // custom errors. A bounded walk keeps a malformed chain from hanging a
+    // request-time classification while preserving ordinary nested causes.
+    for _ in 0..64 {
         if let Some(found) = error.downcast_ref::<DependencyUnavailableError>() {
             return Some(found);
         }
@@ -124,4 +127,5 @@ pub fn find_dependency_unavailable<'a>(
         }
         error = error.source()?;
     }
+    None
 }
