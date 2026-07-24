@@ -41,6 +41,34 @@ impl DependencyObserver for RecordingObserver {
     }
 }
 
+impl RecordingObserver {
+    fn reconnecting_count(&self, dependency: DependencyName) -> usize {
+        self.observations
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|observation| {
+                observation.dependency == dependency
+                    && observation.state == DependencyObservationState::Reconnecting
+            })
+            .count()
+    }
+
+    fn max_reconnect_attempt(&self, dependency: DependencyName) -> u32 {
+        self.observations
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|observation| {
+                observation.dependency == dependency
+                    && observation.state == DependencyObservationState::Reconnecting
+            })
+            .filter_map(|observation| observation.attempt)
+            .max()
+            .unwrap_or(0)
+    }
+}
+
 async fn eventually(timeout: Duration, mut condition: impl FnMut() -> bool) {
     let deadline = Instant::now() + timeout;
     loop {
@@ -203,13 +231,16 @@ async fn managed_paths_recover_store_and_new_pubsub_messages_after_long_outage()
     let port = container.get_host_port_ipv4(6379).await.unwrap();
     let upstream = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
     let proxy = TcpFaultProxy::start(upstream).await.unwrap();
-    let managed = create_managed_redis_adapters(
-        redis::Client::open(proxy.redis_url()).unwrap(),
-        Some("managed-long-outage"),
-        None,
-    )
-    .await
-    .unwrap();
+    let observer = Arc::new(RecordingObserver::default());
+    let managed = Arc::new(
+        create_managed_redis_adapters(
+            redis::Client::open(proxy.redis_url()).unwrap(),
+            Some("managed-long-outage"),
+            Some(observer.clone()),
+        )
+        .await
+        .unwrap(),
+    );
     let received = Arc::new(Mutex::new(Vec::new()));
     let received_handler = Arc::clone(&received);
     let unsubscribe = managed
@@ -233,18 +264,24 @@ async fn managed_paths_recover_store_and_new_pubsub_messages_after_long_outage()
     .await;
 
     let accepted_before_outage = proxy.accepted_connections();
+    let blackholed_activity_before = proxy.blackholed_downstream_activity();
     proxy.blackhole().await;
-    let mut interrupted_manager = managed.command_manager.clone();
+    let interrupted_managed = Arc::clone(&managed);
     let interrupted = tokio::spawn(async move {
-        redis::cmd("GET")
-            .arg("taskcast:managed:interrupted")
-            .query_async::<Option<String>>(&mut interrupted_manager)
+        interrupted_managed
+            .adapters
+            .short_term_store
+            .get_task("taskcast:managed:interrupted")
             .await
     });
     eventually(Duration::from_secs(2), || {
-        proxy.accepted_connections() - accepted_before_outage >= 2
+        proxy.blackholed_downstream_activity() > blackholed_activity_before
     })
     .await;
+    assert!(
+        !interrupted.is_finished(),
+        "the request observed in blackhole mode must remain pending until refusal"
+    );
     proxy.refuse().await;
     let interrupted_result = tokio::time::timeout(Duration::from_secs(5), interrupted)
         .await
@@ -254,11 +291,30 @@ async fn managed_paths_recover_store_and_new_pubsub_messages_after_long_outage()
         interrupted_result.is_err(),
         "the command interrupted by the outage must fail"
     );
+    eventually(Duration::from_secs(2), || {
+        observer.reconnecting_count(DependencyName::RedisCommand) >= 1
+    })
+    .await;
+    let command_rounds_after_interrupted =
+        observer.reconnecting_count(DependencyName::RedisCommand);
 
-    // One command-manager attempt plus one PubSub-supervisor attempt per
-    // round: wait through two refused rounds after the blackholed round.
+    let second_command_result = tokio::time::timeout(
+        Duration::from_secs(10),
+        managed
+            .adapters
+            .short_term_store
+            .get_task("taskcast:managed:second-refused-round"),
+    )
+    .await
+    .expect("the second refused command round did not settle before the deadline");
+    assert!(
+        second_command_result.is_err(),
+        "the second command round must observe the refused dependency"
+    );
     eventually(Duration::from_secs(10), || {
-        proxy.accepted_connections() - accepted_before_outage >= 6
+        observer.reconnecting_count(DependencyName::RedisCommand) > command_rounds_after_interrupted
+            && observer.reconnecting_count(DependencyName::RedisCommand) >= 2
+            && observer.max_reconnect_attempt(DependencyName::RedisPubSub) >= 2
     })
     .await;
     proxy.open().await;
@@ -285,8 +341,9 @@ async fn managed_paths_recover_store_and_new_pubsub_messages_after_long_outage()
     })
     .await;
 
-    // Two coordinated paths, with one allowed transition race per path:
-    // blackhole + two refused rounds + race + successful recovery.
+    // Two coordinated paths with two separately evidenced refused rounds;
+    // allow one transition race and one successful recovery per path, plus
+    // two fixed command-manager handoff attempts.
     assert!(
         proxy.accepted_connections() - accepted_before_outage <= 10,
         "the command manager and PubSub supervisor exceeded their fixed reconnect bound"

@@ -24,6 +24,7 @@ pub struct TcpFaultProxy {
     address: SocketAddr,
     upstream: SocketAddr,
     accepted: Arc<AtomicUsize>,
+    blackholed_downstream_activity: Arc<AtomicUsize>,
     #[allow(dead_code)] // Used by reconnect and PostgreSQL integration binaries.
     matched: Arc<AtomicUsize>,
     mode: Arc<AtomicU8>,
@@ -39,6 +40,7 @@ impl TcpFaultProxy {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let address = listener.local_addr()?;
         let accepted = Arc::new(AtomicUsize::new(0));
+        let blackholed_downstream_activity = Arc::new(AtomicUsize::new(0));
         let matched = Arc::new(AtomicUsize::new(0));
         let mode = Arc::new(AtomicU8::new(MODE_OPEN));
         let generation = Arc::new(Notify::new());
@@ -46,6 +48,7 @@ impl TcpFaultProxy {
         let connections = Arc::new(Mutex::new(Vec::new()));
 
         let accepted_task = Arc::clone(&accepted);
+        let blackholed_activity_task = Arc::clone(&blackholed_downstream_activity);
         let matched_task = Arc::clone(&matched);
         let mode_task = Arc::clone(&mode);
         let generation_task = Arc::clone(&generation);
@@ -59,20 +62,18 @@ impl TcpFaultProxy {
                 let connection_id = accepted_task.fetch_add(1, Ordering::SeqCst) + 1;
                 match mode_task.load(Ordering::SeqCst) {
                     MODE_REFUSE => drop(downstream),
-                    MODE_BLACKHOLE => {
-                        let generation_connection = Arc::clone(&generation_task);
-                        let handle =
-                            tokio::spawn(blackhole_connection(downstream, generation_connection));
-                        connections_task.lock().unwrap().push(handle);
-                    }
                     _ => {
                         let generation_connection = Arc::clone(&generation_task);
+                        let mode_connection = Arc::clone(&mode_task);
+                        let blackholed_activity_connection = Arc::clone(&blackholed_activity_task);
                         let matcher_connection = Arc::clone(&matcher_task);
                         let matched_connection = Arc::clone(&matched_task);
                         let handle = tokio::spawn(forward_connection(
                             downstream,
                             upstream,
                             generation_connection,
+                            mode_connection,
+                            blackholed_activity_connection,
                             matcher_connection,
                             matched_connection,
                             connection_id,
@@ -87,6 +88,7 @@ impl TcpFaultProxy {
             address,
             upstream,
             accepted,
+            blackholed_downstream_activity,
             matched,
             mode,
             generation,
@@ -111,22 +113,23 @@ impl TcpFaultProxy {
         self.accepted.load(Ordering::SeqCst)
     }
 
+    #[allow(dead_code)] // Used by the Rust long-outage regression.
+    pub fn blackholed_downstream_activity(&self) -> usize {
+        self.blackholed_downstream_activity.load(Ordering::SeqCst)
+    }
+
     #[allow(dead_code)] // Used by reconnect and PostgreSQL integration binaries.
     pub fn matched_commands(&self) -> usize {
         self.matched.load(Ordering::SeqCst)
     }
 
     pub async fn open(&self) {
-        let previous = self.mode.swap(MODE_OPEN, Ordering::SeqCst);
-        if previous == MODE_BLACKHOLE {
-            self.close_sockets().await;
-        }
+        self.mode.store(MODE_OPEN, Ordering::SeqCst);
     }
 
     #[allow(dead_code)] // Used by the long-outage reconnect regression.
     pub async fn blackhole(&self) {
         self.mode.store(MODE_BLACKHOLE, Ordering::SeqCst);
-        self.close_sockets().await;
     }
 
     #[allow(dead_code)] // Used by the Redis concurrent integration binary.
@@ -197,25 +200,12 @@ impl Drop for TcpFaultProxy {
     }
 }
 
-async fn blackhole_connection(mut downstream: TcpStream, generation: Arc<Notify>) {
-    let mut buffer = [0_u8; 8 * 1024];
-    loop {
-        tokio::select! {
-            _ = generation.notified() => return,
-            result = downstream.read(&mut buffer) => {
-                match result {
-                    Ok(0) | Err(_) => return,
-                    Ok(_) => {}
-                }
-            }
-        }
-    }
-}
-
 async fn forward_connection(
     mut downstream: TcpStream,
     upstream: SocketAddr,
     generation: Arc<Notify>,
+    mode: Arc<AtomicU8>,
+    blackholed_downstream_activity: Arc<AtomicUsize>,
     response_drop_matcher: Arc<AsyncMutex<Option<ResponseDropRule>>>,
     matched: Arc<AtomicUsize>,
     connection_id: usize,
@@ -236,6 +226,14 @@ async fn forward_connection(
                     Ok(0) | Err(_) => return,
                     Ok(count) => count,
                 };
+                match mode.load(Ordering::SeqCst) {
+                    MODE_BLACKHOLE => {
+                        blackholed_downstream_activity.fetch_add(1, Ordering::SeqCst);
+                        continue;
+                    }
+                    MODE_OPEN => {}
+                    _ => return,
+                }
                 {
                     let mut armed = response_drop_matcher.lock().await;
                     if let Some(rule) = armed.as_ref().filter(|rule| {
@@ -265,6 +263,11 @@ async fn forward_connection(
                     Ok(0) | Err(_) => return,
                     Ok(count) => count,
                 };
+                match mode.load(Ordering::SeqCst) {
+                    MODE_BLACKHOLE => continue,
+                    MODE_OPEN => {}
+                    _ => return,
+                }
                 if drop_response {
                     return;
                 }
