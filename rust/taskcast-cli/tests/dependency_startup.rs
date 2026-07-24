@@ -189,6 +189,46 @@ adapters:
 }
 
 #[tokio::test]
+async fn mixed_short_term_and_broadcast_providers_fail_before_dependency_or_http_bind() {
+    let _env = EnvGuard::isolated(&[]);
+    let (dependency_port, connections, probe) = connection_probe().await;
+    let (_dir, config) = write_config(&format!(
+        r#"
+adapters:
+  shortTermStore:
+    provider: memory
+  broadcast:
+    provider: redis
+    url: redis://127.0.0.1:{dependency_port}
+"#
+    ));
+    let http_port = available_port().await;
+    let http_guard = tokio::net::TcpListener::bind(("127.0.0.1", http_port))
+        .await
+        .expect("test must reserve the HTTP port");
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        taskcast_cli::commands::start::run(StartArgs {
+            config: Some(config),
+            port: http_port,
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("mixed-provider validation must finish before HTTP startup");
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("configured short-term and broadcast providers must match"));
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(connections.load(Ordering::SeqCst), 0);
+    drop(http_guard);
+    probe.abort();
+}
+
+#[tokio::test]
 async fn explicit_postgres_provider_without_url_fails_before_http_bind() {
     let _env = EnvGuard::isolated(&[]);
     let (_dir, config) = write_config(

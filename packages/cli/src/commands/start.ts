@@ -176,6 +176,112 @@ export interface RunStartOptions {
   closeDependencies?: () => Promise<void>
 }
 
+type CloseableServer = {
+  close?: (callback?: (error?: Error) => void) => void
+}
+
+class StartupCancelledError extends Error {
+  constructor() {
+    super('startup cancelled by signal')
+    this.name = 'StartupCancelledError'
+  }
+}
+
+/**
+ * Owns startup cancellation and shutdown for the whole command lifetime.
+ *
+ * Shutdown waits for the startup barrier before closing anything. That lets an
+ * in-flight acquisition publish its resource and reach a cancellation
+ * checkpoint before the single cleanup pass snapshots the owned resources.
+ */
+class StartLifecycle {
+  private readonly startupBarrier: Promise<void>
+  private settleStartupBarrier!: () => void
+  private startupSettled = false
+  private cancellationRequested = false
+  private shutdownPromise: Promise<void> | undefined
+  private stopServices: (() => void) | undefined
+  private server: CloseableServer | undefined
+
+  private readonly signalHandler = (): Promise<void> => {
+    this.cancellationRequested = true
+    const shutdown = this.requestShutdown()
+    void shutdown.catch((error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error)
+      console.error(`[taskcast] shutdown failed: ${message}`)
+    })
+    return shutdown
+  }
+
+  constructor(private readonly closeDependencies?: () => Promise<void>) {
+    this.startupBarrier = new Promise<void>((resolve) => {
+      this.settleStartupBarrier = resolve
+    })
+    process.on('SIGTERM', this.signalHandler)
+    process.on('SIGINT', this.signalHandler)
+  }
+
+  get cancelled(): boolean {
+    return this.cancellationRequested
+  }
+
+  checkpoint(): void {
+    if (this.cancellationRequested) {
+      throw new StartupCancelledError()
+    }
+  }
+
+  attachServices(stop: () => void): void {
+    this.stopServices = stop
+  }
+
+  attachServer(server: CloseableServer): void {
+    this.server = server
+  }
+
+  settleStartup(): void {
+    if (this.startupSettled) return
+    this.startupSettled = true
+    this.settleStartupBarrier()
+  }
+
+  requestShutdown(): Promise<void> {
+    if (this.shutdownPromise !== undefined) return this.shutdownPromise
+    this.shutdownPromise = (async () => {
+      await this.startupBarrier
+      try {
+        try {
+          this.stopServices?.()
+        } finally {
+          await this.closeServer()
+        }
+      } finally {
+        await this.closeDependencies?.()
+      }
+    })().finally(() => {
+      process.off('SIGTERM', this.signalHandler)
+      process.off('SIGINT', this.signalHandler)
+    })
+    return this.shutdownPromise
+  }
+
+  private async closeServer(): Promise<void> {
+    const server = this.server
+    const close = server?.close
+    if (server === undefined || close === undefined) return
+    await new Promise<void>((resolve, reject) => {
+      try {
+        close.call(server, (error?: Error) => {
+          if (error) reject(error)
+          else resolve()
+        })
+      } catch (error) {
+        reject(error)
+      }
+    })
+  }
+}
+
 /**
  * Runs the taskcast server with auto-migrate support.
  *
@@ -191,160 +297,138 @@ export interface RunStartOptions {
  * @throws Error if auto-migrate fails
  */
 export async function runStart(options: RunStartOptions): Promise<void> {
-  let stopServices: (() => void) | undefined
+  const lifecycle = new StartLifecycle(options.closeDependencies)
+  let failed = false
+  let startupError: unknown
+  let shutdown: Promise<void> | undefined
   try {
-    const logLevel = parseLogLevel(options.env?.['TASKCAST_LOG_LEVEL'])
+    await runStartWithLifecycle(options, lifecycle)
+  } catch (error) {
+    failed = true
+    startupError = error
+    shutdown = lifecycle.requestShutdown()
+  } finally {
+    lifecycle.settleStartup()
+  }
 
-    // The startup SELECT is performed before entering runStart. Auto-migration
-    // therefore cannot run before dependency readiness has been established.
-    await performAutoMigrateIfEnabled(options.postgres, options.postgresUrl, options.env)
+  if (failed) {
+    await shutdown
+    if (startupError instanceof StartupCancelledError || lifecycle.cancelled) return
+    throw startupError
+  }
+}
 
-    const engineOpts: ConstructorParameters<typeof TaskEngine>[0] = {
+async function runStartWithLifecycle(options: RunStartOptions, lifecycle: StartLifecycle): Promise<void> {
+  lifecycle.checkpoint()
+  const logLevel = parseLogLevel(options.env?.['TASKCAST_LOG_LEVEL'])
+
+  // The startup SELECT is performed before entering runStart. Auto-migration
+  // therefore cannot run before dependency readiness has been established.
+  await performAutoMigrateIfEnabled(options.postgres, options.postgresUrl, options.env)
+  lifecycle.checkpoint()
+
+  const engineOpts: ConstructorParameters<typeof TaskEngine>[0] = {
+    shortTermStore: options.shortTermStore,
+    broadcast: options.broadcast,
+  }
+  if (options.longTermStore !== undefined) {
+    engineOpts.longTermStore = options.longTermStore
+  }
+  const engine = new TaskEngine(engineOpts)
+  const auth = buildAuthConfig(options.config)
+
+  const workersEnabled = options.config.workers?.enabled ?? false
+  let workerManager: WorkerManager | undefined
+  if (workersEnabled) {
+    console.log('[taskcast] Worker assignment system enabled')
+    const wmOpts: ConstructorParameters<typeof WorkerManager>[0] = {
+      engine,
       shortTermStore: options.shortTermStore,
       broadcast: options.broadcast,
     }
     if (options.longTermStore !== undefined) {
-      engineOpts.longTermStore = options.longTermStore
+      wmOpts.longTermStore = options.longTermStore
     }
-    const engine = new TaskEngine(engineOpts)
-    const auth = buildAuthConfig(options.config)
-
-    const workersEnabled = options.config.workers?.enabled ?? false
-    let workerManager: WorkerManager | undefined
-    if (workersEnabled) {
-      console.log('[taskcast] Worker assignment system enabled')
-      const wmOpts: ConstructorParameters<typeof WorkerManager>[0] = {
-        engine,
-        shortTermStore: options.shortTermStore,
-        broadcast: options.broadcast,
-      }
-      if (options.longTermStore !== undefined) {
-        wmOpts.longTermStore = options.longTermStore
-      }
-      if (options.config.workers?.defaults) {
-        wmOpts.defaults = options.config.workers.defaults
-      }
-      workerManager = new WorkerManager(wmOpts)
+    if (options.config.workers?.defaults) {
+      wmOpts.defaults = options.config.workers.defaults
     }
-
-    resolveAdminToken(options.config)
-
-    const serverOpts: Parameters<typeof createTaskcastApp>[0] = {
-      engine,
-      shortTermStore: options.shortTermStore,
-      auth,
-      config: options.config,
-      verbose: options.verbose,
-      logLevel,
-    }
-    if (workerManager !== undefined) serverOpts.workerManager = workerManager
-    if (options.dependencyHealth !== undefined) {
-      serverOpts.dependencyHealth = options.dependencyHealth
-    }
-    const { app, stop } = createTaskcastApp(serverOpts)
-    stopServices = stop
-
-    if (options.playground) {
-      try {
-        const require = createRequire(import.meta.url)
-        const pkgPath = require.resolve('@taskcast/playground/package.json')
-        const distDir = join(dirname(pkgPath), 'dist')
-        if (existsSync(distDir)) {
-          const { serveStatic } = await import('@hono/node-server/serve-static')
-          app.use(
-            '/_playground/*',
-            serveStatic({
-              root: distDir,
-              rewriteRequestPath: (p) => p.replace(/^\/_playground/, ''),
-            })
-          )
-          app.get(
-            '/_playground/*',
-            serveStatic({
-              root: distDir,
-              rewriteRequestPath: () => '/index.html',
-            })
-          )
-        } else {
-          console.warn('[taskcast] Playground dist not found. Run `pnpm --filter @taskcast/playground build` first.')
-        }
-      } catch {
-        console.warn('[taskcast] @taskcast/playground not available, skipping playground UI.')
-      }
-    }
-
-    const { serve } = await import('@hono/node-server')
-    let server: ReturnType<typeof serve> | undefined
-    await new Promise<void>((resolve, reject) => {
-      const onStartupError = (error: Error) => reject(error)
-      server = serve({ fetch: app.fetch, port: options.port }, () => {
-        ;(server as {
-          off?: (event: string, listener: (error: Error) => void) => void
-        } | undefined)?.off?.('error', onStartupError)
-        console.log(`[taskcast] Server started on http://localhost:${options.port}`)
-        if (options.playground) {
-          console.log(`[taskcast] Playground UI at http://localhost:${options.port}/_playground/`)
-        }
-        resolve()
-      })
-      ;(server as {
-        once?: (event: string, listener: (error: Error) => void) => void
-      }).once?.('error', onStartupError)
-    })
-    if (server === undefined) {
-      throw new Error('HTTP server was not created')
-    }
-
-    let shutdownPromise: Promise<void> | undefined
-    const closeServer = async (): Promise<void> => {
-      const close = (
-        server as {
-          close?: (callback?: (error?: Error) => void) => void
-        }
-      ).close
-      if (close === undefined) return
-      await new Promise<void>((resolve, reject) => {
-        try {
-          close.call(server, (error?: Error) => {
-            if (error) reject(error)
-            else resolve()
-          })
-        } catch (error) {
-          reject(error)
-        }
-      })
-    }
-    const shutdown = (): Promise<void> => {
-      if (shutdownPromise !== undefined) return shutdownPromise
-      shutdownPromise = (async () => {
-        process.off('SIGTERM', signalHandler)
-        process.off('SIGINT', signalHandler)
-        try {
-          stop()
-          await closeServer()
-        } finally {
-          await options.closeDependencies?.()
-        }
-      })()
-      return shutdownPromise
-    }
-    const signalHandler = () => {
-      void shutdown().catch((error: unknown) => {
-        const message = error instanceof Error ? error.message : String(error)
-        console.error(`[taskcast] shutdown failed: ${message}`)
-      })
-    }
-
-    process.on('SIGTERM', signalHandler)
-    process.on('SIGINT', signalHandler)
-  } catch (error) {
-    try {
-      stopServices?.()
-    } finally {
-      await options.closeDependencies?.()
-    }
-    throw error
+    workerManager = new WorkerManager(wmOpts)
   }
+
+  resolveAdminToken(options.config)
+
+  const serverOpts: Parameters<typeof createTaskcastApp>[0] = {
+    engine,
+    shortTermStore: options.shortTermStore,
+    auth,
+    config: options.config,
+    verbose: options.verbose,
+    logLevel,
+  }
+  if (workerManager !== undefined) serverOpts.workerManager = workerManager
+  if (options.dependencyHealth !== undefined) {
+    serverOpts.dependencyHealth = options.dependencyHealth
+  }
+  const { app, stop } = createTaskcastApp(serverOpts)
+  lifecycle.attachServices(stop)
+  lifecycle.checkpoint()
+
+  if (options.playground) {
+    try {
+      const require = createRequire(import.meta.url)
+      const pkgPath = require.resolve('@taskcast/playground/package.json')
+      const distDir = join(dirname(pkgPath), 'dist')
+      if (existsSync(distDir)) {
+        const { serveStatic } = await import('@hono/node-server/serve-static')
+        lifecycle.checkpoint()
+        app.use(
+          '/_playground/*',
+          serveStatic({
+            root: distDir,
+            rewriteRequestPath: (p) => p.replace(/^\/_playground/, ''),
+          })
+        )
+        app.get(
+          '/_playground/*',
+          serveStatic({
+            root: distDir,
+            rewriteRequestPath: () => '/index.html',
+          })
+        )
+      } else {
+        console.warn('[taskcast] Playground dist not found. Run `pnpm --filter @taskcast/playground build` first.')
+      }
+    } catch (error) {
+      if (error instanceof StartupCancelledError) throw error
+      console.warn('[taskcast] @taskcast/playground not available, skipping playground UI.')
+    }
+  }
+
+  lifecycle.checkpoint()
+  const { serve } = await import('@hono/node-server')
+  lifecycle.checkpoint()
+  let server: ReturnType<typeof serve> | undefined
+  await new Promise<void>((resolve, reject) => {
+    const onStartupError = (error: Error) => reject(error)
+    server = serve({ fetch: app.fetch, port: options.port }, () => {
+      ;(server as {
+        off?: (event: string, listener: (error: Error) => void) => void
+      } | undefined)?.off?.('error', onStartupError)
+      console.log(`[taskcast] Server started on http://localhost:${options.port}`)
+      if (options.playground) {
+        console.log(`[taskcast] Playground UI at http://localhost:${options.port}/_playground/`)
+      }
+      resolve()
+    })
+    ;(server as {
+      once?: (event: string, listener: (error: Error) => void) => void
+    }).once?.('error', onStartupError)
+  })
+  if (server === undefined) {
+    throw new Error('HTTP server was not created')
+  }
+  lifecycle.attachServer(server)
+  lifecycle.checkpoint()
 }
 
 export function registerStartCommand(program: Command): void {
@@ -381,15 +465,22 @@ export function registerStartCommand(program: Command): void {
           return cleanupPromise
         }
 
+        const lifecycle = new StartLifecycle(closeDependencies)
+        let failed = false
+        let startupError: unknown
+        let shutdown: Promise<void> | undefined
         try {
           let { config: fileConfig, source, path: configPath } = await loadConfigFile(options.config)
+          lifecycle.checkpoint()
 
           if (source === 'none') {
             const shouldCreate = await promptCreateGlobalConfig()
+            lifecycle.checkpoint()
             if (shouldCreate) {
               const createdPath = createDefaultGlobalConfig()
               if (createdPath) {
                 const created = await loadConfigFile(createdPath)
+                lifecycle.checkpoint()
                 fileConfig = created.config
                 source = created.source
                 configPath = created.path
@@ -423,6 +514,7 @@ export function registerStartCommand(program: Command): void {
                   startupTimeoutMs: 15_000,
                 })
               : undefined
+          lifecycle.checkpoint()
           if (managedRedis !== undefined) {
             dependencyHealth.register('redisCommand', managedRedis.commandCheck)
             dependencyHealth.register('redisPubSub', managedRedis.pubSubCheck)
@@ -470,6 +562,7 @@ export function registerStartCommand(program: Command): void {
               connect_timeout: 5,
             })
             await postgresCheck(postgres_)
+            lifecycle.checkpoint()
             dependencyHealth.register('postgres', () => postgresCheck(postgres_!))
             longTermStore = new PostgresLongTermStore(postgres_, dependencyHealth)
             longTermLabel = `postgres @ ${formatDisplayUrl(postgresUrl)}`
@@ -496,10 +589,19 @@ export function registerStartCommand(program: Command): void {
             ...(configPath === undefined ? {} : { configPath }),
           }
 
-          await runStart(runStartOptions)
+          await runStartWithLifecycle(runStartOptions, lifecycle)
         } catch (err) {
-          await closeDependencies()
-          const msg = err instanceof Error ? err.message : String(err)
+          failed = true
+          startupError = err
+          shutdown = lifecycle.requestShutdown()
+        } finally {
+          lifecycle.settleStartup()
+        }
+
+        if (failed) {
+          await shutdown
+          if (startupError instanceof StartupCancelledError || lifecycle.cancelled) return
+          const msg = startupError instanceof Error ? startupError.message : String(startupError)
           console.error(`[taskcast] ${msg}`)
           process.exit(1)
         }

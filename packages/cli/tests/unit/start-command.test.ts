@@ -1184,3 +1184,242 @@ describe('runStart', () => {
     )
   })
 })
+
+interface Deferred<T> {
+  promise: Promise<T>
+  resolve(value: T): void
+  reject(error: unknown): void
+}
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T | PromiseLike<T>) => void
+  let reject!: (error: unknown) => void
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise
+    reject = rejectPromise
+  })
+  return { promise, resolve, reject }
+}
+
+type AsyncSignalHandler = () => Promise<void>
+
+function addedSignalHandler(
+  signal: 'SIGINT' | 'SIGTERM',
+  before: Set<Function>,
+): AsyncSignalHandler | undefined {
+  return process.listeners(signal).find((listener) =>
+    !before.has(listener)) as AsyncSignalHandler | undefined
+}
+
+describe('startup signal lifecycle', () => {
+  let beforeInt: Set<Function>
+  let beforeTerm: Set<Function>
+  let exitSpy: ReturnType<typeof vi.spyOn>
+  let logSpy: ReturnType<typeof vi.spyOn>
+  let errorSpy: ReturnType<typeof vi.spyOn>
+  let originalRedis: string | undefined
+  let originalPostgres: string | undefined
+
+  beforeEach(async () => {
+    vi.clearAllMocks()
+    beforeInt = new Set(process.listeners('SIGINT'))
+    beforeTerm = new Set(process.listeners('SIGTERM'))
+    exitSpy = vi.spyOn(process, 'exit').mockImplementation(((code?: number) => {
+      throw new ExitError(code ?? 0)
+    }) as never)
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+    errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    originalRedis = process.env['TASKCAST_REDIS_URL']
+    originalPostgres = process.env['TASKCAST_POSTGRES_URL']
+    delete process.env['TASKCAST_REDIS_URL']
+    delete process.env['TASKCAST_POSTGRES_URL']
+
+    const { loadConfigFile } = await import('@taskcast/core')
+    ;(loadConfigFile as ReturnType<typeof vi.fn>).mockResolvedValue({
+      config: { port: 3721 },
+      source: 'file',
+      path: '/fake/taskcast.config.yaml',
+    })
+  })
+
+  afterEach(() => {
+    for (const listener of process.listeners('SIGINT')) {
+      if (!beforeInt.has(listener)) {
+        process.off('SIGINT', listener as NodeJS.SignalsListener)
+      }
+    }
+    for (const listener of process.listeners('SIGTERM')) {
+      if (!beforeTerm.has(listener)) {
+        process.off('SIGTERM', listener as NodeJS.SignalsListener)
+      }
+    }
+    if (originalRedis === undefined) delete process.env['TASKCAST_REDIS_URL']
+    else process.env['TASKCAST_REDIS_URL'] = originalRedis
+    if (originalPostgres === undefined) delete process.env['TASKCAST_POSTGRES_URL']
+    else process.env['TASKCAST_POSTGRES_URL'] = originalPostgres
+    exitSpy.mockRestore()
+    logSpy.mockRestore()
+    errorSpy.mockRestore()
+  })
+
+  it('installs signal handlers before managed acquisition and cancels later startup work', async () => {
+    const managedReady = deferred<{
+      broadcast: object
+      shortTermStore: object
+      commandCheck: ReturnType<typeof vi.fn>
+      pubSubCheck: ReturnType<typeof vi.fn>
+      close: ReturnType<typeof vi.fn>
+    }>()
+    const redisClose = vi.fn().mockResolvedValue(undefined)
+    let handlersInstalledAtAcquire = false
+    const { createManagedRedisAdapters } = await import('@taskcast/redis')
+    ;(createManagedRedisAdapters as ReturnType<typeof vi.fn>)
+      .mockImplementationOnce(() => {
+        handlersInstalledAtAcquire =
+          process.listeners('SIGINT').length === beforeInt.size + 1
+          && process.listeners('SIGTERM').length === beforeTerm.size + 1
+        return managedReady.promise
+      })
+
+    process.env['TASKCAST_REDIS_URL'] = 'redis://127.0.0.1:6379'
+    process.env['TASKCAST_POSTGRES_URL'] =
+      'postgres://127.0.0.1:5432/taskcast'
+    const program = new Command()
+    program.exitOverride()
+    registerStartCommand(program)
+    const startup = program.parseAsync([
+      'node',
+      'test',
+      'start',
+      '--storage',
+      'redis',
+    ])
+
+    await vi.waitFor(() => {
+      expect(createManagedRedisAdapters).toHaveBeenCalledTimes(1)
+    })
+    const earlyHandler = addedSignalHandler('SIGINT', beforeInt)
+    const shutdown = earlyHandler?.()
+    managedReady.resolve({
+      broadcast: {},
+      shortTermStore: {},
+      commandCheck: vi.fn(),
+      pubSubCheck: vi.fn(),
+      close: redisClose,
+    })
+    await startup
+
+    const lateHandler = earlyHandler
+      ?? addedSignalHandler('SIGINT', beforeInt)
+    const finalShutdown = shutdown ?? lateHandler?.()
+    await finalShutdown
+
+    expect(handlersInstalledAtAcquire).toBe(true)
+    expect(earlyHandler).toBeDefined()
+    const postgresModule = await import('postgres')
+    expect(postgresModule.default).not.toHaveBeenCalled()
+    const { serve } = await import('@hono/node-server')
+    expect(serve).not.toHaveBeenCalled()
+    expect(redisClose).toHaveBeenCalledTimes(1)
+    expect(exitSpy).not.toHaveBeenCalled()
+    expect(process.listeners('SIGINT')).toHaveLength(beforeInt.size)
+    expect(process.listeners('SIGTERM')).toHaveLength(beforeTerm.size)
+  })
+
+  it('cancels after an in-flight migration without binding HTTP', async () => {
+    const migration = deferred<void>()
+    const { performAutoMigrateIfEnabled } = await import(
+      '../../src/auto-migrate.js'
+    )
+    ;(performAutoMigrateIfEnabled as ReturnType<typeof vi.fn>)
+      .mockReturnValueOnce(migration.promise)
+    const closeDependencies = vi.fn().mockResolvedValue(undefined)
+    const { serve } = await import('@hono/node-server')
+
+    const startup = runStart({
+      postgres: {} as ReturnType<typeof import('postgres').default>,
+      postgresUrl: 'postgres://127.0.0.1:5432/taskcast',
+      broadcast: {},
+      shortTermStore: {},
+      port: 3721,
+      config: {},
+      verbose: false,
+      playground: false,
+      closeDependencies,
+    })
+
+    await vi.waitFor(() => {
+      expect(performAutoMigrateIfEnabled).toHaveBeenCalledTimes(1)
+    })
+    const earlyHandler = addedSignalHandler('SIGTERM', beforeTerm)
+    const shutdown = earlyHandler?.()
+    migration.resolve(undefined)
+    await startup
+
+    const lateHandler = earlyHandler
+      ?? addedSignalHandler('SIGTERM', beforeTerm)
+    const finalShutdown = shutdown ?? lateHandler?.()
+    await finalShutdown
+
+    expect(earlyHandler).toBeDefined()
+    expect(serve).not.toHaveBeenCalled()
+    expect(closeDependencies).toHaveBeenCalledTimes(1)
+    expect(process.listeners('SIGINT')).toHaveLength(beforeInt.size)
+    expect(process.listeners('SIGTERM')).toHaveLength(beforeTerm.size)
+  })
+
+  it('keeps both handlers installed until repeated signals finish one slow cleanup', async () => {
+    const cleanup = deferred<void>()
+    const closeDependencies = vi.fn(() => cleanup.promise)
+    const serverClose = vi.fn(
+      (callback?: (error?: Error) => void) => callback?.(),
+    )
+    const { serve } = await import('@hono/node-server')
+    ;(serve as ReturnType<typeof vi.fn>).mockImplementationOnce(
+      (_options: unknown, listening: () => void) => {
+        listening()
+        return { close: serverClose }
+      },
+    )
+
+    await runStart({
+      broadcast: {},
+      shortTermStore: {},
+      port: 3721,
+      config: {},
+      verbose: false,
+      playground: false,
+      closeDependencies,
+    })
+
+    const interrupt = addedSignalHandler('SIGINT', beforeInt)
+    const terminate = addedSignalHandler('SIGTERM', beforeTerm)
+    expect(interrupt).toBeDefined()
+    expect(terminate).toBeDefined()
+    const first = interrupt!()
+    await vi.waitFor(() => {
+      expect(closeDependencies).toHaveBeenCalledTimes(1)
+    })
+    const listenersDuringCleanup = {
+      interrupt: process.listeners('SIGINT').length,
+      terminate: process.listeners('SIGTERM').length,
+    }
+    const second = terminate!()
+    cleanup.resolve(undefined)
+    await Promise.all([
+      first ?? Promise.resolve(),
+      second ?? Promise.resolve(),
+    ])
+
+    expect(first).toBeInstanceOf(Promise)
+    expect(second).toBe(first)
+    expect(listenersDuringCleanup).toEqual({
+      interrupt: beforeInt.size + 1,
+      terminate: beforeTerm.size + 1,
+    })
+    expect(serverClose).toHaveBeenCalledTimes(1)
+    expect(closeDependencies).toHaveBeenCalledTimes(1)
+    expect(process.listeners('SIGINT')).toHaveLength(beforeInt.size)
+    expect(process.listeners('SIGTERM')).toHaveLength(beforeTerm.size)
+  })
+})
