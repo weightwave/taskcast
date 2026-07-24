@@ -69,6 +69,36 @@ fn env_non_empty(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|value| !value.is_empty())
 }
 
+fn resolve_log_level(value: Option<&str>) -> Result<taskcast_server::LogLevel, String> {
+    taskcast_server::LogLevel::parse(value)
+}
+
+#[cfg(test)]
+mod log_level_tests {
+    use super::resolve_log_level;
+    use taskcast_server::LogLevel;
+
+    #[test]
+    fn defaults_to_info() {
+        assert_eq!(resolve_log_level(None).unwrap(), LogLevel::Info);
+    }
+
+    #[test]
+    fn accepts_case_insensitive_levels() {
+        assert_eq!(resolve_log_level(Some("DEBUG")).unwrap(), LogLevel::Debug);
+        assert_eq!(resolve_log_level(Some("Info")).unwrap(), LogLevel::Info);
+        assert_eq!(resolve_log_level(Some("Warn")).unwrap(), LogLevel::Warn);
+        assert_eq!(resolve_log_level(Some("error")).unwrap(), LogLevel::Error);
+    }
+
+    #[test]
+    fn rejects_invalid_level() {
+        assert!(resolve_log_level(Some("trace"))
+            .unwrap_err()
+            .contains("invalid TASKCAST_LOG_LEVEL"));
+    }
+}
+
 fn trusted_service_task_ids(
     task_ids: Option<&taskcast_core::config::TrustedServiceTaskIds>,
 ) -> taskcast_server::TaskIdAccess {
@@ -106,6 +136,8 @@ pub async fn run(args: StartArgs) -> Result<(), Box<dyn std::error::Error>> {
         playground,
         verbose,
     } = args;
+
+    let log_level = resolve_log_level(env_non_empty("TASKCAST_LOG_LEVEL").as_deref())?;
 
     // 1. Load config file
     let file_config =
@@ -332,12 +364,13 @@ pub async fn run(args: StartArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // 9. Create and serve app
-    let (app, _ws_registry) = taskcast_server::create_app(
+    let (app, _ws_registry) = taskcast_server::create_app_with_failure_logger(
         engine,
         auth_mode,
         worker_manager,
         None,
         taskcast_server::CorsConfig::default(),
+        Arc::new(taskcast_server::StderrHttpFailureLogger::new(log_level)),
     );
 
     // Apply verbose request logging middleware if --verbose

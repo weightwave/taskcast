@@ -13,7 +13,7 @@ import {
   MemoryShortTermStore,
 } from '@taskcast/core'
 import type { BroadcastProvider, ShortTermStore, LongTermStore, TaskcastConfig } from '@taskcast/core'
-import { createTaskcastApp } from '@taskcast/server'
+import { createTaskcastApp, parseLogLevel } from '@taskcast/server'
 import type { AuthConfig, JWTConfig } from '@taskcast/server'
 import { createRedisAdapters } from '@taskcast/redis'
 import { PostgresLongTermStore } from '@taskcast/postgres'
@@ -125,6 +125,8 @@ export interface RunStartOptions {
  * @throws Error if auto-migrate fails
  */
 export async function runStart(options: RunStartOptions): Promise<void> {
+  const logLevel = parseLogLevel(options.env?.['TASKCAST_LOG_LEVEL'])
+
   // Call auto-migrate (no-op if not enabled or no Postgres).
   // Pass the actual sql connection so the helper can detect "configured via
   // config file" scenarios where TASKCAST_POSTGRES_URL env var is not set.
@@ -163,6 +165,7 @@ export async function runStart(options: RunStartOptions): Promise<void> {
     auth,
     config: options.config,
     verbose: options.verbose,
+    logLevel,
   }
   if (workerManager !== undefined) serverOpts.workerManager = workerManager
   const { app, stop } = createTaskcastApp(serverOpts)

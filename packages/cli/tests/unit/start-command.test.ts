@@ -26,6 +26,13 @@ vi.mock('@taskcast/server', () => ({
     app: { use: vi.fn(), get: vi.fn(), fetch: vi.fn() },
     stop: vi.fn(),
   }),
+  parseLogLevel: vi.fn((value?: string) => {
+    const normalized = value?.trim().toLowerCase() || 'info'
+    if (['debug', 'info', 'warn', 'error'].includes(normalized)) return normalized
+    throw new Error(
+      `invalid TASKCAST_LOG_LEVEL "${value}"; expected debug, info, warn, or error`,
+    )
+  }),
 }))
 
 // Mock @taskcast/redis
@@ -676,6 +683,59 @@ describe('runStart', () => {
     expect(createTaskcastApp).toHaveBeenCalledWith(
       expect.objectContaining({ verbose: true }),
     )
+  })
+
+  it('passes TASKCAST_LOG_LEVEL to createTaskcastApp', async () => {
+    const options: RunStartOptions = {
+      broadcast: {},
+      shortTermStore: {},
+      port: 3721,
+      config: {},
+      verbose: false,
+      playground: false,
+      env: { TASKCAST_LOG_LEVEL: 'ERROR' },
+    }
+
+    await runStart(options)
+
+    const { createTaskcastApp } = await import('@taskcast/server')
+    expect(createTaskcastApp).toHaveBeenCalledWith(
+      expect.objectContaining({ logLevel: 'error' }),
+    )
+  })
+
+  it('defaults TASKCAST_LOG_LEVEL to info', async () => {
+    await runStart({
+      broadcast: {},
+      shortTermStore: {},
+      port: 3721,
+      config: {},
+      verbose: false,
+      playground: false,
+      env: {},
+    })
+
+    const { createTaskcastApp } = await import('@taskcast/server')
+    expect(createTaskcastApp).toHaveBeenCalledWith(
+      expect.objectContaining({ logLevel: 'info' }),
+    )
+  })
+
+  it('rejects an invalid TASKCAST_LOG_LEVEL before startup work', async () => {
+    await expect(runStart({
+      broadcast: {},
+      shortTermStore: {},
+      port: 3721,
+      config: {},
+      verbose: false,
+      playground: false,
+      env: { TASKCAST_LOG_LEVEL: 'trace' },
+    })).rejects.toThrow('invalid TASKCAST_LOG_LEVEL "trace"')
+
+    const { serve } = await import('@hono/node-server')
+    const { performAutoMigrateIfEnabled } = await import('../../src/auto-migrate.js')
+    expect(serve).not.toHaveBeenCalled()
+    expect(performAutoMigrateIfEnabled).not.toHaveBeenCalled()
   })
 
   it('passes jwt config and trusted services to createTaskcastApp', async () => {
