@@ -58,7 +58,11 @@ import {
 } from './middleware/http-failure-logger.js'
 import { TASKCAST_SERVER_VERSION, serverInfo } from './version.js'
 import type { AuthConfig } from './auth.js'
-import { isTerminal, matchesWorkerRule } from '@taskcast/core'
+import {
+  findDependencyUnavailableError,
+  isTerminal,
+  matchesWorkerRule,
+} from '@taskcast/core'
 import type {
   Task,
   TaskEngine,
@@ -89,6 +93,8 @@ export interface TaskcastServerOptions {
   /** Structured 5xx log sink. Defaults to one JSON line on stderr. */
   errorLogger?: HttpFailureLogger
   dependencyHealth?: DependencyHealthRegistry
+  /** Adapters actually instantiated by a managed runtime (takes precedence over file config). */
+  effectiveAdapters?: RuntimeAdapterDescriptors
   cors?: boolean | { origin: string | string[] }
   scheduler?: {
     enabled?: boolean
@@ -103,6 +109,12 @@ export interface TaskcastServerOptions {
     defaultDisconnectPolicy?: DisconnectPolicy
     disconnectGraceMs?: number
   }
+}
+
+export interface RuntimeAdapterDescriptors {
+  broadcast: string
+  shortTermStore: string
+  longTermStore?: string
 }
 
 export interface TaskcastApp {
@@ -129,6 +141,10 @@ export function createTaskcastApp(opts: TaskcastServerOptions): TaskcastApp {
     if ('getResponse' in error && typeof error.getResponse === 'function') {
       const response = error.getResponse()
       return c.newResponse(response.body, response)
+    }
+    const dependency = findDependencyUnavailableError(error)
+    if (dependency) {
+      return c.json({ error: dependency.message }, 503)
     }
     return c.text('Internal Server Error', 500)
   })
@@ -172,9 +188,15 @@ export function createTaskcastApp(opts: TaskcastServerOptions): TaskcastApp {
   app.get('/health/detail', (c) => {
     const uptime = Math.floor((Date.now() - startTime) / 1000)
     const authMode = opts.auth?.mode ?? 'none'
-    const broadcastProvider = opts.config?.adapters?.broadcast?.provider ?? 'memory'
-    const shortTermProvider = opts.config?.adapters?.shortTermStore?.provider ?? 'memory'
-    const longTermProvider = opts.config?.adapters?.longTermStore?.provider
+    const broadcastProvider = opts.effectiveAdapters?.broadcast
+      ?? opts.config?.adapters?.broadcast?.provider
+      ?? 'memory'
+    const shortTermProvider = opts.effectiveAdapters?.shortTermStore
+      ?? opts.config?.adapters?.shortTermStore?.provider
+      ?? 'memory'
+    const longTermProvider = opts.effectiveAdapters === undefined
+      ? opts.config?.adapters?.longTermStore?.provider
+      : opts.effectiveAdapters.longTermStore
 
     const adapters: Record<string, { provider: string; status: string }> = {
       broadcast: { provider: broadcastProvider, status: 'ok' },

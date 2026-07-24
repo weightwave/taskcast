@@ -12,6 +12,11 @@ import type {
   WorkerFilter,
   WorkerAssignment,
 } from '@taskcast/core'
+import {
+  classifyRedisError,
+  observeRedisCommand,
+  type RedisOperationOptions,
+} from './connectivity.js'
 
 function makeKeys(prefix: string) {
   return {
@@ -33,10 +38,23 @@ export class RedisShortTermStore implements ShortTermStore {
 
   constructor(
     private redis: Redis,
-    { prefix }: { prefix?: string } = {},
+    private options: { prefix?: string } & RedisOperationOptions = {},
   ) {
+    const { prefix } = options
     const resolvedPrefix = prefix ?? process.env['TASKCAST_REDIS_PREFIX'] ?? 'taskcast'
     this.KEY = makeKeys(resolvedPrefix)
+    if (options.managed) {
+      return new Proxy(this, {
+        get: (target, property, receiver) => {
+          const value = Reflect.get(target, property, receiver)
+          if (typeof value !== 'function') return value
+          return (...args: unknown[]) =>
+            observeRedisCommand(target.options, () =>
+              (value as (...methodArgs: unknown[]) => Promise<unknown>).apply(target, args),
+            )
+        },
+      })
+    }
   }
 
   async saveTask(task: Task): Promise<void> {
@@ -135,6 +153,7 @@ export class RedisShortTermStore implements ShortTermStore {
 
     for (const [index, [err]] of results.entries()) {
       if (err) {
+        if (classifyRedisError(err)) throw err
         throw new Error(`Redis pipeline failed during ${context} at command ${index}: ${err.message}`)
       }
     }
@@ -169,7 +188,7 @@ export class RedisShortTermStore implements ShortTermStore {
       pipeline.expire(this.KEY.seriesLatest(taskId, sid), ttlSeconds)
     }
     pipeline.expire(this.KEY.seriesIds(taskId), ttlSeconds)
-    await pipeline.exec()
+    await this.inspectPipelineForConnectionErrors(await pipeline.exec())
   }
 
   async getSeriesLatest(taskId: string, seriesId: string): Promise<TaskEvent | null> {
@@ -237,6 +256,7 @@ export class RedisShortTermStore implements ShortTermStore {
       for (let i = 0; i < results.length; i++) {
         const entry = results[i]!
         const [err, raw] = entry
+        if (err && classifyRedisError(err)) throw err
         if (!err && typeof raw === 'string') {
           tasks.push(JSON.parse(raw) as Task)
         } else if (!err) {
@@ -302,6 +322,7 @@ export class RedisShortTermStore implements ShortTermStore {
     let workers: Worker[] = []
     if (results) {
       for (const [err, raw] of results) {
+        if (err && classifyRedisError(err)) throw err
         if (!err && typeof raw === 'string') {
           workers.push(JSON.parse(raw) as Worker)
         }
@@ -418,6 +439,7 @@ export class RedisShortTermStore implements ShortTermStore {
     const assignments: WorkerAssignment[] = []
     if (results) {
       for (const [err, raw] of results) {
+        if (err && classifyRedisError(err)) throw err
         if (!err && typeof raw === 'string') {
           assignments.push(JSON.parse(raw) as WorkerAssignment)
         }
@@ -443,11 +465,20 @@ export class RedisShortTermStore implements ShortTermStore {
       pipeline.persist(this.KEY.seriesLatest(taskId, sid))
     }
     pipeline.persist(this.KEY.seriesIds(taskId))
-    await pipeline.exec()
+    await this.inspectPipelineForConnectionErrors(await pipeline.exec())
   }
 
   // Task query by status
   async listByStatus(statuses: TaskStatus[]): Promise<Task[]> {
     return this.listTasks({ status: statuses })
+  }
+
+  private async inspectPipelineForConnectionErrors(
+    results: Awaited<ReturnType<ReturnType<Redis['pipeline']>['exec']>>,
+  ): Promise<void> {
+    if (!results) return
+    for (const [error] of results) {
+      if (error && classifyRedisError(error)) throw error
+    }
   }
 }

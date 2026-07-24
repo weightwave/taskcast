@@ -115,6 +115,7 @@ vi.mock('../../src/auto-migrate.js', () => ({
 
 import {
   parsePostgresMaxConnections,
+  effectiveRuntimeAdapters,
   registerStartCommand,
   resolveStorageMode,
   runStart,
@@ -122,6 +123,23 @@ import {
 import type { RunStartOptions } from '../../src/commands/start.js'
 
 describe('storage and PostgreSQL option resolution', () => {
+  it('reports the adapters actually selected after storage precedence', () => {
+    expect(effectiveRuntimeAdapters('memory', false)).toEqual({
+      broadcast: 'memory',
+      shortTermStore: 'memory',
+    })
+    expect(effectiveRuntimeAdapters('redis', true)).toEqual({
+      broadcast: 'redis',
+      shortTermStore: 'redis',
+      longTermStore: 'postgres',
+    })
+    expect(effectiveRuntimeAdapters('sqlite', true)).toEqual({
+      broadcast: 'memory',
+      shortTermStore: 'sqlite',
+      longTermStore: 'sqlite',
+    })
+  })
+
   it.each([
     {
       name: 'explicit memory overrides configured Redis and a Redis URL',
@@ -235,6 +253,38 @@ describe('registerStartCommand', () => {
     const { serve } = await import('@hono/node-server')
     expect(serve).toHaveBeenCalled()
     expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('Server started'))
+  })
+
+  it('passes actual memory adapters to the server when a file config names Redis', async () => {
+    const { loadConfigFile } = await import('@taskcast/core')
+    ;(loadConfigFile as ReturnType<typeof vi.fn>).mockResolvedValue({
+      config: {
+        adapters: {
+          broadcast: { provider: 'redis', url: 'redis://configured.example:6379' },
+          shortTermStore: { provider: 'redis', url: 'redis://configured.example:6379' },
+        },
+      },
+      source: 'file',
+      path: '/fake/taskcast.config.yaml',
+    })
+    const program = new Command()
+    program.exitOverride()
+    registerStartCommand(program)
+
+    await program.parseAsync(['node', 'test', 'start', '--storage', 'memory'])
+
+    const { createTaskcastApp } = await import('@taskcast/server')
+    expect(createTaskcastApp).toHaveBeenLastCalledWith(expect.objectContaining({
+      effectiveAdapters: {
+        broadcast: 'memory',
+        shortTermStore: 'memory',
+      },
+    }))
+    ;(loadConfigFile as ReturnType<typeof vi.fn>).mockResolvedValue({
+      config: { port: 3721 },
+      source: 'none',
+      path: undefined,
+    })
   })
 
   it('prints config path and storage info on startup', async () => {

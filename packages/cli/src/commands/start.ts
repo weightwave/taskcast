@@ -13,7 +13,7 @@ import {
 } from '@taskcast/core'
 import type { BroadcastProvider, ShortTermStore, LongTermStore, TaskcastConfig } from '@taskcast/core'
 import { createTaskcastApp, DependencyHealthRegistry, parseLogLevel } from '@taskcast/server'
-import type { AuthConfig, JWTConfig } from '@taskcast/server'
+import type { AuthConfig, JWTConfig, RuntimeAdapterDescriptors } from '@taskcast/server'
 import { createManagedRedisAdapters } from '@taskcast/redis'
 import type { ManagedRedisAdapters } from '@taskcast/redis'
 import { PostgresLongTermStore, postgresCheck } from '@taskcast/postgres'
@@ -71,6 +71,24 @@ export function parsePostgresMaxConnections(value?: string): number {
     throw new Error('TASKCAST_POSTGRES_MAX_CONNECTIONS must be a positive integer')
   }
   return parsed
+}
+
+export function effectiveRuntimeAdapters(
+  storageMode: StorageMode,
+  postgresActive: boolean,
+): RuntimeAdapterDescriptors {
+  if (storageMode === 'sqlite') {
+    return {
+      broadcast: 'memory',
+      shortTermStore: 'sqlite',
+      longTermStore: 'sqlite',
+    }
+  }
+  return {
+    broadcast: storageMode,
+    shortTermStore: storageMode,
+    ...(postgresActive ? { longTermStore: 'postgres' } : {}),
+  }
 }
 
 function configuredStorageProvider(config: TaskcastConfig): string | undefined {
@@ -172,6 +190,8 @@ export interface RunStartOptions {
   env?: Record<string, string | undefined>
   /** Active dependency health registry */
   dependencyHealth?: DependencyHealthRegistry
+  /** Actual adapter selection after CLI/environment precedence resolution. */
+  effectiveAdapters?: RuntimeAdapterDescriptors
   /** Idempotent close callback for active Redis/PostgreSQL resources */
   closeDependencies?: () => Promise<void>
 }
@@ -362,6 +382,9 @@ async function runStartWithLifecycle(options: RunStartOptions, lifecycle: StartL
     shortTermStore: options.shortTermStore,
     auth,
     config: options.config,
+    ...(options.effectiveAdapters === undefined
+      ? {}
+      : { effectiveAdapters: options.effectiveAdapters }),
     verbose: options.verbose,
     logLevel,
   }
@@ -582,6 +605,10 @@ export function registerStartCommand(program: Command): void {
             playground: options.playground ?? false,
             env: process.env as Record<string, string | undefined>,
             dependencyHealth,
+            effectiveAdapters: effectiveRuntimeAdapters(
+              storageMode,
+              postgresState.active,
+            ),
             closeDependencies,
             ...(postgres_ === undefined ? {} : { postgres: postgres_ }),
             ...(postgresUrl === undefined ? {} : { postgresUrl }),

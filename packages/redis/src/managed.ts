@@ -1,11 +1,11 @@
 import { Redis } from 'ioredis'
 import {
   DependencyUnavailableError,
-  type DependencyErrorKind,
   type DependencyObserver,
 } from '@taskcast/core'
 import { equalJitterDelay } from './backoff.js'
 import { RedisBroadcastProvider } from './broadcast.js'
+import { classifyRedisError } from './connectivity.js'
 import type { RedisAdapterOptions } from './index.js'
 import { RedisShortTermStore } from './short-term.js'
 
@@ -49,38 +49,6 @@ async function withDeadline<T>(
   } finally {
     if (timer !== undefined) clearTimeout(timer)
   }
-}
-
-function classifyRedisError(error: unknown): DependencyErrorKind | undefined {
-  if (!(error instanceof Error)) return undefined
-  const code = (error as NodeJS.ErrnoException).code
-  if (code === 'ECONNREFUSED') return 'connection_refused'
-  if (code === 'ECONNRESET' || code === 'EPIPE') return 'connection_reset'
-  if (code === 'ETIMEDOUT' || code === 'ESOCKETTIMEDOUT') return 'timeout'
-  if (code === 'ENOTFOUND' || code === 'EAI_AGAIN') return 'dns'
-  if (code === 'NR_CLOSED' || code === 'CONNECTION_CLOSED') {
-    return 'connection_closed'
-  }
-
-  const message = error.message.toLowerCase()
-  if (
-    message.includes('wrongpass') ||
-    message.includes('noauth') ||
-    message.includes('authentication')
-  ) {
-    return 'authentication'
-  }
-  if (message.includes('connect timeout') || message.includes('timed out')) {
-    return 'timeout'
-  }
-  if (
-    message.includes('connection is closed') ||
-    message.includes('connection closed') ||
-    message.includes("stream isn't writeable")
-  ) {
-    return 'connection_closed'
-  }
-  return undefined
 }
 
 function unavailable(error: unknown): DependencyUnavailableError | undefined {
@@ -217,9 +185,16 @@ export async function createManagedRedisAdapters(
       {
         ...(options.prefix === undefined ? {} : { prefix: options.prefix }),
         subscriptionMode: 'pattern',
+        managed: true,
+        ...(options.observer === undefined
+          ? {}
+          : { observer: options.observer }),
       },
     )
-    const shortTermStore = new RedisShortTermStore(command.client, options)
+    const shortTermStore = new RedisShortTermStore(command.client, {
+      ...options,
+      managed: true,
+    })
 
     const onReady = () => {
       reconnectAttempt = 0

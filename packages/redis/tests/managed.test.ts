@@ -231,6 +231,48 @@ describe('managed Redis command client', () => {
     await managed.close()
   }, 20_000)
 
+  it('maps managed store and publish disconnects to observed typed failures', async () => {
+    await proxy.open()
+    const observations: DependencyObservation[] = []
+    let managed: Awaited<ReturnType<typeof createManagedRedisAdapters>> | undefined
+
+    try {
+      managed = await createManagedRedisAdapters(redisUrl, {
+        prefix: 'managed-typed-business-errors',
+        random: () => 0,
+        observer: { observe: (observation) => observations.push(observation) },
+      })
+
+      await proxy.refuse()
+      await expect(
+        managed.shortTermStore.saveTask(makeTask('managed-typed-store')),
+      ).rejects.toMatchObject({
+        dependency: 'redisCommand',
+        kind: 'connection_closed',
+      })
+      expect(observations).toContainEqual(expect.objectContaining({
+        dependency: 'redisCommand',
+        state: 'reconnecting',
+      }))
+
+      await proxy.open()
+      await eventually(() => managed!.commandCheck())
+      await proxy.refuse()
+      await expect(
+        managed.broadcast.publish('task-1', makeEvent()),
+      ).rejects.toMatchObject({
+        dependency: 'redisCommand',
+        kind: 'connection_closed',
+      })
+    } finally {
+      try {
+        await managed?.close()
+      } finally {
+        await proxy.open()
+      }
+    }
+  }, 20_000)
+
   it('does not replay an INCR whose upstream response is dropped', async () => {
     await proxy.open()
     const key = 'taskcast:test:no-replay'

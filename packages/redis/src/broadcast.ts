@@ -1,5 +1,9 @@
 import type { Redis } from 'ioredis'
 import type { BroadcastProvider, TaskEvent } from '@taskcast/core'
+import {
+  observeRedisCommand,
+  type RedisOperationOptions,
+} from './connectivity.js'
 
 type SubscriptionMode = 'channels' | 'pattern'
 
@@ -14,7 +18,7 @@ export class RedisBroadcastProvider implements BroadcastProvider {
     private options: {
       prefix?: string
       subscriptionMode?: SubscriptionMode
-    } = {},
+    } & RedisOperationOptions = {},
   ) {
     const { prefix, subscriptionMode = 'channels' } = options
     const resolvedPrefix =
@@ -68,7 +72,9 @@ export class RedisBroadcastProvider implements BroadcastProvider {
   }
 
   async publish(channel: string, event: TaskEvent): Promise<void> {
-    await this.pub.publish(this.channelPrefix + channel, JSON.stringify(event))
+    await observeRedisCommand(this.options, () =>
+      this.pub.publish(this.channelPrefix + channel, JSON.stringify(event)),
+    )
   }
 
   subscribe(channel: string, handler: (event: TaskEvent) => void): () => void {

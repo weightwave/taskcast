@@ -8,6 +8,7 @@ import {
 } from '@taskcast/core'
 import { createTasksRouter } from '../src/routes/tasks.js'
 import { createSubscriberCounts } from '../src/routes/sse.js'
+import { createTaskcastApp } from '../src/index.js'
 import type { AuthContext } from '../src/auth.js'
 
 function makeApp() {
@@ -32,6 +33,48 @@ function dependencyFailure(wrapped = false): Error {
   )
   return wrapped ? new Error('store failed', { cause: unavailable }) : unavailable
 }
+
+function makeServerApp() {
+  const store = new MemoryShortTermStore()
+  const broadcast = new MemoryBroadcastProvider()
+  const engine = new TaskEngine({ shortTermStore: store, broadcast })
+  const records: Array<Record<string, unknown>> = []
+  const { app } = createTaskcastApp({
+    engine,
+    errorLogger: (record) => records.push(record),
+  })
+  return { app, engine, records }
+}
+
+describe('app-level dependency failure mapping', () => {
+  it.each([
+    ['list', '/tasks', (engine: TaskEngine, error: Error) => { engine.listTasks = async () => { throw error } }],
+    ['get', '/tasks/task-1', (engine: TaskEngine, error: Error) => { engine.getTask = async () => { throw error } }],
+    ['history', '/tasks/task-1/events/history', (engine: TaskEngine, error: Error) => { engine.getTask = async () => { throw error } }],
+    ['request', '/tasks/task-1/request', (engine: TaskEngine, error: Error) => { engine.getTask = async () => { throw error } }],
+  ] as const)('%s returns a sanitized 503 for an uncaught typed dependency failure', async (_name, path, inject) => {
+    const { app, engine, records } = makeServerApp()
+    inject(engine, dependencyFailure(true))
+
+    const response = await app.request(path)
+
+    expect(response.status).toBe(503)
+    expect(await response.json()).toEqual({
+      error: 'redisCommand unavailable (connection_reset)',
+    })
+    expect(JSON.stringify(records)).not.toContain('redis://admin:secret')
+  })
+
+  it('keeps ordinary uncaught errors as 500', async () => {
+    const { app, engine } = makeServerApp()
+    engine.listTasks = async () => { throw new Error('ordinary failure') }
+
+    const response = await app.request('/tasks')
+
+    expect(response.status).toBe(500)
+    expect(await response.text()).toBe('Internal Server Error')
+  })
+})
 
 async function requestCreateFailure(error: unknown): Promise<Response> {
   const { app, engine } = makeApp()

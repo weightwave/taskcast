@@ -165,6 +165,33 @@ describe('GET /health/detail', () => {
     expect(body.auth.mode).toBe('jwt')
   })
 
+  it('uses effective runtime adapters instead of stale file configuration', async () => {
+    const engine = new TaskEngine({
+      broadcast: new MemoryBroadcastProvider(),
+      shortTermStore: new MemoryShortTermStore(),
+    })
+    const { app } = createTaskcastApp({
+      engine,
+      config: {
+        adapters: {
+          broadcast: { provider: 'redis' },
+          shortTermStore: { provider: 'redis' },
+          longTermStore: { provider: 'postgres' },
+        },
+      },
+      effectiveAdapters: {
+        broadcast: 'memory',
+        shortTermStore: 'memory',
+      },
+    })
+
+    const body = await (await app.request('/health/detail')).json()
+    expect(body.adapters).toEqual({
+      broadcast: { provider: 'memory', status: 'ok' },
+      shortTermStore: { provider: 'memory', status: 'ok' },
+    })
+  })
+
   it('keeps liveness healthy while readiness and detail reflect dependency recovery', async () => {
     let pubSubHealthy = false
     const dependencyHealth = new DependencyHealthRegistry({ logger: () => {} })
