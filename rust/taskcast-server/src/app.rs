@@ -77,6 +77,26 @@ pub fn create_app_with_failure_logger(
     cors_config: CorsConfig,
     failure_logger: Arc<dyn crate::http_failure::HttpFailureLogger>,
 ) -> (Router, Option<WsRegistry>) {
+    create_app_with_failure_logger_and_routes(
+        engine,
+        auth_mode,
+        worker_manager,
+        config,
+        cors_config,
+        failure_logger,
+        Router::new(),
+    )
+}
+
+pub fn create_app_with_failure_logger_and_routes(
+    engine: Arc<TaskEngine>,
+    auth_mode: AuthMode,
+    worker_manager: Option<Arc<WorkerManager>>,
+    config: Option<TaskcastConfig>,
+    cors_config: CorsConfig,
+    failure_logger: Arc<dyn crate::http_failure::HttpFailureLogger>,
+    additional_routes: Router,
+) -> (Router, Option<WsRegistry>) {
     let auth_mode = Arc::new(auth_mode);
     let subscriber_counts = create_subscriber_counts();
 
@@ -241,6 +261,9 @@ pub fn create_app_with_failure_logger(
         }
     };
 
+    // Merge caller-owned routes before applying the outer observer so every
+    // final 5xx response is logged exactly once.
+    let app = app.merge(additional_routes);
     let app = app.layer(middleware::from_fn_with_state(
         failure_logger,
         crate::http_failure::http_failure_logger_middleware,

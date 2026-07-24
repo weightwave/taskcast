@@ -75,8 +75,9 @@ fn resolve_log_level(value: Option<&str>) -> Result<taskcast_server::LogLevel, S
 
 #[cfg(test)]
 mod log_level_tests {
-    use super::resolve_log_level;
     use taskcast_server::LogLevel;
+
+    use super::resolve_log_level;
 
     #[test]
     fn defaults_to_info() {
@@ -363,14 +364,26 @@ pub async fn run(args: StartArgs) -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    // 9. Create and serve app
-    let (app, _ws_registry) = taskcast_server::create_app_with_failure_logger(
+    // 9. Compose all routes before applying the single outer failure logger.
+    let additional_routes = if playground {
+        println!("[taskcast] Playground UI at http://localhost:{port}/_playground/");
+        axum::Router::new().nest(
+            "/_playground",
+            crate::commands::playground::playground_routes(),
+        )
+    } else {
+        axum::Router::new()
+    };
+    let failure_logger: Arc<dyn taskcast_server::HttpFailureLogger> =
+        Arc::new(taskcast_server::StderrHttpFailureLogger::new(log_level));
+    let (app, _ws_registry) = taskcast_server::create_app_with_failure_logger_and_routes(
         engine,
         auth_mode,
         worker_manager,
         None,
         taskcast_server::CorsConfig::default(),
-        Arc::new(taskcast_server::StderrHttpFailureLogger::new(log_level)),
+        Arc::clone(&failure_logger),
+        additional_routes,
     );
 
     // Apply verbose request logging middleware if --verbose
@@ -382,17 +395,6 @@ pub async fn run(args: StartArgs) -> Result<(), Box<dyn std::error::Error>> {
             logger,
             taskcast_server::verbose_logger_middleware,
         ))
-    } else {
-        app
-    };
-
-    // Serve playground static files if --playground
-    let app = if playground {
-        println!("[taskcast] Playground UI at http://localhost:{port}/_playground/");
-        app.nest(
-            "/_playground",
-            crate::commands::playground::playground_routes(),
-        )
     } else {
         app
     };

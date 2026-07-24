@@ -11,8 +11,9 @@ use taskcast_core::{
     BroadcastProvider, EngineError, MemoryShortTermStore, TaskEngine, TaskEngineOptions, TaskEvent,
 };
 use taskcast_server::{
-    create_app_with_failure_logger, http_failure_logger_middleware, AppError, AuthMode,
-    CollectingHttpFailureLogger, CorsConfig, HttpFailureKind, HttpFailureLogger, LogLevel,
+    create_app_with_failure_logger, create_app_with_failure_logger_and_routes,
+    http_failure_logger_middleware, AppError, AuthMode, CollectingHttpFailureLogger, CorsConfig,
+    HttpFailureKind, HttpFailureLogger, LogLevel,
 };
 
 struct UnsupportedBroadcast;
@@ -183,6 +184,42 @@ async fn injectable_app_constructor_installs_logger_and_marks_internal_errors() 
         records[0].error.as_deref(),
         Some("Global SSE not supported with this broadcast provider")
     );
+}
+
+#[tokio::test]
+async fn additional_routes_are_inside_the_single_failure_logger_layer() {
+    let logger = CollectingHttpFailureLogger::default();
+    let logger_arc: Arc<dyn HttpFailureLogger> = Arc::new(logger.clone());
+    let engine = Arc::new(TaskEngine::new(TaskEngineOptions {
+        short_term_store: Arc::new(MemoryShortTermStore::new()),
+        broadcast: Arc::new(UnsupportedBroadcast),
+        long_term_store: None,
+        hooks: None,
+    }));
+    let additional_routes = Router::new().route(
+        "/_playground/failure",
+        get(|| async { StatusCode::BAD_GATEWAY }),
+    );
+    let (app, _) = create_app_with_failure_logger_and_routes(
+        engine,
+        AuthMode::None,
+        None,
+        None,
+        CorsConfig::default(),
+        logger_arc,
+        additional_routes,
+    );
+    let server = TestServer::new(app);
+
+    server
+        .get("/_playground/failure")
+        .await
+        .assert_status(StatusCode::BAD_GATEWAY);
+
+    let records = logger.records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].path, "/_playground/failure");
+    assert_eq!(records[0].status, 502);
 }
 
 #[tokio::test]
