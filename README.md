@@ -432,7 +432,7 @@ cleanup:
 | `TASKCAST_JWT_PUBLIC_KEY_FILE` | Path to JWT public key | — |
 | `TASKCAST_REDIS_URL` | Redis connection URL | — |
 | `TASKCAST_POSTGRES_URL` | PostgreSQL connection URL | — |
-| `TASKCAST_LOG_LEVEL` | `debug` \| `info` \| `warn` \| `error` | `info` |
+| `TASKCAST_LOG_LEVEL` | Minimum server log level (`debug`, `info`, `warn`, or `error`); invalid values fail startup. HTTP 5xx failures are emitted as structured JSON on stderr. | `info` |
 | `SENTRY_DSN` | Sentry error tracking DSN | — |
 
 ## API Overview

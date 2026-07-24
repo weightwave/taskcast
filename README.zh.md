@@ -434,7 +434,7 @@ cleanup:
 | `TASKCAST_JWT_PUBLIC_KEY_FILE` | JWT 公钥文件路径 | — |
 | `TASKCAST_REDIS_URL` | Redis 连接 URL | — |
 | `TASKCAST_POSTGRES_URL` | PostgreSQL 连接 URL | — |
-| `TASKCAST_LOG_LEVEL` | `debug` \| `info` \| `warn` \| `error` | `info` |
+| `TASKCAST_LOG_LEVEL` | 服务端最低日志级别（`debug`、`info`、`warn` 或 `error`）；非法值会阻止启动。HTTP 5xx 故障会以结构化 JSON 写入 stderr。 | `info` |
 | `SENTRY_DSN` | Sentry 错误追踪 DSN | — |
 
 ## API 概览

@@ -61,7 +61,7 @@ Taskcast searches for config files in the current directory:
 | `TASKCAST_POSTGRES_URL` | PostgreSQL connection URL | -- |
 | `TASKCAST_STORAGE` | `memory` \| `redis` \| `sqlite` | `memory` |
 | `TASKCAST_SQLITE_PATH` | SQLite database file path | `./taskcast.db` |
-| `TASKCAST_LOG_LEVEL` | `debug` \| `info` \| `warn` \| `error` | `info` |
+| `TASKCAST_LOG_LEVEL` | Minimum server log level (`debug`, `info`, `warn`, or `error`); invalid values fail startup. HTTP 5xx failures are emitted as structured JSON on stderr. | `info` |
 
 ### SQLite Storage
 

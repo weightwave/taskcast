@@ -248,7 +248,7 @@ All configuration options can be overridden via environment variables:
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `TASKCAST_PORT` | Service port | `3721` |
-| `TASKCAST_LOG_LEVEL` | Log level | `info` |
+| `TASKCAST_LOG_LEVEL` | Minimum server log level (`debug`, `info`, `warn`, or `error`); invalid values fail startup. HTTP 5xx failures are emitted as structured JSON on stderr. | `info` |
 | `TASKCAST_AUTH_MODE` | Auth mode: `none`, `jwt`, or `custom` | `none` |
 | `TASKCAST_JWT_SECRET` | JWT HMAC secret (HS256) | — |
 | `TASKCAST_JWT_ALGORITHM` | JWT algorithm | `HS256` |

@@ -248,7 +248,7 @@ cleanup:
 | 变量 | 说明 | 默认值 |
 |------|------|--------|
 | `TASKCAST_PORT` | 服务端口 | `3721` |
-| `TASKCAST_LOG_LEVEL` | 日志级别 | `info` |
+| `TASKCAST_LOG_LEVEL` | 服务端最低日志级别（`debug`、`info`、`warn` 或 `error`）；非法值会阻止启动。HTTP 5xx 故障会以结构化 JSON 写入 stderr。 | `info` |
 | `TASKCAST_AUTH_MODE` | 认证模式：`none`、`jwt`、`custom` | `none` |
 | `TASKCAST_JWT_SECRET` | JWT HMAC 密钥（HS256） | — |
 | `TASKCAST_JWT_ALGORITHM` | JWT 算法 | `HS256` |
