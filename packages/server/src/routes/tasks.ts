@@ -1,6 +1,7 @@
 import type { Hono } from 'hono'
 import { OpenAPIHono, createRoute, z } from '@hono/zod-openapi'
 import type { Context } from 'hono'
+import type { ContentfulStatusCode } from 'hono/utils/http-status'
 import { checkScope } from '../auth.js'
 import { getSubscriberCount } from './sse.js'
 import type { SubscriberCounts } from './sse.js'
@@ -15,7 +16,13 @@ import {
   TaskEventSchema,
   ErrorSchema,
 } from '../schemas.js'
-import { TaskConflictError, InvalidTaskArchiveError, InvalidTransitionError, collapseAccumulateSeries } from '@taskcast/core'
+import {
+  TaskConflictError,
+  InvalidTaskArchiveError,
+  InvalidTransitionError,
+  collapseAccumulateSeries,
+  findDependencyUnavailableError,
+} from '@taskcast/core'
 import type { TaskArchive, TaskEngine, CreateTaskInput, PublishEventInput, SinceCursor, TaskError, BlockedRequest, TaskFilter, TaskStatus, EventQueryOptions } from '@taskcast/core'
 
 // ─── Route Definitions ─────────────────────────────────────────────────────
@@ -184,6 +191,19 @@ const eventHistoryRoute = createRoute({
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type OpenAPIRegister = (route: any, handler: (c: Context) => Promise<Response>) => void
 
+export function dependencyErrorResponse(
+  c: Context,
+  error: unknown,
+  fallbackStatus: ContentfulStatusCode,
+): Response {
+  const dependency = findDependencyUnavailableError(error)
+  if (dependency) {
+    return c.json({ error: dependency.message }, 503)
+  }
+  const message = error instanceof Error ? error.message : String(error)
+  return c.json({ error: message }, fallbackStatus)
+}
+
 export function createTasksRouter(engine: TaskEngine, subscriberCounts: SubscriberCounts): Hono {
   const router = new OpenAPIHono()
   const register = router.openapi.bind(router) as OpenAPIRegister
@@ -218,6 +238,7 @@ export function createTasksRouter(engine: TaskEngine, subscriberCounts: Subscrib
       if (err instanceof TaskConflictError) return c.json({ error: err.message }, 409)
       const msg = err instanceof Error ? err.message : String(err)
       if (msg.includes('Invalid TTL') || msg.includes('Invalid cost')) return c.json({ error: msg }, 400)
+      if (findDependencyUnavailableError(err)) return dependencyErrorResponse(c, err, 500)
       throw err
     }
   })
@@ -264,6 +285,7 @@ export function createTasksRouter(engine: TaskEngine, subscriberCounts: Subscrib
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
       if (msg.toLowerCase().includes('not found')) return c.json({ error: msg }, 404)
+      if (findDependencyUnavailableError(err)) return dependencyErrorResponse(c, err, 500)
       throw err
     }
   })
@@ -285,6 +307,7 @@ export function createTasksRouter(engine: TaskEngine, subscriberCounts: Subscrib
       if (err instanceof TaskConflictError) return c.json({ error: err.message }, 409)
       const msg = err instanceof Error ? err.message : String(err)
       if (msg.toLowerCase().includes('not found')) return c.json({ error: msg }, 404)
+      if (findDependencyUnavailableError(err)) return dependencyErrorResponse(c, err, 500)
       throw err
     }
   })
@@ -330,7 +353,7 @@ export function createTasksRouter(engine: TaskEngine, subscriberCounts: Subscrib
       if (err instanceof InvalidTransitionError) return c.json({ error: err.message }, 409)
       const msg = err instanceof Error ? err.message : String(err)
       if (msg.toLowerCase().includes('not found')) return c.json({ error: msg }, 404)
-      return c.json({ error: msg }, 400)
+      return dependencyErrorResponse(c, err, 400)
     }
   })
 
@@ -358,7 +381,7 @@ export function createTasksRouter(engine: TaskEngine, subscriberCounts: Subscrib
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
         if (msg.toLowerCase().includes('not found')) return c.json({ error: msg }, 404)
-        return c.json({ error: msg }, 400)
+        return dependencyErrorResponse(c, err, 400)
       }
     }
 
@@ -430,8 +453,7 @@ export function createTasksRouter(engine: TaskEngine, subscriberCounts: Subscrib
       return c.json(updated)
     } catch (err) {
       if (err instanceof InvalidTransitionError) return c.json({ error: err.message }, 409)
-      const msg = err instanceof Error ? err.message : String(err)
-      return c.json({ error: msg }, 400)
+      return dependencyErrorResponse(c, err, 400)
     }
   })
 

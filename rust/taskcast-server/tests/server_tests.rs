@@ -7,9 +7,9 @@ use jsonwebtoken::{encode, EncodingKey, Header};
 use serde_json::json;
 use taskcast_core::worker_manager::{WorkerManager, WorkerManagerOptions, WorkerRegistration};
 use taskcast_core::{
-    BroadcastProvider, ConnectionMode, EngineError, Level, MemoryBroadcastProvider,
-    MemoryShortTermStore, ShortTermStore, TaskEngine, TaskEngineOptions, TaskStatus,
-    WorkerMatchRule,
+    BroadcastProvider, ConnectionMode, DependencyErrorKind, DependencyName,
+    DependencyUnavailableError, EngineError, Level, MemoryBroadcastProvider, MemoryShortTermStore,
+    ShortTermStore, TaskEngine, TaskEngineOptions, TaskStatus, WorkerMatchRule,
 };
 use taskcast_server::{create_app, AppError, AuthMode, CorsConfig, JwtConfig, WebhookDelivery};
 
@@ -947,15 +947,50 @@ fn app_error_engine_task_terminal_returns_409() {
     assert_eq!(response.status(), axum_test::http::StatusCode::CONFLICT);
 }
 
-#[test]
-fn app_error_engine_store_error_returns_500() {
+#[tokio::test]
+async fn app_error_engine_dependency_store_error_returns_503_json() {
+    let unavailable = DependencyUnavailableError::new(
+        DependencyName::RedisCommand,
+        DependencyErrorKind::ConnectionReset,
+        std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "redis://admin:secret@redis.example.com:6379 reset",
+        ),
+    );
+    let wrapped = std::io::Error::new(std::io::ErrorKind::Other, unavailable);
+    let error = AppError::Engine(EngineError::Store(Box::new(wrapped)));
+    let response = error.into_response();
+
+    assert_eq!(
+        response.status(),
+        axum_test::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("dependency response body");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).expect("dependency response JSON"),
+        json!({ "error": "redisCommand unavailable (connection_reset)" })
+    );
+}
+
+#[tokio::test]
+async fn app_error_engine_non_dependency_store_error_remains_500_json() {
     let store_err: Box<dyn std::error::Error + Send + Sync> =
         Box::new(std::io::Error::new(std::io::ErrorKind::Other, "db error"));
     let error = AppError::Engine(EngineError::Store(store_err));
     let response = error.into_response();
+
     assert_eq!(
         response.status(),
         axum_test::http::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("ordinary store response body");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).expect("ordinary store response JSON"),
+        json!({ "error": "db error" })
     );
 }
 

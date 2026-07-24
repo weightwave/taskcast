@@ -58,14 +58,29 @@ impl IntoResponse for AppError {
                         error.to_string(),
                     )),
                 ),
-                EngineError::Store(error) => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    error.to_string(),
-                    Some(HttpFailureDetail::new(
-                        HttpFailureKind::Store,
-                        error.to_string(),
-                    )),
-                ),
+                EngineError::Store(error) => {
+                    if let Some(unavailable) =
+                        taskcast_core::find_dependency_unavailable(error.as_ref())
+                    {
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            unavailable.to_string(),
+                            Some(HttpFailureDetail::new(
+                                HttpFailureKind::Store,
+                                unavailable.to_string(),
+                            )),
+                        )
+                    } else {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            error.to_string(),
+                            Some(HttpFailureDetail::new(
+                                HttpFailureKind::Store,
+                                error.to_string(),
+                            )),
+                        )
+                    }
+                }
             },
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone(), None),
             AppError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone(), None),

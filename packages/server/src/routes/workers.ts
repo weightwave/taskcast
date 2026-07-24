@@ -2,7 +2,9 @@ import type { Hono } from 'hono'
 import { OpenAPIHono, createRoute, z } from '@hono/zod-openapi'
 import type { Context } from 'hono'
 import { checkScope } from '../auth.js'
+import { dependencyErrorResponse } from './tasks.js'
 import { DeclineSchema, WorkerSchema, WorkerStatusUpdateSchema, TaskSchema, ErrorSchema } from '../schemas.js'
+import { findDependencyUnavailableError } from '@taskcast/core'
 import type { WorkerManager, TaskEngine } from '@taskcast/core'
 
 export { WorkerWSHandler, WorkerWSRegistry } from './worker-ws.js'
@@ -153,7 +155,10 @@ export function createWorkersRouter(manager: WorkerManager, engine: TaskEngine):
       const task = await manager.waitForTask(workerId, controller.signal)
       clearTimeout(timeout)
       return c.json(task)
-    } catch {
+    } catch (error) {
+      if (findDependencyUnavailableError(error)) {
+        return dependencyErrorResponse(c, error, 500)
+      }
       return c.body(null, 204)
     }
   })

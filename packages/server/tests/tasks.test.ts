@@ -1,6 +1,11 @@
 import { describe, it, expect } from 'vitest'
 import { Hono } from 'hono'
-import { TaskEngine, MemoryBroadcastProvider, MemoryShortTermStore } from '@taskcast/core'
+import {
+  DependencyUnavailableError,
+  TaskEngine,
+  MemoryBroadcastProvider,
+  MemoryShortTermStore,
+} from '@taskcast/core'
 import { createTasksRouter } from '../src/routes/tasks.js'
 import { createSubscriberCounts } from '../src/routes/sse.js'
 import type { AuthContext } from '../src/auth.js'
@@ -18,6 +23,132 @@ function makeApp() {
   app.route('/tasks', createTasksRouter(engine, createSubscriberCounts()))
   return { app, engine }
 }
+
+function dependencyFailure(wrapped = false): Error {
+  const unavailable = new DependencyUnavailableError(
+    'redisCommand',
+    'connection_reset',
+    new Error('redis://admin:secret@redis.example.com:6379 reset'),
+  )
+  return wrapped ? new Error('store failed', { cause: unavailable }) : unavailable
+}
+
+async function requestCreateFailure(error: unknown): Promise<Response> {
+  const { app, engine } = makeApp()
+  engine.createTask = async () => {
+    throw error
+  }
+  return app.request('/tasks', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ type: 'test' }),
+  })
+}
+
+async function requestExportFailure(error: unknown): Promise<Response> {
+  const { app, engine } = makeApp()
+  engine.exportTaskArchive = async () => {
+    throw error
+  }
+  return app.request('/tasks/task-1/archive')
+}
+
+async function requestImportFailure(error: unknown): Promise<Response> {
+  const { app, engine } = makeApp()
+  engine.importTaskArchive = async () => {
+    throw error
+  }
+  return app.request('/tasks/import', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      archive: {
+        schema: 'taskcast.taskArchive',
+        version: 1,
+        exportedAt: 5000,
+        task: {
+          id: 'task-1',
+          status: 'running',
+          createdAt: 1000,
+          updatedAt: 2000,
+        },
+        events: [],
+      },
+    }),
+  })
+}
+
+async function requestTransitionFailure(error: unknown): Promise<Response> {
+  const { app, engine } = makeApp()
+  engine.transitionTask = async () => {
+    throw error
+  }
+  return app.request('/tasks/task-1/status', {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ status: 'running' }),
+  })
+}
+
+async function requestPublishFailure(error: unknown): Promise<Response> {
+  const { app, engine } = makeApp()
+  engine.publishEvent = async () => {
+    throw error
+  }
+  return app.request('/tasks/task-1/events', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ type: 'test', level: 'info', data: null }),
+  })
+}
+
+async function requestResolveFailure(error: unknown): Promise<Response> {
+  const { app, engine } = makeApp()
+  const task = await engine.createTask({})
+  await engine.transitionTask(task.id, 'running')
+  await engine.transitionTask(task.id, 'blocked', {
+    blockedRequest: { type: 'approval', data: {} },
+  })
+  engine.transitionTask = async () => {
+    throw error
+  }
+  return app.request(`/tasks/${task.id}/resolve`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ data: { approved: true } }),
+  })
+}
+
+const taskCatchCases = [
+  { name: 'create', request: requestCreateFailure, fallbackStatus: 500 },
+  { name: 'export archive', request: requestExportFailure, fallbackStatus: 500 },
+  { name: 'import archive', request: requestImportFailure, fallbackStatus: 500 },
+  { name: 'transition', request: requestTransitionFailure, fallbackStatus: 400 },
+  { name: 'publish', request: requestPublishFailure, fallbackStatus: 400 },
+  { name: 'resolve', request: requestResolveFailure, fallbackStatus: 400 },
+] as const
+
+describe('dependency failures in task catch fallbacks', () => {
+  it.each(taskCatchCases)('$name returns 503 for a typed dependency failure', async ({ name, request }) => {
+    const response = await request(dependencyFailure(name === 'export archive'))
+
+    expect(response.status).toBe(503)
+    expect(await response.json()).toEqual({
+      error: 'redisCommand unavailable (connection_reset)',
+    })
+  })
+
+  it.each(taskCatchCases)('$name preserves its ordinary error fallback', async ({ request, fallbackStatus }) => {
+    const response = await request(new Error('ordinary store error'))
+
+    expect(response.status).toBe(fallbackStatus)
+    if (fallbackStatus === 500) {
+      expect(await response.text()).toBe('Internal Server Error')
+    } else {
+      expect(await response.json()).toEqual({ error: 'ordinary store error' })
+    }
+  })
+})
 
 describe('POST /tasks', () => {
   it('creates a task and returns 201', async () => {

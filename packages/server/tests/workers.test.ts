@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import { Hono } from 'hono'
 import {
+  DependencyUnavailableError,
   TaskEngine,
   MemoryBroadcastProvider,
   MemoryShortTermStore,
@@ -314,5 +315,37 @@ describe('GET /workers/pull', () => {
     const { app } = makeApp({ scope: ['event:subscribe'] })
     const res = await app.request('/workers/pull?workerId=w1')
     expect(res.status).toBe(403)
+  })
+
+  it('returns 503 for a typed dependency failure', async () => {
+    const { app, manager } = makeApp()
+    manager.waitForTask = async () => {
+      throw new Error('store failed', {
+        cause: new DependencyUnavailableError(
+          'redisCommand',
+          'connection_reset',
+          new Error('redis://admin:secret@redis.example.com:6379 reset'),
+        ),
+      })
+    }
+
+    const response = await app.request('/workers/pull?workerId=w1&timeout=1')
+
+    expect(response.status).toBe(503)
+    expect(await response.json()).toEqual({
+      error: 'redisCommand unavailable (connection_reset)',
+    })
+  })
+
+  it('preserves the 204 fallback for an ordinary wait error', async () => {
+    const { app, manager } = makeApp()
+    manager.waitForTask = async () => {
+      throw new Error('ordinary store error')
+    }
+
+    const response = await app.request('/workers/pull?workerId=w1&timeout=1')
+
+    expect(response.status).toBe(204)
+    expect(await response.text()).toBe('')
   })
 })

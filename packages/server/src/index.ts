@@ -13,7 +13,7 @@ export type {
   HttpFailureLoggerOptions,
   LogLevel,
 } from './middleware/http-failure-logger.js'
-export { createTasksRouter } from './routes/tasks.js'
+export { createTasksRouter, dependencyErrorResponse } from './routes/tasks.js'
 export { createSSERouter, createGlobalSSERoute, createSubscriberCounts, getSubscriberCount } from './routes/sse.js'
 export type { SubscriberCounts } from './routes/sse.js'
 export { createWorkersRouter, WorkerWSHandler, WorkerWSRegistry } from './routes/workers.js'
