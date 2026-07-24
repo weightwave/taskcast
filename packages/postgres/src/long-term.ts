@@ -1,20 +1,23 @@
 import type postgres from 'postgres'
-import type {
-  Task,
-  TaskEvent,
-  LongTermStore,
-  EventQueryOptions,
-  TaskArchiveImportOptions,
-  TaskArchiveRestoreData,
-  TaskError,
-  TaskAuthConfig,
-  WebhookConfig,
-  CleanupRule,
-  SeriesMode,
-  WorkerAuditEvent,
-  AssignMode,
-  DisconnectPolicy,
+import {
+  DependencyUnavailableError,
+  type DependencyObserver,
+  type Task,
+  type TaskEvent,
+  type LongTermStore,
+  type EventQueryOptions,
+  type TaskArchiveImportOptions,
+  type TaskArchiveRestoreData,
+  type TaskError,
+  type TaskAuthConfig,
+  type WebhookConfig,
+  type CleanupRule,
+  type SeriesMode,
+  type WorkerAuditEvent,
+  type AssignMode,
+  type DisconnectPolicy,
 } from '@taskcast/core'
+import { classifyPostgresConnectivity } from './health.js'
 
 const TASKS = 'taskcast_tasks'
 const EVENTS = 'taskcast_events'
@@ -24,10 +27,32 @@ type PostgresClient = ReturnType<typeof postgres>
 type EventConflictMode = 'ignore' | 'strict'
 
 export class PostgresLongTermStore implements LongTermStore {
-  constructor(private sql: ReturnType<typeof postgres>) {}
+  constructor(
+    private sql: ReturnType<typeof postgres>,
+    private observer?: DependencyObserver,
+  ) {}
+
+  private async observed<T>(operation: () => Promise<T>): Promise<T> {
+    try {
+      const result = await operation()
+      this.observer?.observe({ dependency: 'postgres', state: 'healthy' })
+      return result
+    } catch (error) {
+      const kind = classifyPostgresConnectivity(error)
+      if (!kind) throw error
+      this.observer?.observe({
+        dependency: 'postgres',
+        state: 'unhealthy',
+        errorKind: kind,
+      })
+      throw new DependencyUnavailableError('postgres', kind, error)
+    }
+  }
 
   async saveTask(task: Task): Promise<void> {
-    await this.saveTaskWithClient(this.sql, task)
+    return this.observed(async () => {
+      await this.saveTaskWithClient(this.sql, task)
+    })
   }
 
   private async saveTaskWithClient(sql: PostgresClient, task: Task): Promise<void> {
@@ -70,66 +95,74 @@ export class PostgresLongTermStore implements LongTermStore {
   }
 
   async getTask(taskId: string): Promise<Task | null> {
-    const t = TASKS
-    const rows = await this.sql`
-      SELECT * FROM ${this.sql(t)} WHERE id = ${taskId}
-    `
-    const row = rows[0]
-    if (!row) return null
-    return this._rowToTask(row)
+    return this.observed(async () => {
+      const t = TASKS
+      const rows = await this.sql`
+        SELECT * FROM ${this.sql(t)} WHERE id = ${taskId}
+      `
+      const row = rows[0]
+      if (!row) return null
+      return this._rowToTask(row)
+    })
   }
 
   async saveEvent(event: TaskEvent): Promise<void> {
-    await this.saveEventWithClient(this.sql, event, 'ignore')
+    return this.observed(async () => {
+      await this.saveEventWithClient(this.sql, event, 'ignore')
+    })
   }
 
   async replaceLastSeriesEvent(taskId: string, seriesId: string, event: TaskEvent): Promise<void> {
-    await this.sql.begin(async (sql) => {
-      const tx = sql as unknown as PostgresClient
-      const existingEvents = await this.getSeriesEventsWithClient(tx, taskId, seriesId, 'latest')
-      const first = existingEvents[0]
+    return this.observed(async () => {
+      await this.sql.begin(async (sql) => {
+        const tx = sql as unknown as PostgresClient
+        const existingEvents = await this.getSeriesEventsWithClient(tx, taskId, seriesId, 'latest')
+        const first = existingEvents[0]
 
-      if (!first) {
-        await this.saveEventWithClient(tx, event, 'ignore')
-        return
-      }
+        if (!first) {
+          await this.saveEventWithClient(tx, event, 'ignore')
+          return
+        }
 
-      await this.updateStoredSeriesEventWithClient(tx, first, event)
-      await this.deleteDuplicateSeriesEventsWithClient(tx, taskId, seriesId, 'latest', first.id)
+        await this.updateStoredSeriesEventWithClient(tx, first, event)
+        await this.deleteDuplicateSeriesEventsWithClient(tx, taskId, seriesId, 'latest', first.id)
+      })
     })
   }
 
   async accumulateSeries(taskId: string, seriesId: string, event: TaskEvent, field: string): Promise<TaskEvent> {
-    return this.sql.begin(async (sql) => {
-      const tx = sql as unknown as PostgresClient
-      const existingEvents = await this.getSeriesEventsWithClient(tx, taskId, seriesId, 'accumulate')
-      const first = existingEvents[0]
-      const previous = existingEvents[existingEvents.length - 1]
+    return this.observed(async () => {
+      return this.sql.begin(async (sql) => {
+        const tx = sql as unknown as PostgresClient
+        const existingEvents = await this.getSeriesEventsWithClient(tx, taskId, seriesId, 'accumulate')
+        const first = existingEvents[0]
+        const previous = existingEvents[existingEvents.length - 1]
 
-      let accumulated = event
-      if (previous) {
-        const prevData = typeof previous.data === 'object' && previous.data !== null
-          ? previous.data as Record<string, unknown>
-          : {}
-        const newData = typeof event.data === 'object' && event.data !== null
-          ? event.data as Record<string, unknown>
-          : {}
-        if (typeof prevData[field] === 'string' && typeof newData[field] === 'string') {
-          accumulated = {
-            ...event,
-            data: { ...newData, [field]: prevData[field] + newData[field] },
+        let accumulated = event
+        if (previous) {
+          const prevData = typeof previous.data === 'object' && previous.data !== null
+            ? previous.data as Record<string, unknown>
+            : {}
+          const newData = typeof event.data === 'object' && event.data !== null
+            ? event.data as Record<string, unknown>
+            : {}
+          if (typeof prevData[field] === 'string' && typeof newData[field] === 'string') {
+            accumulated = {
+              ...event,
+              data: { ...newData, [field]: prevData[field] + newData[field] },
+            }
           }
         }
-      }
 
-      if (!first) {
-        await this.saveEventWithClient(tx, accumulated, 'ignore')
-      } else {
-        await this.updateStoredSeriesEventWithClient(tx, first, accumulated)
-        await this.deleteDuplicateSeriesEventsWithClient(tx, taskId, seriesId, 'accumulate', first.id)
-      }
+        if (!first) {
+          await this.saveEventWithClient(tx, accumulated, 'ignore')
+        } else {
+          await this.updateStoredSeriesEventWithClient(tx, first, accumulated)
+          await this.deleteDuplicateSeriesEventsWithClient(tx, taskId, seriesId, 'accumulate', first.id)
+        }
 
-      return accumulated
+        return accumulated
+      })
     })
   }
 
@@ -207,7 +240,9 @@ export class PostgresLongTermStore implements LongTermStore {
     data: TaskArchiveRestoreData,
     options?: TaskArchiveImportOptions,
   ): Promise<void> {
-    await this.validateTaskArchiveRestoreWithClient(this.sql, data, options)
+    return this.observed(async () => {
+      await this.validateTaskArchiveRestoreWithClient(this.sql, data, options)
+    })
   }
 
   private async validateTaskArchiveRestoreWithClient(
@@ -240,111 +275,119 @@ export class PostgresLongTermStore implements LongTermStore {
     data: TaskArchiveRestoreData,
     options?: TaskArchiveImportOptions,
   ): Promise<{ overwritten: boolean }> {
-    return this.sql.begin(async (sql) => {
-      const tx = sql as unknown as PostgresClient
-      const taskId = data.task.id
-      const overwritten = await this.validateTaskArchiveRestoreWithClient(tx, data, options)
+    return this.observed(async () => {
+      return this.sql.begin(async (sql) => {
+        const tx = sql as unknown as PostgresClient
+        const taskId = data.task.id
+        const overwritten = await this.validateTaskArchiveRestoreWithClient(tx, data, options)
 
-      await tx`DELETE FROM ${tx(EVENTS)} WHERE task_id = ${taskId}`
-      await tx`DELETE FROM ${tx(TASKS)} WHERE id = ${taskId}`
-      await this.saveTaskWithClient(tx, data.task)
-      for (const event of data.events) {
-        await this.saveEventWithClient(tx, event, 'strict')
-      }
+        await tx`DELETE FROM ${tx(EVENTS)} WHERE task_id = ${taskId}`
+        await tx`DELETE FROM ${tx(TASKS)} WHERE id = ${taskId}`
+        await this.saveTaskWithClient(tx, data.task)
+        for (const event of data.events) {
+          await this.saveEventWithClient(tx, event, 'strict')
+        }
 
-      return { overwritten }
+        return { overwritten }
+      })
     })
   }
 
   async getEvents(taskId: string, opts?: EventQueryOptions): Promise<TaskEvent[]> {
-    const t = EVENTS
-    const since = opts?.since
+    return this.observed(async () => {
+      const t = EVENTS
+      const since = opts?.since
 
-    let rows: postgres.RowList<postgres.Row[]>
-    if (since?.index !== undefined) {
-      rows = await this.sql`
-        SELECT * FROM ${this.sql(t)}
-        WHERE task_id = ${taskId} AND idx > ${since.index}
-        ORDER BY idx ASC
-        ${opts?.limit ? this.sql`LIMIT ${opts.limit}` : this.sql``}
-      `
-    } else if (since?.timestamp !== undefined) {
-      rows = await this.sql`
-        SELECT * FROM ${this.sql(t)}
-        WHERE task_id = ${taskId} AND timestamp > ${since.timestamp}
-        ORDER BY idx ASC
-        ${opts?.limit ? this.sql`LIMIT ${opts.limit}` : this.sql``}
-      `
-    } else if (since?.id) {
-      const anchor = await this.sql`
-        SELECT idx FROM ${this.sql(t)} WHERE id = ${since.id}
-      `
-      const anchorIdx = (anchor[0]?.['idx'] as number | undefined) ?? -1
-      rows = await this.sql`
-        SELECT * FROM ${this.sql(t)}
-        WHERE task_id = ${taskId} AND idx > ${anchorIdx}
-        ORDER BY idx ASC
-        ${opts?.limit ? this.sql`LIMIT ${opts.limit}` : this.sql``}
-      `
-    } else {
-      rows = await this.sql`
-        SELECT * FROM ${this.sql(t)}
-        WHERE task_id = ${taskId}
-        ORDER BY idx ASC
-        ${opts?.limit ? this.sql`LIMIT ${opts.limit}` : this.sql``}
-      `
-    }
+      let rows: postgres.RowList<postgres.Row[]>
+      if (since?.index !== undefined) {
+        rows = await this.sql`
+          SELECT * FROM ${this.sql(t)}
+          WHERE task_id = ${taskId} AND idx > ${since.index}
+          ORDER BY idx ASC
+          ${opts?.limit ? this.sql`LIMIT ${opts.limit}` : this.sql``}
+        `
+      } else if (since?.timestamp !== undefined) {
+        rows = await this.sql`
+          SELECT * FROM ${this.sql(t)}
+          WHERE task_id = ${taskId} AND timestamp > ${since.timestamp}
+          ORDER BY idx ASC
+          ${opts?.limit ? this.sql`LIMIT ${opts.limit}` : this.sql``}
+        `
+      } else if (since?.id) {
+        const anchor = await this.sql`
+          SELECT idx FROM ${this.sql(t)} WHERE id = ${since.id}
+        `
+        const anchorIdx = (anchor[0]?.['idx'] as number | undefined) ?? -1
+        rows = await this.sql`
+          SELECT * FROM ${this.sql(t)}
+          WHERE task_id = ${taskId} AND idx > ${anchorIdx}
+          ORDER BY idx ASC
+          ${opts?.limit ? this.sql`LIMIT ${opts.limit}` : this.sql``}
+        `
+      } else {
+        rows = await this.sql`
+          SELECT * FROM ${this.sql(t)}
+          WHERE task_id = ${taskId}
+          ORDER BY idx ASC
+          ${opts?.limit ? this.sql`LIMIT ${opts.limit}` : this.sql``}
+        `
+      }
 
-    return rows.map((r) => this._rowToEvent(r))
+      return rows.map((r) => this._rowToEvent(r))
+    })
   }
 
   async saveWorkerEvent(event: WorkerAuditEvent): Promise<void> {
-    const t = WORKER_EVENTS
-    await this.sql`
-      INSERT INTO ${this.sql(t)} (
-        id, worker_id, timestamp, action, data
-      ) VALUES (
-        ${event.id}, ${event.workerId}, ${event.timestamp},
-        ${event.action},
-        ${event.data ? this.sql.json(event.data as never) : null}
-      )
-      ON CONFLICT (id) DO NOTHING
-    `
+    return this.observed(async () => {
+      const t = WORKER_EVENTS
+      await this.sql`
+        INSERT INTO ${this.sql(t)} (
+          id, worker_id, timestamp, action, data
+        ) VALUES (
+          ${event.id}, ${event.workerId}, ${event.timestamp},
+          ${event.action},
+          ${event.data ? this.sql.json(event.data as never) : null}
+        )
+        ON CONFLICT (id) DO NOTHING
+      `
+    })
   }
 
   async getWorkerEvents(workerId: string, opts?: EventQueryOptions): Promise<WorkerAuditEvent[]> {
-    const t = WORKER_EVENTS
-    const since = opts?.since
+    return this.observed(async () => {
+      const t = WORKER_EVENTS
+      const since = opts?.since
 
-    let rows: postgres.RowList<postgres.Row[]>
-    if (since?.timestamp !== undefined) {
-      rows = await this.sql`
-        SELECT * FROM ${this.sql(t)}
-        WHERE worker_id = ${workerId} AND timestamp > ${since.timestamp}
-        ORDER BY timestamp ASC
-        ${opts?.limit ? this.sql`LIMIT ${opts.limit}` : this.sql``}
-      `
-    } else if (since?.id) {
-      const anchor = await this.sql`
-        SELECT timestamp FROM ${this.sql(t)} WHERE id = ${since.id}
-      `
-      const anchorTs = (anchor[0]?.['timestamp'] as number | undefined) ?? 0
-      rows = await this.sql`
-        SELECT * FROM ${this.sql(t)}
-        WHERE worker_id = ${workerId} AND timestamp > ${anchorTs}
-        ORDER BY timestamp ASC
-        ${opts?.limit ? this.sql`LIMIT ${opts.limit}` : this.sql``}
-      `
-    } else {
-      rows = await this.sql`
-        SELECT * FROM ${this.sql(t)}
-        WHERE worker_id = ${workerId}
-        ORDER BY timestamp ASC
-        ${opts?.limit ? this.sql`LIMIT ${opts.limit}` : this.sql``}
-      `
-    }
+      let rows: postgres.RowList<postgres.Row[]>
+      if (since?.timestamp !== undefined) {
+        rows = await this.sql`
+          SELECT * FROM ${this.sql(t)}
+          WHERE worker_id = ${workerId} AND timestamp > ${since.timestamp}
+          ORDER BY timestamp ASC
+          ${opts?.limit ? this.sql`LIMIT ${opts.limit}` : this.sql``}
+        `
+      } else if (since?.id) {
+        const anchor = await this.sql`
+          SELECT timestamp FROM ${this.sql(t)} WHERE id = ${since.id}
+        `
+        const anchorTs = (anchor[0]?.['timestamp'] as number | undefined) ?? 0
+        rows = await this.sql`
+          SELECT * FROM ${this.sql(t)}
+          WHERE worker_id = ${workerId} AND timestamp > ${anchorTs}
+          ORDER BY timestamp ASC
+          ${opts?.limit ? this.sql`LIMIT ${opts.limit}` : this.sql``}
+        `
+      } else {
+        rows = await this.sql`
+          SELECT * FROM ${this.sql(t)}
+          WHERE worker_id = ${workerId}
+          ORDER BY timestamp ASC
+          ${opts?.limit ? this.sql`LIMIT ${opts.limit}` : this.sql``}
+        `
+      }
 
-    return rows.map((r) => this._rowToWorkerEvent(r))
+      return rows.map((r) => this._rowToWorkerEvent(r))
+    })
   }
 
   private _rowToTask(row: postgres.Row): Task {

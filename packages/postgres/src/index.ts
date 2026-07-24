@@ -1,4 +1,5 @@
 export { PostgresLongTermStore } from './long-term.js'
+export { classifyPostgresConnectivity, postgresCheck } from './health.js'
 export { runMigrations, loadMigrationFiles, buildMigrationFiles } from './migration-runner.js'
 export type { EmbeddedMigration, MigrationFile, MigrationResult } from './migration-runner.js'
 
