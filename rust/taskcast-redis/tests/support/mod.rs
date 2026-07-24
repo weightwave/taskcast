@@ -20,6 +20,16 @@ struct ResponseDropRule {
     max_connection_id: usize,
 }
 
+struct ForwardConnectionOptions {
+    upstream: SocketAddr,
+    generation: Arc<Notify>,
+    mode: Arc<AtomicU8>,
+    blackholed_downstream_activity: Arc<AtomicUsize>,
+    response_drop_matcher: Arc<AsyncMutex<Option<ResponseDropRule>>>,
+    matched: Arc<AtomicUsize>,
+    connection_id: usize,
+}
+
 pub struct TcpFaultProxy {
     address: SocketAddr,
     upstream: SocketAddr,
@@ -70,13 +80,15 @@ impl TcpFaultProxy {
                         let matched_connection = Arc::clone(&matched_task);
                         let handle = tokio::spawn(forward_connection(
                             downstream,
-                            upstream,
-                            generation_connection,
-                            mode_connection,
-                            blackholed_activity_connection,
-                            matcher_connection,
-                            matched_connection,
-                            connection_id,
+                            ForwardConnectionOptions {
+                                upstream,
+                                generation: generation_connection,
+                                mode: mode_connection,
+                                blackholed_downstream_activity: blackholed_activity_connection,
+                                response_drop_matcher: matcher_connection,
+                                matched: matched_connection,
+                                connection_id,
+                            },
                         ));
                         connections_task.lock().unwrap().push(handle);
                     }
@@ -200,16 +212,16 @@ impl Drop for TcpFaultProxy {
     }
 }
 
-async fn forward_connection(
-    mut downstream: TcpStream,
-    upstream: SocketAddr,
-    generation: Arc<Notify>,
-    mode: Arc<AtomicU8>,
-    blackholed_downstream_activity: Arc<AtomicUsize>,
-    response_drop_matcher: Arc<AsyncMutex<Option<ResponseDropRule>>>,
-    matched: Arc<AtomicUsize>,
-    connection_id: usize,
-) {
+async fn forward_connection(mut downstream: TcpStream, options: ForwardConnectionOptions) {
+    let ForwardConnectionOptions {
+        upstream,
+        generation,
+        mode,
+        blackholed_downstream_activity,
+        response_drop_matcher,
+        matched,
+        connection_id,
+    } = options;
     let Ok(mut upstream) = TcpStream::connect(upstream).await else {
         return;
     };

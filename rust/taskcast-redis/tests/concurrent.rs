@@ -365,10 +365,11 @@ async fn cross_instance_broadcast_delivers_to_subscriber_on_other_instance() {
     })
     .await;
 
-    let events = received.lock().unwrap();
-    assert_eq!(events[0].id, before.id);
-    assert_eq!(events[1].id, after.id);
-    drop(events);
+    {
+        let events = received.lock().unwrap();
+        assert_eq!(events[0].id, before.id);
+        assert_eq!(events[1].id, after.id);
+    }
     let mut command = first.command_manager.clone();
     let patterns = redis::cmd("PUBSUB")
         .arg("NUMPAT")

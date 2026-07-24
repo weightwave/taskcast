@@ -215,11 +215,7 @@ mod tests {
     fn strip_prefix_from_channel() {
         let channel_prefix = "taskcast:task:";
         let channel = "taskcast:task:task_01";
-        let task_id = if channel.starts_with(channel_prefix) {
-            &channel[channel_prefix.len()..]
-        } else {
-            channel
-        };
+        let task_id = channel.strip_prefix(channel_prefix).unwrap_or(channel);
         assert_eq!(task_id, "task_01");
     }
 
@@ -227,11 +223,7 @@ mod tests {
     fn strip_prefix_passthrough_when_no_match() {
         let channel_prefix = "taskcast:task:";
         let channel = "other:channel";
-        let task_id = if channel.starts_with(channel_prefix) {
-            &channel[channel_prefix.len()..]
-        } else {
-            channel
-        };
+        let task_id = channel.strip_prefix(channel_prefix).unwrap_or(channel);
         assert_eq!(task_id, "other:channel");
     }
 }
