@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { writeFileSync, unlinkSync, mkdirSync, rmSync } from 'fs'
-import { join } from 'path'
+import { writeFileSync, unlinkSync, mkdirSync, rmSync, existsSync } from 'fs'
+import { join, resolve } from 'path'
 import { tmpdir } from 'os'
 import { interpolateEnvVars, parseConfig, loadConfigFile, resolveAdminToken } from '../../src/config.js'
 import type { TaskcastConfig } from '../../src/config.js'
@@ -175,10 +175,13 @@ describe('loadConfigFile', () => {
   })
 
   it('returns source "explicit" with path when explicit path does not exist', async () => {
-    const result = await loadConfigFile('/tmp/taskcast-nonexistent-xyz-12345.yaml')
+    const nonexistentPath = join(tmpdir(), `taskcast-nonexistent-${Date.now()}.yaml`)
+    expect(existsSync(nonexistentPath)).toBe(false)
+
+    const result = await loadConfigFile(nonexistentPath)
     expect(result.config).toEqual({})
     expect(result.source).toBe('explicit')
-    expect(result.path).toBe('/tmp/taskcast-nonexistent-xyz-12345.yaml')
+    expect(result.path).toBe(resolve(nonexistentPath))
   })
 
   it('returns source "none" with no path when no config files exist anywhere', async () => {
