@@ -14,7 +14,7 @@ use taskcast_core::{
 pub enum RedisCommandConnection {
     Raw(MultiplexedConnection),
     Managed {
-        manager: ConnectionManager,
+        manager: Box<ConnectionManager>,
         observer: Option<Arc<dyn DependencyObserver>>,
     },
 }
@@ -25,7 +25,10 @@ impl RedisCommandConnection {
         manager: ConnectionManager,
         observer: Option<Arc<dyn DependencyObserver>>,
     ) -> Self {
-        Self::Managed { manager, observer }
+        Self::Managed {
+            manager: Box::new(manager),
+            observer,
+        }
     }
 
     pub(crate) fn observe_result<T>(&self, result: RedisResult<T>) -> Result<T, BoxError> {
@@ -160,10 +163,7 @@ pub(crate) fn classify_redis_error(error: &RedisError) -> Option<DependencyError
         .source()
         .and_then(|source| source.downcast_ref::<io::Error>());
     if let Some(io_error) = io_error {
-        if matches!(
-            io_error.raw_os_error(),
-            Some(11_001 | 11_002 | 11_003 | 11_004)
-        ) {
+        if matches!(io_error.raw_os_error(), Some(11_001..=11_004)) {
             return Some(DependencyErrorKind::Dns);
         }
         return Some(match io_error.kind() {
@@ -202,6 +202,14 @@ pub(crate) fn classify_redis_error(error: &RedisError) -> Option<DependencyError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keeps_managed_connection_indirect() {
+        assert!(
+            std::mem::size_of::<RedisCommandConnection>()
+                < std::mem::size_of::<ConnectionManager>()
+        );
+    }
 
     #[test]
     fn classifies_connectivity_and_authentication_errors() {
