@@ -5,7 +5,9 @@ import {
   type DependencyObserver,
 } from '@taskcast/core'
 import { equalJitterDelay } from './backoff.js'
+import { RedisBroadcastProvider } from './broadcast.js'
 import type { RedisAdapterOptions } from './index.js'
+import { RedisShortTermStore } from './short-term.js'
 
 export interface ManagedRedisOptions extends RedisAdapterOptions {
   observer?: DependencyObserver
@@ -16,6 +18,16 @@ export interface ManagedRedisOptions extends RedisAdapterOptions {
 export interface ManagedRedisCommand {
   client: Redis
   check(): Promise<void>
+  close(): Promise<void>
+}
+
+export interface ManagedRedisAdapters {
+  broadcast: RedisBroadcastProvider
+  shortTermStore: RedisShortTermStore
+  commandClient: Redis
+  subscriberClient: Redis
+  commandCheck(): Promise<void>
+  pubSubCheck(): Promise<void>
   close(): Promise<void>
 }
 
@@ -171,5 +183,125 @@ export async function createManagedRedisCommandClient(
       }
     },
     close,
+  }
+}
+
+export async function createManagedRedisAdapters(
+  url: string,
+  options: ManagedRedisOptions = {},
+): Promise<ManagedRedisAdapters> {
+  const deadlineAt = Date.now() + (options.startupTimeoutMs ?? 15_000)
+  const remainingStartupMs = () => Math.max(1, deadlineAt - Date.now())
+  let command: ManagedRedisCommand | undefined
+  let subscriberClient: Redis | undefined
+  let closed = false
+
+  try {
+    command = await createManagedRedisCommandClient(url, {
+      ...options,
+      startupTimeoutMs: remainingStartupMs(),
+    })
+
+    let reconnectAttempt = 0
+    subscriberClient = new Redis(url, {
+      lazyConnect: true,
+      autoResubscribe: true,
+      enableOfflineQueue: false,
+      maxRetriesPerRequest: 0,
+      retryStrategy: (times) =>
+        equalJitterDelay(500, 10_000, times - 1, options.random),
+    })
+    const broadcast = new RedisBroadcastProvider(
+      command.client,
+      subscriberClient,
+      {
+        ...(options.prefix === undefined ? {} : { prefix: options.prefix }),
+        subscriptionMode: 'pattern',
+      },
+    )
+    const shortTermStore = new RedisShortTermStore(command.client, options)
+
+    const onReady = () => {
+      reconnectAttempt = 0
+      options.observer?.observe({
+        dependency: 'redisPubSub',
+        state: 'healthy',
+      })
+    }
+    const onReconnecting = (delay: number) => {
+      reconnectAttempt++
+      options.observer?.observe({
+        dependency: 'redisPubSub',
+        state: 'reconnecting',
+        attempt: reconnectAttempt,
+        nextRetryMs: delay,
+      })
+    }
+    const onUnavailable = (error?: unknown) => {
+      if (closed) return
+      options.observer?.observe({
+        dependency: 'redisPubSub',
+        state: 'reconnecting',
+        errorKind:
+          error === undefined
+            ? 'connection_closed'
+            : (classifyRedisError(error) ?? 'unavailable'),
+      })
+    }
+    const onEnd = () => onUnavailable()
+    const onError = (error: Error) => onUnavailable(error)
+    subscriberClient.on('ready', onReady)
+    subscriberClient.on('reconnecting', onReconnecting)
+    subscriberClient.on('end', onEnd)
+    subscriberClient.on('error', onError)
+
+    const removeSubscriberListeners = () => {
+      subscriberClient?.off('ready', onReady)
+      subscriberClient?.off('reconnecting', onReconnecting)
+      subscriberClient?.off('end', onEnd)
+      subscriberClient?.off('error', onError)
+    }
+    const close = async () => {
+      if (closed) return
+      closed = true
+      removeSubscriberListeners()
+      subscriberClient?.disconnect(false)
+      await command?.close()
+    }
+
+    try {
+      await withDeadline(async () => {
+        await subscriberClient!.connect()
+        await broadcast.startPatternSubscription()
+      }, remainingStartupMs())
+    } catch (error) {
+      throw new DependencyUnavailableError(
+        'redisPubSub',
+        classifyRedisError(error) ?? 'unavailable',
+        error,
+      )
+    }
+
+    return {
+      broadcast,
+      shortTermStore,
+      commandClient: command.client,
+      subscriberClient,
+      commandCheck: command.check,
+      async pubSubCheck() {
+        if (!broadcast.isPatternSubscribed()) {
+          throw new DependencyUnavailableError(
+            'redisPubSub',
+            'connection_closed',
+          )
+        }
+      },
+      close,
+    }
+  } catch (error) {
+    closed = true
+    subscriberClient?.disconnect(false)
+    await command?.close()
+    throw error
   }
 }

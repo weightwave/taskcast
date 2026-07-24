@@ -8,8 +8,13 @@ import {
 export class TcpFaultProxy {
   private server: Server | undefined
   private readonly sockets = new Set<Socket>()
+  private readonly connections: Array<{
+    downstream: Socket
+    upstream: Socket
+  }> = []
   private listenPort = 0
   private accepted = 0
+  private refuseNewConnections = false
 
   constructor(
     private readonly upstreamHost: string,
@@ -29,7 +34,12 @@ export class TcpFaultProxy {
     if (this.server?.listening) return
     const server = createServer((downstream) => {
       this.accepted++
+      if (this.refuseNewConnections) {
+        downstream.destroy()
+        return
+      }
       const upstream = createConnection(this.upstreamPort, this.upstreamHost)
+      this.connections.push({ downstream, upstream })
       this.track(downstream)
       this.track(upstream)
       downstream.pipe(upstream)
@@ -59,6 +69,23 @@ export class TcpFaultProxy {
   async refuse(): Promise<void> {
     this.closeSockets()
     await this.closeServer()
+  }
+
+  pauseNewConnections(): void {
+    this.refuseNewConnections = true
+  }
+
+  resumeNewConnections(): void {
+    this.refuseNewConnections = false
+  }
+
+  closeLatestConnection(): void {
+    const connection = this.connections
+      .slice()
+      .reverse()
+      .find(({ downstream, upstream }) => !downstream.destroyed || !upstream.destroyed)
+    connection?.downstream.destroy()
+    connection?.upstream.destroy()
   }
 
   closeSockets(): void {

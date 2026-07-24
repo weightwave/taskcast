@@ -6,13 +6,21 @@
 //! Run with: `cargo test -p taskcast-redis --test concurrent`
 //! Skip if Docker unavailable: tests will fail with connection errors.
 
-use std::sync::Arc;
+mod support;
 
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use support::TcpFaultProxy;
 use taskcast_core::{
     BroadcastProvider, CreateTaskInput, Level, MemoryBroadcastProvider, PublishEventInput,
     TaskEngine, TaskEngineOptions, TaskEvent, TaskStatus,
 };
-use taskcast_redis::{RedisBroadcastProvider, RedisShortTermStore};
+use taskcast_redis::{create_managed_redis_adapters, RedisBroadcastProvider, RedisShortTermStore};
+use testcontainers::core::{IntoContainerPort, WaitFor};
+use testcontainers::runners::AsyncRunner;
+use testcontainers::GenericImage;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -65,15 +73,30 @@ async fn flush_redis(redis_url: &str) {
         .unwrap();
 }
 
+async fn eventually(timeout: Duration, mut condition: impl FnMut() -> bool) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if condition() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "condition did not become true before deadline"
+        );
+        tokio::task::yield_now().await;
+    }
+}
+
 #[tokio::test]
 async fn two_engine_instances_produce_no_duplicate_event_indices() {
     // This is the Rust equivalent of the TS regression test that found 37/60 index
     // collisions before nextIndex was moved to RedisShortTermStore with INCR.
-    let container = testcontainers::runners::AsyncRunner::start(
-        testcontainers_modules::redis::Redis::default(),
-    )
-    .await
-    .unwrap();
+    let container = GenericImage::new("redis", "7-alpine")
+        .with_exposed_port(6379.tcp())
+        .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
+        .start()
+        .await
+        .unwrap();
     let port = container.get_host_port_ipv4(6379).await.unwrap();
     let redis_url = format!("redis://127.0.0.1:{port}");
 
@@ -160,11 +183,12 @@ async fn two_engine_instances_produce_no_duplicate_event_indices() {
 
 #[tokio::test]
 async fn concurrent_publish_to_redis_maintains_monotonic_index() {
-    let container = testcontainers::runners::AsyncRunner::start(
-        testcontainers_modules::redis::Redis::default(),
-    )
-    .await
-    .unwrap();
+    let container = GenericImage::new("redis", "7-alpine")
+        .with_exposed_port(6379.tcp())
+        .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
+        .start()
+        .await
+        .unwrap();
     let port = container.get_host_port_ipv4(6379).await.unwrap();
     let redis_url = format!("redis://127.0.0.1:{port}");
 
@@ -226,11 +250,12 @@ async fn concurrent_publish_to_redis_maintains_monotonic_index() {
 
 #[tokio::test]
 async fn redis_store_100_concurrent_tasks_all_get_unique_ids() {
-    let container = testcontainers::runners::AsyncRunner::start(
-        testcontainers_modules::redis::Redis::default(),
-    )
-    .await
-    .unwrap();
+    let container = GenericImage::new("redis", "7-alpine")
+        .with_exposed_port(6379.tcp())
+        .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
+        .start()
+        .await
+        .unwrap();
     let port = container.get_host_port_ipv4(6379).await.unwrap();
     let redis_url = format!("redis://127.0.0.1:{port}");
 
@@ -266,27 +291,42 @@ async fn redis_store_100_concurrent_tasks_all_get_unique_ids() {
 
 #[tokio::test]
 async fn cross_instance_broadcast_delivers_to_subscriber_on_other_instance() {
-    // Instance A publishes; instance B subscribes. Before the fix, B's handler
-    // was never called because the background task had no Redis subscriptions.
-    let container = testcontainers::runners::AsyncRunner::start(
-        testcontainers_modules::redis::Redis::default(),
+    let container = GenericImage::new("redis", "7-alpine")
+        .with_exposed_port(6379.tcp())
+        .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
+        .start()
+        .await
+        .unwrap();
+    let port = container.get_host_port_ipv4(6379).await.unwrap();
+    let upstream = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+    let proxy = TcpFaultProxy::start(upstream).await.unwrap();
+    assert_eq!(proxy.upstream(), upstream);
+    let first = create_managed_redis_adapters(
+        redis::Client::open(proxy.redis_url()).unwrap(),
+        Some("managed-cross-instance"),
+        None,
     )
     .await
     .unwrap();
-    let port = container.get_host_port_ipv4(6379).await.unwrap();
-    let redis_url = format!("redis://127.0.0.1:{port}");
+    let second = create_managed_redis_adapters(
+        redis::Client::open(proxy.redis_url()).unwrap(),
+        Some("managed-cross-instance"),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        proxy.accepted_connections(),
+        4,
+        "each instance owns one command and one PubSub connection"
+    );
 
-    let provider_a = make_redis_broadcast(&redis_url).await;
-    let provider_b = make_redis_broadcast(&redis_url).await;
-
-    // Allow PSUBSCRIBE (spawned in tokio::spawn inside new()) to complete
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-    // Register handler on instance B
     let received: Arc<std::sync::Mutex<Vec<TaskEvent>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
     let received_clone = Arc::clone(&received);
-    let _unsub = provider_b
+    let _unsub = second
+        .adapters
+        .broadcast
         .subscribe(
             "task-cross",
             Box::new(move |event| {
@@ -295,32 +335,76 @@ async fn cross_instance_broadcast_delivers_to_subscriber_on_other_instance() {
         )
         .await;
 
-    // Publish from instance A
-    let event = make_test_event("task-cross", "cross.instance");
-    provider_a.publish("task-cross", event.clone()).await.unwrap();
+    let before = make_test_event("task-cross", "cross.before");
+    first
+        .adapters
+        .broadcast
+        .publish("task-cross", before.clone())
+        .await
+        .unwrap();
+    eventually(Duration::from_secs(5), || {
+        received.lock().unwrap().len() == 1
+    })
+    .await;
 
-    // Allow the pub/sub message to propagate through Redis and be dispatched
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    proxy.pause_new_connections();
+    proxy.close_latest_connection().await;
+    eventually(Duration::from_secs(2), || !second.pubsub.is_subscribed()).await;
+    proxy.open().await;
+    eventually(Duration::from_secs(5), || second.pubsub.is_subscribed()).await;
+
+    let after = make_test_event("task-cross", "cross.after");
+    first
+        .adapters
+        .broadcast
+        .publish("task-cross", after.clone())
+        .await
+        .unwrap();
+    eventually(Duration::from_secs(5), || {
+        received.lock().unwrap().len() == 2
+    })
+    .await;
 
     let events = received.lock().unwrap();
+    assert_eq!(events[0].id, before.id);
+    assert_eq!(events[1].id, after.id);
+    drop(events);
+    let mut command = first.command_manager.clone();
+    let patterns = redis::cmd("PUBSUB")
+        .arg("NUMPAT")
+        .query_async::<i64>(&mut command)
+        .await
+        .unwrap();
+    assert_eq!(patterns, 1, "both instances use the same wildcard pattern");
+    let pubsub_clients = redis::cmd("CLIENT")
+        .arg("LIST")
+        .arg("TYPE")
+        .arg("PUBSUB")
+        .query_async::<String>(&mut command)
+        .await
+        .unwrap()
+        .lines()
+        .count();
     assert_eq!(
-        events.len(),
-        1,
-        "instance B must receive the event published by instance A"
+        pubsub_clients, 2,
+        "each managed instance owns one PubSub connection"
     );
-    assert_eq!(events[0].id, event.id);
-    assert_eq!(events[0].r#type, "cross.instance");
+
+    second.pubsub.shutdown().await;
+    first.pubsub.shutdown().await;
+    proxy.stop().await;
 }
 
 #[tokio::test]
 async fn cross_instance_broadcast_wildcard_covers_multiple_task_channels() {
     // PSUBSCRIBE uses a wildcard so all task IDs are covered by a single
     // Redis subscription — no per-task SUBSCRIBE call needed.
-    let container = testcontainers::runners::AsyncRunner::start(
-        testcontainers_modules::redis::Redis::default(),
-    )
-    .await
-    .unwrap();
+    let container = GenericImage::new("redis", "7-alpine")
+        .with_exposed_port(6379.tcp())
+        .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
+        .start()
+        .await
+        .unwrap();
     let port = container.get_host_port_ipv4(6379).await.unwrap();
     let redis_url = format!("redis://127.0.0.1:{port}");
 

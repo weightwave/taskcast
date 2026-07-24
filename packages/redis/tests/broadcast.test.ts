@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest'
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest'
 import { Redis } from 'ioredis'
 import { GenericContainer, type StartedTestContainer } from 'testcontainers'
 import { RedisBroadcastProvider } from '../src/broadcast.js'
@@ -10,8 +10,39 @@ const clients: Redis[] = []
 
 function createClient(): Redis {
   const c = new Redis(redisUrl)
+  c.on('error', () => {
+    // Tests intentionally exercise rapid subscriber teardown.
+  })
   clients.push(c)
   return c
+}
+
+async function eventually(
+  operation: () => void | Promise<void>,
+  timeoutMs = 10_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  let lastError: unknown
+  while (Date.now() < deadline) {
+    try {
+      await operation()
+      return
+    } catch (error) {
+      lastError = error
+      await new Promise((resolve) => setTimeout(resolve, 25))
+    }
+  }
+  throw lastError
+}
+
+async function eventuallySubscribed(
+  client: Redis,
+  channel: string,
+  expected: number,
+): Promise<void> {
+  await eventually(async () => {
+    expect(await client.pubsub('NUMSUB', channel)).toEqual([channel, expected])
+  })
 }
 
 beforeAll(async () => {
@@ -37,6 +68,34 @@ const makeEvent = (): TaskEvent => ({
 })
 
 describe('RedisBroadcastProvider', () => {
+  it('awaits one wildcard subscription and keeps pattern handlers local', async () => {
+    const pub = createClient()
+    const sub = createClient()
+    const subscribe = vi.spyOn(sub, 'subscribe')
+    const unsubscribe = vi.spyOn(sub, 'unsubscribe')
+    const psubscribe = vi.spyOn(sub, 'psubscribe')
+    const provider = new RedisBroadcastProvider(pub, sub, {
+      prefix: 'pattern',
+      subscriptionMode: 'pattern',
+    })
+
+    await provider.startPatternSubscription()
+
+    expect(psubscribe).toHaveBeenCalledOnce()
+    expect(psubscribe).toHaveBeenCalledWith('pattern:task:*')
+    expect(provider.isPatternSubscribed()).toBe(true)
+
+    const received: TaskEvent[] = []
+    const remove = provider.subscribe('task-1', (event) => received.push(event))
+    expect(subscribe).not.toHaveBeenCalled()
+
+    await provider.publish('task-1', makeEvent())
+    await eventually(() => expect(received).toHaveLength(1))
+
+    remove()
+    expect(unsubscribe).not.toHaveBeenCalled()
+  })
+
   it('delivers published events to subscribers', async () => {
     const pub = createClient()
     const sub = createClient()
@@ -45,13 +104,12 @@ describe('RedisBroadcastProvider', () => {
     const received: TaskEvent[] = []
     const unsub = provider.subscribe('task-1', (e) => received.push(e))
 
-    // wait for subscription to be ready
-    await new Promise((r) => setTimeout(r, 100))
+    await eventuallySubscribed(pub, 'taskcast:task:task-1', 1)
 
     const event = makeEvent()
     await provider.publish('task-1', event)
 
-    await new Promise((r) => setTimeout(r, 100))
+    await eventually(() => expect(received).toHaveLength(1))
     expect(received).toHaveLength(1)
     expect(received[0]?.type).toBe('llm.delta')
 
@@ -70,9 +128,12 @@ describe('RedisBroadcastProvider', () => {
     const u1 = p1.subscribe('task-1', (e) => r1.push(e))
     const u2 = p2.subscribe('task-1', (e) => r2.push(e))
 
-    await new Promise((r) => setTimeout(r, 100))
+    await eventuallySubscribed(pub, 'taskcast:task:task-1', 2)
     await p1.publish('task-1', makeEvent())
-    await new Promise((r) => setTimeout(r, 100))
+    await eventually(() => {
+      expect(r1).toHaveLength(1)
+      expect(r2).toHaveLength(1)
+    })
 
     expect(r1).toHaveLength(1)
     expect(r2).toHaveLength(1)
@@ -87,10 +148,10 @@ describe('RedisBroadcastProvider', () => {
 
     const received: TaskEvent[] = []
     const unsub = provider.subscribe('task-1', (e) => received.push(e))
-    await new Promise((r) => setTimeout(r, 100))
+    await eventuallySubscribed(pub, 'myapp:task:task-1', 1)
 
     await provider.publish('task-1', makeEvent())
-    await new Promise((r) => setTimeout(r, 100))
+    await eventually(() => expect(received).toHaveLength(1))
 
     expect(received).toHaveLength(1)
     unsub()
@@ -103,11 +164,12 @@ describe('RedisBroadcastProvider', () => {
 
     const received: TaskEvent[] = []
     const unsub = provider.subscribe('task-1', (e) => received.push(e))
-    await new Promise((r) => setTimeout(r, 100))
+    await eventuallySubscribed(pub, 'taskcast:task:task-1', 1)
 
     await provider.publish('task-1', makeEvent())
-    await new Promise((r) => setTimeout(r, 100))
+    await eventually(() => expect(received).toHaveLength(1))
     unsub()
+    await eventuallySubscribed(pub, 'taskcast:task:task-1', 0)
 
     await provider.publish('task-1', makeEvent())
     await new Promise((r) => setTimeout(r, 100))
@@ -122,7 +184,7 @@ describe('RedisBroadcastProvider', () => {
 
     const received: TaskEvent[] = []
     provider.subscribe('task-1', (e) => received.push(e))
-    await new Promise((r) => setTimeout(r, 100))
+    await eventuallySubscribed(pub, 'taskcast:task:task-1', 1)
 
     // Publish a raw malformed message directly via Redis to trigger the catch branch
     await pub.publish('taskcast:task:task-1', 'not-valid-json{{{{')
@@ -142,7 +204,6 @@ describe('RedisBroadcastProvider', () => {
     // We'll simulate the message handler receiving a channel WITHOUT the prefix
     // by accessing the private sub event emitter directly
     provider.subscribe('task-raw', (e) => received.push(e))
-    await new Promise((r) => setTimeout(r, 100))
 
     // Now manually emit a message event on sub with a channel that does NOT start with the prefix
     // This exercises the `: channel` branch in the message handler
@@ -166,7 +227,6 @@ describe('RedisBroadcastProvider', () => {
     // Subscribe to task-1 then unsubscribe to clear handlers
     const unsub = provider.subscribe('task-1', () => {})
     unsub()
-    await new Promise((r) => setTimeout(r, 100))
 
     // Manually emit a message for a channel with no handlers (handlers map is empty)
     // This exercises the `if (!handlers) return` branch
@@ -186,7 +246,6 @@ describe('RedisBroadcastProvider', () => {
 
     const received: TaskEvent[] = []
     const unsub = provider.subscribe('task-1', (e) => received.push(e))
-    await new Promise((r) => setTimeout(r, 100))
 
     // Call unsub once — this deletes the set when it becomes empty
     unsub()

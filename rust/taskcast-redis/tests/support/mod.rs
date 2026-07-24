@@ -93,9 +93,23 @@ impl TcpFaultProxy {
         self.refusing.store(false, Ordering::SeqCst);
     }
 
+    pub fn pause_new_connections(&self) {
+        self.refusing.store(true, Ordering::SeqCst);
+    }
+
     pub async fn refuse(&self) {
         self.refusing.store(true, Ordering::SeqCst);
         self.close_sockets().await;
+    }
+
+    pub async fn close_latest_connection(&self) {
+        let mut connections = self.connections.lock().await;
+        while let Some(connection) = connections.pop() {
+            if !connection.is_finished() {
+                connection.abort();
+                break;
+            }
+        }
     }
 
     pub async fn close_sockets(&self) {

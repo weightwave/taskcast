@@ -11,7 +11,8 @@ use taskcast_core::DependencyObserver;
 
 use crate::connection::RedisCommandConnection;
 
-type Handler = Arc<dyn Fn(TaskEvent) + Send + Sync>;
+pub(crate) type Handler = Arc<dyn Fn(TaskEvent) + Send + Sync>;
+pub(crate) type HandlerMap = Arc<RwLock<HashMap<String, Vec<Handler>>>>;
 
 /// Redis-backed broadcast provider.
 ///
@@ -38,18 +39,17 @@ impl RedisBroadcastProvider {
         Self::with_command_connection(pub_conn.into(), sub_conn, prefix)
     }
 
-    #[allow(dead_code)] // Used by the managed adapter composition added in Task 4.
     pub(crate) fn new_managed(
         manager: redis::aio::ConnectionManager,
-        sub_conn: redis::aio::PubSub,
+        handlers: HandlerMap,
         prefix: Option<&str>,
         observer: Option<Arc<dyn DependencyObserver>>,
     ) -> Self {
-        Self::with_command_connection(
-            RedisCommandConnection::managed(manager, observer),
-            sub_conn,
-            prefix,
-        )
+        Self {
+            pub_conn: RedisCommandConnection::managed(manager, observer),
+            handlers,
+            channel_prefix: channel_prefix(prefix),
+        }
     }
 
     fn with_command_connection(
@@ -57,11 +57,8 @@ impl RedisBroadcastProvider {
         mut sub_conn: redis::aio::PubSub,
         prefix: Option<&str>,
     ) -> Self {
-        let resolved_prefix = prefix.unwrap_or("taskcast");
-        let channel_prefix = format!("{resolved_prefix}:task:");
-
-        let handlers: Arc<RwLock<HashMap<String, Vec<Handler>>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let channel_prefix = channel_prefix(prefix);
+        let handlers = new_handler_map();
 
         // Spawn background listener that reads from the PubSub connection
         // and dispatches to local handlers.
@@ -72,40 +69,14 @@ impl RedisBroadcastProvider {
         let prefix_clone = channel_prefix.clone();
         tokio::spawn(async move {
             let pattern = format!("{prefix_clone}*");
-            if let Err(e) = sub_conn.psubscribe(&pattern).await {
-                eprintln!("[taskcast] Redis PSUBSCRIBE failed for pattern {pattern}: {e}");
+            if sub_conn.psubscribe(&pattern).await.is_err() {
                 return;
             }
 
             let mut stream = sub_conn.on_message();
 
             while let Some(msg) = stream.next().await {
-                let channel: String = match msg.get_channel() {
-                    Ok(c) => c,
-                    Err(_) => continue,
-                };
-                let payload: String = match msg.get_payload() {
-                    Ok(p) => p,
-                    Err(_) => continue,
-                };
-
-                let task_id = if channel.starts_with(&prefix_clone) {
-                    &channel[prefix_clone.len()..]
-                } else {
-                    &channel
-                };
-
-                let event: TaskEvent = match serde_json::from_str(&payload) {
-                    Ok(e) => e,
-                    Err(_) => continue,
-                };
-
-                let handlers = handlers_clone.read().await;
-                if let Some(task_handlers) = handlers.get(task_id) {
-                    for handler in task_handlers {
-                        handler(event.clone());
-                    }
-                }
+                dispatch_message(&handlers_clone, &prefix_clone, msg).await;
             }
         });
 
@@ -119,6 +90,43 @@ impl RedisBroadcastProvider {
     /// Returns the channel prefix (e.g. `"taskcast:task:"`).
     pub fn channel_prefix(&self) -> &str {
         &self.channel_prefix
+    }
+}
+
+pub(crate) fn new_handler_map() -> HandlerMap {
+    Arc::new(RwLock::new(HashMap::new()))
+}
+
+pub(crate) fn channel_prefix(prefix: Option<&str>) -> String {
+    format!("{}:task:", prefix.unwrap_or("taskcast"))
+}
+
+pub(crate) async fn dispatch_message(
+    handlers: &HandlerMap,
+    channel_prefix: &str,
+    message: redis::Msg,
+) {
+    let channel: String = match message.get_channel() {
+        Ok(channel) => channel,
+        Err(_) => return,
+    };
+    let payload: String = match message.get_payload() {
+        Ok(payload) => payload,
+        Err(_) => return,
+    };
+    let task_id = channel
+        .strip_prefix(channel_prefix)
+        .unwrap_or(channel.as_str());
+    let event: TaskEvent = match serde_json::from_str(&payload) {
+        Ok(event) => event,
+        Err(_) => return,
+    };
+
+    let handlers = handlers.read().await;
+    if let Some(task_handlers) = handlers.get(task_id) {
+        for handler in task_handlers {
+            handler(event.clone());
+        }
     }
 }
 

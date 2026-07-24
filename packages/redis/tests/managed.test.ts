@@ -1,9 +1,12 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import { Redis } from 'ioredis'
 import { GenericContainer, type StartedTestContainer } from 'testcontainers'
-import type { DependencyObservation } from '@taskcast/core'
+import type { DependencyObservation, TaskEvent } from '@taskcast/core'
 import { equalJitterDelay } from '../src/backoff.js'
-import { createManagedRedisCommandClient } from '../src/managed.js'
+import {
+  createManagedRedisAdapters,
+  createManagedRedisCommandClient,
+} from '../src/managed.js'
 import {
   createRedisAdapters,
   RedisBroadcastProvider,
@@ -14,6 +17,16 @@ import { TcpFaultProxy } from './helpers/tcp-fault-proxy.js'
 let container: StartedTestContainer
 let proxy: TcpFaultProxy
 let redisUrl: string
+
+const makeEvent = (): TaskEvent => ({
+  id: 'event-1',
+  taskId: 'task-1',
+  index: 0,
+  timestamp: Date.now(),
+  type: 'managed.event',
+  level: 'info',
+  data: { text: 'managed' },
+})
 
 async function eventually(
   operation: () => Promise<void>,
@@ -33,11 +46,37 @@ async function eventually(
   throw lastError
 }
 
+async function expectConnectionCountStable(
+  proxyUnderTest: TcpFaultProxy,
+  expected: number,
+  durationMs: number,
+): Promise<void> {
+  const deadline = Date.now() + durationMs
+  while (Date.now() < deadline) {
+    expect(proxyUnderTest.acceptedConnections).toBe(expected)
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
+}
+
+function patternSubscriptions(client: Redis): string[] {
+  return (
+    client as unknown as {
+      condition: {
+        subscriber: {
+          channels(kind: 'psubscribe'): string[]
+        }
+      }
+    }
+  ).condition.subscriber.channels('psubscribe')
+}
+
 describe('equalJitterDelay', () => {
   it('uses the lower, upper, and capped equal-jitter bounds', () => {
     expect(equalJitterDelay(500, 5_000, 0, () => 0)).toBe(250)
     expect(equalJitterDelay(500, 5_000, 1, () => 1)).toBe(1_000)
     expect(equalJitterDelay(500, 5_000, 20, () => 1)).toBe(5_000)
+    expect(equalJitterDelay(500, 10_000, 20, () => 0)).toBe(5_000)
+    expect(equalJitterDelay(500, 10_000, 20, () => 1)).toBe(10_000)
   })
 })
 
@@ -121,4 +160,122 @@ describe('managed Redis command client', () => {
     await expect(managed.client.get('taskcast:managed:replay')).resolves.toBe('0')
     await managed.close()
   }, 20_000)
+
+  it('returns only after one pattern subscription and shares the command client', async () => {
+    await proxy.open()
+    proxy.resumeNewConnections()
+    const managed = await createManagedRedisAdapters(redisUrl, {
+      prefix: 'managed-lifecycle',
+      random: () => 0,
+    })
+
+    expect(managed.subscriberClient).not.toBe(managed.commandClient)
+    expect(
+      (managed.broadcast as unknown as { pub: Redis }).pub,
+    ).toBe(managed.commandClient)
+    expect(
+      (managed.shortTermStore as unknown as { redis: Redis }).redis,
+    ).toBe(managed.commandClient)
+    expect(managed.broadcast.isPatternSubscribed()).toBe(true)
+    await expect(managed.commandClient.pubsub('NUMPAT')).resolves.toBe(1)
+    await expect(managed.commandCheck()).resolves.toBeUndefined()
+    await expect(managed.pubSubCheck()).resolves.toBeUndefined()
+
+    await managed.close()
+  })
+
+  it('keeps handlers and the single pattern after a forced subscriber reconnect', async () => {
+    await proxy.open()
+    proxy.resumeNewConnections()
+    const observations: DependencyObservation[] = []
+    const options = {
+      prefix: 'managed-cross-instance',
+      random: () => 0,
+      observer: {
+        observe: (observation: DependencyObservation) =>
+          observations.push(observation),
+      },
+    }
+    const first = await createManagedRedisAdapters(redisUrl, options)
+    const second = await createManagedRedisAdapters(redisUrl, options)
+    const received: string[] = []
+    second.broadcast.subscribe('task-1', (event) => received.push(event.id))
+
+    await first.broadcast.publish('task-1', { ...makeEvent(), id: 'before' })
+    await eventually(() => expect(received).toEqual(['before']))
+    expect(patternSubscriptions(first.subscriberClient)).toEqual([
+      'managed-cross-instance:task:*',
+    ])
+    expect(patternSubscriptions(second.subscriberClient)).toEqual([
+      'managed-cross-instance:task:*',
+    ])
+    await expect(first.commandClient.pubsub('NUMPAT')).resolves.toBe(1)
+
+    proxy.pauseNewConnections()
+    proxy.closeLatestConnection()
+    await eventually(() =>
+      expect(second.broadcast.isPatternSubscribed()).toBe(false),
+    )
+    await expect(second.pubSubCheck()).rejects.toBeDefined()
+    proxy.resumeNewConnections()
+    await eventually(() => second.pubSubCheck())
+
+    await first.broadcast.publish('task-1', { ...makeEvent(), id: 'after' })
+    await eventually(() => expect(received).toEqual(['before', 'after']))
+    expect(patternSubscriptions(first.subscriberClient)).toHaveLength(1)
+    expect(patternSubscriptions(second.subscriberClient)).toHaveLength(1)
+    await expect(first.commandClient.pubsub('NUMPAT')).resolves.toBe(1)
+    expect(
+      observations.some(
+        ({ dependency, state }) =>
+          dependency === 'redisPubSub' && state === 'reconnecting',
+      ),
+    ).toBe(true)
+    expect(
+      observations.every((observation) =>
+        Object.keys(observation).every((key) =>
+          ['dependency', 'state', 'errorKind', 'attempt', 'nextRetryMs'].includes(
+            key,
+          ),
+        ),
+      ),
+    ).toBe(true)
+
+    await second.close()
+    await first.close()
+  }, 20_000)
+
+  it('cancels a pending subscriber retry when closed', async () => {
+    await proxy.open()
+    proxy.resumeNewConnections()
+    const managed = await createManagedRedisAdapters(redisUrl, {
+      prefix: 'managed-shutdown',
+      random: () => 0,
+    })
+
+    proxy.pauseNewConnections()
+    proxy.closeLatestConnection()
+    await eventually(() =>
+      expect(managed.broadcast.isPatternSubscribed()).toBe(false),
+    )
+    await managed.close()
+    const acceptedAfterClose = proxy.acceptedConnections
+
+    proxy.resumeNewConnections()
+    await expectConnectionCountStable(proxy, acceptedAfterClose, 750)
+  })
+
+  it('bounds unreachable startup by one overall deadline', async () => {
+    await proxy.refuse()
+    const startedAt = Date.now()
+
+    await expect(
+      createManagedRedisAdapters(redisUrl, {
+        prefix: 'managed-unreachable',
+        random: () => 0,
+      }),
+    ).rejects.toBeDefined()
+
+    expect(Date.now() - startedAt).toBeLessThanOrEqual(15_500)
+  }, 16_000)
 })

@@ -1,8 +1,12 @@
 export { RedisBroadcastProvider } from './broadcast.js'
 export { RedisShortTermStore } from './short-term.js'
 export { equalJitterDelay } from './backoff.js'
-export { createManagedRedisCommandClient } from './managed.js'
+export {
+  createManagedRedisAdapters,
+  createManagedRedisCommandClient,
+} from './managed.js'
 export type {
+  ManagedRedisAdapters,
   ManagedRedisCommand,
   ManagedRedisOptions,
 } from './managed.js'

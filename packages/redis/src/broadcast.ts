@@ -1,20 +1,27 @@
 import type { Redis } from 'ioredis'
 import type { BroadcastProvider, TaskEvent } from '@taskcast/core'
 
+type SubscriptionMode = 'channels' | 'pattern'
+
 export class RedisBroadcastProvider implements BroadcastProvider {
-  // 每个 channel 的本地 handlers，在接收到 Redis 消息后转发
   private handlers = new Map<string, Set<(event: TaskEvent) => void>>()
   private channelPrefix: string
+  private patternSubscribed = false
 
   constructor(
     private pub: Redis,
     private sub: Redis,
-    { prefix }: { prefix?: string } = {},
+    private options: {
+      prefix?: string
+      subscriptionMode?: SubscriptionMode
+    } = {},
   ) {
-    const resolvedPrefix = prefix ?? process.env['TASKCAST_REDIS_PREFIX'] ?? 'taskcast'
+    const { prefix, subscriptionMode = 'channels' } = options
+    const resolvedPrefix =
+      prefix ?? process.env['TASKCAST_REDIS_PREFIX'] ?? 'taskcast'
     this.channelPrefix = `${resolvedPrefix}:task:`
 
-    this.sub.on('message', (channel: string, message: string) => {
+    const dispatch = (channel: string, message: string) => {
       const taskId = channel.startsWith(this.channelPrefix)
         ? channel.slice(this.channelPrefix.length)
         : channel
@@ -24,9 +31,40 @@ export class RedisBroadcastProvider implements BroadcastProvider {
         const event = JSON.parse(message) as TaskEvent
         for (const handler of handlers) handler(event)
       } catch {
-        // malformed message, ignore
+        // Malformed messages are ignored.
       }
-    })
+    }
+
+    this.sub.on('message', dispatch)
+    this.sub.on(
+      'pmessage',
+      (_pattern: string, channel: string, message: string) =>
+        dispatch(channel, message),
+    )
+
+    if (subscriptionMode === 'pattern') {
+      this.sub.on('ready', () => {
+        this.patternSubscribed = true
+      })
+      this.sub.on('reconnecting', () => {
+        this.patternSubscribed = false
+      })
+      this.sub.on('end', () => {
+        this.patternSubscribed = false
+      })
+    }
+  }
+
+  async startPatternSubscription(): Promise<void> {
+    if ((this.options.subscriptionMode ?? 'channels') !== 'pattern') {
+      throw new Error('Redis pattern subscription mode is not enabled')
+    }
+    await this.sub.psubscribe(`${this.channelPrefix}*`)
+    this.patternSubscribed = true
+  }
+
+  isPatternSubscribed(): boolean {
+    return this.patternSubscribed
   }
 
   async publish(channel: string, event: TaskEvent): Promise<void> {
@@ -36,7 +74,9 @@ export class RedisBroadcastProvider implements BroadcastProvider {
   subscribe(channel: string, handler: (event: TaskEvent) => void): () => void {
     if (!this.handlers.has(channel)) {
       this.handlers.set(channel, new Set())
-      this.sub.subscribe(this.channelPrefix + channel)
+      if ((this.options.subscriptionMode ?? 'channels') === 'channels') {
+        this.sub.subscribe(this.channelPrefix + channel)
+      }
     }
     this.handlers.get(channel)!.add(handler)
 
@@ -46,7 +86,9 @@ export class RedisBroadcastProvider implements BroadcastProvider {
       set.delete(handler)
       if (set.size === 0) {
         this.handlers.delete(channel)
-        this.sub.unsubscribe(this.channelPrefix + channel)
+        if ((this.options.subscriptionMode ?? 'channels') === 'channels') {
+          this.sub.unsubscribe(this.channelPrefix + channel)
+        }
       }
     }
   }
