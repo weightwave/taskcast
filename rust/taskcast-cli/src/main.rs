@@ -149,30 +149,47 @@ mod tests {
 
     #[test]
     fn storage_cli_flag_overrides_all() {
-        assert_eq!(resolve_storage_mode("sqlite", None, true), "sqlite");
-        assert_eq!(resolve_storage_mode("redis", Some("sqlite"), false), "redis");
+        assert_eq!(
+            resolve_storage_mode(Some("sqlite"), None, None, true).unwrap(),
+            "sqlite"
+        );
+        assert_eq!(
+            resolve_storage_mode(Some("redis"), Some("sqlite"), None, false).unwrap(),
+            "redis"
+        );
     }
 
     #[test]
     fn storage_env_var_sqlite_overrides_auto_detect() {
-        assert_eq!(resolve_storage_mode("memory", Some("sqlite"), true), "sqlite");
+        assert_eq!(
+            resolve_storage_mode(None, Some("sqlite"), None, true).unwrap(),
+            "sqlite"
+        );
     }
 
     #[test]
     fn storage_auto_detects_redis_from_url() {
-        assert_eq!(resolve_storage_mode("memory", None, true), "redis");
+        assert_eq!(
+            resolve_storage_mode(None, None, None, true).unwrap(),
+            "redis"
+        );
     }
 
     #[test]
     fn storage_defaults_to_memory() {
-        assert_eq!(resolve_storage_mode("memory", None, false), "memory");
+        assert_eq!(
+            resolve_storage_mode(None, None, None, false).unwrap(),
+            "memory"
+        );
     }
 
     #[test]
-    fn storage_env_var_non_sqlite_falls_through() {
-        // Only "sqlite" env var triggers sqlite mode, other values fall through
-        assert_eq!(resolve_storage_mode("memory", Some("redis"), true), "redis");
-        assert_eq!(resolve_storage_mode("memory", Some("other"), false), "memory");
+    fn storage_env_var_accepts_redis_and_rejects_invalid_values() {
+        assert_eq!(
+            resolve_storage_mode(None, Some("redis"), None, true).unwrap(),
+            "redis"
+        );
+        assert!(resolve_storage_mode(None, Some("other"), None, false).is_err());
     }
 
     // ─── parse_jwt_algorithm ─────────────────────────────────────────────────
@@ -240,7 +257,7 @@ mod tests {
         match cli.command.unwrap() {
             Commands::Start(args) => {
                 assert_eq!(args.port, 8080);
-                assert_eq!(args.storage, "sqlite");
+                assert_eq!(args.storage.as_deref(), Some("sqlite"));
             }
             _ => panic!("expected Start command"),
         }
@@ -253,7 +270,7 @@ mod tests {
             Commands::Start(args) => {
                 assert!(args.config.is_none());
                 assert_eq!(args.port, 3721);
-                assert_eq!(args.storage, "memory");
+                assert_eq!(args.storage, None);
                 assert_eq!(args.db_path, "./taskcast.db");
                 assert!(!args.playground);
             }

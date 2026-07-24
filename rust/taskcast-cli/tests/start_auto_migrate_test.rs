@@ -130,7 +130,7 @@ async fn start_with_auto_migrate_enabled_applies_migrations() {
     let handle = tokio::spawn(async move {
         let _ = taskcast_cli::commands::start::run(StartArgs {
             port,
-            storage: "memory".to_string(),
+            storage: Some("memory".to_string()),
             ..Default::default()
         })
         .await;
@@ -189,7 +189,7 @@ async fn start_auto_migrate_twice_is_idempotent() {
         let handle = tokio::spawn(async move {
             let _ = taskcast_cli::commands::start::run(StartArgs {
                 port,
-                storage: "memory".to_string(),
+                storage: Some("memory".to_string()),
                 ..Default::default()
             })
             .await;
@@ -220,7 +220,7 @@ async fn start_auto_migrate_twice_is_idempotent() {
         let handle = tokio::spawn(async move {
             let _ = taskcast_cli::commands::start::run(StartArgs {
                 port,
-                storage: "memory".to_string(),
+                storage: Some("memory".to_string()),
                 ..Default::default()
             })
             .await;
@@ -266,7 +266,7 @@ async fn start_with_auto_migrate_disabled_skips_migrations_but_starts_server() {
     let handle = tokio::spawn(async move {
         let _ = taskcast_cli::commands::start::run(StartArgs {
             port,
-            storage: "memory".to_string(),
+            storage: Some("memory".to_string()),
             ..Default::default()
         })
         .await;
@@ -313,7 +313,7 @@ async fn start_with_postgres_not_configured_skips_migrations() {
     let handle = tokio::spawn(async move {
         let _ = taskcast_cli::commands::start::run(StartArgs {
             port,
-            storage: "memory".to_string(),
+            storage: Some("memory".to_string()),
             ..Default::default()
         })
         .await;
@@ -355,7 +355,7 @@ async fn auto_migrate_creates_correct_table_structure() {
     let handle = tokio::spawn(async move {
         let _ = taskcast_cli::commands::start::run(StartArgs {
             port,
-            storage: "memory".to_string(),
+            storage: Some("memory".to_string()),
             ..Default::default()
         })
         .await;
@@ -438,7 +438,7 @@ async fn start_redis_storage_with_postgres_long_term_auto_migrate() {
     let handle = tokio::spawn(async move {
         let _ = taskcast_cli::commands::start::run(StartArgs {
             port,
-            storage: "redis".to_string(),
+            storage: Some("redis".to_string()),
             ..Default::default()
         })
         .await;

@@ -11,20 +11,22 @@ pub fn resolve_port(cli_port: u16, config_port: Option<u16>) -> u16 {
     }
 }
 
-/// Resolve storage mode: CLI flag (if not "memory") > env var > auto-detect from redis_url.
+/// Resolve storage mode: CLI > env > configured provider > Redis URL > memory.
 pub fn resolve_storage_mode<'a>(
-    cli_storage: &'a str,
-    env_storage: Option<&'a str>,
+    cli: Option<&'a str>,
+    env: Option<&'a str>,
+    configured_provider: Option<&'a str>,
     has_redis_url: bool,
-) -> &'a str {
-    if cli_storage != "memory" {
-        cli_storage
-    } else if env_storage == Some("sqlite") {
-        "sqlite"
-    } else if has_redis_url {
-        "redis"
-    } else {
-        "memory"
+) -> Result<&'a str, String> {
+    let value = cli
+        .or(env)
+        .or(configured_provider)
+        .unwrap_or(if has_redis_url { "redis" } else { "memory" });
+    match value {
+        "memory" | "redis" | "sqlite" => Ok(value),
+        _ => Err(format!(
+            "invalid storage mode \"{value}\"; expected memory, redis, or sqlite"
+        )),
     }
 }
 
@@ -145,40 +147,31 @@ mod tests {
     // ─── resolve_storage_mode ────────────────────────────────────────────────
 
     #[test]
-    fn storage_defaults_to_memory() {
-        assert_eq!(resolve_storage_mode("memory", None, false), "memory");
+    fn storage_resolution_matches_the_activation_priority_table() {
+        let cases = [
+            (Some("memory"), None, Some("redis"), true, "memory"),
+            (Some("sqlite"), Some("redis"), Some("redis"), true, "sqlite"),
+            (None, Some("memory"), Some("redis"), true, "memory"),
+            (None, None, Some("redis"), true, "redis"),
+            (None, None, None, true, "redis"),
+            (None, None, None, false, "memory"),
+        ];
+
+        for (cli, env, configured_provider, has_redis_url, expected) in cases {
+            assert_eq!(
+                resolve_storage_mode(cli, env, configured_provider, has_redis_url).unwrap(),
+                expected
+            );
+        }
     }
 
     #[test]
-    fn storage_cli_flag_overrides_all() {
-        assert_eq!(resolve_storage_mode("sqlite", None, true), "sqlite");
-        assert_eq!(resolve_storage_mode("redis", Some("sqlite"), false), "redis");
-    }
-
-    #[test]
-    fn storage_env_sqlite_overrides_auto_detect() {
-        assert_eq!(resolve_storage_mode("memory", Some("sqlite"), true), "sqlite");
-    }
-
-    #[test]
-    fn storage_env_sqlite_when_no_redis() {
-        assert_eq!(resolve_storage_mode("memory", Some("sqlite"), false), "sqlite");
-    }
-
-    #[test]
-    fn storage_auto_detects_redis_from_url() {
-        assert_eq!(resolve_storage_mode("memory", None, true), "redis");
-    }
-
-    #[test]
-    fn storage_env_non_sqlite_falls_through_to_redis() {
-        // Only "sqlite" env var triggers sqlite mode; other values fall through
-        assert_eq!(resolve_storage_mode("memory", Some("redis"), true), "redis");
-    }
-
-    #[test]
-    fn storage_env_non_sqlite_falls_through_to_memory() {
-        assert_eq!(resolve_storage_mode("memory", Some("other"), false), "memory");
+    fn storage_resolution_rejects_invalid_values() {
+        for value in ["", "disk", "REDIS"] {
+            assert!(resolve_storage_mode(Some(value), None, None, false)
+                .unwrap_err()
+                .contains("invalid storage mode"));
+        }
     }
 
     // ─── parse_jwt_algorithm ─────────────────────────────────────────────────

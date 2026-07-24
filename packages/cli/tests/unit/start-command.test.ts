@@ -22,6 +22,9 @@ vi.mock('@taskcast/core', () => ({
 
 // Mock @taskcast/server — use inline object, no top-level refs
 vi.mock('@taskcast/server', () => ({
+  DependencyHealthRegistry: vi.fn().mockImplementation(() => ({
+    register: vi.fn(),
+  })),
   createTaskcastApp: vi.fn().mockReturnValue({
     app: { use: vi.fn(), get: vi.fn(), fetch: vi.fn() },
     stop: vi.fn(),
@@ -37,25 +40,27 @@ vi.mock('@taskcast/server', () => ({
 
 // Mock @taskcast/redis
 vi.mock('@taskcast/redis', () => ({
-  createRedisAdapters: vi.fn().mockReturnValue({
+  createManagedRedisAdapters: vi.fn().mockResolvedValue({
     broadcast: {},
     shortTermStore: {},
+    commandCheck: vi.fn(),
+    pubSubCheck: vi.fn(),
+    close: vi.fn(),
   }),
-}))
-
-// Mock ioredis
-vi.mock('ioredis', () => ({
-  Redis: vi.fn(),
 }))
 
 // Mock @taskcast/postgres
 vi.mock('@taskcast/postgres', () => ({
-  PostgresLongTermStore: vi.fn(),
+  PostgresLongTermStore: vi.fn().mockImplementation(() => ({})),
+  postgresCheck: vi.fn().mockResolvedValue(undefined),
 }))
 
 // Mock postgres
 vi.mock('postgres', () => ({
-  default: vi.fn(),
+  default: vi.fn().mockImplementation(() => {
+    const sql = vi.fn().mockResolvedValue([])
+    return Object.assign(sql, { end: vi.fn().mockResolvedValue(undefined) })
+  }),
 }))
 
 // Mock @taskcast/sqlite
@@ -108,8 +113,91 @@ vi.mock('../../src/auto-migrate.js', () => ({
   performAutoMigrateIfEnabled: vi.fn(),
 }))
 
-import { registerStartCommand, runStart } from '../../src/commands/start.js'
+import {
+  parsePostgresMaxConnections,
+  registerStartCommand,
+  resolveStorageMode,
+  runStart,
+} from '../../src/commands/start.js'
 import type { RunStartOptions } from '../../src/commands/start.js'
+
+describe('storage and PostgreSQL option resolution', () => {
+  it.each([
+    {
+      name: 'explicit memory overrides configured Redis and a Redis URL',
+      options: {
+        cli: 'memory',
+        configuredProvider: 'redis',
+        hasRedisUrl: true,
+      },
+      expected: 'memory',
+    },
+    {
+      name: 'explicit sqlite overrides env, config, and URL',
+      options: {
+        cli: 'sqlite',
+        env: 'redis',
+        configuredProvider: 'redis',
+        hasRedisUrl: true,
+      },
+      expected: 'sqlite',
+    },
+    {
+      name: 'env memory overrides configured Redis and a Redis URL',
+      options: {
+        env: 'memory',
+        configuredProvider: 'redis',
+        hasRedisUrl: true,
+      },
+      expected: 'memory',
+    },
+    {
+      name: 'configured Redis is selected',
+      options: {
+        configuredProvider: 'redis',
+        hasRedisUrl: true,
+      },
+      expected: 'redis',
+    },
+    {
+      name: 'a Redis URL is auto-detected',
+      options: { hasRedisUrl: true },
+      expected: 'redis',
+    },
+    {
+      name: 'memory is the final fallback',
+      options: { hasRedisUrl: false },
+      expected: 'memory',
+    },
+  ])('$name', ({ options, expected }) => {
+    expect(resolveStorageMode(options)).toBe(expected)
+  })
+
+  it.each(['disk', '', 'REDIS'])('rejects invalid storage mode %j', (value) => {
+    expect(() => resolveStorageMode({
+      cli: value,
+      hasRedisUrl: false,
+    })).toThrow('invalid storage mode')
+  })
+
+  it.each([
+    [undefined, 10],
+    ['', 10],
+    ['10', 10],
+    ['1', 1],
+  ])('parses PostgreSQL max connections %j as %i', (value, expected) => {
+    expect(parsePostgresMaxConnections(value)).toBe(expected)
+  })
+
+  it.each(['0', '-1', '1.5', 'abc', '9007199254740992'])(
+    'rejects invalid PostgreSQL max connections %j',
+    (value) => {
+      expect(() => parsePostgresMaxConnections(value)).toThrow(
+        'TASKCAST_POSTGRES_MAX_CONNECTIONS must be a positive integer',
+      )
+    },
+  )
+})
 
 describe('registerStartCommand', () => {
   let exitSpy: ReturnType<typeof vi.spyOn>
@@ -302,6 +390,191 @@ describe('registerStartCommand', () => {
 
     const { serve } = await import('@hono/node-server')
     expect(serve).toHaveBeenCalled()
+    const { createManagedRedisAdapters } = await import('@taskcast/redis')
+    expect(createManagedRedisAdapters).toHaveBeenCalledWith(
+      'redis://localhost:6379',
+      expect.objectContaining({ startupTimeoutMs: 15_000 }),
+    )
+  })
+
+  it('explicit memory ignores an unrelated Redis URL', async () => {
+    const origRedis = process.env['TASKCAST_REDIS_URL']
+    process.env['TASKCAST_REDIS_URL'] = 'redis://unrelated.invalid:6379'
+    const program = new Command()
+    program.exitOverride()
+    registerStartCommand(program)
+
+    try {
+      await program.parseAsync(['node', 'test', 'start', '--storage', 'memory'])
+    } finally {
+      if (origRedis === undefined) delete process.env['TASKCAST_REDIS_URL']
+      else process.env['TASKCAST_REDIS_URL'] = origRedis
+    }
+
+    const { createManagedRedisAdapters } = await import('@taskcast/redis')
+    expect(createManagedRedisAdapters).not.toHaveBeenCalled()
+  })
+
+  it('rejects mixed configured short-term and broadcast providers', async () => {
+    const { loadConfigFile } = await import('@taskcast/core')
+    ;(loadConfigFile as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      config: {
+        adapters: {
+          shortTermStore: { provider: 'memory' },
+          broadcast: { provider: 'redis', url: 'redis://localhost:6379' },
+        },
+      },
+      source: 'file',
+      path: '/fake/taskcast.config.yaml',
+    })
+    const program = new Command()
+    program.exitOverride()
+    registerStartCommand(program)
+
+    await expect(
+      program.parseAsync(['node', 'test', 'start']),
+    ).rejects.toMatchObject({ code: 1 })
+    expect(errorSpy).toHaveBeenCalledWith(
+      expect.stringContaining('configured short-term and broadcast providers must match'),
+    )
+    const { createManagedRedisAdapters } = await import('@taskcast/redis')
+    expect(createManagedRedisAdapters).not.toHaveBeenCalled()
+  })
+
+  it('rejects an explicit PostgreSQL provider without a resolved URL', async () => {
+    const { loadConfigFile } = await import('@taskcast/core')
+    ;(loadConfigFile as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      config: {
+        adapters: {
+          longTermStore: { provider: 'postgres' },
+        },
+      },
+      source: 'file',
+      path: '/fake/taskcast.config.yaml',
+    })
+    const original = process.env['TASKCAST_POSTGRES_URL']
+    delete process.env['TASKCAST_POSTGRES_URL']
+    const program = new Command()
+    program.exitOverride()
+    registerStartCommand(program)
+
+    try {
+      await expect(
+        program.parseAsync(['node', 'test', 'start']),
+      ).rejects.toMatchObject({ code: 1 })
+    } finally {
+      if (original === undefined) delete process.env['TASKCAST_POSTGRES_URL']
+      else process.env['TASKCAST_POSTGRES_URL'] = original
+    }
+
+    expect(errorSpy).toHaveBeenCalledWith(
+      expect.stringContaining(
+        'configured PostgreSQL long-term store requires TASKCAST_POSTGRES_URL',
+      ),
+    )
+    const postgresModule = await import('postgres')
+    expect(postgresModule.default).not.toHaveBeenCalled()
+  })
+
+  it('does not bind when active Redis startup fails', async () => {
+    const { createManagedRedisAdapters } = await import('@taskcast/redis')
+    ;(createManagedRedisAdapters as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+      new Error('Redis unavailable'),
+    )
+    const origRedis = process.env['TASKCAST_REDIS_URL']
+    process.env['TASKCAST_REDIS_URL'] = 'redis://127.0.0.1:1'
+    const program = new Command()
+    program.exitOverride()
+    registerStartCommand(program)
+
+    try {
+      await expect(
+        program.parseAsync(['node', 'test', 'start', '--storage', 'redis']),
+      ).rejects.toMatchObject({ code: 1 })
+    } finally {
+      if (origRedis === undefined) delete process.env['TASKCAST_REDIS_URL']
+      else process.env['TASKCAST_REDIS_URL'] = origRedis
+    }
+
+    const { serve } = await import('@hono/node-server')
+    expect(serve).not.toHaveBeenCalled()
+  })
+
+  it('closes managed dependencies when HTTP listener binding fails', async () => {
+    const redisClose = vi.fn().mockResolvedValue(undefined)
+    const { createManagedRedisAdapters } = await import('@taskcast/redis')
+    ;(createManagedRedisAdapters as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      broadcast: {},
+      shortTermStore: {},
+      commandCheck: vi.fn(),
+      pubSubCheck: vi.fn(),
+      close: redisClose,
+    })
+    const { serve } = await import('@hono/node-server')
+    ;(serve as ReturnType<typeof vi.fn>).mockImplementationOnce(() => ({
+      close: vi.fn(),
+      once: vi.fn((
+        event: string,
+        listener: (error: Error) => void,
+      ) => {
+        if (event === 'error') {
+          queueMicrotask(() => listener(new Error('EADDRINUSE')))
+        }
+      }),
+    }))
+    const original = process.env['TASKCAST_REDIS_URL']
+    process.env['TASKCAST_REDIS_URL'] = 'redis://127.0.0.1:6379'
+    const program = new Command()
+    program.exitOverride()
+    registerStartCommand(program)
+
+    try {
+      await expect(
+        program.parseAsync([
+          'node',
+          'test',
+          'start',
+          '--storage',
+          'redis',
+        ]),
+      ).rejects.toMatchObject({ code: 1 })
+    } finally {
+      if (original === undefined) delete process.env['TASKCAST_REDIS_URL']
+      else process.env['TASKCAST_REDIS_URL'] = original
+    }
+
+    expect(redisClose).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not bind and closes PostgreSQL when its startup check fails', async () => {
+    const sql = Object.assign(vi.fn(), {
+      end: vi.fn().mockResolvedValue(undefined),
+    })
+    const postgresModule = await import('postgres')
+    ;(postgresModule.default as ReturnType<typeof vi.fn>).mockReturnValueOnce(sql)
+    const { postgresCheck } = await import('@taskcast/postgres')
+    ;(postgresCheck as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+      new Error('PostgreSQL unavailable'),
+    )
+    const origPg = process.env['TASKCAST_POSTGRES_URL']
+    process.env['TASKCAST_POSTGRES_URL'] = 'postgres://127.0.0.1:1/taskcast'
+    const program = new Command()
+    program.exitOverride()
+    registerStartCommand(program)
+
+    try {
+      await expect(
+        program.parseAsync(['node', 'test', 'start']),
+      ).rejects.toMatchObject({ code: 1 })
+    } finally {
+      if (origPg === undefined) delete process.env['TASKCAST_POSTGRES_URL']
+      else process.env['TASKCAST_POSTGRES_URL'] = origPg
+    }
+
+    const { serve } = await import('@hono/node-server')
+    expect(serve).not.toHaveBeenCalled()
+    expect(sql.end).toHaveBeenCalledTimes(1)
+    expect(sql.end).toHaveBeenCalledWith({ timeout: 5 })
   })
 
   it('starts server with playground flag', async () => {

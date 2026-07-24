@@ -4,9 +4,54 @@
 
 use std::sync::{Mutex, MutexGuard};
 use taskcast_cli::commands::start::StartArgs;
-use testcontainers::runners::AsyncRunner;
+use testcontainers::{runners::AsyncRunner, ImageExt};
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::redis::Redis;
+
+#[test]
+fn storage_resolution_matches_the_activation_priority_table() {
+    let cases = [
+        (Some("memory"), None, Some("redis"), true, "memory"),
+        (Some("sqlite"), Some("redis"), Some("redis"), true, "sqlite"),
+        (None, Some("memory"), Some("redis"), true, "memory"),
+        (None, None, Some("redis"), true, "redis"),
+        (None, None, None, true, "redis"),
+        (None, None, None, false, "memory"),
+    ];
+
+    for (cli, env, configured_provider, has_redis_url, expected) in cases {
+        assert_eq!(
+            taskcast_cli::helpers::resolve_storage_mode(
+                cli,
+                env,
+                configured_provider,
+                has_redis_url
+            )
+            .unwrap(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn postgres_max_connections_accepts_defaults_and_positive_integers() {
+    for (input, expected) in [(None, 10), (Some(""), 10), (Some("10"), 10), (Some("1"), 1)] {
+        assert_eq!(
+            taskcast_cli::commands::start::parse_postgres_max_connections(input).unwrap(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn postgres_max_connections_rejects_non_positive_non_integer_and_overflow_values() {
+    for input in ["0", "-1", "1.5", "abc", "4294967296"] {
+        assert_eq!(
+            taskcast_cli::commands::start::parse_postgres_max_connections(Some(input)).unwrap_err(),
+            "TASKCAST_POSTGRES_MAX_CONNECTIONS must be a positive integer"
+        );
+    }
+}
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -63,6 +108,10 @@ async fn find_available_port() -> u16 {
     let port = listener.local_addr().unwrap().port();
     drop(listener);
     port
+}
+
+fn local_client() -> reqwest::Client {
+    reqwest::Client::builder().no_proxy().build().unwrap()
 }
 
 const TEST_RSA_PRIVATE_KEY: &str = r#"-----BEGIN PRIVATE KEY-----
@@ -146,7 +195,7 @@ async fn run_jwt_auth_rejects_unauthenticated_requests() {
 
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-    let client = reqwest::Client::new();
+    let client = local_client();
     let res = client
         .get(&format!("http://127.0.0.1:{port}/tasks"))
         .send()
@@ -154,12 +203,16 @@ async fn run_jwt_auth_rejects_unauthenticated_requests() {
         .unwrap();
     assert_eq!(res.status(), 401);
 
-    let res = reqwest::get(&format!("http://127.0.0.1:{port}/health"))
+    let res = local_client()
+        .get(format!("http://127.0.0.1:{port}/health"))
+        .send()
         .await
         .unwrap();
     assert!(res.status().is_success());
 
-    let res = reqwest::get(&format!("http://127.0.0.1:{port}/health/detail"))
+    let res = local_client()
+        .get(format!("http://127.0.0.1:{port}/health/detail"))
+        .send()
         .await
         .unwrap();
     assert!(res.status().is_success());
@@ -206,7 +259,7 @@ async fn run_jwt_auth_accepts_valid_token() {
     )
     .unwrap();
 
-    let client = reqwest::Client::new();
+    let client = local_client();
     let res = client
         .get(&format!("http://127.0.0.1:{port}/tasks"))
         .header("Authorization", format!("Bearer {token}"))
@@ -267,7 +320,7 @@ trustedServices:
 
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-    let client = reqwest::Client::new();
+    let client = local_client();
     let res = client
         .get(&format!("http://127.0.0.1:{port}/tasks"))
         .header("X-Taskcast-Service-Key", "service-key-that-is-long-enough")
@@ -330,7 +383,7 @@ async fn run_jwt_env_secret_overrides_config_secret() {
     )
     .unwrap();
 
-    let client = reqwest::Client::new();
+    let client = local_client();
     let res = client
         .get(&format!("http://127.0.0.1:{port}/tasks"))
         .header("Authorization", format!("Bearer {token}"))
@@ -370,7 +423,7 @@ async fn run_jwt_auth_accepts_rs256_public_key_from_env_and_enforces_audience() 
 
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-    let client = reqwest::Client::new();
+    let client = local_client();
     let valid_token = make_rs256_token("railway-auth", "taskcast");
     let res = client
         .get(&format!("http://127.0.0.1:{port}/tasks"))
@@ -429,7 +482,7 @@ async fn run_jwt_auth_accepts_rs256_public_key_file_from_env() {
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
     let token = make_rs256_token("any-issuer", "any-audience");
-    let client = reqwest::Client::new();
+    let client = local_client();
     let res = client
         .get(&format!("http://127.0.0.1:{port}/tasks"))
         .header("Authorization", format!("Bearer {token}"))
@@ -467,7 +520,9 @@ async fn run_env_storage_sqlite_overrides_default_memory() {
 
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-    let res = reqwest::get(&format!("http://127.0.0.1:{port}/health"))
+    let res = local_client()
+        .get(format!("http://127.0.0.1:{port}/health"))
+        .send()
         .await
         .unwrap();
     assert!(res.status().is_success());
@@ -482,7 +537,7 @@ async fn run_env_storage_sqlite_overrides_default_memory() {
 
 #[tokio::test]
 async fn run_redis_backend_serves_health() {
-    let container = Redis::default().start().await.unwrap();
+    let container = Redis::default().with_tag("7-alpine").start().await.unwrap();
     let host_port = container.get_host_port_ipv4(6379).await.unwrap();
     let redis_url = format!("redis://127.0.0.1:{}", host_port);
 
@@ -493,7 +548,7 @@ async fn run_redis_backend_serves_health() {
     let handle = tokio::spawn(async move {
         let _ = taskcast_cli::commands::start::run(StartArgs {
             port,
-            storage: "redis".to_string(),
+            storage: Some("redis".to_string()),
             ..Default::default()
         })
         .await;
@@ -501,7 +556,9 @@ async fn run_redis_backend_serves_health() {
 
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-    let res = reqwest::get(&format!("http://127.0.0.1:{port}/health"))
+    let res = local_client()
+        .get(format!("http://127.0.0.1:{port}/health"))
+        .send()
         .await
         .unwrap();
     assert!(res.status().is_success());
@@ -515,7 +572,11 @@ async fn run_redis_backend_serves_health() {
 
 #[tokio::test]
 async fn run_memory_backend_with_postgres_long_term_store() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = Postgres::default()
+        .with_tag("16-alpine")
+        .start()
+        .await
+        .unwrap();
     let host_port = container.get_host_port_ipv4(5432).await.unwrap();
     let pg_url = format!(
         "postgres://postgres:postgres@127.0.0.1:{}/postgres?sslmode=disable",
@@ -535,7 +596,9 @@ async fn run_memory_backend_with_postgres_long_term_store() {
 
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-    let res = reqwest::get(&format!("http://127.0.0.1:{port}/health"))
+    let res = local_client()
+        .get(format!("http://127.0.0.1:{port}/health"))
+        .send()
         .await
         .unwrap();
     assert!(res.status().is_success());
@@ -549,7 +612,11 @@ async fn run_memory_backend_with_postgres_long_term_store() {
 
 #[tokio::test]
 async fn auto_migrate_disabled_when_env_var_not_set() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = Postgres::default()
+        .with_tag("16-alpine")
+        .start()
+        .await
+        .unwrap();
     let host_port = container.get_host_port_ipv4(5432).await.unwrap();
     let pg_url = format!(
         "postgres://postgres:postgres@127.0.0.1:{}/postgres?sslmode=disable",
@@ -570,7 +637,9 @@ async fn auto_migrate_disabled_when_env_var_not_set() {
 
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-    let res = reqwest::get(&format!("http://127.0.0.1:{port}/health"))
+    let res = local_client()
+        .get(format!("http://127.0.0.1:{port}/health"))
+        .send()
         .await
         .unwrap();
     assert!(res.status().is_success());
@@ -582,7 +651,11 @@ async fn auto_migrate_disabled_when_env_var_not_set() {
 
 #[tokio::test]
 async fn auto_migrate_enabled_runs_migrations_on_startup() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = Postgres::default()
+        .with_tag("16-alpine")
+        .start()
+        .await
+        .unwrap();
     let host_port = container.get_host_port_ipv4(5432).await.unwrap();
     let pg_url = format!(
         "postgres://postgres:postgres@127.0.0.1:{}/postgres?sslmode=disable",
@@ -607,13 +680,15 @@ async fn auto_migrate_enabled_runs_migrations_on_startup() {
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     // Verify server started successfully
-    let res = reqwest::get(&format!("http://127.0.0.1:{port}/health"))
+    let res = local_client()
+        .get(format!("http://127.0.0.1:{port}/health"))
+        .send()
         .await
         .unwrap();
     assert!(res.status().is_success());
 
     // Verify that migrations were applied by checking that we can create a task
-    let client = reqwest::Client::new();
+    let client = local_client();
     let task_payload = serde_json::json!({
         "type": "test:task",
         "params": {"foo": "bar"}
@@ -639,7 +714,11 @@ async fn auto_migrate_enabled_runs_migrations_on_startup() {
 
 #[tokio::test]
 async fn auto_migrate_disabled_when_env_var_is_false() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = Postgres::default()
+        .with_tag("16-alpine")
+        .start()
+        .await
+        .unwrap();
     let host_port = container.get_host_port_ipv4(5432).await.unwrap();
     let pg_url = format!(
         "postgres://postgres:postgres@127.0.0.1:{}/postgres?sslmode=disable",
@@ -663,7 +742,9 @@ async fn auto_migrate_disabled_when_env_var_is_false() {
 
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-    let res = reqwest::get(&format!("http://127.0.0.1:{port}/health"))
+    let res = local_client()
+        .get(format!("http://127.0.0.1:{port}/health"))
+        .send()
         .await
         .unwrap();
     assert!(res.status().is_success());
@@ -675,7 +756,11 @@ async fn auto_migrate_disabled_when_env_var_is_false() {
 
 #[tokio::test]
 async fn auto_migrate_enabled_with_case_insensitive_env_var() {
-    let container = Postgres::default().start().await.unwrap();
+    let container = Postgres::default()
+        .with_tag("16-alpine")
+        .start()
+        .await
+        .unwrap();
     let host_port = container.get_host_port_ipv4(5432).await.unwrap();
     let pg_url = format!(
         "postgres://postgres:postgres@127.0.0.1:{}/postgres?sslmode=disable",
@@ -699,7 +784,9 @@ async fn auto_migrate_enabled_with_case_insensitive_env_var() {
 
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-    let res = reqwest::get(&format!("http://127.0.0.1:{port}/health"))
+    let res = local_client()
+        .get(format!("http://127.0.0.1:{port}/health"))
+        .send()
         .await
         .unwrap();
     assert!(res.status().is_success());

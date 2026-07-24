@@ -13,7 +13,7 @@ async fn find_available_port() -> u16 {
 fn start_args_default_values() {
     let args = StartArgs::default();
     assert_eq!(args.port, 3721);
-    assert_eq!(args.storage, "memory");
+    assert_eq!(args.storage, None);
     assert_eq!(args.db_path, "./taskcast.db");
     assert!(args.config.is_none());
     assert!(!args.playground);
@@ -118,7 +118,7 @@ async fn run_sqlite_backend_serves_health() {
     let handle = tokio::spawn(async move {
         let _ = taskcast_cli::commands::start::run(StartArgs {
             port,
-            storage: "sqlite".to_string(),
+            storage: Some("sqlite".to_string()),
             db_path: db_path_str,
             ..Default::default()
         })
@@ -255,7 +255,7 @@ async fn run_sqlite_backend_health_detail() {
     let handle = tokio::spawn(async move {
         let _ = taskcast_cli::commands::start::run(StartArgs {
             port,
-            storage: "sqlite".to_string(),
+            storage: Some("sqlite".to_string()),
             db_path: db_path_str,
             ..Default::default()
         })
@@ -673,7 +673,7 @@ adapters:
             port,
             config: Some(config_str),
             // Explicitly use memory so we don't try to connect to redis
-            storage: "memory".to_string(),
+            storage: Some("memory".to_string()),
             ..Default::default()
         })
         .await;

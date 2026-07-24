@@ -1,5 +1,4 @@
 import { Command } from 'commander'
-import { Redis } from 'ioredis'
 import postgres from 'postgres'
 import { existsSync } from 'fs'
 import { join, dirname } from 'path'
@@ -13,10 +12,11 @@ import {
   MemoryShortTermStore,
 } from '@taskcast/core'
 import type { BroadcastProvider, ShortTermStore, LongTermStore, TaskcastConfig } from '@taskcast/core'
-import { createTaskcastApp, parseLogLevel } from '@taskcast/server'
+import { createTaskcastApp, DependencyHealthRegistry, parseLogLevel } from '@taskcast/server'
 import type { AuthConfig, JWTConfig } from '@taskcast/server'
-import { createRedisAdapters } from '@taskcast/redis'
-import { PostgresLongTermStore } from '@taskcast/postgres'
+import { createManagedRedisAdapters } from '@taskcast/redis'
+import type { ManagedRedisAdapters } from '@taskcast/redis'
+import { PostgresLongTermStore, postgresCheck } from '@taskcast/postgres'
 import { createSqliteAdapters } from '@taskcast/sqlite'
 import { promptCreateGlobalConfig, createDefaultGlobalConfig } from '../utils.js'
 import { performAutoMigrateIfEnabled } from '../auto-migrate.js'
@@ -44,6 +44,68 @@ function formatConnectionUrlForLog(url: string): string {
 function envNonEmpty(key: string): string | undefined {
   const value = process.env[key]
   return value === undefined || value === '' ? undefined : value
+}
+
+type StorageMode = 'memory' | 'redis' | 'sqlite'
+
+export function resolveStorageMode(options: {
+  cli?: string
+  env?: string
+  configuredProvider?: string
+  hasRedisUrl: boolean
+}): StorageMode {
+  const value = options.cli ?? options.env ?? options.configuredProvider ?? (options.hasRedisUrl ? 'redis' : 'memory')
+  if (value !== 'memory' && value !== 'redis' && value !== 'sqlite') {
+    throw new Error(`invalid storage mode "${value}"; expected memory, redis, or sqlite`)
+  }
+  return value
+}
+
+export function parsePostgresMaxConnections(value?: string): number {
+  if (value === undefined || value === '') return 10
+  if (!/^[1-9]\d*$/.test(value)) {
+    throw new Error('TASKCAST_POSTGRES_MAX_CONNECTIONS must be a positive integer')
+  }
+  const parsed = Number(value)
+  if (!Number.isSafeInteger(parsed)) {
+    throw new Error('TASKCAST_POSTGRES_MAX_CONNECTIONS must be a positive integer')
+  }
+  return parsed
+}
+
+function configuredStorageProvider(config: TaskcastConfig): string | undefined {
+  const shortTerm = config.adapters?.shortTermStore?.provider
+  const broadcast = config.adapters?.broadcast?.provider
+  if (shortTerm !== undefined && broadcast !== undefined && shortTerm !== broadcast) {
+    throw new Error('configured short-term and broadcast providers must match')
+  }
+  return shortTerm ?? broadcast
+}
+
+function configuredRedisUrl(config: TaskcastConfig): string | undefined {
+  const broadcast = config.adapters?.broadcast?.url
+  const shortTerm = config.adapters?.shortTermStore?.url
+  return [broadcast, shortTerm].find((value): value is string => value !== undefined && value !== '')
+}
+
+function postgresActivation(options: {
+  storageMode: StorageMode
+  configuredProvider?: string
+  envUrl?: string
+  configuredUrl?: string
+}): { active: false } | { active: true; url: string } {
+  if (options.storageMode === 'sqlite') return { active: false }
+  if (options.configuredProvider !== undefined) {
+    if (options.configuredProvider !== 'postgres') return { active: false }
+    const url = options.envUrl ?? options.configuredUrl
+    if (url === undefined || url === '') {
+      throw new Error(
+        'configured PostgreSQL long-term store requires TASKCAST_POSTGRES_URL or adapters.longTermStore.url'
+      )
+    }
+    return { active: true, url }
+  }
+  return options.envUrl === undefined ? { active: false } : { active: true, url: options.envUrl }
 }
 
 function buildAuthConfig(config: TaskcastConfig): AuthConfig {
@@ -108,6 +170,10 @@ export interface RunStartOptions {
   configPath?: string
   /** Environment variables for auto-migrate */
   env?: Record<string, string | undefined>
+  /** Active dependency health registry */
+  dependencyHealth?: DependencyHealthRegistry
+  /** Idempotent close callback for active Redis/PostgreSQL resources */
+  closeDependencies?: () => Promise<void>
 }
 
 /**
@@ -125,81 +191,160 @@ export interface RunStartOptions {
  * @throws Error if auto-migrate fails
  */
 export async function runStart(options: RunStartOptions): Promise<void> {
-  const logLevel = parseLogLevel(options.env?.['TASKCAST_LOG_LEVEL'])
+  let stopServices: (() => void) | undefined
+  try {
+    const logLevel = parseLogLevel(options.env?.['TASKCAST_LOG_LEVEL'])
 
-  // Call auto-migrate (no-op if not enabled or no Postgres).
-  // Pass the actual sql connection so the helper can detect "configured via
-  // config file" scenarios where TASKCAST_POSTGRES_URL env var is not set.
-  await performAutoMigrateIfEnabled(options.postgres, options.postgresUrl, options.env)
+    // The startup SELECT is performed before entering runStart. Auto-migration
+    // therefore cannot run before dependency readiness has been established.
+    await performAutoMigrateIfEnabled(options.postgres, options.postgresUrl, options.env)
 
-  const engineOpts: ConstructorParameters<typeof TaskEngine>[0] = {
-    shortTermStore: options.shortTermStore,
-    broadcast: options.broadcast,
-  }
-  if (options.longTermStore !== undefined) engineOpts.longTermStore = options.longTermStore
-  const engine = new TaskEngine(engineOpts)
-
-  const auth = buildAuthConfig(options.config)
-
-  // Worker assignment system
-  const workersEnabled = options.config.workers?.enabled ?? false
-  let workerManager: WorkerManager | undefined
-  if (workersEnabled) {
-    console.log('[taskcast] Worker assignment system enabled')
-    const wmOpts: ConstructorParameters<typeof WorkerManager>[0] = {
-      engine,
+    const engineOpts: ConstructorParameters<typeof TaskEngine>[0] = {
       shortTermStore: options.shortTermStore,
       broadcast: options.broadcast,
     }
-    if (options.longTermStore !== undefined) wmOpts.longTermStore = options.longTermStore
-    if (options.config.workers?.defaults) wmOpts.defaults = options.config.workers.defaults
-    workerManager = new WorkerManager(wmOpts)
-  }
+    if (options.longTermStore !== undefined) {
+      engineOpts.longTermStore = options.longTermStore
+    }
+    const engine = new TaskEngine(engineOpts)
+    const auth = buildAuthConfig(options.config)
 
-  // Resolve admin token (auto-generate + print if adminApi is enabled)
-  resolveAdminToken(options.config)
-
-  const serverOpts: Parameters<typeof createTaskcastApp>[0] = {
-    engine,
-    shortTermStore: options.shortTermStore,
-    auth,
-    config: options.config,
-    verbose: options.verbose,
-    logLevel,
-  }
-  if (workerManager !== undefined) serverOpts.workerManager = workerManager
-  const { app, stop } = createTaskcastApp(serverOpts)
-
-  // Serve playground static files if enabled and dist exists
-  if (options.playground) {
-    try {
-      const require = createRequire(import.meta.url)
-      const pkgPath = require.resolve('@taskcast/playground/package.json')
-      const distDir = join(dirname(pkgPath), 'dist')
-      if (existsSync(distDir)) {
-        const { serveStatic } = await import('@hono/node-server/serve-static')
-        app.use('/_playground/*', serveStatic({ root: distDir, rewriteRequestPath: (p) => p.replace(/^\/_playground/, '') }))
-        // SPA fallback: serve index.html for non-asset paths
-        app.get('/_playground/*', serveStatic({ root: distDir, rewriteRequestPath: () => '/index.html' }))
-      } else {
-        console.warn('[taskcast] Playground dist not found. Run `pnpm --filter @taskcast/playground build` first.')
+    const workersEnabled = options.config.workers?.enabled ?? false
+    let workerManager: WorkerManager | undefined
+    if (workersEnabled) {
+      console.log('[taskcast] Worker assignment system enabled')
+      const wmOpts: ConstructorParameters<typeof WorkerManager>[0] = {
+        engine,
+        shortTermStore: options.shortTermStore,
+        broadcast: options.broadcast,
       }
-    } catch {
-      console.warn('[taskcast] @taskcast/playground not available, skipping playground UI.')
+      if (options.longTermStore !== undefined) {
+        wmOpts.longTermStore = options.longTermStore
+      }
+      if (options.config.workers?.defaults) {
+        wmOpts.defaults = options.config.workers.defaults
+      }
+      workerManager = new WorkerManager(wmOpts)
     }
-  }
 
-  const { serve } = await import('@hono/node-server')
-  const server = serve({ fetch: app.fetch, port: options.port }, () => {
-    console.log(`[taskcast] Server started on http://localhost:${options.port}`)
+    resolveAdminToken(options.config)
+
+    const serverOpts: Parameters<typeof createTaskcastApp>[0] = {
+      engine,
+      shortTermStore: options.shortTermStore,
+      auth,
+      config: options.config,
+      verbose: options.verbose,
+      logLevel,
+    }
+    if (workerManager !== undefined) serverOpts.workerManager = workerManager
+    if (options.dependencyHealth !== undefined) {
+      serverOpts.dependencyHealth = options.dependencyHealth
+    }
+    const { app, stop } = createTaskcastApp(serverOpts)
+    stopServices = stop
+
     if (options.playground) {
-      console.log(`[taskcast] Playground UI at http://localhost:${options.port}/_playground/`)
+      try {
+        const require = createRequire(import.meta.url)
+        const pkgPath = require.resolve('@taskcast/playground/package.json')
+        const distDir = join(dirname(pkgPath), 'dist')
+        if (existsSync(distDir)) {
+          const { serveStatic } = await import('@hono/node-server/serve-static')
+          app.use(
+            '/_playground/*',
+            serveStatic({
+              root: distDir,
+              rewriteRequestPath: (p) => p.replace(/^\/_playground/, ''),
+            })
+          )
+          app.get(
+            '/_playground/*',
+            serveStatic({
+              root: distDir,
+              rewriteRequestPath: () => '/index.html',
+            })
+          )
+        } else {
+          console.warn('[taskcast] Playground dist not found. Run `pnpm --filter @taskcast/playground build` first.')
+        }
+      } catch {
+        console.warn('[taskcast] @taskcast/playground not available, skipping playground UI.')
+      }
     }
-  })
 
-  // Clean up scheduler/heartbeat on shutdown
-  process.on('SIGTERM', () => { stop(); (server as { close?: () => void }).close?.() })
-  process.on('SIGINT', () => { stop(); (server as { close?: () => void }).close?.() })
+    const { serve } = await import('@hono/node-server')
+    let server: ReturnType<typeof serve> | undefined
+    await new Promise<void>((resolve, reject) => {
+      const onStartupError = (error: Error) => reject(error)
+      server = serve({ fetch: app.fetch, port: options.port }, () => {
+        ;(server as {
+          off?: (event: string, listener: (error: Error) => void) => void
+        } | undefined)?.off?.('error', onStartupError)
+        console.log(`[taskcast] Server started on http://localhost:${options.port}`)
+        if (options.playground) {
+          console.log(`[taskcast] Playground UI at http://localhost:${options.port}/_playground/`)
+        }
+        resolve()
+      })
+      ;(server as {
+        once?: (event: string, listener: (error: Error) => void) => void
+      }).once?.('error', onStartupError)
+    })
+    if (server === undefined) {
+      throw new Error('HTTP server was not created')
+    }
+
+    let shutdownPromise: Promise<void> | undefined
+    const closeServer = async (): Promise<void> => {
+      const close = (
+        server as {
+          close?: (callback?: (error?: Error) => void) => void
+        }
+      ).close
+      if (close === undefined) return
+      await new Promise<void>((resolve, reject) => {
+        try {
+          close.call(server, (error?: Error) => {
+            if (error) reject(error)
+            else resolve()
+          })
+        } catch (error) {
+          reject(error)
+        }
+      })
+    }
+    const shutdown = (): Promise<void> => {
+      if (shutdownPromise !== undefined) return shutdownPromise
+      shutdownPromise = (async () => {
+        process.off('SIGTERM', signalHandler)
+        process.off('SIGINT', signalHandler)
+        try {
+          stop()
+          await closeServer()
+        } finally {
+          await options.closeDependencies?.()
+        }
+      })()
+      return shutdownPromise
+    }
+    const signalHandler = () => {
+      void shutdown().catch((error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error)
+        console.error(`[taskcast] shutdown failed: ${message}`)
+      })
+    }
+
+    process.on('SIGTERM', signalHandler)
+    process.on('SIGINT', signalHandler)
+  } catch (error) {
+    try {
+      stopServices?.()
+    } finally {
+      await options.closeDependencies?.()
+    }
+    throw error
+  }
 }
 
 export function registerStartCommand(program: Command): void {
@@ -208,112 +353,156 @@ export function registerStartCommand(program: Command): void {
     .description('Start the taskcast server in foreground (default)')
     .option('-c, --config <path>', 'config file path')
     .option('-p, --port <port>', 'port to listen on', '3721')
-    .option('-s, --storage <type>', 'storage backend: memory | redis | sqlite', 'memory')
+    .option('-s, --storage <type>', 'storage backend: memory | redis | sqlite')
     .option('--db-path <path>', 'SQLite database file path (default: ./taskcast.db)')
     .option('--playground', 'serve the interactive playground UI at /_playground/')
     .option('-v, --verbose', 'enable verbose logging')
-    .action(async (options: { config?: string; port: string; storage?: string; dbPath?: string; playground?: boolean; verbose?: boolean }) => {
-      let { config: fileConfig, source, path: configPath } = await loadConfigFile(options.config)
+    .action(
+      async (options: {
+        config?: string
+        port: string
+        storage?: string
+        dbPath?: string
+        playground?: boolean
+        verbose?: boolean
+      }) => {
+        let managedRedis: ManagedRedisAdapters | undefined
+        let postgres_: ReturnType<typeof postgres> | undefined
+        let cleanupPromise: Promise<void> | undefined
+        const closeDependencies = (): Promise<void> => {
+          cleanupPromise ??= (async () => {
+            const closes: Promise<unknown>[] = []
+            if (managedRedis !== undefined) closes.push(managedRedis.close())
+            if (postgres_ !== undefined) {
+              closes.push(postgres_.end({ timeout: 5 }))
+            }
+            await Promise.allSettled(closes)
+          })()
+          return cleanupPromise
+        }
 
-      if (source === 'none') {
-        const shouldCreate = await promptCreateGlobalConfig()
-        if (shouldCreate) {
-          const createdPath = createDefaultGlobalConfig()
-          if (createdPath) {
-            const created = await loadConfigFile(createdPath)
-            fileConfig = created.config
-            source = created.source
-            configPath = created.path
+        try {
+          let { config: fileConfig, source, path: configPath } = await loadConfigFile(options.config)
+
+          if (source === 'none') {
+            const shouldCreate = await promptCreateGlobalConfig()
+            if (shouldCreate) {
+              const createdPath = createDefaultGlobalConfig()
+              if (createdPath) {
+                const created = await loadConfigFile(createdPath)
+                fileConfig = created.config
+                source = created.source
+                configPath = created.path
+              }
+            }
           }
+
+          const port = Number(options.port ?? fileConfig.port ?? 3721)
+          const envRedisUrl = envNonEmpty('TASKCAST_REDIS_URL')
+          const redisUrl = envRedisUrl ?? configuredRedisUrl(fileConfig)
+          const envStorage = envNonEmpty('TASKCAST_STORAGE')
+          const configuredProvider =
+            options.storage === undefined && envStorage === undefined
+              ? configuredStorageProvider(fileConfig)
+              : undefined
+          const storageMode = resolveStorageMode({
+            ...(options.storage === undefined ? {} : { cli: options.storage }),
+            ...(envStorage === undefined ? {} : { env: envStorage }),
+            ...(configuredProvider === undefined ? {} : { configuredProvider }),
+            hasRedisUrl: redisUrl !== undefined,
+          })
+          if (storageMode === 'redis' && redisUrl === undefined) {
+            throw new Error('storage mode redis requires TASKCAST_REDIS_URL or a configured Redis URL')
+          }
+
+          const dependencyHealth = new DependencyHealthRegistry()
+          managedRedis =
+            storageMode === 'redis'
+              ? await createManagedRedisAdapters(redisUrl!, {
+                  observer: dependencyHealth,
+                  startupTimeoutMs: 15_000,
+                })
+              : undefined
+          if (managedRedis !== undefined) {
+            dependencyHealth.register('redisCommand', managedRedis.commandCheck)
+            dependencyHealth.register('redisPubSub', managedRedis.pubSubCheck)
+          }
+
+          let shortTermStore: ShortTermStore
+          let broadcast: BroadcastProvider
+          let longTermStore: LongTermStore | undefined
+          let shortTermLabel: string
+          let longTermLabel = '(none)'
+
+          if (storageMode === 'sqlite') {
+            const dbPath = options.dbPath ?? './taskcast.db'
+            const sqliteOpts = options.dbPath ? { path: options.dbPath } : {}
+            const adapters = createSqliteAdapters(sqliteOpts)
+            broadcast = new MemoryBroadcastProvider()
+            shortTermStore = adapters.shortTermStore
+            longTermStore = adapters.longTermStore
+            shortTermLabel = `sqlite @ ${dbPath}`
+            longTermLabel = `sqlite @ ${dbPath}`
+          } else if (managedRedis !== undefined) {
+            broadcast = managedRedis.broadcast
+            shortTermStore = managedRedis.shortTermStore
+            shortTermLabel = `redis @ ${formatConnectionUrlForLog(redisUrl!)}`
+          } else {
+            broadcast = new MemoryBroadcastProvider()
+            shortTermStore = new MemoryShortTermStore()
+            shortTermLabel = 'memory'
+          }
+
+          const configuredLongTerm = fileConfig.adapters?.longTermStore
+          const envPostgresUrl = envNonEmpty('TASKCAST_POSTGRES_URL')
+          const postgresState = postgresActivation({
+            storageMode,
+            ...(configuredLongTerm?.provider === undefined ? {} : { configuredProvider: configuredLongTerm.provider }),
+            ...(envPostgresUrl === undefined ? {} : { envUrl: envPostgresUrl }),
+            ...(configuredLongTerm?.url === undefined ? {} : { configuredUrl: configuredLongTerm.url }),
+          })
+          let postgresUrl: string | undefined
+          if (postgresState.active) {
+            postgresUrl = postgresState.url
+            const max = parsePostgresMaxConnections(process.env['TASKCAST_POSTGRES_MAX_CONNECTIONS'])
+            postgres_ = postgres(postgresUrl, {
+              max,
+              connect_timeout: 5,
+            })
+            await postgresCheck(postgres_)
+            dependencyHealth.register('postgres', () => postgresCheck(postgres_!))
+            longTermStore = new PostgresLongTermStore(postgres_, dependencyHealth)
+            longTermLabel = `postgres @ ${formatDisplayUrl(postgresUrl)}`
+          }
+
+          // Print startup configuration summary
+          console.log(`[taskcast] Config: ${configPath ?? '(none)'}`)
+          console.log(`[taskcast] Short-term store: ${shortTermLabel}`)
+          console.log(`[taskcast] Long-term store:  ${longTermLabel}`)
+
+          const runStartOptions: RunStartOptions = {
+            broadcast,
+            shortTermStore,
+            port,
+            config: fileConfig,
+            verbose: options.verbose ?? false,
+            playground: options.playground ?? false,
+            env: process.env as Record<string, string | undefined>,
+            dependencyHealth,
+            closeDependencies,
+            ...(postgres_ === undefined ? {} : { postgres: postgres_ }),
+            ...(postgresUrl === undefined ? {} : { postgresUrl }),
+            ...(longTermStore === undefined ? {} : { longTermStore }),
+            ...(configPath === undefined ? {} : { configPath }),
+          }
+
+          await runStart(runStartOptions)
+        } catch (err) {
+          await closeDependencies()
+          const msg = err instanceof Error ? err.message : String(err)
+          console.error(`[taskcast] ${msg}`)
+          process.exit(1)
         }
       }
-
-      const port = Number(options.port ?? fileConfig.port ?? 3721)
-      const redisUrl = process.env['TASKCAST_REDIS_URL'] ?? fileConfig.adapters?.broadcast?.url
-      const postgresUrl = process.env['TASKCAST_POSTGRES_URL'] ?? fileConfig.adapters?.longTermStore?.url
-
-      let shortTermStore: ShortTermStore
-      let broadcast: BroadcastProvider
-      let longTermStore: LongTermStore | undefined
-      let postgres_: ReturnType<typeof postgres> | undefined
-
-      const storage = options.storage ?? process.env['TASKCAST_STORAGE'] ?? (redisUrl ? 'redis' : 'memory')
-
-      let shortTermLabel: string
-      let longTermLabel: string
-
-      if (storage === 'sqlite') {
-        const dbPath = options.dbPath ?? './taskcast.db'
-        const sqliteOpts = options.dbPath ? { path: options.dbPath } : {}
-        const adapters = createSqliteAdapters(sqliteOpts)
-        broadcast = new MemoryBroadcastProvider()
-        shortTermStore = adapters.shortTermStore
-        longTermStore = adapters.longTermStore
-        shortTermLabel = `sqlite @ ${dbPath}`
-        longTermLabel = `sqlite @ ${dbPath}`
-      } else if (storage === 'redis' || redisUrl) {
-        const pubClient = new Redis(redisUrl!)
-        const subClient = new Redis(redisUrl!)
-        const storeClient = new Redis(redisUrl!)
-        const adapters = createRedisAdapters(pubClient, subClient, storeClient)
-        broadcast = adapters.broadcast
-        shortTermStore = adapters.shortTermStore
-        // Strip any userinfo from the displayed URL so credentials don't land
-        // in stdout / log aggregators.
-        shortTermLabel = `redis @ ${formatConnectionUrlForLog(redisUrl!)}`
-        longTermLabel = '(none)'
-      } else {
-        broadcast = new MemoryBroadcastProvider()
-        shortTermStore = new MemoryShortTermStore()
-        shortTermLabel = 'memory'
-        longTermLabel = '(none)'
-      }
-
-      if (storage !== 'sqlite' && postgresUrl) {
-        postgres_ = postgres(postgresUrl)
-        longTermStore = new PostgresLongTermStore(postgres_)
-        // formatDisplayUrl returns host:port/dbname — credentials stripped.
-        longTermLabel = `postgres @ ${formatDisplayUrl(postgresUrl)}`
-      }
-
-      // Print startup configuration summary
-      console.log(`[taskcast] Config: ${configPath ?? '(none)'}`)
-      console.log(`[taskcast] Short-term store: ${shortTermLabel}`)
-      console.log(`[taskcast] Long-term store:  ${longTermLabel}`)
-
-      // Call runStart with resolved options
-      const runStartOptions: Omit<
-        RunStartOptions,
-        'postgres' | 'postgresUrl' | 'longTermStore' | 'configPath' | 'env'
-      > & {
-        postgres?: ReturnType<typeof postgres>
-        postgresUrl?: string
-        longTermStore?: LongTermStore
-        configPath?: string
-        env?: Record<string, string | undefined>
-      } = {
-        broadcast,
-        shortTermStore,
-        port,
-        config: fileConfig,
-        verbose: options.verbose ?? false,
-        playground: options.playground ?? false,
-      }
-      if (postgres_ !== undefined) runStartOptions.postgres = postgres_
-      if (postgresUrl !== undefined) runStartOptions.postgresUrl = postgresUrl
-      if (longTermStore !== undefined) runStartOptions.longTermStore = longTermStore
-      if (configPath !== undefined) runStartOptions.configPath = configPath
-      runStartOptions.env = process.env as Record<string, string | undefined>
-
-      // Fail-fast: auto-migrate errors (and any other runStart errors) should
-      // produce a clean user-facing message and non-zero exit, not an unhandled
-      // rejection from Commander.
-      try {
-        await runStart(runStartOptions as RunStartOptions)
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err)
-        console.error(`[taskcast] ${msg}`)
-        process.exit(1)
-      }
-    })
+    )
 }

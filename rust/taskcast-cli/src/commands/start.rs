@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Args;
 
@@ -16,8 +17,8 @@ pub struct StartArgs {
     #[arg(short, long, default_value = "3721")]
     pub port: u16,
     /// Storage backend: memory, redis, or sqlite
-    #[arg(short, long, default_value = "memory")]
-    pub storage: String,
+    #[arg(short, long)]
+    pub storage: Option<String>,
     /// SQLite database file path (default: ./taskcast.db)
     #[arg(long, default_value = "./taskcast.db")]
     pub db_path: String,
@@ -34,7 +35,7 @@ impl Default for StartArgs {
         Self {
             config: None,
             port: 3721,
-            storage: "memory".to_string(),
+            storage: None,
             db_path: "./taskcast.db".to_string(),
             playground: false,
             verbose: false,
@@ -52,15 +53,44 @@ impl Default for StartArgs {
 /// regardless of whether the URL came from an env var or the config file.
 async fn create_postgres_pool_with_auto_migrate(
     postgres_url: &str,
-) -> Result<sqlx::PgPool, Box<dyn std::error::Error>> {
-    let pool = sqlx::PgPool::connect(postgres_url).await?;
+    max_connections: u32,
+) -> Result<sqlx::PgPool, std::io::Error> {
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(max_connections)
+        .min_connections(0)
+        .acquire_timeout(Duration::from_secs(5))
+        .connect(postgres_url)
+        .await
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
 
-    run_auto_migrate(
+    match tokio::time::timeout(
+        Duration::from_secs(5),
+        sqlx::query("SELECT 1").execute(&pool),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            pool.close().await;
+            return Err(std::io::Error::other(error.to_string()));
+        }
+        Err(error) => {
+            pool.close().await;
+            return Err(std::io::Error::other(error.to_string()));
+        }
+    }
+
+    let migration_result: Result<(), std::io::Error> = run_auto_migrate(
         Some(&pool),
         Some(postgres_url),
         std::env::var("TASKCAST_AUTO_MIGRATE").ok().as_deref(),
     )
-    .await?;
+    .await
+    .map_err(|error| std::io::Error::other(error.to_string()));
+    if let Err(error) = migration_result {
+        pool.close().await;
+        return Err(error);
+    }
 
     Ok(pool)
 }
@@ -71,6 +101,80 @@ fn env_non_empty(key: &str) -> Option<String> {
 
 fn resolve_log_level(value: Option<&str>) -> Result<taskcast_server::LogLevel, String> {
     taskcast_server::LogLevel::parse(value)
+}
+
+pub fn parse_postgres_max_connections(value: Option<&str>) -> Result<u32, String> {
+    match value.filter(|value| !value.is_empty()) {
+        None => Ok(10),
+        Some(value) => value
+            .parse::<u32>()
+            .ok()
+            .filter(|parsed| *parsed > 0)
+            .ok_or_else(|| {
+                "TASKCAST_POSTGRES_MAX_CONNECTIONS must be a positive integer".to_string()
+            }),
+    }
+}
+
+fn configured_storage_provider(
+    config: &taskcast_core::config::TaskcastConfig,
+) -> Result<Option<&str>, String> {
+    let short_term = config
+        .adapters
+        .as_ref()
+        .and_then(|adapters| adapters.short_term_store.as_ref())
+        .map(|entry| entry.provider.as_str());
+    let broadcast = config
+        .adapters
+        .as_ref()
+        .and_then(|adapters| adapters.broadcast.as_ref())
+        .map(|entry| entry.provider.as_str());
+    if short_term.is_some() && broadcast.is_some() && short_term != broadcast {
+        return Err("configured short-term and broadcast providers must match".to_string());
+    }
+    Ok(short_term.or(broadcast))
+}
+
+fn configured_redis_url(config: &taskcast_core::config::TaskcastConfig) -> Option<String> {
+    config
+        .adapters
+        .as_ref()
+        .and_then(|adapters| adapters.broadcast.as_ref())
+        .and_then(|entry| entry.url.clone())
+        .filter(|url| !url.is_empty())
+        .or_else(|| {
+            config
+                .adapters
+                .as_ref()
+                .and_then(|adapters| adapters.short_term_store.as_ref())
+                .and_then(|entry| entry.url.clone())
+                .filter(|url| !url.is_empty())
+        })
+}
+
+fn postgres_activation(
+    storage_mode: &str,
+    configured_provider: Option<&str>,
+    env_url: Option<String>,
+    configured_url: Option<String>,
+) -> Result<Option<String>, String> {
+    if storage_mode == "sqlite" {
+        return Ok(None);
+    }
+    if let Some(provider) = configured_provider {
+        if provider != "postgres" {
+            return Ok(None);
+        }
+        return env_url
+            .or(configured_url)
+            .filter(|url| !url.is_empty())
+            .map(Some)
+            .ok_or_else(|| {
+                "configured PostgreSQL long-term store requires TASKCAST_POSTGRES_URL or adapters.longTermStore.url"
+                    .to_string()
+            });
+    }
+    Ok(env_url)
 }
 
 #[cfg(test)]
@@ -128,6 +232,60 @@ fn trusted_services_from_config(
         .collect()
 }
 
+fn build_auth_mode(
+    file_config: &taskcast_core::config::TaskcastConfig,
+) -> Result<taskcast_server::AuthMode, Box<dyn std::error::Error>> {
+    let auth_mode_str = std::env::var("TASKCAST_AUTH_MODE").ok().or_else(|| {
+        file_config
+            .auth
+            .as_ref()
+            .map(|auth| auth_mode_to_string(&auth.mode))
+    });
+
+    if auth_mode_str.as_deref() != Some("jwt") {
+        return Ok(taskcast_server::AuthMode::None);
+    }
+
+    let jwt_config = file_config.auth.as_ref().and_then(|auth| auth.jwt.as_ref());
+    let env_algorithm = env_non_empty("TASKCAST_JWT_ALGORITHM");
+    let algorithm = parse_jwt_algorithm(
+        env_algorithm
+            .as_deref()
+            .or_else(|| jwt_config.and_then(|jwt| jwt.algorithm.as_deref())),
+    );
+    let public_key = if let Some(key) = env_non_empty("TASKCAST_JWT_PUBLIC_KEY") {
+        Some(key)
+    } else if let Some(path) = env_non_empty("TASKCAST_JWT_PUBLIC_KEY_FILE") {
+        Some(std::fs::read_to_string(path)?)
+    } else if let Some(key) = jwt_config.and_then(|jwt| jwt.public_key.clone()) {
+        Some(key)
+    } else if let Some(path) = jwt_config.and_then(|jwt| jwt.public_key_file.clone()) {
+        Some(std::fs::read_to_string(path)?)
+    } else {
+        None
+    };
+    let jwt = taskcast_server::JwtConfig {
+        algorithm,
+        secret: env_non_empty("TASKCAST_JWT_SECRET")
+            .or_else(|| jwt_config.and_then(|jwt| jwt.secret.clone())),
+        public_key,
+        issuer: env_non_empty("TASKCAST_JWT_ISSUER")
+            .or_else(|| jwt_config.and_then(|jwt| jwt.issuer.clone())),
+        audience: env_non_empty("TASKCAST_JWT_AUDIENCE")
+            .or_else(|| jwt_config.and_then(|jwt| jwt.audience.clone())),
+    };
+    let trusted_services = trusted_services_from_config(file_config.trusted_services.as_deref());
+
+    Ok(if trusted_services.is_empty() {
+        taskcast_server::AuthMode::Jwt(jwt)
+    } else {
+        taskcast_server::AuthMode::JwtWithTrustedServices {
+            jwt,
+            trusted_services,
+        }
+    })
+}
+
 pub async fn run(args: StartArgs) -> Result<(), Box<dyn std::error::Error>> {
     let StartArgs {
         config,
@@ -147,31 +305,146 @@ pub async fn run(args: StartArgs) -> Result<(), Box<dyn std::error::Error>> {
     // 2. Resolve port: CLI flag > config file > default
     let port = resolve_port(port, file_config.port);
 
-    // 3. Resolve adapter URLs
-    let redis_url = std::env::var("TASKCAST_REDIS_URL").ok().or_else(|| {
-        file_config
-            .adapters
-            .as_ref()?
-            .broadcast
-            .as_ref()?
-            .url
-            .clone()
-    });
-    let postgres_url = std::env::var("TASKCAST_POSTGRES_URL").ok().or_else(|| {
-        file_config
-            .adapters
-            .as_ref()?
-            .long_term_store
-            .as_ref()?
-            .url
-            .clone()
-    });
+    // 3. Resolve activation before opening any network connection.
+    let redis_url =
+        env_non_empty("TASKCAST_REDIS_URL").or_else(|| configured_redis_url(&file_config));
+    let env_storage = env_non_empty("TASKCAST_STORAGE");
+    let configured_provider = if storage.is_none() && env_storage.is_none() {
+        configured_storage_provider(&file_config)?
+    } else {
+        None
+    };
+    let storage_mode = resolve_storage_mode(
+        storage.as_deref(),
+        env_storage.as_deref(),
+        configured_provider,
+        redis_url.is_some(),
+    )?;
+    if storage_mode == "redis" && redis_url.is_none() {
+        return Err(
+            "storage mode redis requires TASKCAST_REDIS_URL or a configured Redis URL".into(),
+        );
+    }
 
-    // 4. Resolve storage mode: CLI flag > env var > auto-detect
-    let env_storage = std::env::var("TASKCAST_STORAGE").ok();
-    let storage_mode = resolve_storage_mode(&storage, env_storage.as_deref(), redis_url.is_some());
+    let configured_long_term = file_config
+        .adapters
+        .as_ref()
+        .and_then(|adapters| adapters.long_term_store.as_ref());
+    let postgres_url = postgres_activation(
+        storage_mode,
+        configured_long_term.map(|entry| entry.provider.as_str()),
+        env_non_empty("TASKCAST_POSTGRES_URL"),
+        configured_long_term.and_then(|entry| entry.url.clone()),
+    )?;
+    let max_connections = if postgres_url.is_some() {
+        parse_postgres_max_connections(
+            std::env::var("TASKCAST_POSTGRES_MAX_CONNECTIONS")
+                .ok()
+                .as_deref(),
+        )?
+    } else {
+        10
+    };
+    let auth_mode = build_auth_mode(&file_config)?;
 
-    // 5. Build adapters
+    let dependency_health = Arc::new(taskcast_server::DependencyHealthRegistry::new());
+    let observer: Arc<dyn taskcast_core::DependencyObserver> = dependency_health.clone();
+    let managed_redis = if storage_mode == "redis" {
+        let client = redis::Client::open(
+            redis_url
+                .as_deref()
+                .expect("Redis URL checked for active Redis storage"),
+        )?;
+        Some(
+            taskcast_redis::create_managed_redis_adapters(client, None, Some(observer.clone()))
+                .await
+                .map_err(|error| {
+                    Box::new(std::io::Error::other(error.to_string())) as Box<dyn std::error::Error>
+                })?,
+        )
+    } else {
+        None
+    };
+
+    let (redis_adapters, redis_command_manager, redis_pubsub) = if let Some(managed) = managed_redis
+    {
+        let taskcast_redis::ManagedRedisAdapters {
+            adapters,
+            command_manager,
+            pubsub,
+        } = managed;
+        let pubsub = Arc::new(pubsub);
+        let manager_for_check = command_manager.clone();
+        let command_check: taskcast_server::DependencyCheck = Arc::new(move || {
+            let manager = manager_for_check.clone();
+            Box::pin(async move { taskcast_redis::command_check(&manager).await })
+        });
+        if let Err(error) =
+            dependency_health.register(taskcast_core::DependencyName::RedisCommand, command_check)
+        {
+            pubsub.shutdown().await;
+            drop(command_manager);
+            return Err(error.into());
+        }
+        let pubsub_for_check = Arc::clone(&pubsub);
+        let pubsub_check: taskcast_server::DependencyCheck = Arc::new(move || {
+            let pubsub = Arc::clone(&pubsub_for_check);
+            Box::pin(async move {
+                if pubsub.is_subscribed() {
+                    Ok(())
+                } else {
+                    Err(taskcast_core::DependencyUnavailableError::new(
+                        taskcast_core::DependencyName::RedisPubSub,
+                        taskcast_core::DependencyErrorKind::ConnectionClosed,
+                        std::io::Error::new(
+                            std::io::ErrorKind::NotConnected,
+                            "Redis PubSub is not subscribed",
+                        ),
+                    ))
+                }
+            })
+        });
+        if let Err(error) =
+            dependency_health.register(taskcast_core::DependencyName::RedisPubSub, pubsub_check)
+        {
+            pubsub.shutdown().await;
+            drop(command_manager);
+            return Err(error.into());
+        }
+        (Some(adapters), Some(command_manager), Some(pubsub))
+    } else {
+        (None, None, None)
+    };
+
+    let postgres_pool = if let Some(postgres_url) = postgres_url.as_deref() {
+        match create_postgres_pool_with_auto_migrate(postgres_url, max_connections).await {
+            Ok(pool) => Some(pool),
+            Err(error) => {
+                if let Some(pubsub) = redis_pubsub.as_ref() {
+                    pubsub.shutdown().await;
+                }
+                return Err(Box::new(error));
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(pool) = postgres_pool.as_ref() {
+        let pool_for_check = pool.clone();
+        let check: taskcast_server::DependencyCheck = Arc::new(move || {
+            let pool = pool_for_check.clone();
+            Box::pin(async move { taskcast_postgres::postgres_check(&pool).await })
+        });
+        if let Err(error) =
+            dependency_health.register(taskcast_core::DependencyName::Postgres, check)
+        {
+            close_runtime_dependencies(redis_pubsub.as_ref(), postgres_pool.as_ref()).await;
+            drop(redis_command_manager);
+            return Err(error.into());
+        }
+    }
+
+    // 4. Build adapters.
     type StorageAdapters = (
         Arc<dyn taskcast_core::BroadcastProvider>,
         Arc<dyn taskcast_core::ShortTermStore>,
@@ -188,26 +461,13 @@ pub async fn run(args: StartArgs) -> Result<(), Box<dyn std::error::Error>> {
             )
         }
         "redis" => {
-            let url = redis_url
-                .as_deref()
-                .ok_or("--storage redis requires TASKCAST_REDIS_URL")?;
-            let client = redis::Client::open(url)?;
-            let pub_conn = client.get_multiplexed_async_connection().await?;
-            let sub_conn = client.get_async_pubsub().await?;
-            let store_conn = client.get_multiplexed_async_connection().await?;
-
-            let adapters =
-                taskcast_redis::create_redis_adapters(pub_conn, sub_conn, store_conn, None);
-
-            let long_term_store: Option<Arc<dyn taskcast_core::LongTermStore>> =
-                if let Some(ref pg_url) = postgres_url {
-                    let pool = create_postgres_pool_with_auto_migrate(pg_url).await?;
-                    let store = taskcast_postgres::PostgresLongTermStore::new(pool);
-                    Some(Arc::new(store))
-                } else {
-                    None
-                };
-
+            let adapters = redis_adapters.expect("managed Redis adapters must exist");
+            let long_term_store = postgres_pool.as_ref().map(|pool| {
+                Arc::new(taskcast_postgres::PostgresLongTermStore::new_observed(
+                    pool.clone(),
+                    observer.clone(),
+                )) as Arc<dyn taskcast_core::LongTermStore>
+            });
             (
                 Arc::new(adapters.broadcast),
                 Arc::new(adapters.short_term_store),
@@ -215,18 +475,13 @@ pub async fn run(args: StartArgs) -> Result<(), Box<dyn std::error::Error>> {
             )
         }
         _ => {
-            eprintln!(
-                "[taskcast] No TASKCAST_REDIS_URL configured \u{2014} using in-memory adapters"
-            );
-
-            let long_term_store: Option<Arc<dyn taskcast_core::LongTermStore>> =
-                if let Some(ref pg_url) = postgres_url {
-                    let pool = create_postgres_pool_with_auto_migrate(pg_url).await?;
-                    let store = taskcast_postgres::PostgresLongTermStore::new(pool);
-                    Some(Arc::new(store))
-                } else {
-                    None
-                };
+            eprintln!("[taskcast] Using in-memory adapters");
+            let long_term_store = postgres_pool.as_ref().map(|pool| {
+                Arc::new(taskcast_postgres::PostgresLongTermStore::new_observed(
+                    pool.clone(),
+                    observer.clone(),
+                )) as Arc<dyn taskcast_core::LongTermStore>
+            });
 
             (
                 Arc::new(taskcast_core::MemoryBroadcastProvider::new()),
@@ -236,7 +491,7 @@ pub async fn run(args: StartArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // 6. Build engine (clone adapters for WorkerManager before moving into engine)
+    // 5. Build engine (clone adapters for WorkerManager before moving into engine)
     let short_term_for_wm = Arc::clone(&short_term_store);
     let broadcast_for_wm = Arc::clone(&broadcast);
     let long_term_for_wm = long_term_store.clone();
@@ -250,62 +505,7 @@ pub async fn run(args: StartArgs) -> Result<(), Box<dyn std::error::Error>> {
         },
     ));
 
-    // 7. Auth mode
-    let auth_mode_str = std::env::var("TASKCAST_AUTH_MODE").ok().or_else(|| {
-        file_config
-            .auth
-            .as_ref()
-            .map(|a| auth_mode_to_string(&a.mode))
-    });
-
-    let auth_mode = match auth_mode_str.as_deref() {
-        Some("jwt") => {
-            let jwt_config = file_config.auth.as_ref().and_then(|a| a.jwt.as_ref());
-
-            let env_algorithm = env_non_empty("TASKCAST_JWT_ALGORITHM");
-            let algorithm = parse_jwt_algorithm(
-                env_algorithm
-                    .as_deref()
-                    .or_else(|| jwt_config.and_then(|j| j.algorithm.as_deref())),
-            );
-
-            let public_key = if let Some(key) = env_non_empty("TASKCAST_JWT_PUBLIC_KEY") {
-                Some(key)
-            } else if let Some(path) = env_non_empty("TASKCAST_JWT_PUBLIC_KEY_FILE") {
-                Some(std::fs::read_to_string(path)?)
-            } else if let Some(key) = jwt_config.and_then(|j| j.public_key.clone()) {
-                Some(key)
-            } else if let Some(path) = jwt_config.and_then(|j| j.public_key_file.clone()) {
-                Some(std::fs::read_to_string(path)?)
-            } else {
-                None
-            };
-
-            let jwt = taskcast_server::JwtConfig {
-                algorithm,
-                secret: env_non_empty("TASKCAST_JWT_SECRET").or_else(|| jwt_config?.secret.clone()),
-                public_key,
-                issuer: env_non_empty("TASKCAST_JWT_ISSUER")
-                    .or_else(|| jwt_config.and_then(|j| j.issuer.clone())),
-                audience: env_non_empty("TASKCAST_JWT_AUDIENCE")
-                    .or_else(|| jwt_config.and_then(|j| j.audience.clone())),
-            };
-            let trusted_services =
-                trusted_services_from_config(file_config.trusted_services.as_deref());
-
-            if trusted_services.is_empty() {
-                taskcast_server::AuthMode::Jwt(jwt)
-            } else {
-                taskcast_server::AuthMode::JwtWithTrustedServices {
-                    jwt,
-                    trusted_services,
-                }
-            }
-        }
-        _ => taskcast_server::AuthMode::None,
-    };
-
-    // 8. Create WorkerManager if workers enabled in config
+    // 6. Create WorkerManager if workers enabled in config
     let workers_enabled = file_config
         .workers
         .as_ref()
@@ -364,7 +564,7 @@ pub async fn run(args: StartArgs) -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    // 9. Compose all routes before applying the single outer failure logger.
+    // 7. Compose all routes before applying the single outer failure logger.
     let additional_routes = if playground {
         println!("[taskcast] Playground UI at http://localhost:{port}/_playground/");
         axum::Router::new().nest(
@@ -376,13 +576,17 @@ pub async fn run(args: StartArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
     let failure_logger: Arc<dyn taskcast_server::HttpFailureLogger> =
         Arc::new(taskcast_server::StderrHttpFailureLogger::new(log_level));
-    let (app, _ws_registry) = taskcast_server::create_app_with_failure_logger_and_routes(
+    let runtime_health = taskcast_server::RuntimeHealth {
+        registry: Some(dependency_health),
+    };
+    let (app, _ws_registry) = taskcast_server::create_app_with_runtime_health_and_routes(
         engine,
         auth_mode,
         worker_manager,
-        None,
+        Some(file_config.clone()),
         taskcast_server::CorsConfig::default(),
         Arc::clone(&failure_logger),
+        runtime_health,
         additional_routes,
     );
 
@@ -399,13 +603,35 @@ pub async fn run(args: StartArgs) -> Result<(), Box<dyn std::error::Error>> {
         app
     };
 
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await?;
+    let listener = match tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            close_runtime_dependencies(redis_pubsub.as_ref(), postgres_pool.as_ref()).await;
+            drop(redis_command_manager);
+            return Err(Box::new(error));
+        }
+    };
     println!("[taskcast] Server started on http://localhost:{port}");
-    axum::serve(listener, app)
+    let serve_result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
-        .await?;
+        .await;
+    close_runtime_dependencies(redis_pubsub.as_ref(), postgres_pool.as_ref()).await;
+    drop(redis_command_manager);
+    serve_result?;
 
     Ok(())
+}
+
+async fn close_runtime_dependencies(
+    redis_pubsub: Option<&Arc<taskcast_redis::RedisPubSubHandle>>,
+    postgres_pool: Option<&sqlx::PgPool>,
+) {
+    if let Some(pubsub) = redis_pubsub {
+        pubsub.shutdown().await;
+    }
+    if let Some(pool) = postgres_pool {
+        pool.close().await;
+    }
 }
 
 async fn shutdown_signal() {
