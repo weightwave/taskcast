@@ -957,7 +957,7 @@ async fn app_error_engine_dependency_store_error_returns_503_json() {
             "redis://admin:secret@redis.example.com:6379 reset",
         ),
     );
-    let wrapped = std::io::Error::new(std::io::ErrorKind::Other, unavailable);
+    let wrapped = std::io::Error::other(unavailable);
     let error = AppError::Engine(EngineError::Store(Box::new(wrapped)));
     let response = error.into_response();
 
