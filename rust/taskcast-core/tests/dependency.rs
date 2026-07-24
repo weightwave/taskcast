@@ -3,7 +3,7 @@ use std::io;
 
 use taskcast_core::{
     find_dependency_unavailable, DependencyErrorKind, DependencyName, DependencyObservation,
-    DependencyState, DependencyUnavailableError,
+    DependencyObservationState, DependencyUnavailableError,
 };
 
 #[test]
@@ -28,7 +28,7 @@ fn finds_dependency_error_through_source_chain() {
 fn serializes_observation_with_the_public_names() {
     let observation = DependencyObservation {
         dependency: DependencyName::RedisPubSub,
-        state: DependencyState::Reconnecting,
+        state: DependencyObservationState::Reconnecting,
         error_kind: Some(DependencyErrorKind::ConnectionClosed),
         attempt: Some(3),
         next_retry_ms: Some(1_750),
@@ -39,4 +39,14 @@ fn serializes_observation_with_the_public_names() {
     assert_eq!(json["state"], "reconnecting");
     assert_eq!(json["errorKind"], "connection_closed");
     assert_eq!(json["nextRetryMs"], 1_750);
+}
+
+#[test]
+fn rejects_starting_observation_state() {
+    let result = serde_json::from_value::<DependencyObservation>(serde_json::json!({
+        "dependency": "redisCommand",
+        "state": "starting",
+    }));
+
+    assert!(result.is_err());
 }

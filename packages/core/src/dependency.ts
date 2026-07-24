@@ -36,6 +36,7 @@ export class DependencyUnavailableError extends Error {
     super(`${dependency} unavailable (${kind})`)
     this.name = 'DependencyUnavailableError'
     this.cause = cause
+    Object.defineProperty(this, 'cause', { enumerable: false })
   }
 }
 

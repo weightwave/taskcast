@@ -23,6 +23,14 @@ pub enum DependencyState {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DependencyObservationState {
+    Healthy,
+    Reconnecting,
+    Unhealthy,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DependencyErrorKind {
     ConnectionRefused,
@@ -38,7 +46,7 @@ pub enum DependencyErrorKind {
 #[serde(rename_all = "camelCase")]
 pub struct DependencyObservation {
     pub dependency: DependencyName,
-    pub state: DependencyState,
+    pub state: DependencyObservationState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_kind: Option<DependencyErrorKind>,
     #[serde(skip_serializing_if = "Option::is_none")]

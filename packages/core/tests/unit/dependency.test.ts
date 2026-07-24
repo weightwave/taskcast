@@ -23,6 +23,20 @@ describe('dependency contract', () => {
     expect(unavailable.cause).toBe(cause)
   })
 
+  it('does not serialize the raw cause', () => {
+    const cause = {
+      connectionString: 'redis://user:secret@redis:6379',
+    }
+    const unavailable = new DependencyUnavailableError(
+      'redisCommand',
+      'connection_reset',
+      cause,
+    )
+
+    expect(unavailable.cause).toBe(cause)
+    expect(JSON.stringify(unavailable)).not.toContain('secret')
+  })
+
   it('returns undefined for cycles and ordinary errors', () => {
     const cyclic = new Error('ordinary') as Error & { cause?: unknown }
     cyclic.cause = cyclic
