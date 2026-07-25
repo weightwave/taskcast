@@ -1,5 +1,12 @@
 # @taskcast/sqlite
 
+## 1.5.5
+
+### Patch Changes
+
+- Updated dependencies [28b5d8f]
+  - @taskcast/core@1.5.5
+
 ## 1.5.4
 
 ### Patch Changes

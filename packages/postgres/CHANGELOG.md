@@ -1,5 +1,15 @@
 # @taskcast/postgres
 
+## 1.5.5
+
+### Patch Changes
+
+- 28b5d8f: Recover managed Redis and PostgreSQL connectivity without replaying failed
+  business operations, restore Redis PubSub subscriptions, and expose
+  dependency-aware readiness in both server runtimes.
+- Updated dependencies [28b5d8f]
+  - @taskcast/core@1.5.5
+
 ## 1.5.4
 
 ### Patch Changes

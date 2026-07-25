@@ -1,5 +1,25 @@
 # @taskcast/cli
 
+## 1.5.5
+
+### Patch Changes
+
+- 28b5d8f: Recover managed Redis and PostgreSQL connectivity without replaying failed
+  business operations, restore Redis PubSub subscriptions, and expose
+  dependency-aware readiness in both server runtimes.
+- 8bbd598: Log every HTTP 5xx response once as sanitized structured JSON in both the
+  TypeScript and Rust servers, and validate `TASKCAST_LOG_LEVEL` at startup.
+- Updated dependencies [28b5d8f]
+- Updated dependencies [8bbd598]
+  - @taskcast/core@1.5.5
+  - @taskcast/server@1.5.5
+  - @taskcast/redis@1.5.5
+  - @taskcast/postgres@1.5.5
+  - @taskcast/dashboard-web@0.3.13
+  - @taskcast/playground@0.3.13
+  - @taskcast/server-sdk@1.5.5
+  - @taskcast/sqlite@1.5.5
+
 ## 1.5.4
 
 ### Patch Changes
