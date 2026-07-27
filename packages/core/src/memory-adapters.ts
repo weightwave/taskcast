@@ -11,7 +11,17 @@ import type {
   WorkerAssignment,
   TaskArchiveImportOptions,
   TaskArchiveRestoreData,
+  StorageLease,
+  TaskWriteFence,
+  ClosedWriteFence,
+  HotWriteToken,
+  SeriesResult,
+  ArchiveSourcePage,
+  RehydrateSnapshot,
+  TaskStoragePresence,
+  StorageWriterRegistration,
 } from './types.js'
+import { StorageFenceConflictError } from './types.js'
 import { TaskConflictError } from './engine.js'
 
 export class MemoryBroadcastProvider implements BroadcastProvider {
@@ -37,15 +47,30 @@ export class MemoryBroadcastProvider implements BroadcastProvider {
 }
 
 export class MemoryShortTermStore implements ShortTermStore {
+  readonly supportsHotColdRelease = true
   private tasks = new Map<string, Task>()
   private events = new Map<string, TaskEvent[]>()
   private seriesLatest = new Map<string, TaskEvent>()
   private indexCounters = new Map<string, number>()
   private workers = new Map<string, Worker>()
   private assignments = new Map<string, WorkerAssignment>()
+  private storageLocks = new Map<
+    string,
+    { lockToken: string; generation: string; storageEpoch: number; expiresAt: number }
+  >()
+  private writeFences = new Map<string, TaskWriteFence>()
+  private storageWriters = new Map<string, StorageWriterRegistration>()
 
   async saveTask(task: Task): Promise<void> {
     this.tasks.set(task.id, { ...task })
+    if (!this.writeFences.has(task.id)) {
+      this.writeFences.set(task.id, {
+        taskId: task.id,
+        acceptingWrites: true,
+        storageEpoch: 1,
+        activeReleaseGeneration: null,
+      })
+    }
   }
 
   async getTask(taskId: string): Promise<Task | null> {
@@ -60,8 +85,7 @@ export class MemoryShortTermStore implements ShortTermStore {
   }
 
   async appendEvent(taskId: string, event: TaskEvent): Promise<void> {
-    if (!this.events.has(taskId)) this.events.set(taskId, [])
-    this.events.get(taskId)!.push({ ...event })
+    this.appendEventSync(taskId, event)
   }
 
   async validateTaskArchiveRestore(
@@ -100,6 +124,252 @@ export class MemoryShortTermStore implements ShortTermStore {
     return { overwritten: existing !== undefined }
   }
 
+  async acquireStorageLock(
+    taskId: string,
+    lockToken: string,
+    generation: string,
+    ttlMs: number,
+  ): Promise<StorageLease | null> {
+    const now = Date.now()
+    const current = this.storageLocks.get(taskId)
+    if (current && current.expiresAt > now) {
+      if (current.lockToken !== lockToken || current.generation !== generation) return null
+      current.expiresAt = now + ttlMs
+      return { taskId, lockToken, generation, storageEpoch: current.storageEpoch }
+    }
+
+    const storageEpoch = this.writeFences.get(taskId)?.storageEpoch ?? 1
+    this.storageLocks.set(taskId, {
+      lockToken,
+      generation,
+      storageEpoch,
+      expiresAt: now + ttlMs,
+    })
+    return { taskId, lockToken, generation, storageEpoch }
+  }
+
+  async renewStorageLock(lease: StorageLease, ttlMs: number): Promise<boolean> {
+    const current = this.getOwnedStorageLock(lease)
+    if (!current) return false
+    current.expiresAt = Date.now() + ttlMs
+    return true
+  }
+
+  async releaseStorageLock(lease: StorageLease): Promise<boolean> {
+    if (!this.getOwnedStorageLock(lease)) return false
+    this.storageLocks.delete(lease.taskId)
+    return true
+  }
+
+  async getWriteFence(taskId: string): Promise<TaskWriteFence | null> {
+    const fence = this.writeFences.get(taskId)
+    return fence ? { ...fence } : null
+  }
+
+  async closeWriteFence(lease: StorageLease, expectedEpoch: number): Promise<ClosedWriteFence> {
+    this.assertOwnedStorageLock(lease)
+    const fence = this.writeFences.get(lease.taskId)
+    if (!fence || !fence.acceptingWrites || fence.storageEpoch !== expectedEpoch) {
+      throw new StorageFenceConflictError()
+    }
+
+    const highWatermark = Math.max(
+      this.indexCounters.get(lease.taskId) ?? -1,
+      ...(this.events.get(lease.taskId) ?? []).map((event) => event.index),
+    )
+    const closed: ClosedWriteFence = {
+      ...fence,
+      acceptingWrites: false,
+      activeReleaseGeneration: lease.generation,
+      highWatermark,
+    }
+    this.writeFences.set(lease.taskId, closed)
+    return { ...closed }
+  }
+
+  async reopenWriteFence(lease: StorageLease, expectedEpoch: number): Promise<HotWriteToken> {
+    this.assertOwnedStorageLock(lease)
+    const fence = this.writeFences.get(lease.taskId)
+    if (
+      !fence ||
+      fence.acceptingWrites ||
+      fence.storageEpoch !== expectedEpoch ||
+      fence.activeReleaseGeneration !== lease.generation
+    ) {
+      throw new StorageFenceConflictError()
+    }
+
+    const storageEpoch = expectedEpoch + 1
+    this.writeFences.set(lease.taskId, {
+      taskId: lease.taskId,
+      acceptingWrites: true,
+      storageEpoch,
+      activeReleaseGeneration: null,
+    })
+    return { taskId: lease.taskId, storageEpoch }
+  }
+
+  async commitEventFenced(
+    taskId: string,
+    event: Omit<TaskEvent, 'index'>,
+    token: HotWriteToken,
+  ): Promise<SeriesResult> {
+    const fence = this.writeFences.get(taskId)
+    if (
+      token.taskId !== taskId ||
+      !fence?.acceptingWrites ||
+      fence.storageEpoch !== token.storageEpoch
+    ) {
+      throw new StorageFenceConflictError()
+    }
+
+    const index = (this.indexCounters.get(taskId) ?? -1) + 1
+    const committed = { ...event, taskId, index } as TaskEvent
+    this.indexCounters.set(taskId, index)
+
+    if (committed.seriesId && committed.seriesMode === 'latest') {
+      this.replaceLastSeriesEventSync(taskId, committed.seriesId, committed)
+      return { event: committed, stored: true }
+    }
+
+    if (committed.seriesId && committed.seriesMode === 'accumulate') {
+      this.appendEventSync(taskId, committed)
+      const accumulatedEvent = this.accumulateSeriesSync(
+        taskId,
+        committed.seriesId,
+        committed,
+        committed.seriesAccField ?? 'delta',
+      )
+      return { event: committed, accumulatedEvent, stored: true }
+    }
+
+    this.appendEventSync(taskId, committed)
+    return { event: committed, stored: true }
+  }
+
+  async saveTaskFenced(task: Task, token: HotWriteToken): Promise<void> {
+    const fence = this.writeFences.get(task.id)
+    if (
+      token.taskId !== task.id ||
+      !fence?.acceptingWrites ||
+      fence.storageEpoch !== token.storageEpoch
+    ) {
+      throw new StorageFenceConflictError()
+    }
+    this.tasks.set(task.id, { ...task })
+  }
+
+  async readArchiveSourcePage(
+    taskId: string,
+    watermark: number,
+    cursor: string | null,
+    limit: number,
+  ): Promise<ArchiveSourcePage> {
+    const offset = cursor === null ? 0 : Number.parseInt(cursor, 10)
+    const source = (this.events.get(taskId) ?? [])
+      .filter((event) => event.index <= watermark)
+      .sort((left, right) => left.index - right.index)
+    const events = source.slice(offset, offset + Math.max(1, limit)).map((event) => ({ ...event }))
+    const nextOffset = offset + events.length
+    const done = nextOffset >= source.length
+    return {
+      taskId,
+      watermark,
+      cursor,
+      nextCursor: done ? null : String(nextOffset),
+      events,
+      done,
+    }
+  }
+
+  async deleteTaskStorageFenced(lease: StorageLease, expectedEpoch: number): Promise<void> {
+    this.assertOwnedStorageLock(lease)
+    const fence = this.writeFences.get(lease.taskId)
+    if (
+      !fence ||
+      fence.acceptingWrites ||
+      fence.storageEpoch !== expectedEpoch ||
+      fence.activeReleaseGeneration !== lease.generation
+    ) {
+      throw new StorageFenceConflictError()
+    }
+
+    this.tasks.delete(lease.taskId)
+    this.events.delete(lease.taskId)
+    this.indexCounters.delete(lease.taskId)
+    this.writeFences.delete(lease.taskId)
+    const prefix = `${lease.taskId}:`
+    for (const key of this.seriesLatest.keys()) {
+      if (key.startsWith(prefix)) this.seriesLatest.delete(key)
+    }
+  }
+
+  async restoreHotTaskFenced(
+    snapshot: RehydrateSnapshot,
+    lease: StorageLease,
+    nextEpoch: number,
+  ): Promise<HotWriteToken> {
+    this.assertOwnedStorageLock(lease)
+    if (snapshot.task.id !== lease.taskId || nextEpoch <= snapshot.storageEpoch) {
+      throw new StorageFenceConflictError()
+    }
+
+    const taskId = snapshot.task.id
+    this.tasks.set(taskId, { ...snapshot.task })
+    this.events.set(
+      taskId,
+      snapshot.replayEvents.map((event) => ({ ...event })),
+    )
+    this.indexCounters.set(taskId, snapshot.maxEventIndex)
+    const prefix = `${taskId}:`
+    for (const key of this.seriesLatest.keys()) {
+      if (key.startsWith(prefix)) this.seriesLatest.delete(key)
+    }
+    for (const entry of snapshot.seriesLatest) {
+      this.seriesLatest.set(`${taskId}:${entry.seriesId}`, { ...entry.event })
+    }
+    this.writeFences.set(taskId, {
+      taskId,
+      acceptingWrites: true,
+      storageEpoch: nextEpoch,
+      activeReleaseGeneration: null,
+    })
+    return { taskId, storageEpoch: nextEpoch }
+  }
+
+  async getTaskStoragePresence(taskId: string): Promise<TaskStoragePresence> {
+    const prefix = `${taskId}:`
+    let seriesStateCount = 0
+    for (const key of this.seriesLatest.keys()) {
+      if (key.startsWith(prefix)) seriesStateCount += 1
+    }
+    return {
+      task: this.tasks.has(taskId),
+      eventCount: this.events.get(taskId)?.length ?? 0,
+      nextIndex: this.indexCounters.has(taskId),
+      seriesStateCount,
+      writeFence: this.writeFences.has(taskId),
+    }
+  }
+
+  async registerStorageWriter(
+    registration: StorageWriterRegistration,
+    ttlMs: number,
+  ): Promise<void> {
+    this.storageWriters.set(registration.instanceId, {
+      ...registration,
+      expiresAt: Date.now() + ttlMs,
+    })
+  }
+
+  async listStorageWriters(): Promise<StorageWriterRegistration[]> {
+    const now = Date.now()
+    for (const [instanceId, registration] of this.storageWriters) {
+      if (registration.expiresAt <= now) this.storageWriters.delete(instanceId)
+    }
+    return Array.from(this.storageWriters.values()).map((registration) => ({ ...registration }))
+  }
+
   async getEvents(taskId: string, opts?: EventQueryOptions): Promise<TaskEvent[]> {
     const all = this.events.get(taskId) ?? []
     let result = all
@@ -130,6 +400,15 @@ export class MemoryShortTermStore implements ShortTermStore {
   }
 
   async accumulateSeries(taskId: string, seriesId: string, event: TaskEvent, field: string): Promise<TaskEvent> {
+    return this.accumulateSeriesSync(taskId, seriesId, event, field)
+  }
+
+  private accumulateSeriesSync(
+    taskId: string,
+    seriesId: string,
+    event: TaskEvent,
+    field: string,
+  ): TaskEvent {
     const key = `${taskId}:${seriesId}`
     const prev = this.seriesLatest.get(key)
 
@@ -152,6 +431,10 @@ export class MemoryShortTermStore implements ShortTermStore {
   }
 
   async replaceLastSeriesEvent(taskId: string, seriesId: string, event: TaskEvent): Promise<void> {
+    this.replaceLastSeriesEventSync(taskId, seriesId, event)
+  }
+
+  private replaceLastSeriesEventSync(taskId: string, seriesId: string, event: TaskEvent): void {
     const key = `${taskId}:${seriesId}`
     const prev = this.seriesLatest.get(key)
     if (prev) {
@@ -168,9 +451,38 @@ export class MemoryShortTermStore implements ShortTermStore {
         if (idx >= 0) taskEvents[idx] = { ...event }
       }
     } else {
-      await this.appendEvent(taskId, event)
+      this.appendEventSync(taskId, event)
     }
     this.seriesLatest.set(key, { ...event })
+  }
+
+  private appendEventSync(taskId: string, event: TaskEvent): void {
+    if (!this.events.has(taskId)) this.events.set(taskId, [])
+    this.events.get(taskId)!.push({ ...event })
+  }
+
+  private getOwnedStorageLock(
+    lease: StorageLease,
+  ): { lockToken: string; generation: string; storageEpoch: number; expiresAt: number } | null {
+    const current = this.storageLocks.get(lease.taskId)
+    if (!current || current.expiresAt <= Date.now()) {
+      if (current) this.storageLocks.delete(lease.taskId)
+      return null
+    }
+    if (
+      current.lockToken !== lease.lockToken ||
+      current.generation !== lease.generation ||
+      current.storageEpoch !== lease.storageEpoch
+    ) {
+      return null
+    }
+    return current
+  }
+
+  private assertOwnedStorageLock(lease: StorageLease): void {
+    if (!this.getOwnedStorageLock(lease)) {
+      throw new StorageFenceConflictError('Storage lease is stale')
+    }
   }
 
   // Task query

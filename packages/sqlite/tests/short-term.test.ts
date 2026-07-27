@@ -57,6 +57,10 @@ describe('SqliteShortTermStore', () => {
     store = new SqliteShortTermStore(db)
   })
 
+  it('does not advertise split-tier hot/cold release', () => {
+    expect(store.supportsHotColdRelease).toBe(false)
+  })
+
   afterEach(() => {
     db.close()
     rmSync(dir, { recursive: true, force: true })

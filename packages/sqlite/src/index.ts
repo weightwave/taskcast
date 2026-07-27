@@ -25,10 +25,45 @@ export function createSqliteAdapters(options: SqliteAdapterOptions = {}): {
   const __dirname = dirname(fileURLToPath(import.meta.url))
   const migration = readFileSync(join(__dirname, '../migrations/001_initial.sql'), 'utf8')
   db.exec(migration)
+  runStorageLifecycleMigration(db, __dirname)
 
   return {
     shortTermStore: new SqliteShortTermStore(db),
     longTermStore: new SqliteLongTermStore(db, true),
     db,
   }
+}
+
+const LIFECYCLE_COLUMNS: ReadonlyArray<readonly [string, string]> = [
+  ['storage_state', "TEXT NOT NULL DEFAULT 'hot'"],
+  ['storage_epoch', 'INTEGER NOT NULL DEFAULT 1'],
+  ['active_release_generation', 'TEXT'],
+  ['archive_watermark', 'INTEGER NOT NULL DEFAULT -1'],
+  ['last_event_at', 'INTEGER'],
+  ['cold_at', 'INTEGER'],
+  ['execution_deadline_at', 'INTEGER'],
+  ['task_version', 'INTEGER NOT NULL DEFAULT 0'],
+  ['ttl_claim_token', 'TEXT'],
+  ['ttl_claim_until', 'INTEGER'],
+]
+
+function runStorageLifecycleMigration(db: DatabaseType, baseDir: string): void {
+  const migrate = db.transaction(() => {
+    const existing = new Set(
+      (db.pragma('table_info(taskcast_tasks)') as { name: string }[]).map((column) => column.name),
+    )
+    for (const [name, definition] of LIFECYCLE_COLUMNS) {
+      if (!existing.has(name)) {
+        db.exec(`ALTER TABLE taskcast_tasks ADD COLUMN ${name} ${definition}`)
+      }
+    }
+
+    const migration = readFileSync(
+      join(baseDir, '../migrations/002_storage_lifecycle.sql'),
+      'utf8',
+    )
+    db.exec(migration)
+  })
+
+  migrate()
 }

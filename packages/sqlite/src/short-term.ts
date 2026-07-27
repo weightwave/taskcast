@@ -17,6 +17,8 @@ import { rowToTask, rowToEvent, rowToWorker, rowToWorkerAssignment } from './row
 // ─── SqliteShortTermStore ─────────────────────────────────────────────────
 
 export class SqliteShortTermStore implements ShortTermStore {
+  readonly supportsHotColdRelease = false
+
   constructor(private db: Database.Database) {}
 
   async saveTask(task: Task): Promise<void> {

@@ -5,8 +5,11 @@ use std::sync::{Arc, RwLock};
 use async_trait::async_trait;
 
 use crate::types::{
-    BroadcastProvider, EventQueryOptions, ShortTermStore, Task, TaskEvent, TaskFilter, TaskStatus,
-    TaskArchiveImportOptions, TaskArchiveRestoreData, Worker, WorkerAssignment, WorkerFilter,
+    ArchiveSourcePage, BroadcastProvider, ClosedWriteFence, EventQueryOptions, HotWriteToken,
+    RehydrateSnapshot, SeriesMode, SeriesResult, ShortTermStore, StorageFenceConflictError,
+    StorageLease, StorageWriterRegistration, Task, TaskArchiveImportOptions, TaskArchiveRestoreData,
+    TaskEvent, TaskFilter, TaskStatus, TaskStoragePresence, TaskWriteFence, Worker,
+    WorkerAssignment, WorkerFilter,
 };
 
 // ─── MemoryBroadcastProvider ────────────────────────────────────────────────
@@ -96,6 +99,17 @@ pub struct MemoryShortTermStore {
     index_counters: RwLock<HashMap<String, Arc<AtomicU64>>>,
     workers: RwLock<HashMap<String, Worker>>,
     assignments: RwLock<Vec<WorkerAssignment>>,
+    storage_locks: RwLock<HashMap<String, MemoryStorageLock>>,
+    write_fences: RwLock<HashMap<String, TaskWriteFence>>,
+    storage_writers: RwLock<HashMap<String, StorageWriterRegistration>>,
+}
+
+#[derive(Clone)]
+struct MemoryStorageLock {
+    lock_token: String,
+    generation: String,
+    storage_epoch: u64,
+    expires_at: u128,
 }
 
 impl MemoryShortTermStore {
@@ -107,6 +121,42 @@ impl MemoryShortTermStore {
             index_counters: RwLock::new(HashMap::new()),
             workers: RwLock::new(HashMap::new()),
             assignments: RwLock::new(Vec::new()),
+            storage_locks: RwLock::new(HashMap::new()),
+            write_fences: RwLock::new(HashMap::new()),
+            storage_writers: RwLock::new(HashMap::new()),
+        }
+    }
+
+    fn now_ms() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    }
+
+    fn owns_storage_lock(&self, lease: &StorageLease) -> bool {
+        let now = Self::now_ms();
+        let locks = self.storage_locks.read().unwrap();
+        matches!(
+            locks.get(&lease.task_id),
+            Some(current)
+                if current.expires_at > now
+                    && current.lock_token == lease.lock_token
+                    && current.generation == lease.generation
+                    && current.storage_epoch == lease.storage_epoch
+        )
+    }
+
+    fn assert_owned_storage_lock(
+        &self,
+        lease: &StorageLease,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if self.owns_storage_lock(lease) {
+            Ok(())
+        } else {
+            Err(Box::new(StorageFenceConflictError::new(
+                "Storage lease is stale",
+            )))
         }
     }
 }
@@ -119,12 +169,28 @@ impl Default for MemoryShortTermStore {
 
 #[async_trait]
 impl ShortTermStore for MemoryShortTermStore {
+    fn supports_hot_cold_release(&self) -> bool {
+        true
+    }
+
     async fn save_task(
         &self,
         task: Task,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut tasks = self.tasks.write().unwrap();
-        tasks.insert(task.id.clone(), task);
+        let task_id = task.id.clone();
+        tasks.insert(task_id.clone(), task);
+        drop(tasks);
+        self.write_fences
+            .write()
+            .unwrap()
+            .entry(task_id.clone())
+            .or_insert(TaskWriteFence {
+                task_id,
+                accepting_writes: true,
+                storage_epoch: 1,
+                active_release_generation: None,
+            });
         Ok(())
     }
 
@@ -359,6 +425,438 @@ impl ShortTermStore for MemoryShortTermStore {
         );
 
         Ok(overwritten)
+    }
+
+    async fn acquire_storage_lock(
+        &self,
+        task_id: &str,
+        lock_token: &str,
+        generation: &str,
+        ttl_ms: u64,
+    ) -> Result<Option<StorageLease>, Box<dyn std::error::Error + Send + Sync>> {
+        let now = Self::now_ms();
+        let mut locks = self.storage_locks.write().unwrap();
+        if let Some(current) = locks.get_mut(task_id) {
+            if current.expires_at > now {
+                if current.lock_token != lock_token || current.generation != generation {
+                    return Ok(None);
+                }
+                current.expires_at = now + ttl_ms as u128;
+                return Ok(Some(StorageLease {
+                    task_id: task_id.to_string(),
+                    lock_token: lock_token.to_string(),
+                    generation: generation.to_string(),
+                    storage_epoch: current.storage_epoch,
+                }));
+            }
+        }
+
+        let storage_epoch = self
+            .write_fences
+            .read()
+            .unwrap()
+            .get(task_id)
+            .map(|fence| fence.storage_epoch)
+            .unwrap_or(1);
+        locks.insert(
+            task_id.to_string(),
+            MemoryStorageLock {
+                lock_token: lock_token.to_string(),
+                generation: generation.to_string(),
+                storage_epoch,
+                expires_at: now + ttl_ms as u128,
+            },
+        );
+        Ok(Some(StorageLease {
+            task_id: task_id.to_string(),
+            lock_token: lock_token.to_string(),
+            generation: generation.to_string(),
+            storage_epoch,
+        }))
+    }
+
+    async fn renew_storage_lock(
+        &self,
+        lease: &StorageLease,
+        ttl_ms: u64,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let now = Self::now_ms();
+        let mut locks = self.storage_locks.write().unwrap();
+        let Some(current) = locks.get_mut(&lease.task_id) else {
+            return Ok(false);
+        };
+        if current.expires_at <= now
+            || current.lock_token != lease.lock_token
+            || current.generation != lease.generation
+            || current.storage_epoch != lease.storage_epoch
+        {
+            return Ok(false);
+        }
+        current.expires_at = now + ttl_ms as u128;
+        Ok(true)
+    }
+
+    async fn release_storage_lock(
+        &self,
+        lease: &StorageLease,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        if !self.owns_storage_lock(lease) {
+            return Ok(false);
+        }
+        self.storage_locks.write().unwrap().remove(&lease.task_id);
+        Ok(true)
+    }
+
+    async fn get_write_fence(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<TaskWriteFence>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self.write_fences.read().unwrap().get(task_id).cloned())
+    }
+
+    async fn close_write_fence(
+        &self,
+        lease: &StorageLease,
+        expected_epoch: u64,
+    ) -> Result<ClosedWriteFence, Box<dyn std::error::Error + Send + Sync>> {
+        self.assert_owned_storage_lock(lease)?;
+        let mut fences = self.write_fences.write().unwrap();
+        let Some(fence) = fences.get_mut(&lease.task_id) else {
+            return Err(Box::new(StorageFenceConflictError::default()));
+        };
+        if !fence.accepting_writes || fence.storage_epoch != expected_epoch {
+            return Err(Box::new(StorageFenceConflictError::default()));
+        }
+
+        let counter_watermark = self
+            .index_counters
+            .read()
+            .unwrap()
+            .get(&lease.task_id)
+            .map(|counter| counter.load(Ordering::SeqCst) as i64 - 1)
+            .unwrap_or(-1);
+        let event_watermark = self
+            .events
+            .read()
+            .unwrap()
+            .get(&lease.task_id)
+            .and_then(|events| events.iter().map(|event| event.index as i64).max())
+            .unwrap_or(-1);
+        let high_watermark = counter_watermark.max(event_watermark);
+        fence.accepting_writes = false;
+        fence.active_release_generation = Some(lease.generation.clone());
+        Ok(ClosedWriteFence {
+            task_id: lease.task_id.clone(),
+            accepting_writes: false,
+            storage_epoch: fence.storage_epoch,
+            active_release_generation: fence.active_release_generation.clone(),
+            high_watermark,
+        })
+    }
+
+    async fn reopen_write_fence(
+        &self,
+        lease: &StorageLease,
+        expected_epoch: u64,
+    ) -> Result<HotWriteToken, Box<dyn std::error::Error + Send + Sync>> {
+        self.assert_owned_storage_lock(lease)?;
+        let mut fences = self.write_fences.write().unwrap();
+        let Some(fence) = fences.get_mut(&lease.task_id) else {
+            return Err(Box::new(StorageFenceConflictError::default()));
+        };
+        if fence.accepting_writes
+            || fence.storage_epoch != expected_epoch
+            || fence.active_release_generation.as_deref() != Some(lease.generation.as_str())
+        {
+            return Err(Box::new(StorageFenceConflictError::default()));
+        }
+        fence.accepting_writes = true;
+        fence.storage_epoch = expected_epoch + 1;
+        fence.active_release_generation = None;
+        Ok(HotWriteToken {
+            task_id: lease.task_id.clone(),
+            storage_epoch: fence.storage_epoch,
+        })
+    }
+
+    async fn commit_event_fenced(
+        &self,
+        task_id: &str,
+        mut event: TaskEvent,
+        token: &HotWriteToken,
+    ) -> Result<SeriesResult, Box<dyn std::error::Error + Send + Sync>> {
+        let fences = self.write_fences.read().unwrap();
+        let Some(fence) = fences.get(task_id) else {
+            return Err(Box::new(StorageFenceConflictError::default()));
+        };
+        if token.task_id != task_id
+            || !fence.accepting_writes
+            || fence.storage_epoch != token.storage_epoch
+        {
+            return Err(Box::new(StorageFenceConflictError::default()));
+        }
+
+        let counter = {
+            let mut counters = self.index_counters.write().unwrap();
+            counters
+                .entry(task_id.to_string())
+                .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+                .clone()
+        };
+        event.task_id = task_id.to_string();
+        event.index = counter.fetch_add(1, Ordering::SeqCst);
+
+        if let (Some(series_id), Some(SeriesMode::Latest)) =
+            (event.series_id.as_deref(), event.series_mode.as_ref())
+        {
+            let key = format!("{task_id}:{series_id}");
+            let mut series = self.series_latest.write().unwrap();
+            let previous = series.get(&key).cloned();
+            let mut events = self.events.write().unwrap();
+            let task_events = events.entry(task_id.to_string()).or_default();
+            if let Some(previous) = previous {
+                if let Some(position) = task_events
+                    .iter()
+                    .rposition(|candidate| candidate.id == previous.id)
+                {
+                    task_events[position] = event.clone();
+                } else {
+                    task_events.push(event.clone());
+                }
+            } else {
+                task_events.push(event.clone());
+            }
+            series.insert(key, event.clone());
+            return Ok(SeriesResult {
+                event,
+                accumulated_event: None,
+                stored: true,
+            });
+        }
+
+        self.events
+            .write()
+            .unwrap()
+            .entry(task_id.to_string())
+            .or_default()
+            .push(event.clone());
+
+        let accumulated_event = if let (Some(series_id), Some(SeriesMode::Accumulate)) =
+            (event.series_id.as_deref(), event.series_mode.as_ref())
+        {
+            let key = format!("{task_id}:{series_id}");
+            let field = event.series_acc_field.as_deref().unwrap_or("delta");
+            let mut series = self.series_latest.write().unwrap();
+            let accumulated = if let Some(previous) = series.get(&key) {
+                let previous_value = previous.data.get(field).and_then(|value| value.as_str());
+                let delta = event.data.get(field).and_then(|value| value.as_str());
+                if let (Some(previous_value), Some(delta)) = (previous_value, delta) {
+                    let mut accumulated = event.clone();
+                    let mut data = event.data.as_object().cloned().unwrap_or_default();
+                    data.insert(
+                        field.to_string(),
+                        serde_json::Value::String(format!("{previous_value}{delta}")),
+                    );
+                    accumulated.data = serde_json::Value::Object(data);
+                    accumulated
+                } else {
+                    event.clone()
+                }
+            } else {
+                event.clone()
+            };
+            series.insert(key, accumulated.clone());
+            Some(accumulated)
+        } else {
+            None
+        };
+
+        Ok(SeriesResult {
+            event,
+            accumulated_event,
+            stored: true,
+        })
+    }
+
+    async fn save_task_fenced(
+        &self,
+        task: Task,
+        token: &HotWriteToken,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let fences = self.write_fences.read().unwrap();
+        let Some(fence) = fences.get(&task.id) else {
+            return Err(Box::new(StorageFenceConflictError::default()));
+        };
+        if token.task_id != task.id
+            || !fence.accepting_writes
+            || fence.storage_epoch != token.storage_epoch
+        {
+            return Err(Box::new(StorageFenceConflictError::default()));
+        }
+        self.tasks.write().unwrap().insert(task.id.clone(), task);
+        Ok(())
+    }
+
+    async fn read_archive_source_page(
+        &self,
+        task_id: &str,
+        watermark: i64,
+        cursor: Option<&str>,
+        limit: u64,
+    ) -> Result<ArchiveSourcePage, Box<dyn std::error::Error + Send + Sync>> {
+        let offset = cursor
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        let mut source = self
+            .events
+            .read()
+            .unwrap()
+            .get(task_id)
+            .cloned()
+            .unwrap_or_default();
+        source.retain(|event| event.index as i64 <= watermark);
+        source.sort_by_key(|event| event.index);
+        let events = source
+            .iter()
+            .skip(offset)
+            .take(limit.max(1) as usize)
+            .cloned()
+            .collect::<Vec<_>>();
+        let next_offset = offset + events.len();
+        let done = next_offset >= source.len();
+        Ok(ArchiveSourcePage {
+            task_id: task_id.to_string(),
+            watermark,
+            cursor: cursor.map(str::to_string),
+            next_cursor: (!done).then(|| next_offset.to_string()),
+            events,
+            done,
+        })
+    }
+
+    async fn delete_task_storage_fenced(
+        &self,
+        lease: &StorageLease,
+        expected_epoch: u64,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.assert_owned_storage_lock(lease)?;
+        {
+            let fences = self.write_fences.read().unwrap();
+            let Some(fence) = fences.get(&lease.task_id) else {
+                return Err(Box::new(StorageFenceConflictError::default()));
+            };
+            if fence.accepting_writes
+                || fence.storage_epoch != expected_epoch
+                || fence.active_release_generation.as_deref() != Some(lease.generation.as_str())
+            {
+                return Err(Box::new(StorageFenceConflictError::default()));
+            }
+        }
+
+        self.tasks.write().unwrap().remove(&lease.task_id);
+        self.events.write().unwrap().remove(&lease.task_id);
+        self.index_counters.write().unwrap().remove(&lease.task_id);
+        self.write_fences.write().unwrap().remove(&lease.task_id);
+        let prefix = format!("{}:", lease.task_id);
+        self.series_latest
+            .write()
+            .unwrap()
+            .retain(|key, _| !key.starts_with(&prefix));
+        Ok(())
+    }
+
+    async fn restore_hot_task_fenced(
+        &self,
+        snapshot: RehydrateSnapshot,
+        lease: &StorageLease,
+        next_epoch: u64,
+    ) -> Result<HotWriteToken, Box<dyn std::error::Error + Send + Sync>> {
+        self.assert_owned_storage_lock(lease)?;
+        if snapshot.task.id != lease.task_id || next_epoch <= snapshot.storage_epoch {
+            return Err(Box::new(StorageFenceConflictError::default()));
+        }
+
+        let task_id = snapshot.task.id.clone();
+        self.tasks
+            .write()
+            .unwrap()
+            .insert(task_id.clone(), snapshot.task);
+        self.events
+            .write()
+            .unwrap()
+            .insert(task_id.clone(), snapshot.replay_events);
+        self.index_counters.write().unwrap().insert(
+            task_id.clone(),
+            Arc::new(AtomicU64::new((snapshot.max_event_index + 1).max(0) as u64)),
+        );
+        let prefix = format!("{task_id}:");
+        let mut series = self.series_latest.write().unwrap();
+        series.retain(|key, _| !key.starts_with(&prefix));
+        for entry in snapshot.series_latest {
+            series.insert(format!("{task_id}:{}", entry.series_id), entry.event);
+        }
+        drop(series);
+        self.write_fences.write().unwrap().insert(
+            task_id.clone(),
+            TaskWriteFence {
+                task_id: task_id.clone(),
+                accepting_writes: true,
+                storage_epoch: next_epoch,
+                active_release_generation: None,
+            },
+        );
+        Ok(HotWriteToken {
+            task_id,
+            storage_epoch: next_epoch,
+        })
+    }
+
+    async fn get_task_storage_presence(
+        &self,
+        task_id: &str,
+    ) -> Result<TaskStoragePresence, Box<dyn std::error::Error + Send + Sync>> {
+        let prefix = format!("{task_id}:");
+        Ok(TaskStoragePresence {
+            task: self.tasks.read().unwrap().contains_key(task_id),
+            event_count: self
+                .events
+                .read()
+                .unwrap()
+                .get(task_id)
+                .map(|events| events.len() as u64)
+                .unwrap_or(0),
+            next_index: self.index_counters.read().unwrap().contains_key(task_id),
+            series_state_count: self
+                .series_latest
+                .read()
+                .unwrap()
+                .keys()
+                .filter(|key| key.starts_with(&prefix))
+                .count() as u64,
+            write_fence: self.write_fences.read().unwrap().contains_key(task_id),
+        })
+    }
+
+    async fn register_storage_writer(
+        &self,
+        mut registration: StorageWriterRegistration,
+        ttl_ms: u64,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        registration.expires_at = (Self::now_ms() + ttl_ms as u128) as f64;
+        self.storage_writers
+            .write()
+            .unwrap()
+            .insert(registration.instance_id.clone(), registration);
+        Ok(())
+    }
+
+    async fn list_storage_writers(
+        &self,
+    ) -> Result<Vec<StorageWriterRegistration>, Box<dyn std::error::Error + Send + Sync>> {
+        let now = Self::now_ms() as f64;
+        let mut writers = self.storage_writers.write().unwrap();
+        writers.retain(|_, registration| registration.expires_at > now);
+        Ok(writers.values().cloned().collect())
     }
 
     async fn list_tasks(

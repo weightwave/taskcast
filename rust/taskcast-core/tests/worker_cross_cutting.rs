@@ -312,11 +312,9 @@ async fn task_with_ttl_claimed_by_worker_preserves_ttl() {
     assert_eq!(task.status, TaskStatus::Assigned);
 }
 
-/// 6. TTL expiry during assigned status.
-///    The state machine does NOT allow assigned -> timeout (it's not in the
-///    allowed transitions). Verify this is rejected.
+/// 6. TTL expiry during assigned status is a valid durable terminal transition.
 #[tokio::test]
-async fn ttl_expiry_during_assigned_is_invalid_transition() {
+async fn ttl_expiry_during_assigned_is_valid_transition() {
     let ctx = make_context();
 
     ctx.manager
@@ -339,31 +337,15 @@ async fn ttl_expiry_during_assigned_is_invalid_transition() {
     let task = ctx.engine.get_task("t1").await.unwrap().unwrap();
     assert_eq!(task.status, TaskStatus::Assigned);
 
-    // Attempt to transition directly to timeout -- should fail
-    let result = ctx
-        .engine
-        .transition_task("t1", TaskStatus::Timeout, None)
-        .await;
-    assert!(
-        result.is_err(),
-        "assigned -> timeout should be an invalid transition"
-    );
-
-    // The task should still be assigned
-    let task = ctx.engine.get_task("t1").await.unwrap().unwrap();
-    assert_eq!(task.status, TaskStatus::Assigned);
-
-    // The valid path for TTL expiry on an assigned task would be:
-    // assigned -> cancelled (admin cancellation)
     let task = ctx
         .engine
-        .transition_task("t1", TaskStatus::Cancelled, None)
+        .transition_task("t1", TaskStatus::Timeout, None)
         .await
         .unwrap();
     assert_eq!(
         task.status,
-        TaskStatus::Cancelled,
-        "assigned -> cancelled should work as TTL expiry fallback"
+        TaskStatus::Timeout,
+        "assigned -> timeout should be a valid TTL transition"
     );
 }
 

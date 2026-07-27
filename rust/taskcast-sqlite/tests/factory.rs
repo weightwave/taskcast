@@ -9,6 +9,57 @@ use taskcast_sqlite::create_sqlite_adapters;
 use tempfile::TempDir;
 
 #[tokio::test]
+async fn lifecycle_migration_is_idempotent_and_release_is_unsupported() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("lifecycle.db");
+    let path = db_path.to_str().unwrap();
+    let first = create_sqlite_adapters(path).await.unwrap();
+    assert!(!first.short_term_store.supports_hot_cold_release());
+    assert!(!first.long_term_store.supports_hot_cold_release());
+    drop(first);
+
+    let second = create_sqlite_adapters(path).await.unwrap();
+    drop(second);
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite:{path}?mode=rw"))
+        .await
+        .unwrap();
+    let columns = sqlx::query("PRAGMA table_info(taskcast_tasks)")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    let names = columns
+        .iter()
+        .map(|row| sqlx::Row::get::<String, _>(row, "name"))
+        .collect::<Vec<_>>();
+    for expected in [
+        "storage_state",
+        "storage_epoch",
+        "archive_watermark",
+        "last_event_at",
+        "execution_deadline_at",
+        "task_version",
+        "ttl_claim_token",
+        "ttl_claim_until",
+    ] {
+        assert!(names.iter().any(|name| name == expected), "missing {expected}");
+    }
+
+    let tables = sqlx::query(
+        "SELECT name FROM sqlite_master
+         WHERE type = 'table'
+           AND name IN (
+             'taskcast_storage_locks',
+             'taskcast_durable_assignments',
+             'taskcast_terminal_outbox'
+           )",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(tables.len(), 3);
+}
+
+#[tokio::test]
 async fn returns_working_adapters() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("test.db");
