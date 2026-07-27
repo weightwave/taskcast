@@ -110,6 +110,16 @@ pub type TransitionListener = Box<dyn Fn(&Task, &TaskStatus, &TaskStatus) + Send
 /// Receives the newly created task.
 pub type CreationListener = Arc<dyn Fn(&Task) + Send + Sync>;
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct StorageReleaseSweepResult {
+    pub claimed: u64,
+    pub released: u64,
+    pub recovered: u64,
+    pub stale: u64,
+    pub deferred: u64,
+    pub failed: u64,
+}
+
 pub struct TaskEngine {
     short_term_store: Arc<dyn ShortTermStore>,
     broadcast: Arc<dyn BroadcastProvider>,
@@ -128,6 +138,19 @@ impl TaskEngine {
     const CREATION_CLAIM_TTL_MS: u64 = 30_000;
 
     pub fn new(opts: TaskEngineOptions) -> Self {
+        Self::new_with_storage_lifecycle(opts, 30_000, 1_000)
+    }
+
+    pub fn new_with_storage_lifecycle(
+        opts: TaskEngineOptions,
+        storage_lock_ttl_ms: u64,
+        rehydrate_replay_events: u64,
+    ) -> Self {
+        assert!(storage_lock_ttl_ms > 0, "storage lock TTL must be positive");
+        assert!(
+            rehydrate_replay_events > 0,
+            "rehydrate replay event count must be positive"
+        );
         let transition_listeners: Arc<Mutex<Vec<TransitionListener>>> =
             Arc::new(Mutex::new(Vec::new()));
         let emit_locks: Arc<Mutex<HashMap<String, Arc<TokioMutex<()>>>>> =
@@ -136,10 +159,14 @@ impl TaskEngine {
             if opts.short_term_store.supports_hot_cold_release()
                 && long_term_store.supports_hot_cold_release()
             {
-                Some(StorageCoordinator::new(
-                    Arc::clone(&opts.short_term_store),
-                    Arc::clone(long_term_store),
-                ))
+                Some(
+                    StorageCoordinator::new(
+                        Arc::clone(&opts.short_term_store),
+                        Arc::clone(long_term_store),
+                    )
+                    .with_storage_lock_ttl_ms(storage_lock_ttl_ms)
+                    .with_rehydrate_replay_events(rehydrate_replay_events),
+                )
             } else {
                 None
             }
@@ -157,17 +184,19 @@ impl TaskEngine {
                     Arc::clone(&opts.broadcast),
                 )
                 .map(|coordinator| {
-                    coordinator.with_on_timeout_projected(Arc::new(move |task, from| {
-                        ttl_emit_locks.lock().unwrap().remove(&task.id);
-                        if let Some(hooks) = &hooks {
-                            hooks.on_task_timeout(task);
-                            hooks.on_task_transitioned(task, from, &task.status);
-                        }
-                        let listeners = ttl_transition_listeners.lock().unwrap();
-                        for listener in listeners.iter() {
-                            listener(task, from, &task.status);
-                        }
-                    }))
+                    coordinator
+                        .with_storage_lock_ttl_ms(storage_lock_ttl_ms)
+                        .with_on_timeout_projected(Arc::new(move |task, from| {
+                            ttl_emit_locks.lock().unwrap().remove(&task.id);
+                            if let Some(hooks) = &hooks {
+                                hooks.on_task_timeout(task);
+                                hooks.on_task_transitioned(task, from, &task.status);
+                            }
+                            let listeners = ttl_transition_listeners.lock().unwrap();
+                            for listener in listeners.iter() {
+                                listener(task, from, &task.status);
+                            }
+                        }))
                 })
                 .ok()
             } else {
@@ -653,6 +682,93 @@ impl TaskEngine {
                 Err(EngineError::Store(error))
             }
         }
+    }
+
+    pub async fn release_task_storage_at_current_durable_index(
+        &self,
+        task_id: &str,
+        inactive_since: f64,
+    ) -> Result<ReleaseResult, EngineError> {
+        let durable = self.long_term_store.as_ref().ok_or_else(|| {
+            EngineError::Store(Box::new(StorageReleaseUnsupportedError::new(
+                "Long-term store cannot read the durable event watermark",
+            )))
+        })?;
+        let expected_last_event_index = durable.get_last_event_index(task_id).await?;
+        self.release_task_storage(
+            task_id,
+            ReleasePreconditions {
+                expected_last_event_index,
+                inactive_since,
+            },
+        )
+        .await
+    }
+
+    pub async fn retry_storage_release_requests(
+        &self,
+        limit: u64,
+        inactive_before: f64,
+    ) -> Result<StorageReleaseSweepResult, EngineError> {
+        if limit == 0
+            || !inactive_before.is_finite()
+            || inactive_before < 0.0
+            || inactive_before.fract() != 0.0
+        {
+            return Err(EngineError::Store(Box::new(StoragePreconditionError::new(
+                "Storage release sweep bounds are invalid",
+            ))));
+        }
+        let coordinator = self.storage_coordinator.as_ref().ok_or_else(|| {
+            EngineError::Store(Box::new(StorageReleaseUnsupportedError::new(
+                "Storage release is not supported by the configured stores",
+            )))
+        })?;
+        let durable = self.long_term_store.as_ref().ok_or_else(|| {
+            EngineError::Store(Box::new(StorageReleaseUnsupportedError::new(
+                "Long-term store cannot list storage release requests",
+            )))
+        })?;
+        let requests = durable.list_storage_release_requests(limit).await?;
+        let mut result = StorageReleaseSweepResult {
+            claimed: requests.len() as u64,
+            ..Default::default()
+        };
+        for request in requests {
+            if request.inactive_since > inactive_before {
+                result.deferred += 1;
+                continue;
+            }
+            let outcome = async {
+                let recovery = coordinator.recover_task_storage(&request.task_id).await?;
+                if recovery.storage_state == crate::types::StorageState::Cold {
+                    durable.clear_storage_release_request(&request).await?;
+                    return Ok::<_, Box<dyn std::error::Error + Send + Sync>>("recovered");
+                }
+                coordinator
+                    .release_task_storage(
+                        &request.task_id,
+                        ReleasePreconditions {
+                            expected_last_event_index: request.expected_last_event_index,
+                            inactive_since: request.inactive_since,
+                        },
+                    )
+                    .await?;
+                durable.clear_storage_release_request(&request).await?;
+                Ok("released")
+            }
+            .await;
+            match outcome {
+                Ok("recovered") => result.recovered += 1,
+                Ok(_) => result.released += 1,
+                Err(error) if error.downcast_ref::<StoragePreconditionError>().is_some() => {
+                    durable.clear_storage_release_request(&request).await?;
+                    result.stale += 1;
+                }
+                Err(_) => result.failed += 1,
+            }
+        }
+        Ok(result)
     }
 
     pub async fn register_storage_writer(

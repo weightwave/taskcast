@@ -13,7 +13,8 @@ use crate::types::{
 type StorageResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 type TimeoutProjectionCallback = Arc<dyn Fn(&Task, &TaskStatus) + Send + Sync>;
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DurableTtlSweepResult {
     pub claimed: u64,
     pub timed_out: u64,

@@ -83,6 +83,8 @@ export class InvalidTransitionError extends Error {
 interface TaskEngineOptionsBase {
   broadcast: BroadcastProvider
   hooks?: TaskcastHooks
+  storageLockTtlMs?: number
+  rehydrateReplayEvents?: number
 }
 
 interface TaskEngineOptionsCanonical extends TaskEngineOptionsBase {
@@ -125,6 +127,15 @@ export interface CreateTaskInput {
 export type TransitionListener = (task: Task, from: TaskStatus, to: TaskStatus) => void
 export type CreationListener = (task: Task) => void
 
+export interface StorageReleaseSweepResult {
+  claimed: number
+  released: number
+  recovered: number
+  stale: number
+  deferred: number
+  failed: number
+}
+
 export class TaskEngine {
   private static readonly CREATION_CLAIM_TTL_MS = 30_000
   private shortTermStore: ShortTermStore
@@ -161,6 +172,12 @@ export class TaskEngine {
       this.storageCoordinator = new StorageCoordinator({
         shortTermStore: this.shortTermStore,
         longTermStore: this.longTermStore,
+        ...(opts.storageLockTtlMs !== undefined && {
+          storageLockTtlMs: opts.storageLockTtlMs,
+        }),
+        ...(opts.rehydrateReplayEvents !== undefined && {
+          rehydrateReplayEvents: opts.rehydrateReplayEvents,
+        }),
       })
     }
     if (
@@ -173,6 +190,9 @@ export class TaskEngine {
         longTermStore: this.longTermStore,
         broadcast: this.broadcast,
         storageCoordinator: this.storageCoordinator,
+        ...(opts.storageLockTtlMs !== undefined && {
+          storageLockTtlMs: opts.storageLockTtlMs,
+        }),
         onTimeoutProjected: (task, from) => {
           this._emitChains.delete(task.id)
           this.hooks?.onTaskTimeout?.(task)
@@ -518,6 +538,86 @@ export class TaskEngine {
       }
       throw error
     }
+  }
+
+  async releaseTaskStorageAtCurrentDurableIndex(
+    taskId: string,
+    inactiveSince: number,
+  ): Promise<ReleaseResult> {
+    const durable = this.longTermStore
+    if (!durable?.getLastEventIndex) {
+      throw new StorageReleaseUnsupportedError(
+        'Long-term store cannot read the durable event watermark',
+      )
+    }
+    const expectedLastEventIndex = await durable.getLastEventIndex(taskId)
+    return this.releaseTaskStorage(taskId, {
+      expectedLastEventIndex,
+      inactiveSince,
+    })
+  }
+
+  async retryStorageReleaseRequests(
+    limit: number,
+    inactiveBefore = Number.MAX_SAFE_INTEGER,
+  ): Promise<StorageReleaseSweepResult> {
+    if (
+      !Number.isSafeInteger(limit) ||
+      limit <= 0 ||
+      !Number.isSafeInteger(inactiveBefore) ||
+      inactiveBefore < 0
+    ) {
+      throw new StoragePreconditionError('Storage release sweep bounds are invalid')
+    }
+    const coordinator = this.storageCoordinator
+    const durable = this.longTermStore
+    if (!coordinator || !durable?.listStorageReleaseRequests) {
+      throw new StorageReleaseUnsupportedError(
+        'Long-term store cannot list storage release requests',
+      )
+    }
+    if (!durable.clearStorageReleaseRequest) {
+      throw new StorageReleaseUnsupportedError(
+        'Long-term store cannot clear storage release requests',
+      )
+    }
+    const requests = await durable.listStorageReleaseRequests(limit)
+    const result: StorageReleaseSweepResult = {
+      claimed: requests.length,
+      released: 0,
+      recovered: 0,
+      stale: 0,
+      deferred: 0,
+      failed: 0,
+    }
+    for (const request of requests) {
+      if (request.inactiveSince > inactiveBefore) {
+        result.deferred += 1
+        continue
+      }
+      try {
+        const recovery = await coordinator.recoverTaskStorage(request.taskId)
+        if (recovery.storageState === 'cold') {
+          await durable.clearStorageReleaseRequest(request)
+          result.recovered += 1
+          continue
+        }
+        await coordinator.releaseTaskStorage(request.taskId, {
+          expectedLastEventIndex: request.expectedLastEventIndex,
+          inactiveSince: request.inactiveSince,
+        })
+        await durable.clearStorageReleaseRequest(request)
+        result.released += 1
+      } catch (error) {
+        if (error instanceof StoragePreconditionError) {
+          await durable.clearStorageReleaseRequest(request)
+          result.stale += 1
+        } else {
+          result.failed += 1
+        }
+      }
+    }
+    return result
   }
 
   async registerStorageWriter(

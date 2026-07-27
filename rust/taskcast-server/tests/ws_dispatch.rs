@@ -1132,6 +1132,7 @@ fn background_services_stop_with_empty_fields() {
     let mut services = BackgroundServices {
         scheduler: None,
         heartbeat_monitor: None,
+        storage_lifecycle_worker: None,
     };
     // Should not panic
     services.stop();

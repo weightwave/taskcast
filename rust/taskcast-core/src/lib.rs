@@ -19,6 +19,7 @@ pub mod worker_matching;
 pub use archive::*;
 pub use canonical_history::*;
 pub use cleanup::*;
+pub use config::*;
 pub use dependency::*;
 pub use engine::*;
 pub use filter::*;

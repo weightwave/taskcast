@@ -11,8 +11,10 @@ pub mod webhook;
 pub use app::{
     auto_release_worker, create_app, create_app_with_failure_logger,
     create_app_with_failure_logger_and_routes, create_app_with_runtime_health_and_routes,
-    dispatch_ws_offer, dispatch_ws_race, start_background_services, AppState, BackgroundServices,
-    CorsConfig, RuntimeAppOptions,
+    dispatch_ws_offer, dispatch_ws_race, start_background_services,
+    start_background_services_with_config, AppState, BackgroundServices, CorsConfig,
+    RuntimeAppOptions, StorageLifecycleTickResult, StorageLifecycleWorker,
+    StorageLifecycleWorkerOptions, StorageRetentionSweepResult,
 };
 pub use auth::{check_scope, AuthContext, AuthMode, JwtConfig, TaskIdAccess, TrustedServiceConfig};
 pub use dependency_health::{

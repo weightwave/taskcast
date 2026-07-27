@@ -1,4 +1,5 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
 
@@ -8,14 +9,17 @@ use axum::response::IntoResponse;
 use axum::routing::{get, patch, post};
 use axum::{Extension, Json, Router};
 use http::StatusCode;
-use taskcast_core::config::TaskcastConfig;
+use taskcast_core::config::{
+    resolve_storage_lifecycle_config, ResolvedStorageLifecycleConfig, TaskcastConfig,
+};
 use taskcast_core::heartbeat_monitor::{HeartbeatMonitor, HeartbeatMonitorOptions};
 use taskcast_core::scheduler::{TaskScheduler, TaskSchedulerOptions};
 use taskcast_core::state_machine::is_terminal;
 use taskcast_core::worker_manager::{DispatchResult, WorkerManager};
 use taskcast_core::{
-    AssignMode, ConnectionMode, DisconnectPolicy, EngineError, ShortTermStore,
-    StorageUnavailableError, StorageWriterRegistration, Task, TaskEngine, TaskStatus, WorkerStatus,
+    AssignMode, ConnectionMode, DisconnectPolicy, DurableTtlSweepResult, EngineError,
+    ShortTermStore, StorageReleaseSweepResult, StorageUnavailableError, StorageWriterRegistration,
+    Task, TaskEngine, TaskFilter, TaskStatus, WorkerStatus,
 };
 use tower_http::cors::{Any, CorsLayer};
 use utoipa::OpenApi;
@@ -155,6 +159,278 @@ impl StorageWriterHeartbeat {
 }
 
 impl Drop for StorageWriterHeartbeat {
+    fn drop(&mut self) {
+        if let Some(handle) = self.abort_handle.lock().unwrap().take() {
+            handle.abort();
+        }
+    }
+}
+
+pub struct StorageLifecycleWorkerOptions {
+    pub engine: Arc<TaskEngine>,
+    pub short_term_store: Arc<dyn ShortTermStore>,
+    pub config: ResolvedStorageLifecycleConfig,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageRetentionSweepResult {
+    pub eligible: u64,
+    pub released: u64,
+    pub failed: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageLifecycleTickResult {
+    pub ttl: DurableTtlSweepResult,
+    pub projection: DurableTtlSweepResult,
+    pub release_requests: StorageReleaseSweepResult,
+    pub retention: StorageRetentionSweepResult,
+}
+
+pub struct StorageLifecycleWorker {
+    engine: Arc<TaskEngine>,
+    short_term_store: Arc<dyn ShortTermStore>,
+    config: ResolvedStorageLifecycleConfig,
+    running: AtomicBool,
+    ttl_failure_streak: Mutex<u32>,
+    ttl_retry_after: Mutex<f64>,
+    release_failure_streak: Mutex<u32>,
+    release_retry_after: Mutex<f64>,
+    abort_handle: Mutex<Option<tokio::task::AbortHandle>>,
+}
+
+impl StorageLifecycleWorker {
+    pub fn new(options: StorageLifecycleWorkerOptions) -> Self {
+        Self {
+            engine: options.engine,
+            short_term_store: options.short_term_store,
+            config: options.config,
+            running: AtomicBool::new(false),
+            ttl_failure_streak: Mutex::new(0),
+            ttl_retry_after: Mutex::new(0.0),
+            release_failure_streak: Mutex::new(0),
+            release_retry_after: Mutex::new(0.0),
+            abort_handle: Mutex::new(None),
+        }
+    }
+
+    pub fn start(self: &Arc<Self>) {
+        if self.abort_handle.lock().unwrap().is_some() {
+            return;
+        }
+        let worker = Arc::clone(self);
+        let interval = self.config.ttl_sweep_interval_seconds;
+        let task = tokio::spawn(async move {
+            loop {
+                let _ = worker.tick().await;
+                tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+            }
+        });
+        *self.abort_handle.lock().unwrap() = Some(task.abort_handle());
+    }
+
+    pub fn stop(&self) {
+        if let Some(handle) = self.abort_handle.lock().unwrap().take() {
+            handle.abort();
+        }
+    }
+
+    pub async fn tick(&self) -> Result<StorageLifecycleTickResult, EngineError> {
+        let started_at = chrono::Utc::now().timestamp_millis() as f64;
+        if self.running.swap(true, Ordering::AcqRel) {
+            return Ok(StorageLifecycleTickResult::default());
+        }
+        let result = self.tick_owned(started_at).await;
+        self.running.store(false, Ordering::Release);
+        result
+    }
+
+    async fn tick_owned(&self, started_at: f64) -> Result<StorageLifecycleTickResult, EngineError> {
+        let limit = self.config.ttl_sweep_batch_size;
+        let claim_ttl_ms = self.config.storage_lock_ttl_seconds * 1_000;
+        let mut result = StorageLifecycleTickResult::default();
+        let ttl_attempted = self.engine.supports_durable_ttl()
+            && started_at >= *self.ttl_retry_after.lock().unwrap();
+        if ttl_attempted {
+            match self
+                .engine
+                .sweep_durable_ttl(limit, Some(claim_ttl_ms))
+                .await
+            {
+                Ok(value) => result.ttl = value,
+                Err(error) => {
+                    result.ttl.failed += 1;
+                    Self::log_error("durable_ttl", &error.to_string(), None);
+                }
+            }
+            match self
+                .engine
+                .sweep_terminal_projections(limit, Some(claim_ttl_ms))
+                .await
+            {
+                Ok(value) => result.projection = value,
+                Err(error) => {
+                    result.projection.failed += 1;
+                    Self::log_error("terminal_projection", &error.to_string(), None);
+                }
+            }
+        }
+
+        let release_attempted = self.engine.supports_storage_release()
+            && started_at >= *self.release_retry_after.lock().unwrap();
+        if release_attempted {
+            if self.release_ready().await {
+                match self
+                    .engine
+                    .retry_storage_release_requests(
+                        limit,
+                        started_at - self.config.hot_retention_idle_seconds as f64 * 1_000.0,
+                    )
+                    .await
+                {
+                    Ok(value) => result.release_requests = value,
+                    Err(error) => {
+                        result.release_requests.failed += 1;
+                        Self::log_error("release_request_retry", &error.to_string(), None);
+                    }
+                }
+                if self.config.hot_retention_enabled {
+                    let candidates = self
+                        .short_term_store
+                        .list_tasks(TaskFilter {
+                            status: Some(vec![
+                                TaskStatus::Completed,
+                                TaskStatus::Failed,
+                                TaskStatus::Timeout,
+                                TaskStatus::Cancelled,
+                            ]),
+                            limit: Some(limit),
+                            ..Default::default()
+                        })
+                        .await;
+                    match candidates {
+                        Ok(candidates) => {
+                            let eligible_before = started_at
+                                - self.config.hot_retention_terminal_seconds as f64 * 1_000.0;
+                            for task in candidates {
+                                if task.updated_at > eligible_before {
+                                    continue;
+                                }
+                                result.retention.eligible += 1;
+                                match self
+                                    .engine
+                                    .release_task_storage_at_current_durable_index(
+                                        &task.id, started_at,
+                                    )
+                                    .await
+                                {
+                                    Ok(_) => result.retention.released += 1,
+                                    Err(error) => {
+                                        result.retention.failed += 1;
+                                        Self::log_error(
+                                            "terminal_retention",
+                                            &error.to_string(),
+                                            Some(&task.id),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            result.retention.failed += 1;
+                            Self::log_error("terminal_retention_scan", &error.to_string(), None);
+                        }
+                    }
+                }
+            } else {
+                result.release_requests.failed += 1;
+                Self::log_error(
+                    "release_readiness",
+                    "Storage writer readiness is not satisfied",
+                    None,
+                );
+            }
+        }
+
+        if ttl_attempted {
+            Self::update_backoff(
+                result.ttl.failed + result.projection.failed,
+                started_at,
+                self.config.ttl_sweep_interval_seconds,
+                &self.ttl_failure_streak,
+                &self.ttl_retry_after,
+            );
+        }
+        if release_attempted {
+            Self::update_backoff(
+                result.release_requests.failed + result.retention.failed,
+                started_at,
+                self.config.ttl_sweep_interval_seconds,
+                &self.release_failure_streak,
+                &self.release_retry_after,
+            );
+        }
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "component": "storage-lifecycle",
+                "event": "storage_lifecycle_tick",
+                "durationMs": (chrono::Utc::now().timestamp_millis() as f64 - started_at).max(0.0),
+                "result": result,
+            })
+        );
+        Ok(result)
+    }
+
+    fn update_backoff(
+        failures: u64,
+        started_at: f64,
+        interval_seconds: u64,
+        failure_streak: &Mutex<u32>,
+        retry_after: &Mutex<f64>,
+    ) {
+        if failures == 0 {
+            *failure_streak.lock().unwrap() = 0;
+            *retry_after.lock().unwrap() = 0.0;
+            return;
+        }
+        let mut streak = failure_streak.lock().unwrap();
+        *streak = (*streak + 1).min(6);
+        let delay = (interval_seconds * 1_000)
+            .saturating_mul(2_u64.pow(*streak))
+            .min(5 * 60_000);
+        *retry_after.lock().unwrap() = started_at + delay as f64;
+    }
+
+    fn log_error(operation: &str, error: &str, task_id: Option<&str>) {
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "component": "storage-lifecycle",
+                "event": "storage_lifecycle_error",
+                "operation": operation,
+                "taskId": task_id,
+                "error": error,
+            })
+        );
+    }
+
+    async fn release_ready(&self) -> bool {
+        self.engine
+            .list_storage_writers()
+            .await
+            .is_ok_and(|writers| {
+                !writers.is_empty()
+                    && writers
+                        .iter()
+                        .all(|writer| writer.storage_protocol_version >= STORAGE_PROTOCOL_VERSION)
+            })
+    }
+}
+
+impl Drop for StorageLifecycleWorker {
     fn drop(&mut self) {
         if let Some(handle) = self.abort_handle.lock().unwrap().take() {
             handle.abort();
@@ -654,6 +930,7 @@ pub async fn dispatch_ws_race(wm: &WorkerManager, registry: &WsRegistry, task: &
 pub struct BackgroundServices {
     pub scheduler: Option<TaskScheduler>,
     pub heartbeat_monitor: Option<HeartbeatMonitor>,
+    pub storage_lifecycle_worker: Option<Arc<StorageLifecycleWorker>>,
 }
 
 impl BackgroundServices {
@@ -665,6 +942,15 @@ impl BackgroundServices {
         if let Some(ref mut h) = self.heartbeat_monitor {
             h.stop();
         }
+        if let Some(ref worker) = self.storage_lifecycle_worker {
+            worker.stop();
+        }
+    }
+}
+
+impl Drop for BackgroundServices {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -676,6 +962,17 @@ pub fn start_background_services(
     engine: Arc<TaskEngine>,
     store: Arc<dyn ShortTermStore>,
     worker_manager: Option<Arc<WorkerManager>>,
+) -> BackgroundServices {
+    let config =
+        resolve_storage_lifecycle_config(&TaskcastConfig::default(), &HashMap::new()).unwrap();
+    start_background_services_with_config(engine, store, worker_manager, config)
+}
+
+pub fn start_background_services_with_config(
+    engine: Arc<TaskEngine>,
+    store: Arc<dyn ShortTermStore>,
+    worker_manager: Option<Arc<WorkerManager>>,
+    config: ResolvedStorageLifecycleConfig,
 ) -> BackgroundServices {
     let mut scheduler = TaskScheduler::new(TaskSchedulerOptions {
         engine: Arc::clone(&engine),
@@ -689,8 +986,8 @@ pub fn start_background_services(
     let heartbeat_monitor = worker_manager.map(|wm| {
         let mut monitor = HeartbeatMonitor::new(HeartbeatMonitorOptions {
             worker_manager: wm,
-            engine,
-            short_term_store: store,
+            engine: Arc::clone(&engine),
+            short_term_store: Arc::clone(&store),
             check_interval_ms: 30_000,
             heartbeat_timeout_ms: 90_000,
             default_disconnect_policy: DisconnectPolicy::Reassign,
@@ -699,9 +996,22 @@ pub fn start_background_services(
         monitor.start();
         monitor
     });
+    let storage_lifecycle_worker =
+        if engine.supports_durable_ttl() || engine.supports_storage_release() {
+            let worker = Arc::new(StorageLifecycleWorker::new(StorageLifecycleWorkerOptions {
+                engine: Arc::clone(&engine),
+                short_term_store: Arc::clone(&store),
+                config,
+            }));
+            worker.start();
+            Some(worker)
+        } else {
+            None
+        };
 
     BackgroundServices {
         scheduler: Some(scheduler),
         heartbeat_monitor,
+        storage_lifecycle_worker,
     }
 }

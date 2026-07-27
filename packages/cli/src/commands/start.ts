@@ -7,6 +7,7 @@ import {
   TaskEngine,
   WorkerManager,
   loadConfigFile,
+  resolveStorageLifecycleConfig,
   resolveAdminToken,
   MemoryBroadcastProvider,
   MemoryShortTermStore,
@@ -418,10 +419,16 @@ async function runStartWithLifecycle(options: RunStartOptions, lifecycle: StartL
     throw postgresUnavailable(error)
   }
   lifecycle.checkpoint()
+  const storageLifecycle = resolveStorageLifecycleConfig(
+    options.config,
+    options.env ?? process.env,
+  )
 
   const engineOpts: ConstructorParameters<typeof TaskEngine>[0] = {
     shortTermStore: options.shortTermStore,
     broadcast: options.broadcast,
+    storageLockTtlMs: storageLifecycle.storageLockTtlSeconds * 1_000,
+    rehydrateReplayEvents: storageLifecycle.rehydrateReplayEvents,
   }
   if (options.longTermStore !== undefined) {
     engineOpts.longTermStore = options.longTermStore
@@ -457,6 +464,7 @@ async function runStartWithLifecycle(options: RunStartOptions, lifecycle: StartL
     ...(options.effectiveAdapters === undefined
       ? {}
       : { effectiveAdapters: options.effectiveAdapters }),
+    storageLifecycle,
     verbose: options.verbose,
     logLevel,
   }

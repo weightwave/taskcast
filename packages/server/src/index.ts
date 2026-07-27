@@ -66,6 +66,9 @@ import {
   matchesWorkerRule,
 } from '@taskcast/core'
 import type {
+  DurableTtlSweepResult,
+  ResolvedStorageLifecycleConfig,
+  StorageReleaseSweepResult,
   Task,
   TaskEngine,
   WorkerManager,
@@ -74,7 +77,11 @@ import type {
   TaskcastConfig,
   StorageWriterRegistration,
 } from '@taskcast/core'
-import { StorageUnavailableError, TaskScheduler } from '@taskcast/core'
+import {
+  resolveStorageLifecycleConfig,
+  StorageUnavailableError,
+  TaskScheduler,
+} from '@taskcast/core'
 import { HeartbeatMonitor } from '@taskcast/core'
 import {
   DependencyHealthRegistry,
@@ -112,6 +119,7 @@ export interface TaskcastServerOptions {
     defaultDisconnectPolicy?: DisconnectPolicy
     disconnectGraceMs?: number
   }
+  storageLifecycle?: ResolvedStorageLifecycleConfig
 }
 
 export interface RuntimeAdapterDescriptors {
@@ -209,6 +217,228 @@ class StorageWriterHeartbeat implements StorageReleaseReadiness {
 
   stop(): void {
     clearInterval(this.timer)
+  }
+}
+
+export interface StorageLifecycleWorkerOptions {
+  engine: TaskEngine
+  shortTermStore: ShortTermStore
+  config: ResolvedStorageLifecycleConfig
+  readiness?: StorageReleaseReadiness
+  logger?: (record: Record<string, unknown>) => void
+  now?: () => number
+}
+
+export interface StorageLifecycleTickResult {
+  ttl: DurableTtlSweepResult
+  projection: DurableTtlSweepResult
+  releaseRequests: StorageReleaseSweepResult
+  retention: {
+    eligible: number
+    released: number
+    failed: number
+  }
+}
+
+const emptyTtlResult = (): DurableTtlSweepResult => ({
+  claimed: 0,
+  timedOut: 0,
+  raceLost: 0,
+  failed: 0,
+  projected: 0,
+})
+
+const emptyReleaseResult = (): StorageReleaseSweepResult => ({
+  claimed: 0,
+  released: 0,
+  recovered: 0,
+  stale: 0,
+  deferred: 0,
+  failed: 0,
+})
+
+export class StorageLifecycleWorker {
+  private readonly engine: TaskEngine
+  private readonly shortTermStore: ShortTermStore
+  private readonly config: ResolvedStorageLifecycleConfig
+  private readonly readiness: StorageReleaseReadiness | undefined
+  private readonly logger: (record: Record<string, unknown>) => void
+  private readonly now: () => number
+  private timer: ReturnType<typeof setInterval> | undefined
+  private running = false
+  private ttlFailureStreak = 0
+  private ttlRetryAfter = 0
+  private releaseFailureStreak = 0
+  private releaseRetryAfter = 0
+
+  constructor(options: StorageLifecycleWorkerOptions) {
+    this.engine = options.engine
+    this.shortTermStore = options.shortTermStore
+    this.config = options.config
+    this.readiness = options.readiness
+    this.logger = options.logger ?? ((record) => {
+      console.log(JSON.stringify({ component: 'storage-lifecycle', ...record }))
+    })
+    this.now = options.now ?? Date.now
+  }
+
+  start(): void {
+    if (this.timer) return
+    void this.tick()
+    this.timer = setInterval(() => {
+      void this.tick()
+    }, this.config.ttlSweepIntervalSeconds * 1_000)
+    ;(this.timer as unknown as { unref?: () => void }).unref?.()
+  }
+
+  stop(): void {
+    if (this.timer) clearInterval(this.timer)
+    this.timer = undefined
+  }
+
+  async tick(): Promise<StorageLifecycleTickResult | null> {
+    const startedAt = this.now()
+    if (this.running) return null
+    this.running = true
+    const ttl = emptyTtlResult()
+    const projection = emptyTtlResult()
+    const releaseRequests = emptyReleaseResult()
+    const retention = { eligible: 0, released: 0, failed: 0 }
+    try {
+      const limit = this.config.ttlSweepBatchSize
+      const claimTtlMs = this.config.storageLockTtlSeconds * 1_000
+      const ttlAttempted =
+        this.engine.supportsDurableTtl() && startedAt >= this.ttlRetryAfter
+      if (ttlAttempted) {
+        try {
+          Object.assign(ttl, await this.engine.sweepDurableTtl(limit, claimTtlMs))
+        } catch (error) {
+          ttl.failed += 1
+          this.logError('durable_ttl', error)
+        }
+        try {
+          Object.assign(
+            projection,
+            await this.engine.sweepTerminalProjections(limit, claimTtlMs),
+          )
+        } catch (error) {
+          projection.failed += 1
+          this.logError('terminal_projection', error)
+        }
+      }
+
+      const releaseAttempted =
+        this.engine.supportsStorageRelease() &&
+        startedAt >= this.releaseRetryAfter
+      if (releaseAttempted) {
+        let releaseReady = true
+        try {
+          await this.readiness?.ensureReady()
+        } catch (error) {
+          releaseReady = false
+          releaseRequests.failed += 1
+          this.logError('release_readiness', error)
+        }
+        if (releaseReady) {
+          try {
+            Object.assign(
+              releaseRequests,
+              await this.engine.retryStorageReleaseRequests(
+                limit,
+                startedAt - this.config.hotRetentionIdleSeconds * 1_000,
+              ),
+            )
+          } catch (error) {
+            releaseRequests.failed += 1
+            this.logError('release_request_retry', error)
+          }
+
+          if (this.config.hotRetentionEnabled) {
+            try {
+              const candidates = await this.shortTermStore.listTasks({
+                status: ['completed', 'failed', 'timeout', 'cancelled'],
+                limit,
+              })
+              const eligibleBefore =
+                startedAt - this.config.hotRetentionTerminalSeconds * 1_000
+              for (const task of candidates) {
+                if (task.updatedAt > eligibleBefore) continue
+                retention.eligible += 1
+                try {
+                  await this.engine.releaseTaskStorageAtCurrentDurableIndex(
+                    task.id,
+                    startedAt,
+                  )
+                  retention.released += 1
+                } catch (error) {
+                  retention.failed += 1
+                  this.logError('terminal_retention', error, {
+                    taskId: task.id,
+                  })
+                }
+              }
+            } catch (error) {
+              retention.failed += 1
+              this.logError('terminal_retention_scan', error)
+            }
+          }
+        }
+      }
+
+      if (ttlAttempted) {
+        const ttlFailures = ttl.failed + projection.failed
+        if (ttlFailures > 0) {
+          this.ttlFailureStreak = Math.min(this.ttlFailureStreak + 1, 6)
+          this.ttlRetryAfter = startedAt + this.backoffMs(this.ttlFailureStreak)
+        } else {
+          this.ttlFailureStreak = 0
+          this.ttlRetryAfter = 0
+        }
+      }
+      if (releaseAttempted) {
+        const releaseFailures = releaseRequests.failed + retention.failed
+        if (releaseFailures > 0) {
+          this.releaseFailureStreak = Math.min(
+            this.releaseFailureStreak + 1,
+            6,
+          )
+          this.releaseRetryAfter =
+            startedAt + this.backoffMs(this.releaseFailureStreak)
+        } else {
+          this.releaseFailureStreak = 0
+          this.releaseRetryAfter = 0
+        }
+      }
+      const result = { ttl, projection, releaseRequests, retention }
+      this.logger({
+        event: 'storage_lifecycle_tick',
+        durationMs: Math.max(0, this.now() - startedAt),
+        ...result,
+      })
+      return result
+    } finally {
+      this.running = false
+    }
+  }
+
+  private backoffMs(failureStreak: number): number {
+    return Math.min(
+      this.config.ttlSweepIntervalSeconds * 1_000 * 2 ** failureStreak,
+      5 * 60_000,
+    )
+  }
+
+  private logError(
+    operation: string,
+    error: unknown,
+    detail: Record<string, unknown> = {},
+  ): void {
+    this.logger({
+      event: 'storage_lifecycle_error',
+      operation,
+      ...detail,
+      error: error instanceof Error ? error.message : String(error),
+    })
   }
 }
 
@@ -364,6 +594,22 @@ export function createTaskcastApp(opts: TaskcastServerOptions): TaskcastApp {
 
   const cleanups: Array<() => void> = []
   cleanups.push(() => storageReadiness.stop())
+
+  if (
+    opts.shortTermStore &&
+    (opts.engine.supportsDurableTtl() || opts.engine.supportsStorageRelease())
+  ) {
+    const lifecycle = new StorageLifecycleWorker({
+      engine: opts.engine,
+      shortTermStore: opts.shortTermStore,
+      config:
+        opts.storageLifecycle ??
+        resolveStorageLifecycleConfig(opts.config ?? {}, {}),
+      readiness: storageReadiness,
+    })
+    lifecycle.start()
+    cleanups.push(() => lifecycle.stop())
+  }
 
   // Wire scheduler
   let scheduler: TaskScheduler | undefined
