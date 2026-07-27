@@ -4,7 +4,13 @@ import { GenericContainer, Wait, type StartedTestContainer } from 'testcontainer
 import { PostgresLongTermStore } from '../src/long-term.js'
 import { join } from 'node:path'
 import { runMigrations } from '../src/migration-runner.js'
-import type { Task, TaskArchiveRestoreData, TaskEvent, WorkerAuditEvent } from '@taskcast/core'
+import type {
+  StorageReleaseRequest,
+  Task,
+  TaskArchiveRestoreData,
+  TaskEvent,
+  WorkerAuditEvent,
+} from '@taskcast/core'
 
 let container: StartedTestContainer
 let sql: ReturnType<typeof postgres>
@@ -136,6 +142,35 @@ describe('PostgresLongTermStore - tasks', () => {
     expect(await store.completeTaskCreation('task-1', 'token-1')).toBe(false)
     expect(await store.completeTaskCreation('task-1', 'token-2')).toBe(true)
     expect(await store.completeTaskCreation('task-1', 'token-2')).toBe(true)
+  })
+})
+
+describe('PostgresLongTermStore - storage release requests', () => {
+  it('persists, lists, and compare-clears bounded release intent', async () => {
+    await store.saveTask(makeTask('release-request'))
+    const request: StorageReleaseRequest = {
+      taskId: 'release-request',
+      requestedAt: 2_000,
+      expectedLastEventIndex: 7,
+      inactiveSince: 1_500,
+    }
+
+    expect(await store.persistStorageReleaseRequest(request)).toBe(true)
+    expect(await store.listStorageReleaseRequests(10)).toEqual([request])
+    expect(await store.clearStorageReleaseRequest({
+      ...request,
+      requestedAt: request.requestedAt + 1,
+    })).toBe(false)
+    expect(await store.listStorageReleaseRequests(10)).toEqual([request])
+    expect(await store.clearStorageReleaseRequest(request)).toBe(true)
+    expect(await store.listStorageReleaseRequests(10)).toEqual([])
+    expect(await store.persistStorageReleaseRequest({
+      ...request,
+      taskId: 'missing',
+    })).toBe(false)
+    await expect(store.listStorageReleaseRequests(0)).rejects.toThrow(
+      'Storage release request limit must be positive',
+    )
   })
 })
 

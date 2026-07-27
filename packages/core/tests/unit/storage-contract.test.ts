@@ -3,7 +3,9 @@ import {
   StorageBusyError,
   StorageFenceConflictError,
   StorageIntegrityError,
+  StoragePreconditionError,
   StorageReleaseUnsupportedError,
+  StorageUnavailableError,
   canTransition,
 } from '../../src/index.js'
 import type {
@@ -18,6 +20,7 @@ import type {
   ReleasePreconditions,
   ReleaseResult,
   StorageLease,
+  StorageReleaseRequest,
   Task,
   TaskEvent,
   TaskStorageMetadata,
@@ -61,9 +64,16 @@ describe('storage lifecycle contract', () => {
       archiveWatermark: 7,
       released: true,
     }
+    const request: StorageReleaseRequest = {
+      taskId: 'task-1',
+      requestedAt: 1_250,
+      expectedLastEventIndex: 7,
+      inactiveSince: 1_500,
+    }
 
     expect(JSON.parse(JSON.stringify(metadata))).toEqual(metadata)
     expect(JSON.parse(JSON.stringify(release))).toEqual(release)
+    expect(JSON.parse(JSON.stringify(request))).toEqual(request)
   })
 
   it('defines release fencing, archive, rehydrate, and TTL payloads', () => {
@@ -174,7 +184,9 @@ describe('storage lifecycle contract', () => {
     expect(new StorageFenceConflictError().code).toBe('storage_fence_conflict')
     expect(new StorageFenceConflictError().retryable).toBe(true)
     expect(new StorageBusyError().code).toBe('storage_busy')
+    expect(new StoragePreconditionError().code).toBe('storage_precondition_failed')
     expect(new StorageIntegrityError().code).toBe('storage_integrity_error')
+    expect(new StorageUnavailableError().code).toBe('storage_unavailable')
     expect(new StorageReleaseUnsupportedError().code).toBe('storage_release_unsupported')
   })
 })

@@ -3,8 +3,11 @@ use std::sync::Arc;
 use axum_test::TestServer;
 use std::future::Future;
 use std::pin::Pin;
-use taskcast_core::{DependencyName, DependencyUnavailableError};
-use taskcast_core::{MemoryBroadcastProvider, MemoryShortTermStore, TaskEngine, TaskEngineOptions};
+use taskcast_core::{
+    DependencyName, DependencyUnavailableError, LongTermStore, MemoryBroadcastProvider,
+    MemoryLongTermStore, MemoryShortTermStore, ShortTermStore, StorageWriterRegistration,
+    TaskEngine, TaskEngineOptions,
+};
 use taskcast_server::{
     create_app, create_app_with_runtime_health_and_routes, AuthMode, CorsConfig, DependencyCheck,
     DependencyHealthRegistry, JwtConfig, RuntimeAdapterDescriptors, RuntimeAppOptions,
@@ -110,6 +113,48 @@ async fn health_detail_reports_memory_adapters_by_default() {
     assert_eq!(body["adapters"]["broadcast"]["status"], "ok");
     assert_eq!(body["adapters"]["shortTermStore"]["provider"], "memory");
     assert_eq!(body["adapters"]["shortTermStore"]["status"], "ok");
+}
+
+#[tokio::test]
+async fn health_detail_reports_writer_protocol_readiness() {
+    let hot = Arc::new(MemoryShortTermStore::new());
+    hot.register_storage_writer(
+        StorageWriterRegistration {
+            instance_id: "legacy-writer".to_string(),
+            storage_protocol_version: 1,
+            build: "old".to_string(),
+            expires_at: 0.0,
+        },
+        30_000,
+    )
+    .await
+    .unwrap();
+    let durable = Arc::new(MemoryLongTermStore::new());
+    let engine = Arc::new(TaskEngine::new(TaskEngineOptions {
+        short_term_store: hot,
+        broadcast: Arc::new(MemoryBroadcastProvider::new()),
+        long_term_store: Some(durable as Arc<dyn LongTermStore>),
+        hooks: None,
+    }));
+    let server = make_server_from_engine(engine);
+    let body = server
+        .get("/health/detail")
+        .await
+        .json::<serde_json::Value>();
+    assert_eq!(
+        body["storage"],
+        serde_json::json!({
+            "releaseReady": false,
+            "requiredStorageProtocolVersion": 2,
+            "activeWriterCount": 2,
+            "incompatibleWriterIds": ["legacy-writer"]
+        })
+    );
+}
+
+fn make_server_from_engine(engine: Arc<TaskEngine>) -> TestServer {
+    let (app, _) = create_app(engine, AuthMode::None, None, None, CorsConfig::default());
+    TestServer::new(app)
 }
 
 fn make_jwt_server() -> TestServer {

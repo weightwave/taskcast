@@ -20,7 +20,8 @@ use crate::types::{
     AssignMode, BlockedRequest, BroadcastProvider, CleanupConfig, DisconnectPolicy,
     DurableSeriesState, EventQueryOptions, HotWriteToken, Level, LongTermStore,
     ReleasePreconditions, ReleaseResult, SeriesMode, ShortTermStore, SinceCursor,
-    StorageFenceConflictError, StorageIntegrityError, StorageReleaseUnsupportedError, Task,
+    StorageFenceConflictError, StorageIntegrityError, StoragePreconditionError,
+    StorageReleaseRequest, StorageReleaseUnsupportedError, StorageWriterRegistration, Task,
     TaskArchive, TaskArchiveImportOptions, TaskArchiveImportResult, TaskAuthConfig, TaskError,
     TaskEvent, TaskFilter, TaskStatus, TaskcastHooks, WebhookConfig,
 };
@@ -569,9 +570,79 @@ impl TaskEngine {
         let coordinator = self.storage_coordinator.as_ref().ok_or_else(|| {
             EngineError::Store(Box::new(StorageReleaseUnsupportedError::default()))
         })?;
-        Ok(coordinator
+        if preconditions.expected_last_event_index < -1
+            || !preconditions.inactive_since.is_finite()
+            || preconditions.inactive_since < 0.0
+            || preconditions.inactive_since.fract() != 0.0
+            || preconditions.inactive_since > i64::MAX as f64
+        {
+            return Err(EngineError::Store(Box::new(StoragePreconditionError::new(
+                "Storage release preconditions are invalid",
+            ))));
+        }
+        let durable = self.long_term_store.as_ref().ok_or_else(|| {
+            EngineError::Store(Box::new(StorageReleaseUnsupportedError::default()))
+        })?;
+        let request = StorageReleaseRequest {
+            task_id: task_id.to_string(),
+            requested_at: now_millis(),
+            expected_last_event_index: preconditions.expected_last_event_index,
+            inactive_since: preconditions.inactive_since,
+        };
+        if !durable
+            .persist_storage_release_request(request.clone())
+            .await?
+        {
+            return Err(EngineError::TaskNotFound(task_id.to_string()));
+        }
+        match coordinator
             .release_task_storage(task_id, preconditions)
-            .await?)
+            .await
+        {
+            Ok(result) => {
+                durable.clear_storage_release_request(&request).await?;
+                Ok(result)
+            }
+            Err(error) => {
+                if error.downcast_ref::<StoragePreconditionError>().is_some() {
+                    durable.clear_storage_release_request(&request).await?;
+                }
+                Err(EngineError::Store(error))
+            }
+        }
+    }
+
+    pub async fn register_storage_writer(
+        &self,
+        registration: StorageWriterRegistration,
+        ttl_ms: u64,
+    ) -> Result<(), EngineError> {
+        if !self.short_term_store.supports_hot_cold_release() {
+            return Err(EngineError::Store(Box::new(
+                StorageReleaseUnsupportedError::new(
+                    "Short-term store cannot register storage writers",
+                ),
+            )));
+        }
+        self.short_term_store
+            .register_storage_writer(registration, ttl_ms)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_storage_writers(
+        &self,
+    ) -> Result<Vec<StorageWriterRegistration>, EngineError> {
+        if !self.short_term_store.supports_hot_cold_release() {
+            return Err(EngineError::Store(Box::new(
+                StorageReleaseUnsupportedError::new("Short-term store cannot list storage writers"),
+            )));
+        }
+        Ok(self.short_term_store.list_storage_writers().await?)
+    }
+
+    pub fn supports_storage_release(&self) -> bool {
+        self.storage_coordinator.is_some()
     }
 
     pub async fn recover_task_storage(&self, task_id: &str) -> Result<ReleaseResult, EngineError> {

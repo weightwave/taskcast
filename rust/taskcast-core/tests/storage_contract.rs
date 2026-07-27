@@ -2,8 +2,9 @@ use taskcast_core::{
     can_transition, ArchiveBatchReceipt, ArchiveGeneration, ArchiveSourceManifest,
     ArchiveSourcePage, CanonicalHistoryEntry, DurableSeriesState, HotWriteToken, RehydrateSnapshot,
     ReleasePreconditions, ReleaseResult, StorageBusyError, StorageFenceConflictError,
-    StorageIntegrityError, StorageLease, StorageReleaseUnsupportedError, TaskStatus,
-    TaskStorageMetadata, TerminalProjection, TtlClaim,
+    StorageIntegrityError, StorageLease, StoragePreconditionError, StorageReleaseRequest,
+    StorageReleaseUnsupportedError, StorageUnavailableError, TaskStatus, TaskStorageMetadata,
+    TerminalProjection, TtlClaim,
 };
 
 #[test]
@@ -62,6 +63,7 @@ fn storage_contract_types_are_public_and_serializable() {
     assert_contract::<HotWriteToken>();
     assert_contract::<StorageLease>();
     assert_contract::<ReleasePreconditions>();
+    assert_contract::<StorageReleaseRequest>();
     assert_contract::<ArchiveSourceManifest>();
     assert_contract::<ArchiveGeneration>();
     assert_contract::<ArchiveBatchReceipt>();
@@ -82,12 +84,20 @@ fn storage_errors_have_stable_codes_and_retryability() {
     assert!(StorageFenceConflictError::default().retryable());
     assert_eq!(StorageBusyError::default().code(), "storage_busy");
     assert_eq!(
+        StoragePreconditionError::default().code(),
+        "storage_precondition_failed"
+    );
+    assert_eq!(
         StorageIntegrityError::default().code(),
         "storage_integrity_error"
     );
     assert_eq!(
         StorageReleaseUnsupportedError::default().code(),
         "storage_release_unsupported"
+    );
+    assert_eq!(
+        StorageUnavailableError::default().code(),
+        "storage_unavailable"
     );
 }
 

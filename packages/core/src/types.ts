@@ -434,6 +434,13 @@ export interface StorageWriterRegistration {
   expiresAt: number
 }
 
+export interface StorageReleaseRequest {
+  taskId: string
+  requestedAt: number
+  expectedLastEventIndex: number
+  inactiveSince: number
+}
+
 export interface TaskStorageMetadataCas {
   taskId: string
   expectedStorageState: StorageState
@@ -476,11 +483,29 @@ export class StorageBusyError extends TaskStorageError {
   }
 }
 
+export class StoragePreconditionError extends TaskStorageError {
+  readonly code = 'storage_precondition_failed'
+  readonly retryable = false
+
+  constructor(message = 'Task storage release precondition failed') {
+    super(message)
+  }
+}
+
 export class StorageIntegrityError extends TaskStorageError {
   readonly code = 'storage_integrity_error'
   readonly retryable = false
 
   constructor(message = 'Task storage integrity check failed') {
+    super(message)
+  }
+}
+
+export class StorageUnavailableError extends TaskStorageError {
+  readonly code = 'storage_unavailable'
+  readonly retryable = true
+
+  constructor(message = 'Task storage lifecycle service is unavailable') {
     super(message)
   }
 }
@@ -635,6 +660,9 @@ export interface LongTermStore {
   ): Promise<{ overwritten: boolean }>
 
   // Durable lifecycle metadata and archive barrier.
+  persistStorageReleaseRequest?(request: StorageReleaseRequest): Promise<boolean>
+  clearStorageReleaseRequest?(request: StorageReleaseRequest): Promise<boolean>
+  listStorageReleaseRequests?(limit: number): Promise<StorageReleaseRequest[]>
   getTaskStorageMetadata?(taskId: string): Promise<TaskStorageMetadata | null>
   compareAndSetTaskStorageMetadata?(update: TaskStorageMetadataCas): Promise<boolean>
   beginArchive?(generation: ArchiveGeneration): Promise<ArchiveGeneration>

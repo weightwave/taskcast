@@ -29,6 +29,7 @@ import {
   type TaskEvent,
   type TaskStorageMetadata,
   type TaskStorageMetadataCas,
+  type StorageReleaseRequest,
   type WebhookConfig,
   type WorkerAuditEvent,
 } from '@taskcast/core'
@@ -609,6 +610,56 @@ export class PostgresLongTermStore implements LongTermStore {
       WHERE id = ${taskId}
     `
     return rows[0] ? rowToStorageMetadata(rows[0]) : null
+  }
+
+  async persistStorageReleaseRequest(request: StorageReleaseRequest): Promise<boolean> {
+    validateStorageReleaseRequest(request)
+    const rows = await this.sql`
+      UPDATE ${this.sql(TASKS)}
+      SET release_requested_at = ${request.requestedAt},
+          release_expected_index = ${request.expectedLastEventIndex},
+          release_inactive_since = ${request.inactiveSince}
+      WHERE id = ${request.taskId}
+      RETURNING id
+    `
+    return rows.length === 1
+  }
+
+  async clearStorageReleaseRequest(request: StorageReleaseRequest): Promise<boolean> {
+    validateStorageReleaseRequest(request)
+    const rows = await this.sql`
+      UPDATE ${this.sql(TASKS)}
+      SET release_requested_at = NULL,
+          release_expected_index = NULL,
+          release_inactive_since = NULL
+      WHERE id = ${request.taskId}
+        AND release_requested_at = ${request.requestedAt}
+        AND release_expected_index = ${request.expectedLastEventIndex}
+        AND release_inactive_since = ${request.inactiveSince}
+      RETURNING id
+    `
+    return rows.length === 1
+  }
+
+  async listStorageReleaseRequests(limit: number): Promise<StorageReleaseRequest[]> {
+    if (!Number.isSafeInteger(limit) || limit <= 0) {
+      throw new StorageIntegrityError('Storage release request limit must be positive')
+    }
+    const rows = await this.sql`
+      SELECT id, release_requested_at, release_expected_index, release_inactive_since
+      FROM ${this.sql(TASKS)}
+      WHERE release_requested_at IS NOT NULL
+        AND release_expected_index IS NOT NULL
+        AND release_inactive_since IS NOT NULL
+      ORDER BY release_requested_at, id
+      LIMIT ${limit}
+    `
+    return rows.map((row) => ({
+      taskId: row['id'] as string,
+      requestedAt: Number(row['release_requested_at']),
+      expectedLastEventIndex: Number(row['release_expected_index']),
+      inactiveSince: Number(row['release_inactive_since']),
+    }))
   }
 
   async compareAndSetTaskStorageMetadata(update: TaskStorageMetadataCas): Promise<boolean> {
@@ -1498,6 +1549,20 @@ function validateStorageMetadataCas(update: TaskStorageMetadataCas): void {
     if (timestamp !== null && !Number.isSafeInteger(timestamp)) {
       throw new StorageIntegrityError('Storage metadata timestamps must be safe integers')
     }
+  }
+}
+
+function validateStorageReleaseRequest(request: StorageReleaseRequest): void {
+  if (
+    request.taskId.length === 0 ||
+    !Number.isSafeInteger(request.requestedAt) ||
+    request.requestedAt < 0 ||
+    !Number.isSafeInteger(request.expectedLastEventIndex) ||
+    request.expectedLastEventIndex < -1 ||
+    !Number.isSafeInteger(request.inactiveSince) ||
+    request.inactiveSince < 0
+  ) {
+    throw new StorageIntegrityError('Storage release request is invalid')
   }
 }
 

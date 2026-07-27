@@ -9,7 +9,9 @@ import {
   StorageBusyError,
   StorageFenceConflictError,
   StorageIntegrityError,
+  StoragePreconditionError,
   StorageReleaseUnsupportedError,
+  StorageUnavailableError,
   type ArchiveBatch,
   type ArchiveGeneration,
   type ArchiveSourcePage,
@@ -172,7 +174,7 @@ export class StorageCoordinator {
           writer.storageProtocolVersion < this.requiredStorageProtocolVersion,
       )
       if (incompatible.length > 0) {
-        throw new StorageBusyError(
+        throw new StorageUnavailableError(
           `Storage release is blocked by incompatible writers: ${incompatible
             .map((writer) => writer.instanceId)
             .join(', ')}`,
@@ -191,14 +193,14 @@ export class StorageCoordinator {
         preconditions.expectedLastEventIndex < -1 ||
         closed.highWatermark !== preconditions.expectedLastEventIndex
       ) {
-        throw new StorageBusyError('Task event index changed before storage release')
+        throw new StoragePreconditionError('Task event index changed before storage release')
       }
       if (
         !Number.isFinite(preconditions.inactiveSince) ||
         (metadata.lastEventAt !== null &&
           metadata.lastEventAt > preconditions.inactiveSince)
       ) {
-        throw new StorageBusyError('Task has activity newer than the release cutoff')
+        throw new StoragePreconditionError('Task has activity newer than the release cutoff')
       }
 
       const releasing: TaskStorageMetadata = {
@@ -234,7 +236,7 @@ export class StorageCoordinator {
         description.maxEventTimestamp !== null &&
         description.maxEventTimestamp > preconditions.inactiveSince
       ) {
-        throw new StorageBusyError(
+        throw new StoragePreconditionError(
           'Task source has activity newer than the release cutoff',
         )
       }

@@ -32,6 +32,7 @@ export {
   TaskSchema, TaskEventSchema, WorkerSchema, ErrorSchema,
   CreateTaskSchema, TransitionSchema, PublishEventSchema,
   TaskArchiveSchema, ImportTaskArchiveSchema, ImportTaskArchiveResultSchema, ServerInfoSchema,
+  StorageReleaseRequestSchema, StorageReleaseResultSchema,
 } from './schemas.js'
 export {
   TASKCAST_API_VERSION,
@@ -46,6 +47,7 @@ import { cors } from 'hono/cors'
 import { apiReference } from '@scalar/hono-api-reference'
 import { createAuthMiddleware } from './auth.js'
 import { createTasksRouter } from './routes/tasks.js'
+import type { StorageReleaseReadiness } from './routes/tasks.js'
 import { createSSERouter, createGlobalSSERoute, createSubscriberCounts } from './routes/sse.js'
 import { createWorkersRouter } from './routes/workers.js'
 import { WorkerWSRegistry } from './routes/worker-ws.js'
@@ -70,8 +72,9 @@ import type {
   ShortTermStore,
   DisconnectPolicy,
   TaskcastConfig,
+  StorageWriterRegistration,
 } from '@taskcast/core'
-import { TaskScheduler } from '@taskcast/core'
+import { StorageUnavailableError, TaskScheduler } from '@taskcast/core'
 import { HeartbeatMonitor } from '@taskcast/core'
 import {
   DependencyHealthRegistry,
@@ -123,6 +126,92 @@ export interface TaskcastApp {
   stop(): void
 }
 
+const STORAGE_PROTOCOL_VERSION = 2
+const STORAGE_WRITER_TTL_MS = 30_000
+const STORAGE_WRITER_HEARTBEAT_MS = 10_000
+
+interface StorageReadinessSnapshot {
+  releaseReady: boolean
+  requiredStorageProtocolVersion: number
+  activeWriterCount: number
+  incompatibleWriterIds: string[]
+}
+
+class StorageWriterHeartbeat implements StorageReleaseReadiness {
+  private readonly instanceId = globalThis.crypto?.randomUUID?.()
+    ?? `taskcast-${Date.now()}-${Math.random().toString(36).slice(2)}`
+  private readonly registration: StorageWriterRegistration
+  private readonly timer: ReturnType<typeof setInterval>
+  private heartbeatError: unknown = null
+
+  constructor(private readonly engine: TaskEngine) {
+    this.registration = {
+      instanceId: this.instanceId,
+      storageProtocolVersion: STORAGE_PROTOCOL_VERSION,
+      build: TASKCAST_SERVER_VERSION,
+      expiresAt: 0,
+    }
+    void this.heartbeat()
+    this.timer = setInterval(() => {
+      void this.heartbeat()
+    }, STORAGE_WRITER_HEARTBEAT_MS)
+    ;(this.timer as unknown as { unref?: () => void }).unref?.()
+  }
+
+  private async heartbeat(): Promise<void> {
+    try {
+      await this.engine.registerStorageWriter(this.registration, STORAGE_WRITER_TTL_MS)
+      this.heartbeatError = null
+    } catch (error) {
+      this.heartbeatError = error
+    }
+  }
+
+  async snapshot(): Promise<StorageReadinessSnapshot> {
+    await this.heartbeat()
+    let writers: StorageWriterRegistration[]
+    try {
+      writers = await this.engine.listStorageWriters()
+    } catch {
+      return {
+        releaseReady: false,
+        requiredStorageProtocolVersion: STORAGE_PROTOCOL_VERSION,
+        activeWriterCount: 0,
+        incompatibleWriterIds: [],
+      }
+    }
+    const incompatibleWriterIds = writers
+      .filter((writer) => writer.storageProtocolVersion < STORAGE_PROTOCOL_VERSION)
+      .map((writer) => writer.instanceId)
+      .sort()
+    return {
+      releaseReady:
+        this.engine.supportsStorageRelease() &&
+        this.heartbeatError === null &&
+        writers.some((writer) => writer.instanceId === this.instanceId) &&
+        incompatibleWriterIds.length === 0,
+      requiredStorageProtocolVersion: STORAGE_PROTOCOL_VERSION,
+      activeWriterCount: writers.length,
+      incompatibleWriterIds,
+    }
+  }
+
+  async ensureReady(): Promise<void> {
+    if (!this.engine.supportsStorageRelease()) return
+    const readiness = await this.snapshot()
+    if (!readiness.releaseReady) {
+      const detail = readiness.incompatibleWriterIds.length > 0
+        ? `: ${readiness.incompatibleWriterIds.join(', ')}`
+        : ''
+      throw new StorageUnavailableError(`Storage writer readiness is not satisfied${detail}`)
+    }
+  }
+
+  stop(): void {
+    clearInterval(this.timer)
+  }
+}
+
 /**
  * Creates an OpenAPIHono app with all taskcast routes mounted.
  * Can be used standalone or mounted into an existing Hono app.
@@ -133,6 +222,7 @@ export interface TaskcastApp {
 export function createTaskcastApp(opts: TaskcastServerOptions): TaskcastApp {
   const startTime = Date.now()
   const app = new OpenAPIHono()
+  const storageReadiness = new StorageWriterHeartbeat(opts.engine)
 
   // Hono's default handler writes the raw error to stderr before middleware
   // can sanitize it. Preserve its response behavior while leaving the single
@@ -185,7 +275,7 @@ export function createTaskcastApp(opts: TaskcastServerOptions): TaskcastApp {
     return c.json(result, result.ok ? 200 : 503)
   })
 
-  app.get('/health/detail', (c) => {
+  app.get('/health/detail', async (c) => {
     const uptime = Math.floor((Date.now() - startTime) / 1000)
     const authMode = opts.auth?.mode ?? 'none'
     const broadcastProvider = opts.effectiveAdapters?.broadcast
@@ -248,6 +338,7 @@ export function createTaskcastApp(opts: TaskcastServerOptions): TaskcastApp {
       auth: { mode: authMode },
       adapters,
       dependencies,
+      storage: await storageReadiness.snapshot(),
     })
   })
 
@@ -267,11 +358,12 @@ export function createTaskcastApp(opts: TaskcastServerOptions): TaskcastApp {
   app.use('/workers', authMiddleware)
   app.use('/workers/*', authMiddleware)
 
-  app.route('/tasks', createTasksRouter(opts.engine, subscriberCounts))
+  app.route('/tasks', createTasksRouter(opts.engine, subscriberCounts, storageReadiness))
   app.route('/tasks', createSSERouter(opts.engine, subscriberCounts))
   app.route('/events', createGlobalSSERoute(opts.engine))
 
   const cleanups: Array<() => void> = []
+  cleanups.push(() => storageReadiness.stop())
 
   // Wire scheduler
   let scheduler: TaskScheduler | undefined

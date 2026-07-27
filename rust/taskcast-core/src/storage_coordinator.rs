@@ -11,8 +11,9 @@ use crate::types::{
     ArchiveBatch, ArchiveBatchReceipt, ArchiveGeneration, ArchiveGenerationStatus,
     ArchiveSourceManifest, DurableSeriesState, HotWriteToken, LongTermStore, RehydrateSnapshot,
     ReleasePreconditions, ReleaseResult, SeriesMode, ShortTermStore, StorageBusyError,
-    StorageFenceConflictError, StorageIntegrityError, StorageLease, StorageReleaseUnsupportedError,
-    StorageState, TaskEvent, TaskStorageMetadata, TaskStorageMetadataCas,
+    StorageFenceConflictError, StorageIntegrityError, StorageLease, StoragePreconditionError,
+    StorageReleaseUnsupportedError, StorageState, StorageUnavailableError, TaskEvent,
+    TaskStorageMetadata, TaskStorageMetadataCas,
 };
 
 type StorageResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -731,7 +732,7 @@ impl StorageCoordinator {
             .map(|writer| writer.instance_id.as_str())
             .collect::<Vec<_>>();
         if !incompatible.is_empty() {
-            return Err(boxed(StorageBusyError::new(format!(
+            return Err(boxed(StorageUnavailableError::new(format!(
                 "Storage release is blocked by incompatible writers: {}",
                 incompatible.join(", ")
             ))));
@@ -744,7 +745,7 @@ impl StorageCoordinator {
             .await?;
         fence_closed.store(true, Ordering::SeqCst);
         if closed.high_watermark != preconditions.expected_last_event_index {
-            return Err(boxed(StorageBusyError::new(
+            return Err(boxed(StoragePreconditionError::new(
                 "Task event index changed before storage release",
             )));
         }
@@ -753,7 +754,7 @@ impl StorageCoordinator {
                 .last_event_at
                 .is_some_and(|last_event_at| last_event_at > preconditions.inactive_since)
         {
-            return Err(boxed(StorageBusyError::new(
+            return Err(boxed(StoragePreconditionError::new(
                 "Task has activity newer than the release cutoff",
             )));
         }
@@ -795,7 +796,7 @@ impl StorageCoordinator {
             .max_event_timestamp
             .is_some_and(|timestamp| timestamp > preconditions.inactive_since)
         {
-            return Err(boxed(StorageBusyError::new(
+            return Err(boxed(StoragePreconditionError::new(
                 "Task source has activity newer than the release cutoff",
             )));
         }

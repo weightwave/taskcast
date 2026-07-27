@@ -19,6 +19,7 @@ import {
   type TaskEvent,
   type TaskStorageMetadata,
   type TaskStorageMetadataCas,
+  type StorageReleaseRequest,
   type Worker,
   type WorkerAuditEvent,
 } from '../../src/index.js'
@@ -49,6 +50,7 @@ class CoordinatorLongTermStore implements LongTermStore {
   readonly batches: ArchiveBatch[] = []
   readonly series = new Map<string, DurableSeriesState[]>()
   readonly creationTokens = new Map<string, string>()
+  readonly releaseRequests = new Map<string, StorageReleaseRequest>()
   failArchiveBatch = false
   failMetadataCas = 0
 
@@ -116,6 +118,30 @@ class CoordinatorLongTermStore implements LongTermStore {
     taskId: string,
   ): Promise<TaskStorageMetadata | null> {
     return structuredClone(this.metadata.get(taskId) ?? null)
+  }
+
+  async persistStorageReleaseRequest(request: StorageReleaseRequest): Promise<boolean> {
+    if (!this.tasks.has(request.taskId)) return false
+    this.releaseRequests.set(request.taskId, structuredClone(request))
+    return true
+  }
+
+  async clearStorageReleaseRequest(request: StorageReleaseRequest): Promise<boolean> {
+    const current = this.releaseRequests.get(request.taskId)
+    if (
+      !current ||
+      current.requestedAt !== request.requestedAt ||
+      current.expectedLastEventIndex !== request.expectedLastEventIndex ||
+      current.inactiveSince !== request.inactiveSince
+    ) {
+      return false
+    }
+    this.releaseRequests.delete(request.taskId)
+    return true
+  }
+
+  async listStorageReleaseRequests(limit: number): Promise<StorageReleaseRequest[]> {
+    return Array.from(this.releaseRequests.values()).slice(0, limit)
   }
 
   async compareAndSetTaskStorageMetadata(
@@ -327,7 +353,7 @@ describe('StorageCoordinator', () => {
         expectedLastEventIndex: 1,
         inactiveSince: 3_000,
       }),
-    ).rejects.toMatchObject({ code: 'storage_busy' })
+    ).rejects.toMatchObject({ code: 'storage_precondition_failed' })
     await expect(hot.getWriteFence('task-1')).resolves.toEqual({
       taskId: 'task-1',
       acceptingWrites: true,
@@ -356,7 +382,7 @@ describe('StorageCoordinator', () => {
         expectedLastEventIndex: 2,
         inactiveSince: 2_001,
       }),
-    ).rejects.toMatchObject({ code: 'storage_busy' })
+    ).rejects.toMatchObject({ code: 'storage_precondition_failed' })
     await expect(hot.getTaskStoragePresence('task-1')).resolves.toMatchObject({
       task: true,
       eventCount: 3,

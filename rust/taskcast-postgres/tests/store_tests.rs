@@ -9,8 +9,8 @@ use taskcast_core::archive::{
 use taskcast_core::types::{
     ArchiveBatch, ArchiveBatchReceipt, ArchiveGeneration, ArchiveGenerationStatus,
     ArchiveSourceManifest, DurableSeriesState, EventQueryOptions, Level, LongTermStore, SeriesMode,
-    SinceCursor, StorageState, Task, TaskEvent, TaskStatus, TaskStorageMetadataCas,
-    WorkerAuditAction, WorkerAuditEvent,
+    SinceCursor, StorageReleaseRequest, StorageState, Task, TaskEvent, TaskStatus,
+    TaskStorageMetadataCas, WorkerAuditAction, WorkerAuditEvent,
 };
 use taskcast_postgres::PostgresLongTermStore;
 
@@ -170,6 +170,52 @@ async fn start_archive_release(store: &PostgresLongTermStore, generation: &str) 
         })
         .await
         .unwrap());
+}
+
+#[tokio::test]
+async fn storage_release_request_is_persisted_and_compare_cleared() {
+    let (store, _container) = setup().await;
+    store.save_task(make_task("release-request")).await.unwrap();
+    let request = StorageReleaseRequest {
+        task_id: "release-request".to_string(),
+        requested_at: 2_000.0,
+        expected_last_event_index: 7,
+        inactive_since: 1_500.0,
+    };
+
+    assert!(store
+        .persist_storage_release_request(request.clone())
+        .await
+        .unwrap());
+    assert_eq!(
+        store.list_storage_release_requests(10).await.unwrap(),
+        vec![request.clone()]
+    );
+    assert!(!store
+        .clear_storage_release_request(&StorageReleaseRequest {
+            requested_at: request.requested_at + 1.0,
+            ..request.clone()
+        })
+        .await
+        .unwrap());
+    assert_eq!(
+        store.list_storage_release_requests(10).await.unwrap(),
+        vec![request.clone()]
+    );
+    assert!(store.clear_storage_release_request(&request).await.unwrap());
+    assert!(store
+        .list_storage_release_requests(10)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(!store
+        .persist_storage_release_request(StorageReleaseRequest {
+            task_id: "missing".to_string(),
+            ..request
+        })
+        .await
+        .unwrap());
+    assert!(store.list_storage_release_requests(0).await.is_err());
 }
 
 fn build_archive(

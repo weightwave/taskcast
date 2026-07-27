@@ -16,9 +16,10 @@ use taskcast_core::archive::{
 use taskcast_core::types::{
     ArchiveBatch, ArchiveBatchReceipt, ArchiveGeneration, ArchiveGenerationStatus,
     ArchiveSourceManifest, AssignMode, CleanupConfig, DisconnectPolicy, DurableSeriesState,
-    EventQueryOptions, Level, LongTermStore, SeriesMode, StorageIntegrityError, StorageState, Task,
-    TaskAuthConfig, TaskError, TaskEvent, TaskStatus, TaskStorageMetadata, TaskStorageMetadataCas,
-    WebhookConfig, WorkerAuditAction, WorkerAuditEvent,
+    EventQueryOptions, Level, LongTermStore, SeriesMode, StorageIntegrityError,
+    StorageReleaseRequest, StorageState, Task, TaskAuthConfig, TaskError, TaskEvent, TaskStatus,
+    TaskStorageMetadata, TaskStorageMetadataCas, WebhookConfig, WorkerAuditAction,
+    WorkerAuditEvent,
 };
 use taskcast_core::{
     BoxError, DependencyName, DependencyObservation, DependencyObservationState,
@@ -911,6 +912,79 @@ impl LongTermStore for PostgresLongTermStore {
             .fetch_optional(&self.pool)
             .await?;
         row.as_ref().map(row_to_storage_metadata).transpose()
+    }
+
+    async fn persist_storage_release_request(
+        &self,
+        request: StorageReleaseRequest,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        validate_storage_release_request(&request)?;
+        let sql = format!(
+            "UPDATE {TASKS} \
+             SET release_requested_at = $1, release_expected_index = $2, \
+                 release_inactive_since = $3 \
+             WHERE id = $4"
+        );
+        let result = sqlx::query(&sql)
+            .bind(request.requested_at as i64)
+            .bind(request.expected_last_event_index)
+            .bind(request.inactive_since as i64)
+            .bind(&request.task_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn clear_storage_release_request(
+        &self,
+        request: &StorageReleaseRequest,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        validate_storage_release_request(request)?;
+        let sql = format!(
+            "UPDATE {TASKS} \
+             SET release_requested_at = NULL, release_expected_index = NULL, \
+                 release_inactive_since = NULL \
+             WHERE id = $1 AND release_requested_at = $2 \
+               AND release_expected_index = $3 AND release_inactive_since = $4"
+        );
+        let result = sqlx::query(&sql)
+            .bind(&request.task_id)
+            .bind(request.requested_at as i64)
+            .bind(request.expected_last_event_index)
+            .bind(request.inactive_since as i64)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn list_storage_release_requests(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<StorageReleaseRequest>, Box<dyn std::error::Error + Send + Sync>> {
+        if limit == 0 || limit > i64::MAX as u64 {
+            return Err(integrity("Storage release request limit must be positive"));
+        }
+        let sql = format!(
+            "SELECT id, release_requested_at, release_expected_index, release_inactive_since \
+             FROM {TASKS} \
+             WHERE release_requested_at IS NOT NULL \
+               AND release_expected_index IS NOT NULL \
+               AND release_inactive_since IS NOT NULL \
+             ORDER BY release_requested_at, id LIMIT $1"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|row| StorageReleaseRequest {
+                task_id: row.get("id"),
+                requested_at: row.get::<i64, _>("release_requested_at") as f64,
+                expected_last_event_index: row.get("release_expected_index"),
+                inactive_since: row.get::<i64, _>("release_inactive_since") as f64,
+            })
+            .collect())
     }
 
     async fn compare_and_set_task_storage_metadata(
@@ -1861,6 +1935,25 @@ fn validate_storage_metadata_cas(
         return Err(integrity(
             "Storage metadata timestamps must be PostgreSQL BIGINT values",
         ));
+    }
+    Ok(())
+}
+
+fn validate_storage_release_request(
+    request: &StorageReleaseRequest,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if request.task_id.is_empty()
+        || !request.requested_at.is_finite()
+        || request.requested_at < 0.0
+        || request.requested_at.fract() != 0.0
+        || request.requested_at > i64::MAX as f64
+        || request.expected_last_event_index < -1
+        || !request.inactive_since.is_finite()
+        || request.inactive_since < 0.0
+        || request.inactive_since.fract() != 0.0
+        || request.inactive_since > i64::MAX as f64
+    {
+        return Err(integrity("Storage release request is invalid"));
     }
     Ok(())
 }

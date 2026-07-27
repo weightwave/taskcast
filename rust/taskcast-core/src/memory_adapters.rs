@@ -8,10 +8,11 @@ use crate::types::{
     ArchiveBatch, ArchiveBatchReceipt, ArchiveGeneration, ArchiveGenerationStatus,
     ArchiveSourcePage, BroadcastProvider, ClosedWriteFence, DurableSeriesState, EventQueryOptions,
     HotWriteToken, LongTermStore, RehydrateSnapshot, SeriesMode, SeriesResult, ShortTermStore,
-    StorageFenceConflictError, StorageIntegrityError, StorageLease, StorageState,
-    StorageWriterRegistration, Task, TaskArchiveImportOptions, TaskArchiveRestoreData, TaskEvent,
-    TaskFilter, TaskMutationSnapshot, TaskStatus, TaskStorageMetadata, TaskStorageMetadataCas,
-    TaskStoragePresence, TaskWriteFence, Worker, WorkerAssignment, WorkerAuditEvent, WorkerFilter,
+    StorageFenceConflictError, StorageIntegrityError, StorageLease, StorageReleaseRequest,
+    StorageState, StorageWriterRegistration, Task, TaskArchiveImportOptions,
+    TaskArchiveRestoreData, TaskEvent, TaskFilter, TaskMutationSnapshot, TaskStatus,
+    TaskStorageMetadata, TaskStorageMetadataCas, TaskStoragePresence, TaskWriteFence, Worker,
+    WorkerAssignment, WorkerAuditEvent, WorkerFilter,
 };
 use crate::{
     compute_archive_batch_digest, compute_archive_source_digest,
@@ -197,6 +198,7 @@ pub struct MemoryLongTermStore {
     series: RwLock<HashMap<String, Vec<DurableSeriesState>>>,
     worker_events: RwLock<HashMap<String, Vec<WorkerAuditEvent>>>,
     creation_claims: RwLock<HashMap<String, MemoryCreationClaim>>,
+    release_requests: RwLock<HashMap<String, StorageReleaseRequest>>,
 }
 
 impl MemoryLongTermStore {
@@ -211,6 +213,7 @@ impl MemoryLongTermStore {
             series: RwLock::new(HashMap::new()),
             worker_events: RwLock::new(HashMap::new()),
             creation_claims: RwLock::new(HashMap::new()),
+            release_requests: RwLock::new(HashMap::new()),
         }
     }
 
@@ -644,6 +647,52 @@ impl LongTermStore for MemoryLongTermStore {
         task_id: &str,
     ) -> Result<Option<TaskStorageMetadata>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(self.metadata.read().unwrap().get(task_id).cloned())
+    }
+
+    async fn persist_storage_release_request(
+        &self,
+        request: StorageReleaseRequest,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        if !self.tasks.read().unwrap().contains_key(&request.task_id) {
+            return Ok(false);
+        }
+        self.release_requests
+            .write()
+            .unwrap()
+            .insert(request.task_id.clone(), request);
+        Ok(true)
+    }
+
+    async fn clear_storage_release_request(
+        &self,
+        request: &StorageReleaseRequest,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let mut requests = self.release_requests.write().unwrap();
+        if requests.get(&request.task_id) != Some(request) {
+            return Ok(false);
+        }
+        requests.remove(&request.task_id);
+        Ok(true)
+    }
+
+    async fn list_storage_release_requests(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<StorageReleaseRequest>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut requests = self
+            .release_requests
+            .read()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        requests.sort_by(|left, right| {
+            left.requested_at
+                .total_cmp(&right.requested_at)
+                .then_with(|| left.task_id.cmp(&right.task_id))
+        });
+        requests.truncate(limit as usize);
+        Ok(requests)
     }
 
     async fn compare_and_set_task_storage_metadata(

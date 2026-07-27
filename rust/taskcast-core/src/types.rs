@@ -803,6 +803,15 @@ pub struct StorageWriterRegistration {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
+pub struct StorageReleaseRequest {
+    pub task_id: String,
+    pub requested_at: f64,
+    pub expected_last_event_index: i64,
+    pub inactive_since: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct TaskStorageMetadataCas {
     pub task_id: String,
     pub expected_storage_state: StorageState,
@@ -864,10 +873,22 @@ storage_error!(
     true
 );
 storage_error!(
+    StoragePreconditionError,
+    "Task storage release precondition failed",
+    "storage_precondition_failed",
+    false
+);
+storage_error!(
     StorageIntegrityError,
     "Task storage integrity check failed",
     "storage_integrity_error",
     false
+);
+storage_error!(
+    StorageUnavailableError,
+    "Task storage lifecycle service is unavailable",
+    "storage_unavailable",
+    true
 );
 storage_error!(
     StorageReleaseUnsupportedError,
@@ -1316,6 +1337,27 @@ pub trait LongTermStore: Send + Sync {
         &self,
         _task_id: &str,
     ) -> Result<Option<TaskStorageMetadata>, Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(StorageReleaseUnsupportedError::default()))
+    }
+
+    async fn persist_storage_release_request(
+        &self,
+        _request: StorageReleaseRequest,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(StorageReleaseUnsupportedError::default()))
+    }
+
+    async fn clear_storage_release_request(
+        &self,
+        _request: &StorageReleaseRequest,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(StorageReleaseUnsupportedError::default()))
+    }
+
+    async fn list_storage_release_requests(
+        &self,
+        _limit: u64,
+    ) -> Result<Vec<StorageReleaseRequest>, Box<dyn std::error::Error + Send + Sync>> {
         Err(Box::new(StorageReleaseUnsupportedError::default()))
     }
 

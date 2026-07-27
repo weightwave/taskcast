@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
 
 use axum::extract::State as AxumState;
@@ -13,8 +14,8 @@ use taskcast_core::scheduler::{TaskScheduler, TaskSchedulerOptions};
 use taskcast_core::state_machine::is_terminal;
 use taskcast_core::worker_manager::{DispatchResult, WorkerManager};
 use taskcast_core::{
-    AssignMode, ConnectionMode, DisconnectPolicy, ShortTermStore, Task, TaskEngine, TaskStatus,
-    WorkerStatus,
+    AssignMode, ConnectionMode, DisconnectPolicy, EngineError, ShortTermStore,
+    StorageUnavailableError, StorageWriterRegistration, Task, TaskEngine, TaskStatus, WorkerStatus,
 };
 use tower_http::cors::{Any, CorsLayer};
 use utoipa::OpenApi;
@@ -35,6 +36,130 @@ pub struct AppState {
     pub start_time: Instant,
     pub config: Option<Arc<TaskcastConfig>>,
     pub runtime_health: RuntimeHealth,
+    pub storage_readiness: Arc<StorageWriterHeartbeat>,
+}
+
+const STORAGE_PROTOCOL_VERSION: u64 = 2;
+const STORAGE_WRITER_TTL_MS: u64 = 30_000;
+const STORAGE_WRITER_HEARTBEAT_MS: u64 = 10_000;
+static WRITER_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageReadinessSnapshot {
+    pub release_ready: bool,
+    pub required_storage_protocol_version: u64,
+    pub active_writer_count: usize,
+    pub incompatible_writer_ids: Vec<String>,
+}
+
+pub struct StorageWriterHeartbeat {
+    engine: Arc<TaskEngine>,
+    registration: StorageWriterRegistration,
+    heartbeat_error: Mutex<Option<String>>,
+    abort_handle: Mutex<Option<tokio::task::AbortHandle>>,
+}
+
+impl StorageWriterHeartbeat {
+    fn start(engine: Arc<TaskEngine>) -> Arc<Self> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let counter = WRITER_INSTANCE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let heartbeat = Arc::new(Self {
+            engine,
+            registration: StorageWriterRegistration {
+                instance_id: format!("taskcast-{}-{now}-{counter}", std::process::id()),
+                storage_protocol_version: STORAGE_PROTOCOL_VERSION,
+                build: SERVER_VERSION.to_string(),
+                expires_at: 0.0,
+            },
+            heartbeat_error: Mutex::new(None),
+            abort_handle: Mutex::new(None),
+        });
+        if tokio::runtime::Handle::try_current().is_ok() {
+            let weak: Weak<Self> = Arc::downgrade(&heartbeat);
+            let task = tokio::spawn(async move {
+                loop {
+                    let Some(heartbeat) = weak.upgrade() else {
+                        break;
+                    };
+                    heartbeat.refresh().await;
+                    drop(heartbeat);
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        STORAGE_WRITER_HEARTBEAT_MS,
+                    ))
+                    .await;
+                }
+            });
+            *heartbeat.abort_handle.lock().unwrap() = Some(task.abort_handle());
+        }
+        heartbeat
+    }
+
+    async fn refresh(&self) {
+        let result = self
+            .engine
+            .register_storage_writer(self.registration.clone(), STORAGE_WRITER_TTL_MS)
+            .await;
+        *self.heartbeat_error.lock().unwrap() = result.err().map(|error| error.to_string());
+    }
+
+    pub async fn snapshot(&self) -> StorageReadinessSnapshot {
+        self.refresh().await;
+        let writers = match self.engine.list_storage_writers().await {
+            Ok(writers) => writers,
+            Err(_) => {
+                return StorageReadinessSnapshot {
+                    release_ready: false,
+                    required_storage_protocol_version: STORAGE_PROTOCOL_VERSION,
+                    active_writer_count: 0,
+                    incompatible_writer_ids: Vec::new(),
+                }
+            }
+        };
+        let mut incompatible_writer_ids = writers
+            .iter()
+            .filter(|writer| writer.storage_protocol_version < STORAGE_PROTOCOL_VERSION)
+            .map(|writer| writer.instance_id.clone())
+            .collect::<Vec<_>>();
+        incompatible_writer_ids.sort();
+        StorageReadinessSnapshot {
+            release_ready: self.engine.supports_storage_release()
+                && self.heartbeat_error.lock().unwrap().is_none()
+                && writers
+                    .iter()
+                    .any(|writer| writer.instance_id == self.registration.instance_id)
+                && incompatible_writer_ids.is_empty(),
+            required_storage_protocol_version: STORAGE_PROTOCOL_VERSION,
+            active_writer_count: writers.len(),
+            incompatible_writer_ids,
+        }
+    }
+
+    pub async fn ensure_ready(&self) -> Result<(), EngineError> {
+        if !self.engine.supports_storage_release() {
+            return Ok(());
+        }
+        let snapshot = self.snapshot().await;
+        if snapshot.release_ready {
+            return Ok(());
+        }
+        let detail = if snapshot.incompatible_writer_ids.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", snapshot.incompatible_writer_ids.join(", "))
+        };
+        Err(EngineError::Store(Box::new(StorageUnavailableError::new(
+            format!("Storage writer readiness is not satisfied{detail}"),
+        ))))
+    }
+}
+
+impl Drop for StorageWriterHeartbeat {
+    fn drop(&mut self) {
+        if let Some(handle) = self.abort_handle.lock().unwrap().take() {
+            handle.abort();
+        }
+    }
 }
 
 /// Create the Axum router with all taskcast routes mounted.
@@ -144,6 +269,7 @@ pub fn create_app_with_runtime_health_and_routes(
     } = runtime_options;
     let auth_mode = Arc::new(auth_mode);
     let subscriber_counts = create_subscriber_counts();
+    let storage_readiness = StorageWriterHeartbeat::start(Arc::clone(&engine));
 
     let app_state = AppState {
         engine: Arc::clone(&engine),
@@ -151,6 +277,7 @@ pub fn create_app_with_runtime_health_and_routes(
         start_time: Instant::now(),
         config: config.as_ref().map(|c| Arc::new(c.clone())),
         runtime_health,
+        storage_readiness: Arc::clone(&storage_readiness),
     };
 
     let task_routes = Router::new()
@@ -159,6 +286,10 @@ pub fn create_app_with_runtime_health_and_routes(
         .route("/{task_id}/archive", get(tasks::export_task_archive))
         .route("/{task_id}", get(tasks::get_task))
         .route("/{task_id}/status", patch(tasks::transition_task))
+        .route(
+            "/{task_id}/storage/release",
+            post(tasks::release_task_storage),
+        )
         .route("/{task_id}/resolve", post(tasks::resolve_task))
         .route("/{task_id}/request", get(tasks::get_blocked_request))
         .route(
@@ -167,6 +298,7 @@ pub fn create_app_with_runtime_health_and_routes(
         )
         .route("/{task_id}/events/history", get(tasks::get_event_history))
         .layer(Extension(subscriber_counts))
+        .layer(Extension(storage_readiness))
         .with_state(Arc::clone(&engine));
 
     let events_route = Router::new()
@@ -409,13 +541,16 @@ async fn health_detail(AxumState(state): AxumState<AppState>) -> impl IntoRespon
     }
 
     let mut response = serde_json::json!({
+    let storage = state.storage_readiness.snapshot().await;
+    let mut response = serde_json::json!({
         "ok": true,
         "name": SERVER_NAME,
         "version": SERVER_VERSION,
         "apiVersion": API_VERSION,
         "uptime": uptime,
         "auth": { "mode": auth_mode_str },
-        "adapters": adapters
+        "adapters": adapters,
+        "storage": storage
     });
 
     if let Some(registry) = state.runtime_health.registry {

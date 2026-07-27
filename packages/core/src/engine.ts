@@ -25,12 +25,15 @@ import type {
   TaskArchiveEvent,
   ReleasePreconditions,
   ReleaseResult,
+  StorageReleaseRequest,
+  StorageWriterRegistration,
   HotWriteToken,
   DurableSeriesState,
 } from './types.js'
 import {
   StorageFenceConflictError,
   StorageIntegrityError,
+  StoragePreconditionError,
   StorageReleaseUnsupportedError,
 } from './types.js'
 
@@ -448,7 +451,69 @@ export class TaskEngine {
     preconditions: ReleasePreconditions,
   ): Promise<ReleaseResult> {
     if (!this.storageCoordinator) throw new StorageReleaseUnsupportedError()
-    return this.storageCoordinator.releaseTaskStorage(taskId, preconditions)
+    if (
+      !Number.isSafeInteger(preconditions.expectedLastEventIndex) ||
+      preconditions.expectedLastEventIndex < -1 ||
+      !Number.isSafeInteger(preconditions.inactiveSince) ||
+      preconditions.inactiveSince < 0
+    ) {
+      throw new StoragePreconditionError('Storage release preconditions are invalid')
+    }
+    const durable = this.longTermStore
+    if (!durable?.persistStorageReleaseRequest || !durable.clearStorageReleaseRequest) {
+      throw new StorageReleaseUnsupportedError(
+        'Long-term store cannot persist storage release requests',
+      )
+    }
+    const request: StorageReleaseRequest = {
+      taskId,
+      requestedAt: Date.now(),
+      expectedLastEventIndex: preconditions.expectedLastEventIndex,
+      inactiveSince: preconditions.inactiveSince,
+    }
+    const persisted = await durable.persistStorageReleaseRequest(request)
+    if (!persisted) throw new Error(`Task not found: ${taskId}`)
+    try {
+      const result = await this.storageCoordinator.releaseTaskStorage(taskId, preconditions)
+      await durable.clearStorageReleaseRequest(request)
+      return result
+    } catch (error) {
+      if (error instanceof StoragePreconditionError) {
+        await durable.clearStorageReleaseRequest(request)
+      }
+      throw error
+    }
+  }
+
+  async registerStorageWriter(
+    registration: StorageWriterRegistration,
+    ttlMs: number,
+  ): Promise<void> {
+    if (
+      this.shortTermStore.supportsHotColdRelease !== true ||
+      !this.shortTermStore.registerStorageWriter
+    ) {
+      throw new StorageReleaseUnsupportedError(
+        'Short-term store cannot register storage writers',
+      )
+    }
+    await this.shortTermStore.registerStorageWriter(registration, ttlMs)
+  }
+
+  async listStorageWriters(): Promise<StorageWriterRegistration[]> {
+    if (
+      this.shortTermStore.supportsHotColdRelease !== true ||
+      !this.shortTermStore.listStorageWriters
+    ) {
+      throw new StorageReleaseUnsupportedError(
+        'Short-term store cannot list storage writers',
+      )
+    }
+    return this.shortTermStore.listStorageWriters()
+  }
+
+  supportsStorageRelease(): boolean {
+    return this.storageCoordinator !== undefined
   }
 
   async recoverTaskStorage(taskId: string): Promise<ReleaseResult> {

@@ -21,6 +21,7 @@ import type {
   RehydrateSnapshot,
   TaskStoragePresence,
   StorageWriterRegistration,
+  StorageReleaseRequest,
   LongTermStore,
   ArchiveBatch,
   ArchiveBatchReceipt,
@@ -678,6 +679,7 @@ export class MemoryLongTermStore implements LongTermStore {
   private batches = new Map<string, Map<number, ArchiveBatch>>()
   private series = new Map<string, DurableSeriesState[]>()
   private workerEvents = new Map<string, WorkerAuditEvent[]>()
+  private releaseRequests = new Map<string, StorageReleaseRequest>()
   private creationClaims = new Map<
     string,
     { token: string; claimedAt: number; expiresAt: number | null; completedAt: number | null }
@@ -951,6 +953,33 @@ export class MemoryLongTermStore implements LongTermStore {
     taskId: string,
   ): Promise<TaskStorageMetadata | null> {
     return structuredClone(this.metadata.get(taskId) ?? null)
+  }
+
+  async persistStorageReleaseRequest(request: StorageReleaseRequest): Promise<boolean> {
+    if (!this.tasks.has(request.taskId)) return false
+    this.releaseRequests.set(request.taskId, structuredClone(request))
+    return true
+  }
+
+  async clearStorageReleaseRequest(request: StorageReleaseRequest): Promise<boolean> {
+    const current = this.releaseRequests.get(request.taskId)
+    if (
+      !current ||
+      current.requestedAt !== request.requestedAt ||
+      current.expectedLastEventIndex !== request.expectedLastEventIndex ||
+      current.inactiveSince !== request.inactiveSince
+    ) {
+      return false
+    }
+    this.releaseRequests.delete(request.taskId)
+    return true
+  }
+
+  async listStorageReleaseRequests(limit: number): Promise<StorageReleaseRequest[]> {
+    return Array.from(this.releaseRequests.values())
+      .sort((left, right) => left.requestedAt - right.requestedAt)
+      .slice(0, limit)
+      .map((request) => structuredClone(request))
   }
 
   async compareAndSetTaskStorageMetadata(
