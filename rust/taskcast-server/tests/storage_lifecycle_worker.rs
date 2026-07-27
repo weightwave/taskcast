@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
 use taskcast_core::{
-    BroadcastProvider, LongTermStore, MemoryBroadcastProvider, MemoryLongTermStore,
+    BroadcastProvider, Level, LongTermStore, MemoryBroadcastProvider, MemoryLongTermStore,
     MemoryShortTermStore, ResolvedStorageLifecycleConfig, ShortTermStore, StorageReleaseRequest,
-    StorageState, StorageWriterRegistration, Task, TaskEngine, TaskEngineOptions, TaskStatus,
-    TaskStorageMetadataCas,
+    StorageState, StorageWriterRegistration, Task, TaskEngine, TaskEngineOptions, TaskEvent,
+    TaskStatus, TaskStorageMetadataCas,
 };
 use taskcast_server::{StorageLifecycleWorker, StorageLifecycleWorkerOptions};
 
@@ -255,4 +255,62 @@ async fn release_backoff_does_not_suppress_durable_ttl_sweeps() {
             .status,
         TaskStatus::Timeout
     );
+}
+
+#[tokio::test]
+async fn samples_old_and_large_hot_tasks_without_payloads() {
+    let hot = Arc::new(MemoryShortTermStore::new());
+    let durable = Arc::new(MemoryLongTermStore::new());
+    let short: Arc<dyn ShortTermStore> = hot.clone();
+    let long: Arc<dyn LongTermStore> = durable.clone();
+    let engine = Arc::new(TaskEngine::new(TaskEngineOptions {
+        short_term_store: short.clone(),
+        long_term_store: Some(long),
+        broadcast: Arc::new(MemoryBroadcastProvider::new()),
+        hooks: None,
+    }));
+    let observed = task("large-old-hot", TaskStatus::Pending);
+    hot.save_task(observed.clone()).await.unwrap();
+    durable.save_task(observed.clone()).await.unwrap();
+    for index in 0..2 {
+        hot.append_event(
+            &observed.id,
+            TaskEvent {
+                id: format!("event-{index}"),
+                task_id: observed.id.clone(),
+                index,
+                timestamp: 2_000.0 + index as f64,
+                r#type: "llm.delta".to_string(),
+                level: Level::Info,
+                data: serde_json::json!({ "secretPayload": "must-not-be-logged" }),
+                series_id: None,
+                series_mode: None,
+                series_acc_field: None,
+                series_snapshot: None,
+                _accumulated_data: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let worker = StorageLifecycleWorker::new(StorageLifecycleWorkerOptions {
+        engine,
+        short_term_store: short,
+        config: ResolvedStorageLifecycleConfig {
+            hot_retention_enabled: false,
+            hot_retention_terminal_seconds: 60,
+            hot_retention_idle_seconds: 1,
+            rehydrate_replay_events: 1,
+            storage_lock_ttl_seconds: 30,
+            ttl_sweep_interval_seconds: 5,
+            ttl_sweep_batch_size: 10,
+        },
+    });
+
+    let result = worker.tick().await.unwrap();
+
+    assert_eq!(result.hot_storage.scanned, 1);
+    assert_eq!(result.hot_storage.old, 1);
+    assert_eq!(result.hot_storage.large, 1);
+    assert_eq!(result.hot_storage.failed, 0);
 }

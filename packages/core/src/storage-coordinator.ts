@@ -36,6 +36,7 @@ export interface StorageCoordinatorOptions {
   requiredStorageProtocolVersion?: number
   generateId?: () => string
   now?: () => number
+  observe?: (observation: Record<string, unknown>) => void
 }
 
 interface LifecycleMethods {
@@ -72,6 +73,18 @@ interface SourceDescription {
   maxEventTimestamp: number | null
 }
 
+interface ReleaseObservationProgress {
+  sourceEventCount: number
+  sourceBytes: number
+}
+
+interface RehydrateObservationProgress {
+  replayEventCount: number
+  archiveWatermark: number | null
+  maxEventIndex: number | null
+  storageEpoch: number | null
+}
+
 export class StorageCoordinator {
   private readonly shortTermStore: ShortTermStore
   private readonly longTermStore: LongTermStore
@@ -81,6 +94,7 @@ export class StorageCoordinator {
   private readonly requiredStorageProtocolVersion: number
   private readonly generateId: () => string
   private readonly now: () => number
+  private readonly observe: (observation: Record<string, unknown>) => void
 
   constructor(options: StorageCoordinatorOptions) {
     this.shortTermStore = options.shortTermStore
@@ -92,6 +106,13 @@ export class StorageCoordinator {
       options.requiredStorageProtocolVersion ?? 2
     this.generateId = options.generateId ?? ulid
     this.now = options.now ?? Date.now
+    this.observe = (observation) => {
+      try {
+        options.observe?.(observation)
+      } catch {
+        // Observability must never affect storage correctness.
+      }
+    }
 
     if (!Number.isSafeInteger(this.archiveBatchSize) || this.archiveBatchSize <= 0) {
       throw new StorageIntegrityError('Archive batch size must be a positive integer')
@@ -112,6 +133,51 @@ export class StorageCoordinator {
   async releaseTaskStorage(
     taskId: string,
     preconditions: ReleasePreconditions,
+  ): Promise<ReleaseResult> {
+    const startedAt = this.now()
+    const progress: ReleaseObservationProgress = {
+      sourceEventCount: 0,
+      sourceBytes: 0,
+    }
+    try {
+      const result = await this.releaseTaskStorageInner(
+        taskId,
+        preconditions,
+        progress,
+      )
+      this.observe({
+        event: 'storage_release',
+        taskId,
+        outcome: result.released ? 'released' : 'noop',
+        durationMs: Math.max(0, this.now() - startedAt),
+        sourceEventCount: progress.sourceEventCount,
+        sourceBytes: progress.sourceBytes,
+        storageStateBefore: result.released ? 'hot' : 'cold',
+        storageStateAfter: result.storageState,
+        archiveWatermark: result.archiveWatermark,
+      })
+      return result
+    } catch (error) {
+      this.observe({
+        event: 'storage_release',
+        taskId,
+        outcome: 'failed',
+        durationMs: Math.max(0, this.now() - startedAt),
+        sourceEventCount: progress.sourceEventCount,
+        sourceBytes: progress.sourceBytes,
+        storageStateBefore: 'hot',
+        storageStateAfter: 'hot',
+        errorCode: this.errorCode(error),
+        error: error instanceof Error ? error.message : String(error),
+      })
+      throw error
+    }
+  }
+
+  private async releaseTaskStorageInner(
+    taskId: string,
+    preconditions: ReleasePreconditions,
+    progress: ReleaseObservationProgress,
   ): Promise<ReleaseResult> {
     const hot = this.requireHotLifecycle()
     const durable = this.requireDurableLifecycle()
@@ -232,6 +298,7 @@ export class StorageCoordinator {
         hot,
         renew,
       )
+      progress.sourceEventCount = description.manifest.sourceEntryCount
       if (
         description.maxEventTimestamp !== null &&
         description.maxEventTimestamp > preconditions.inactiveSince
@@ -262,6 +329,9 @@ export class StorageCoordinator {
         metadata.archiveWatermark,
         hot,
       )) {
+        progress.sourceBytes += new TextEncoder().encode(
+          JSON.stringify(events),
+        ).byteLength
         await renew()
         const batchDigest = await computeArchiveBatchDigest(
           previousBatchDigest,
@@ -321,6 +391,15 @@ export class StorageCoordinator {
         current.storageEpoch !== metadata.storageEpoch ||
         current.activeReleaseGeneration !== generation
       ) {
+        this.observe({
+          event: 'storage_watermark_mismatch',
+          operation: 'release',
+          taskId,
+          expectedWatermark: closed.highWatermark,
+          actualWatermark: watermark,
+          storageState: current?.storageState ?? null,
+          storageEpoch: current?.storageEpoch ?? null,
+        })
         throw new StorageIntegrityError('Durable archive read-back did not prove release')
       }
 
@@ -438,6 +517,60 @@ export class StorageCoordinator {
     initial: TaskStorageMetadata,
     hot: LifecycleMethods,
     durable: DurableMethods,
+  ): Promise<HotWriteToken> {
+    const startedAt = this.now()
+    const progress: RehydrateObservationProgress = {
+      replayEventCount: 0,
+      archiveWatermark: initial.archiveWatermark,
+      maxEventIndex: null,
+      storageEpoch: initial.storageEpoch,
+    }
+    try {
+      const token = await this.rehydrateColdTaskInner(
+        taskId,
+        initial,
+        hot,
+        durable,
+        progress,
+      )
+      this.observe({
+        event: 'storage_rehydrate',
+        taskId,
+        outcome: 'rehydrated',
+        durationMs: Math.max(0, this.now() - startedAt),
+        replayEventCount: progress.replayEventCount,
+        archiveWatermark: progress.archiveWatermark,
+        maxEventIndex: progress.maxEventIndex,
+        storageEpoch: token.storageEpoch,
+        storageStateBefore: 'cold',
+        storageStateAfter: 'hot',
+      })
+      return token
+    } catch (error) {
+      this.observe({
+        event: 'storage_rehydrate',
+        taskId,
+        outcome: 'failed',
+        durationMs: Math.max(0, this.now() - startedAt),
+        replayEventCount: progress.replayEventCount,
+        archiveWatermark: progress.archiveWatermark,
+        maxEventIndex: progress.maxEventIndex,
+        storageEpoch: progress.storageEpoch,
+        storageStateBefore: 'cold',
+        storageStateAfter: 'cold',
+        errorCode: this.errorCode(error),
+        error: error instanceof Error ? error.message : String(error),
+      })
+      throw error
+    }
+  }
+
+  private async rehydrateColdTaskInner(
+    taskId: string,
+    initial: TaskStorageMetadata,
+    hot: LifecycleMethods,
+    durable: DurableMethods,
+    progress: RehydrateObservationProgress,
   ): Promise<HotWriteToken> {
     const generation = this.generateId()
     const lease = await hot.acquireStorageLock.call(
@@ -559,6 +692,10 @@ export class StorageCoordinator {
         ),
         durable.getDurableSeriesState.call(this.longTermStore, taskId),
       ])
+      progress.replayEventCount = replayEvents.length
+      progress.maxEventIndex = maxEventIndex
+      progress.archiveWatermark = metadata.archiveWatermark
+      progress.storageEpoch = metadata.storageEpoch
       if (!task) {
         throw new StorageIntegrityError(`Durable task does not exist: ${taskId}`)
       }
@@ -572,6 +709,15 @@ export class StorageCoordinator {
             event.index > maxEventIndex,
         )
       ) {
+        this.observe({
+          event: 'storage_watermark_mismatch',
+          operation: 'rehydrate',
+          taskId,
+          expectedWatermark: metadata.archiveWatermark,
+          actualWatermark: maxEventIndex,
+          replayEventCount: replayEvents.length,
+          storageEpoch: metadata.storageEpoch,
+        })
         throw new StorageIntegrityError('Durable rehydrate snapshot is inconsistent')
       }
       const nextEpoch = metadata.storageEpoch + 1
@@ -1105,6 +1251,18 @@ export class StorageCoordinator {
       throw new StorageReleaseUnsupportedError()
     }
     return methods as LifecycleMethods
+  }
+
+  private errorCode(error: unknown): string {
+    if (
+      error &&
+      typeof error === 'object' &&
+      'code' in error &&
+      typeof error.code === 'string'
+    ) {
+      return error.code
+    }
+    return 'storage_unavailable'
   }
 
   private requireDurableLifecycle(): DurableMethods {

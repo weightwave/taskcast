@@ -182,11 +182,21 @@ pub struct StorageRetentionSweepResult {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct HotStorageSampleResult {
+    pub scanned: u64,
+    pub old: u64,
+    pub large: u64,
+    pub failed: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StorageLifecycleTickResult {
     pub ttl: DurableTtlSweepResult,
     pub projection: DurableTtlSweepResult,
     pub release_requests: StorageReleaseSweepResult,
     pub retention: StorageRetentionSweepResult,
+    pub hot_storage: HotStorageSampleResult,
 }
 
 pub struct StorageLifecycleWorker {
@@ -354,6 +364,8 @@ impl StorageLifecycleWorker {
             }
         }
 
+        result.hot_storage = self.sample_hot_storage(started_at, limit).await;
+
         if ttl_attempted {
             Self::update_backoff(
                 result.ttl.failed + result.projection.failed,
@@ -382,6 +394,67 @@ impl StorageLifecycleWorker {
             })
         );
         Ok(result)
+    }
+
+    async fn sample_hot_storage(&self, started_at: f64, limit: u64) -> HotStorageSampleResult {
+        let mut result = HotStorageSampleResult::default();
+        let tasks = match self
+            .short_term_store
+            .list_tasks(TaskFilter {
+                limit: Some(limit),
+                ..Default::default()
+            })
+            .await
+        {
+            Ok(tasks) => tasks,
+            Err(error) => {
+                result.failed += 1;
+                Self::log_error("hot_storage_scan", &error.to_string(), None);
+                return result;
+            }
+        };
+        let old_after_ms = self.config.hot_retention_idle_seconds as f64 * 1_000.0;
+        for task in tasks {
+            result.scanned += 1;
+            let age_ms = (started_at - task.updated_at).max(0.0);
+            let event_count = match self
+                .short_term_store
+                .get_task_storage_presence(&task.id)
+                .await
+            {
+                Ok(presence) => Some(presence.event_count),
+                Err(error) => {
+                    result.failed += 1;
+                    Self::log_error("hot_storage_presence", &error.to_string(), Some(&task.id));
+                    None
+                }
+            };
+            let old = age_ms >= old_after_ms;
+            let large =
+                event_count.is_some_and(|count| count > self.config.rehydrate_replay_events);
+            if old {
+                result.old += 1;
+            }
+            if large {
+                result.large += 1;
+            }
+            if old || large {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "component": "storage-lifecycle",
+                        "event": "storage_hot_task",
+                        "taskId": task.id,
+                        "status": task.status,
+                        "ageMs": age_ms,
+                        "eventCount": event_count,
+                        "old": old,
+                        "large": large,
+                    })
+                );
+            }
+        }
+        result
     }
 
     fn update_backoff(
@@ -543,6 +616,14 @@ pub fn create_app_with_runtime_health_and_routes(
         runtime_health,
         additional_routes,
     } = runtime_options;
+    engine.add_storage_lifecycle_listener(Arc::new(|observation| {
+        let mut record = observation.as_object().cloned().unwrap_or_default();
+        record.insert(
+            "component".to_string(),
+            serde_json::Value::String("storage-lifecycle".to_string()),
+        );
+        eprintln!("{}", serde_json::Value::Object(record));
+    }));
     let auth_mode = Arc::new(auth_mode);
     let subscriber_counts = create_subscriber_counts();
     let storage_readiness = StorageWriterHeartbeat::start(Arc::clone(&engine));

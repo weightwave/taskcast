@@ -12,7 +12,7 @@ use crate::canonical_history::{
     apply_canonical_history_query, merge_canonical_history, resolve_canonical_series_latest,
 };
 use crate::series::process_series;
-use crate::storage_coordinator::StorageCoordinator;
+use crate::storage_coordinator::{StorageCoordinator, StorageLifecycleObserver};
 use crate::ttl_coordinator::{DurableTtlSweepResult, TtlCoordinator};
 use serde::{Deserialize, Serialize};
 
@@ -20,7 +20,7 @@ use crate::state_machine::{can_transition, is_suspended, is_terminal};
 use crate::types::{
     AssignMode, BlockedRequest, BroadcastProvider, CleanupConfig, DisconnectPolicy,
     DurableSeriesState, EventQueryOptions, HotWriteToken, Level, LongTermStore,
-    ReleasePreconditions, ReleaseResult, SeriesMode, ShortTermStore, SinceCursor,
+    ReleasePreconditions, ReleaseResult, SeriesMode, ShortTermStore, SinceCursor, StorageBusyError,
     StorageFenceConflictError, StorageIntegrityError, StoragePreconditionError,
     StorageReleaseRequest, StorageReleaseUnsupportedError, StorageWriterRegistration, Task,
     TaskArchive, TaskArchiveImportOptions, TaskArchiveImportResult, TaskAuthConfig, TaskError,
@@ -109,6 +109,7 @@ pub type TransitionListener = Box<dyn Fn(&Task, &TaskStatus, &TaskStatus) + Send
 /// Callback signature for creation listeners.
 /// Receives the newly created task.
 pub type CreationListener = Arc<dyn Fn(&Task) + Send + Sync>;
+pub type StorageLifecycleListener = StorageLifecycleObserver;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct StorageReleaseSweepResult {
@@ -120,6 +121,13 @@ pub struct StorageReleaseSweepResult {
     pub failed: u64,
 }
 
+struct ObservedHistory {
+    events: Vec<TaskEvent>,
+    source: &'static str,
+    hot_event_count: usize,
+    durable_event_count: usize,
+}
+
 pub struct TaskEngine {
     short_term_store: Arc<dyn ShortTermStore>,
     broadcast: Arc<dyn BroadcastProvider>,
@@ -129,6 +137,7 @@ pub struct TaskEngine {
     hooks: Option<Arc<dyn TaskcastHooks>>,
     transition_listeners: Arc<Mutex<Vec<TransitionListener>>>,
     creation_listeners: Mutex<Vec<CreationListener>>,
+    storage_lifecycle_listeners: Arc<Mutex<Vec<StorageLifecycleListener>>>,
     /// Per-task mutex to serialize `emit` calls, ensuring events are stored
     /// in the same order as their atomically-assigned indices.
     emit_locks: Arc<Mutex<HashMap<String, Arc<TokioMutex<()>>>>>,
@@ -155,6 +164,9 @@ impl TaskEngine {
             Arc::new(Mutex::new(Vec::new()));
         let emit_locks: Arc<Mutex<HashMap<String, Arc<TokioMutex<()>>>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let storage_lifecycle_listeners: Arc<Mutex<Vec<StorageLifecycleListener>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let coordinator_listeners = Arc::clone(&storage_lifecycle_listeners);
         let storage_coordinator = opts.long_term_store.as_ref().and_then(|long_term_store| {
             if opts.short_term_store.supports_hot_cold_release()
                 && long_term_store.supports_hot_cold_release()
@@ -165,7 +177,15 @@ impl TaskEngine {
                         Arc::clone(long_term_store),
                     )
                     .with_storage_lock_ttl_ms(storage_lock_ttl_ms)
-                    .with_rehydrate_replay_events(rehydrate_replay_events),
+                    .with_rehydrate_replay_events(rehydrate_replay_events)
+                    .with_observer(Arc::new(move |observation| {
+                        let listeners = coordinator_listeners.lock().unwrap();
+                        for listener in listeners.iter() {
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                listener(observation)
+                            }));
+                        }
+                    })),
                 )
             } else {
                 None
@@ -212,6 +232,7 @@ impl TaskEngine {
             hooks: opts.hooks,
             transition_listeners,
             creation_listeners: Mutex::new(Vec::new()),
+            storage_lifecycle_listeners,
             emit_locks,
         }
     }
@@ -226,6 +247,13 @@ impl TaskEngine {
     /// Returns the listener Arc so it can be passed to `remove_creation_listener`.
     pub fn add_creation_listener(&self, listener: CreationListener) {
         self.creation_listeners.lock().unwrap().push(listener);
+    }
+
+    pub fn add_storage_lifecycle_listener(&self, listener: StorageLifecycleListener) {
+        self.storage_lifecycle_listeners
+            .lock()
+            .unwrap()
+            .push(listener);
     }
 
     /// Remove a previously registered creation listener by Arc identity.
@@ -930,19 +958,75 @@ impl TaskEngine {
         task_id: &str,
         opts: Option<EventQueryOptions>,
     ) -> Result<Vec<TaskEvent>, EngineError> {
-        let Some(ref long_term_store) = self.long_term_store else {
+        if self.long_term_store.is_none() {
             return Ok(self.short_term_store.get_events(task_id, opts).await?);
+        }
+        let started_at = now_millis();
+        match self.get_events_observed(task_id, opts).await {
+            Ok(read) => {
+                self.observe_storage_lifecycle(serde_json::json!({
+                    "event": "storage_history_read",
+                    "taskId": task_id,
+                    "outcome": "success",
+                    "source": read.source,
+                    "durationMs": (now_millis() - started_at).max(0.0),
+                    "eventCount": read.events.len(),
+                    "hotEventCount": read.hot_event_count,
+                    "durableEventCount": read.durable_event_count,
+                }));
+                Ok(read.events)
+            }
+            Err(error) => {
+                self.observe_storage_lifecycle(serde_json::json!({
+                    "event": "storage_history_read",
+                    "taskId": task_id,
+                    "outcome": "failed",
+                    "durationMs": (now_millis() - started_at).max(0.0),
+                    "errorCode": Self::storage_error_code(&error),
+                    "error": error.to_string(),
+                }));
+                Err(error)
+            }
+        }
+    }
+
+    async fn get_events_observed(
+        &self,
+        task_id: &str,
+        opts: Option<EventQueryOptions>,
+    ) -> Result<ObservedHistory, EngineError> {
+        let Some(ref long_term_store) = self.long_term_store else {
+            let events = self.short_term_store.get_events(task_id, opts).await?;
+            let event_count = events.len();
+            return Ok(ObservedHistory {
+                events,
+                source: "hot",
+                hot_event_count: event_count,
+                durable_event_count: 0,
+            });
         };
         if !long_term_store.supports_hot_cold_release() {
             let from_short = self
                 .short_term_store
                 .get_events(task_id, opts.clone())
                 .await?;
-            return if from_short.is_empty() {
-                Ok(long_term_store.get_events(task_id, opts).await?)
-            } else {
-                Ok(from_short)
-            };
+            if !from_short.is_empty() {
+                let event_count = from_short.len();
+                return Ok(ObservedHistory {
+                    events: from_short,
+                    source: "hot",
+                    hot_event_count: event_count,
+                    durable_event_count: 0,
+                });
+            }
+            let from_durable = long_term_store.get_events(task_id, opts).await?;
+            let event_count = from_durable.len();
+            return Ok(ObservedHistory {
+                events: from_durable,
+                source: "durable",
+                hot_event_count: 0,
+                durable_event_count: event_count,
+            });
         }
         let overlay_hot = self.should_overlay_hot_history(task_id).await?;
         let hot_events = if overlay_hot {
@@ -960,7 +1044,17 @@ impl TaskEngine {
             .await?;
         let merged = merge_canonical_history(&durable_events, &hot_events, &durable_series)
             .map_err(|error| EngineError::Store(Box::new(error)))?;
-        Ok(apply_canonical_history_query(&merged, opts))
+        let events = apply_canonical_history_query(&merged, opts);
+        Ok(ObservedHistory {
+            events,
+            source: if overlay_hot {
+                "durable+hot"
+            } else {
+                "durable"
+            },
+            hot_event_count: hot_events.len(),
+            durable_event_count: durable_events.len(),
+        })
     }
 
     pub async fn list_tasks(&self, filter: TaskFilter) -> Result<Vec<Task>, EngineError> {
@@ -1041,6 +1135,37 @@ impl TaskEngine {
             }
         }
         Ok(true)
+    }
+
+    fn observe_storage_lifecycle(&self, observation: serde_json::Value) {
+        let listeners = self.storage_lifecycle_listeners.lock().unwrap();
+        for listener in listeners.iter() {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                listener(&observation);
+            }));
+        }
+    }
+
+    fn storage_error_code(error: &EngineError) -> &'static str {
+        let EngineError::Store(source) = error else {
+            return "storage_unavailable";
+        };
+        if source.downcast_ref::<StoragePreconditionError>().is_some() {
+            "storage_precondition_failed"
+        } else if source.downcast_ref::<StorageFenceConflictError>().is_some() {
+            "storage_fence_conflict"
+        } else if source.downcast_ref::<StorageBusyError>().is_some() {
+            "storage_busy"
+        } else if source.downcast_ref::<StorageIntegrityError>().is_some() {
+            "storage_integrity_error"
+        } else if source
+            .downcast_ref::<StorageReleaseUnsupportedError>()
+            .is_some()
+        {
+            "storage_release_unsupported"
+        } else {
+            "storage_unavailable"
+        }
     }
 
     async fn load_canonical_durable_events(

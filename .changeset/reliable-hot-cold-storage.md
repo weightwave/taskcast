@@ -8,4 +8,5 @@
 
 Add a fenced hot-to-cold storage lifecycle with a guarded release endpoint,
 PostgreSQL-canonical history, bounded Redis rehydration, and durable task TTL
-terminalization.
+terminalization. Emit payload-free release, rehydration, history-source,
+watermark, TTL, and unusually old/large hot-task observations.

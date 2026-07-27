@@ -144,9 +144,26 @@ TTL and release paths have separate exponential backoff. A PostgreSQL outage
 does not trigger Redis deletion. The worker emits payload-free structured JSON:
 
 - `storage_lifecycle_tick` contains duration and counters for TTL,
-  projections, release requests, and retention;
+  projections, release requests, retention, and the bounded hot-task sample;
 - `storage_lifecycle_error` contains the failed operation, error, and a task ID
-  when one is safely available.
+  when one is safely available;
+- `storage_release` contains the outcome, duration, source event/serialized-byte
+  counts, before/after state, archive watermark, and a stable error code on
+  failure;
+- `storage_rehydrate` contains the outcome, duration, replay count, archive
+  watermark, maximum event index, and storage epoch;
+- `storage_history_read` contains the `hot`, `durable`, or `durable+hot` source,
+  latency, and event counts;
+- `storage_watermark_mismatch` records expected/actual watermarks without event
+  contents; and
+- `storage_hot_task` identifies a bounded sample of unusually old or large hot
+  tasks with age and event count.
+
+These events contain task IDs and storage metadata, never task/event payloads.
+Metrics collectors can maintain hot/releasing/cold gauges from before/after
+state transitions and reconcile them against the PostgreSQL metadata table.
+`sourceBytes` is the serialized archive-source size and may differ from Redis
+allocator bytes.
 
 Use `/health/detail` before enabling release. `storage.releaseReady` must be
 true, `requiredStorageProtocolVersion` must be `2`, and

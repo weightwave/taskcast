@@ -346,7 +346,9 @@ Start with one task, then a batch smaller than
 
 Between batches, inspect:
 
-- `storage_lifecycle_tick` and `storage_lifecycle_error`;
+- `storage_lifecycle_tick`, `storage_lifecycle_error`, `storage_release`,
+  `storage_rehydrate`, `storage_history_read`, `storage_watermark_mismatch`,
+  and `storage_hot_task`;
 - Redis used memory, command latency, evictions, and blocked clients;
 - PostgreSQL query latency, locks, connections, CPU, I/O, replication lag, and
   archive generation/receipt rows; and

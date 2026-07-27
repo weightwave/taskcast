@@ -120,6 +120,8 @@ export interface TaskcastServerOptions {
     disconnectGraceMs?: number
   }
   storageLifecycle?: ResolvedStorageLifecycleConfig
+  /** Payload-free structured storage lifecycle logger. */
+  storageLifecycleLogger?: (record: Record<string, unknown>) => void
 }
 
 export interface RuntimeAdapterDescriptors {
@@ -238,6 +240,12 @@ export interface StorageLifecycleTickResult {
     released: number
     failed: number
   }
+  hotStorage: {
+    scanned: number
+    old: number
+    large: number
+    failed: number
+  }
 }
 
 const emptyTtlResult = (): DurableTtlSweepResult => ({
@@ -304,6 +312,7 @@ export class StorageLifecycleWorker {
     const projection = emptyTtlResult()
     const releaseRequests = emptyReleaseResult()
     const retention = { eligible: 0, released: 0, failed: 0 }
+    const hotStorage = { scanned: 0, old: 0, large: 0, failed: 0 }
     try {
       const limit = this.config.ttlSweepBatchSize
       const claimTtlMs = this.config.storageLockTtlSeconds * 1_000
@@ -385,6 +394,44 @@ export class StorageLifecycleWorker {
         }
       }
 
+      try {
+        const tasks = await this.shortTermStore.listTasks({ limit })
+        const oldAfterMs = this.config.hotRetentionIdleSeconds * 1_000
+        for (const task of tasks) {
+          hotStorage.scanned += 1
+          const ageMs = Math.max(0, startedAt - task.updatedAt)
+          let eventCount: number | null = null
+          try {
+            eventCount =
+              (await this.shortTermStore.getTaskStoragePresence?.(task.id))
+                ?.eventCount ?? null
+          } catch (error) {
+            hotStorage.failed += 1
+            this.logError('hot_storage_presence', error, { taskId: task.id })
+          }
+          const old = ageMs >= oldAfterMs
+          const large =
+            eventCount !== null &&
+            eventCount > this.config.rehydrateReplayEvents
+          if (old) hotStorage.old += 1
+          if (large) hotStorage.large += 1
+          if (old || large) {
+            this.logger({
+              event: 'storage_hot_task',
+              taskId: task.id,
+              status: task.status,
+              ageMs,
+              eventCount,
+              old,
+              large,
+            })
+          }
+        }
+      } catch (error) {
+        hotStorage.failed += 1
+        this.logError('hot_storage_scan', error)
+      }
+
       if (ttlAttempted) {
         const ttlFailures = ttl.failed + projection.failed
         if (ttlFailures > 0) {
@@ -409,7 +456,13 @@ export class StorageLifecycleWorker {
           this.releaseRetryAfter = 0
         }
       }
-      const result = { ttl, projection, releaseRequests, retention }
+      const result = {
+        ttl,
+        projection,
+        releaseRequests,
+        retention,
+        hotStorage,
+      }
       this.logger({
         event: 'storage_lifecycle_tick',
         durationMs: Math.max(0, this.now() - startedAt),
@@ -453,6 +506,11 @@ export function createTaskcastApp(opts: TaskcastServerOptions): TaskcastApp {
   const startTime = Date.now()
   const app = new OpenAPIHono()
   const storageReadiness = new StorageWriterHeartbeat(opts.engine)
+  const storageLifecycleLogger =
+    opts.storageLifecycleLogger ??
+    ((record: Record<string, unknown>) => {
+      console.log(JSON.stringify({ component: 'storage-lifecycle', ...record }))
+    })
 
   // Hono's default handler writes the raw error to stderr before middleware
   // can sanitize it. Preserve its response behavior while leaving the single
@@ -594,6 +652,11 @@ export function createTaskcastApp(opts: TaskcastServerOptions): TaskcastApp {
 
   const cleanups: Array<() => void> = []
   cleanups.push(() => storageReadiness.stop())
+  if (typeof opts.engine.addStorageLifecycleListener === 'function') {
+    cleanups.push(
+      opts.engine.addStorageLifecycleListener(storageLifecycleLogger),
+    )
+  }
 
   if (
     opts.shortTermStore &&
@@ -606,6 +669,7 @@ export function createTaskcastApp(opts: TaskcastServerOptions): TaskcastApp {
         opts.storageLifecycle ??
         resolveStorageLifecycleConfig(opts.config ?? {}, {}),
       readiness: storageReadiness,
+      logger: storageLifecycleLogger,
     })
     lifecycle.start()
     cleanups.push(() => lifecycle.stop())

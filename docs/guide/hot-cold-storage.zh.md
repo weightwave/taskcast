@@ -132,9 +132,23 @@ TTL 与 release 使用独立指数退避。PostgreSQL 故障不会导致 Redis �
 worker 输出不包含 payload 的结构化 JSON：
 
 - `storage_lifecycle_tick`：包含耗时，以及 TTL、projection、release request、
-  retention 的计数；
+  retention 和有界热任务采样的计数；
 - `storage_lifecycle_error`：包含失败操作、错误信息，以及在可安全提供时的
-  task ID。
+  task ID；
+- `storage_release`：包含结果、耗时、源事件数/序列化字节数、前后状态、
+  archive watermark，以及失败时的稳定错误码；
+- `storage_rehydrate`：包含结果、耗时、重放数量、archive watermark、
+  最大 event index 和 storage epoch；
+- `storage_history_read`：包含 `hot`、`durable` 或 `durable+hot` 来源、
+  延迟和事件数；
+- `storage_watermark_mismatch`：只记录期望/实际 watermark，不记录事件内容；
+- `storage_hot_task`：在有界采样中标记异常老或异常大的热任务，并记录
+  age 和 event count。
+
+这些事件只包含 task ID 和存储元数据，不包含 task/event payload。指标系统可
+根据状态前后变化维护 hot/releasing/cold gauge，并用 PostgreSQL 元数据表定期
+校准。`sourceBytes` 是归档源的序列化大小，可能与 Redis allocator 实际释放
+字节数不同。
 
 启用 release 前检查 `/health/detail`：`storage.releaseReady` 必须为 `true`，
 `requiredStorageProtocolVersion` 必须为 `2`，且 `incompatibleWriterIds`

@@ -119,6 +119,99 @@ describe('StorageLifecycleWorker', () => {
     await expect(hot.getTask('pending-hot')).resolves.not.toBeNull()
   })
 
+  it('samples unusually old and large hot tasks without logging payloads', async () => {
+    const { hot, durable, engine } = await makeFixture()
+    const task = makeTask('large-old-hot', 'pending', {
+      updatedAt: Date.now() - 10_000,
+    })
+    await hot.saveTask(task)
+    await durable.saveTask(task)
+    for (let index = 0; index < 2; index++) {
+      await hot.appendEvent(task.id, {
+        id: `event-${index}`,
+        taskId: task.id,
+        index,
+        timestamp: Date.now(),
+        type: 'llm.delta',
+        level: 'info',
+        data: { secretPayload: 'must-not-be-logged' },
+      })
+    }
+    const records: Array<Record<string, unknown>> = []
+    const worker = new StorageLifecycleWorker({
+      engine,
+      shortTermStore: hot,
+      config: {
+        ...config,
+        hotRetentionIdleSeconds: 1,
+        rehydrateReplayEvents: 1,
+      },
+      logger: (record) => records.push(record),
+    })
+
+    const result = await worker.tick()
+
+    expect(result?.hotStorage).toMatchObject({
+      scanned: 1,
+      old: 1,
+      large: 1,
+      failed: 0,
+    })
+    expect(records).toContainEqual(expect.objectContaining({
+      event: 'storage_hot_task',
+      taskId: task.id,
+      eventCount: 2,
+      old: true,
+      large: true,
+    }))
+    expect(JSON.stringify(records)).not.toContain('must-not-be-logged')
+  })
+
+  it('contains hot-task presence and scan failures in the sample result', async () => {
+    const { hot, durable, engine } = await makeFixture()
+    const task = makeTask('presence-failure', 'pending')
+    await hot.saveTask(task)
+    await durable.saveTask(task)
+    const records: Array<Record<string, unknown>> = []
+    vi.spyOn(hot, 'getTaskStoragePresence').mockRejectedValueOnce(
+      new Error('presence unavailable'),
+    )
+    const presenceWorker = new StorageLifecycleWorker({
+      engine,
+      shortTermStore: hot,
+      config,
+      logger: (record) => records.push(record),
+    })
+
+    await expect(presenceWorker.tick()).resolves.toMatchObject({
+      hotStorage: { scanned: 1, failed: 1 },
+    })
+    expect(records).toContainEqual(expect.objectContaining({
+      event: 'storage_lifecycle_error',
+      operation: 'hot_storage_presence',
+      taskId: task.id,
+      error: 'presence unavailable',
+    }))
+
+    vi.spyOn(hot, 'listTasks').mockRejectedValueOnce(
+      new Error('scan unavailable'),
+    )
+    const scanWorker = new StorageLifecycleWorker({
+      engine,
+      shortTermStore: hot,
+      config,
+      logger: (record) => records.push(record),
+    })
+    await expect(scanWorker.tick()).resolves.toMatchObject({
+      hotStorage: { scanned: 0, failed: 1 },
+    })
+    expect(records).toContainEqual(expect.objectContaining({
+      event: 'storage_lifecycle_error',
+      operation: 'hot_storage_scan',
+      error: 'scan unavailable',
+    }))
+  })
+
   it('automatically releases only terminal tasks after the configured grace', async () => {
     const { hot, durable, engine } = await makeFixture()
     const terminal = makeTask('old-terminal', 'completed', {

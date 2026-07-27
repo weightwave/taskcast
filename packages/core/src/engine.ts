@@ -126,6 +126,10 @@ export interface CreateTaskInput {
 
 export type TransitionListener = (task: Task, from: TaskStatus, to: TaskStatus) => void
 export type CreationListener = (task: Task) => void
+export type StorageLifecycleObservation = Readonly<Record<string, unknown>>
+export type StorageLifecycleListener = (
+  observation: StorageLifecycleObservation,
+) => void
 
 export interface StorageReleaseSweepResult {
   claimed: number
@@ -146,6 +150,7 @@ export class TaskEngine {
   private ttlCoordinator: TtlCoordinator | undefined
   private transitionListeners: TransitionListener[] = []
   private creationListeners: CreationListener[] = []
+  private storageLifecycleListeners = new Set<StorageLifecycleListener>()
   /** Per-task promise chain to serialize `_emit` calls, preventing race
    *  conditions where concurrent publishes store events out of index order. */
   private _emitChains = new Map<string, Promise<void>>()
@@ -172,6 +177,9 @@ export class TaskEngine {
       this.storageCoordinator = new StorageCoordinator({
         shortTermStore: this.shortTermStore,
         longTermStore: this.longTermStore,
+        observe: (observation) => {
+          this.emitStorageLifecycleObservation(observation)
+        },
         ...(opts.storageLockTtlMs !== undefined && {
           storageLockTtlMs: opts.storageLockTtlMs,
         }),
@@ -202,6 +210,15 @@ export class TaskEngine {
           }
         },
       })
+    }
+  }
+
+  addStorageLifecycleListener(
+    listener: StorageLifecycleListener,
+  ): () => void {
+    this.storageLifecycleListeners.add(listener)
+    return () => {
+      this.storageLifecycleListeners.delete(listener)
     }
   }
 
@@ -897,33 +914,72 @@ export class TaskEngine {
     if (!this.longTermStore) {
       return this.shortTermStore.getEvents(taskId, opts)
     }
-    if (this.longTermStore.supportsHotColdRelease !== true) {
-      const fromShort = await this.shortTermStore.getEvents(taskId, opts)
-      return fromShort.length > 0
-        ? fromShort
-        : this.longTermStore.getEvents(taskId, opts)
+    const startedAt = Date.now()
+    const succeed = (
+      events: TaskEvent[],
+      source: 'hot' | 'durable' | 'durable+hot',
+      hotEventCount: number,
+      durableEventCount: number,
+    ): TaskEvent[] => {
+      this.emitStorageLifecycleObservation({
+        event: 'storage_history_read',
+        taskId,
+        outcome: 'success',
+        source,
+        durationMs: Math.max(0, Date.now() - startedAt),
+        eventCount: events.length,
+        hotEventCount,
+        durableEventCount,
+      })
+      return events
     }
+    try {
+      if (this.longTermStore.supportsHotColdRelease !== true) {
+        const fromShort = await this.shortTermStore.getEvents(taskId, opts)
+        if (fromShort.length > 0) {
+          return succeed(fromShort, 'hot', fromShort.length, 0)
+        }
+        const fromDurable = await this.longTermStore.getEvents(taskId, opts)
+        return succeed(fromDurable, 'durable', 0, fromDurable.length)
+      }
 
-    const overlayHot = await this.shouldOverlayHotHistory(taskId)
-    const hotEvents = overlayHot
-      ? await this.shortTermStore.getEvents(taskId)
-      : []
-    const getDurableSeriesState = this.longTermStore.getDurableSeriesState
-    if (!getDurableSeriesState) throw new StorageReleaseUnsupportedError()
-    const durableSeries = await getDurableSeriesState.call(
-      this.longTermStore,
-      taskId,
-    )
-    const durableEvents = await this.loadCanonicalDurableEvents(
-      taskId,
-      opts,
-      hotEvents,
-      durableSeries,
-    )
-    return applyCanonicalHistoryQuery(
-      mergeCanonicalHistory(durableEvents, hotEvents, durableSeries),
-      opts,
-    )
+      const overlayHot = await this.shouldOverlayHotHistory(taskId)
+      const hotEvents = overlayHot
+        ? await this.shortTermStore.getEvents(taskId)
+        : []
+      const getDurableSeriesState = this.longTermStore.getDurableSeriesState
+      if (!getDurableSeriesState) throw new StorageReleaseUnsupportedError()
+      const durableSeries = await getDurableSeriesState.call(
+        this.longTermStore,
+        taskId,
+      )
+      const durableEvents = await this.loadCanonicalDurableEvents(
+        taskId,
+        opts,
+        hotEvents,
+        durableSeries,
+      )
+      const events = applyCanonicalHistoryQuery(
+        mergeCanonicalHistory(durableEvents, hotEvents, durableSeries),
+        opts,
+      )
+      return succeed(
+        events,
+        overlayHot ? 'durable+hot' : 'durable',
+        hotEvents.length,
+        durableEvents.length,
+      )
+    } catch (error) {
+      this.emitStorageLifecycleObservation({
+        event: 'storage_history_read',
+        taskId,
+        outcome: 'failed',
+        durationMs: Math.max(0, Date.now() - startedAt),
+        errorCode: this.storageErrorCode(error),
+        error: error instanceof Error ? error.message : String(error),
+      })
+      throw error
+    }
   }
 
   subscribe(taskId: string, handler: (event: TaskEvent) => void): () => void {
@@ -1034,6 +1090,30 @@ export class TaskEngine {
     } finally {
       release()
     }
+  }
+
+  private emitStorageLifecycleObservation(
+    observation: StorageLifecycleObservation,
+  ): void {
+    for (const listener of this.storageLifecycleListeners) {
+      try {
+        listener(observation)
+      } catch {
+        // Observability must never affect task correctness.
+      }
+    }
+  }
+
+  private storageErrorCode(error: unknown): string {
+    if (
+      error &&
+      typeof error === 'object' &&
+      'code' in error &&
+      typeof error.code === 'string'
+    ) {
+      return error.code
+    }
+    return 'storage_unavailable'
   }
 
   private async _emitInner(taskId: string, input: PublishEventInput): Promise<TaskEvent> {

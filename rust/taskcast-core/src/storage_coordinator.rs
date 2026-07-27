@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -17,6 +17,7 @@ use crate::types::{
 };
 
 type StorageResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+pub type StorageLifecycleObserver = Arc<dyn Fn(&serde_json::Value) + Send + Sync>;
 
 pub struct StorageCoordinator {
     short_term_store: Arc<dyn ShortTermStore>,
@@ -26,6 +27,7 @@ pub struct StorageCoordinator {
     rehydrate_replay_events: u64,
     required_storage_protocol_version: u64,
     id_generator: Arc<dyn Fn() -> String + Send + Sync>,
+    observer: Option<StorageLifecycleObserver>,
 }
 
 struct SourceDescription {
@@ -38,6 +40,33 @@ struct SourceDescription {
 struct ReleaseProgress {
     fence_closed: AtomicBool,
     hot_deleted: AtomicBool,
+    source_event_count: AtomicU64,
+    source_bytes: AtomicU64,
+}
+
+struct RehydrateProgress {
+    replay_event_count: AtomicU64,
+    archive_watermark: AtomicI64,
+    max_event_index: AtomicI64,
+    storage_epoch: AtomicU64,
+}
+
+struct ArchiveUpload<'a> {
+    target_watermark: i64,
+    prior_watermark: i64,
+    manifest: &'a ArchiveSourceManifest,
+    progress: &'a ReleaseProgress,
+}
+
+impl RehydrateProgress {
+    fn new(initial: &TaskStorageMetadata) -> Self {
+        Self {
+            replay_event_count: AtomicU64::new(0),
+            archive_watermark: AtomicI64::new(initial.archive_watermark),
+            max_event_index: AtomicI64::new(-1),
+            storage_epoch: AtomicU64::new(initial.storage_epoch),
+        }
+    }
 }
 
 impl StorageCoordinator {
@@ -53,6 +82,7 @@ impl StorageCoordinator {
             rehydrate_replay_events: 1_000,
             required_storage_protocol_version: 2,
             id_generator: Arc::new(|| ulid::Ulid::new().to_string()),
+            observer: None,
         }
     }
 
@@ -89,6 +119,11 @@ impl StorageCoordinator {
         F: Fn() -> String + Send + Sync + 'static,
     {
         self.id_generator = Arc::new(id_generator);
+        self
+    }
+
+    pub fn with_observer(mut self, observer: StorageLifecycleObserver) -> Self {
+        self.observer = Some(observer);
         self
     }
 
@@ -189,6 +224,8 @@ impl StorageCoordinator {
         task_id: &str,
         initial: TaskStorageMetadata,
     ) -> StorageResult<HotWriteToken> {
+        let started_at = now_millis();
+        let progress = RehydrateProgress::new(&initial);
         let lease = self
             .short_term_store
             .acquire_storage_lock(
@@ -205,10 +242,38 @@ impl StorageCoordinator {
             })?;
         let lease_lost = AtomicBool::new(false);
         let result = self
-            .rehydrate_cold_task_owned(task_id, initial, &lease, &lease_lost)
+            .rehydrate_cold_task_owned(task_id, initial, &lease, &lease_lost, &progress)
             .await;
         if !lease_lost.load(Ordering::SeqCst) {
             let _ = self.short_term_store.release_storage_lock(&lease).await;
+        }
+        match &result {
+            Ok(token) => self.observe(serde_json::json!({
+                "event": "storage_rehydrate",
+                "taskId": task_id,
+                "outcome": "rehydrated",
+                "durationMs": (now_millis() - started_at).max(0.0),
+                "replayEventCount": progress.replay_event_count.load(Ordering::SeqCst),
+                "archiveWatermark": progress.archive_watermark.load(Ordering::SeqCst),
+                "maxEventIndex": progress.max_event_index.load(Ordering::SeqCst),
+                "storageEpoch": token.storage_epoch,
+                "storageStateBefore": "cold",
+                "storageStateAfter": "hot",
+            })),
+            Err(error) => self.observe(serde_json::json!({
+                "event": "storage_rehydrate",
+                "taskId": task_id,
+                "outcome": "failed",
+                "durationMs": (now_millis() - started_at).max(0.0),
+                "replayEventCount": progress.replay_event_count.load(Ordering::SeqCst),
+                "archiveWatermark": progress.archive_watermark.load(Ordering::SeqCst),
+                "maxEventIndex": progress.max_event_index.load(Ordering::SeqCst),
+                "storageEpoch": progress.storage_epoch.load(Ordering::SeqCst),
+                "storageStateBefore": "cold",
+                "storageStateAfter": "cold",
+                "errorCode": Self::error_code(error.as_ref()),
+                "error": error.to_string(),
+            })),
         }
         result
     }
@@ -219,6 +284,7 @@ impl StorageCoordinator {
         initial: TaskStorageMetadata,
         lease: &StorageLease,
         lease_lost: &AtomicBool,
+        progress: &RehydrateProgress,
     ) -> StorageResult<HotWriteToken> {
         self.renew(lease, lease_lost).await?;
         let metadata = self
@@ -318,6 +384,18 @@ impl StorageCoordinator {
                 .get_recent_events(task_id, self.rehydrate_replay_events),
             self.long_term_store.get_durable_series_state(task_id),
         )?;
+        progress
+            .replay_event_count
+            .store(replay_events.len() as u64, Ordering::SeqCst);
+        progress
+            .archive_watermark
+            .store(metadata.archive_watermark, Ordering::SeqCst);
+        progress
+            .max_event_index
+            .store(max_event_index, Ordering::SeqCst);
+        progress
+            .storage_epoch
+            .store(metadata.storage_epoch, Ordering::SeqCst);
         let task = task.ok_or_else(|| {
             boxed(StorageIntegrityError::new(format!(
                 "Durable task does not exist: {task_id}"
@@ -331,6 +409,15 @@ impl StorageCoordinator {
                         .unwrap_or(true)
             })
         {
+            self.observe(serde_json::json!({
+                "event": "storage_watermark_mismatch",
+                "operation": "rehydrate",
+                "taskId": task_id,
+                "expectedWatermark": metadata.archive_watermark,
+                "actualWatermark": max_event_index,
+                "replayEventCount": replay_events.len(),
+                "storageEpoch": metadata.storage_epoch,
+            }));
             return Err(boxed(StorageIntegrityError::new(
                 "Durable rehydrate snapshot is inconsistent",
             )));
@@ -404,6 +491,45 @@ impl StorageCoordinator {
         task_id: &str,
         preconditions: ReleasePreconditions,
     ) -> StorageResult<ReleaseResult> {
+        let started_at = now_millis();
+        let progress = ReleaseProgress::default();
+        let result = self
+            .release_task_storage_inner(task_id, preconditions, &progress)
+            .await;
+        match &result {
+            Ok(release) => self.observe(serde_json::json!({
+                "event": "storage_release",
+                "taskId": task_id,
+                "outcome": if release.released { "released" } else { "noop" },
+                "durationMs": (now_millis() - started_at).max(0.0),
+                "sourceEventCount": progress.source_event_count.load(Ordering::SeqCst),
+                "sourceBytes": progress.source_bytes.load(Ordering::SeqCst),
+                "storageStateBefore": if release.released { "hot" } else { "cold" },
+                "storageStateAfter": release.storage_state,
+                "archiveWatermark": release.archive_watermark,
+            })),
+            Err(error) => self.observe(serde_json::json!({
+                "event": "storage_release",
+                "taskId": task_id,
+                "outcome": "failed",
+                "durationMs": (now_millis() - started_at).max(0.0),
+                "sourceEventCount": progress.source_event_count.load(Ordering::SeqCst),
+                "sourceBytes": progress.source_bytes.load(Ordering::SeqCst),
+                "storageStateBefore": "hot",
+                "storageStateAfter": "hot",
+                "errorCode": Self::error_code(error.as_ref()),
+                "error": error.to_string(),
+            })),
+        }
+        result
+    }
+
+    async fn release_task_storage_inner(
+        &self,
+        task_id: &str,
+        preconditions: ReleasePreconditions,
+        progress: &ReleaseProgress,
+    ) -> StorageResult<ReleaseResult> {
         self.require_capabilities()?;
         let metadata = self
             .long_term_store
@@ -436,8 +562,6 @@ impl StorageCoordinator {
             .await?
             .ok_or_else(|| boxed(StorageBusyError::default()))?;
         let lease_lost = AtomicBool::new(false);
-        let progress = ReleaseProgress::default();
-
         let result = self
             .release_owned(
                 task_id,
@@ -445,7 +569,7 @@ impl StorageCoordinator {
                 metadata,
                 &lease,
                 &lease_lost,
-                &progress,
+                progress,
             )
             .await;
         if result.is_err()
@@ -795,6 +919,9 @@ impl StorageCoordinator {
                 lease_lost,
             )
             .await?;
+        progress
+            .source_event_count
+            .store(description.manifest.source_entry_count, Ordering::SeqCst);
         if description
             .max_event_timestamp
             .is_some_and(|timestamp| timestamp > preconditions.inactive_since)
@@ -818,11 +945,14 @@ impl StorageCoordinator {
         self.long_term_store.begin_archive(archive).await?;
         self.upload_archive_batches(
             task_id,
-            closed.high_watermark,
-            metadata.archive_watermark,
             lease,
             lease_lost,
-            &description.manifest,
+            ArchiveUpload {
+                target_watermark: closed.high_watermark,
+                prior_watermark: metadata.archive_watermark,
+                manifest: &description.manifest,
+                progress,
+            },
         )
         .await?;
 
@@ -851,6 +981,15 @@ impl StorageCoordinator {
             || current.storage_epoch != metadata.storage_epoch
             || current.active_release_generation.as_deref() != Some(lease.generation.as_str())
         {
+            self.observe(serde_json::json!({
+                "event": "storage_watermark_mismatch",
+                "operation": "release",
+                "taskId": task_id,
+                "expectedWatermark": closed.high_watermark,
+                "actualWatermark": watermark,
+                "storageState": current.storage_state,
+                "storageEpoch": current.storage_epoch,
+            }));
             return Err(boxed(StorageIntegrityError::new(
                 "Durable archive read-back did not prove release",
             )));
@@ -1025,11 +1164,9 @@ impl StorageCoordinator {
     async fn upload_archive_batches(
         &self,
         task_id: &str,
-        target_watermark: i64,
-        prior_watermark: i64,
         lease: &StorageLease,
         lease_lost: &AtomicBool,
-        manifest: &ArchiveSourceManifest,
+        upload: ArchiveUpload<'_>,
     ) -> StorageResult<()> {
         let mut cursor: Option<String> = None;
         let mut previous_index: Option<u64> = None;
@@ -1041,7 +1178,7 @@ impl StorageCoordinator {
                 .short_term_store
                 .read_archive_source_page(
                     task_id,
-                    target_watermark,
+                    upload.target_watermark,
                     cursor.as_deref(),
                     self.archive_batch_size,
                 )
@@ -1055,11 +1192,15 @@ impl StorageCoordinator {
                     )));
                 }
                 previous_index = Some(event.index);
-                if event.index as i64 <= prior_watermark {
+                if event.index as i64 <= upload.prior_watermark {
                     continue;
                 }
                 batch.push(event);
                 if batch.len() == self.archive_batch_size as usize {
+                    upload
+                        .progress
+                        .source_bytes
+                        .fetch_add(serde_json::to_vec(&batch)?.len() as u64, Ordering::SeqCst);
                     self.upload_batch(
                         task_id,
                         lease,
@@ -1084,6 +1225,10 @@ impl StorageCoordinator {
             }
         }
         if !batch.is_empty() {
+            upload
+                .progress
+                .source_bytes
+                .fetch_add(serde_json::to_vec(&batch)?.len() as u64, Ordering::SeqCst);
             self.upload_batch(
                 task_id,
                 lease,
@@ -1095,7 +1240,7 @@ impl StorageCoordinator {
             .await?;
             ordinal += 1;
         }
-        if ordinal as usize != manifest.expected_batch_ordinals.len() {
+        if ordinal as usize != upload.manifest.expected_batch_ordinals.len() {
             return Err(boxed(StorageIntegrityError::new(
                 "Archive source changed between sealing passes",
             )));
@@ -1159,6 +1304,33 @@ impl StorageCoordinator {
                     "Storage lease was lost",
                 )))
             }
+        }
+    }
+
+    fn observe(&self, observation: serde_json::Value) {
+        if let Some(observer) = &self.observer {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                observer(&observation);
+            }));
+        }
+    }
+
+    fn error_code(error: &(dyn std::error::Error + Send + Sync + 'static)) -> &'static str {
+        if error.downcast_ref::<StoragePreconditionError>().is_some() {
+            "storage_precondition_failed"
+        } else if error.downcast_ref::<StorageFenceConflictError>().is_some() {
+            "storage_fence_conflict"
+        } else if error.downcast_ref::<StorageBusyError>().is_some() {
+            "storage_busy"
+        } else if error.downcast_ref::<StorageIntegrityError>().is_some() {
+            "storage_integrity_error"
+        } else if error
+            .downcast_ref::<StorageReleaseUnsupportedError>()
+            .is_some()
+        {
+            "storage_release_unsupported"
+        } else {
+            "storage_unavailable"
         }
     }
 
