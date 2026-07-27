@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Postgres, Row, Transaction};
@@ -8,10 +9,16 @@ use std::future::Future;
 use std::sync::Arc;
 
 use crate::classify_postgres_connectivity;
+use taskcast_core::archive::{
+    archive_event_record, compute_archive_batch_digest, compute_archive_source_digest,
+    compute_archive_source_page_digest, compute_series_state_digest, durable_series_state_record,
+};
 use taskcast_core::types::{
-    AssignMode, CleanupConfig, DisconnectPolicy, EventQueryOptions, Level, LongTermStore,
-    SeriesMode, Task, TaskAuthConfig, TaskError, TaskEvent, TaskStatus, WebhookConfig,
-    WorkerAuditAction, WorkerAuditEvent,
+    ArchiveBatch, ArchiveBatchReceipt, ArchiveGeneration, ArchiveGenerationStatus,
+    ArchiveSourceManifest, AssignMode, CleanupConfig, DisconnectPolicy, DurableSeriesState,
+    EventQueryOptions, Level, LongTermStore, SeriesMode, StorageIntegrityError, StorageState, Task,
+    TaskAuthConfig, TaskError, TaskEvent, TaskStatus, TaskStorageMetadata, TaskStorageMetadataCas,
+    WebhookConfig, WorkerAuditAction, WorkerAuditEvent,
 };
 use taskcast_core::{
     BoxError, DependencyName, DependencyObservation, DependencyObservationState,
@@ -21,6 +28,17 @@ use taskcast_core::{
 const TASKS: &str = "taskcast_tasks";
 const EVENTS: &str = "taskcast_events";
 const WORKER_EVENTS: &str = "taskcast_worker_events";
+const ARCHIVE_GENERATIONS: &str = "taskcast_archive_generations";
+const ARCHIVE_BATCHES: &str = "taskcast_archive_batches";
+const SERIES_STATE: &str = "taskcast_series_state";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ArchiveSeriesCoverage {
+    series_id: String,
+    mode: SeriesMode,
+    through_index: u64,
+}
 
 /// PostgreSQL-backed long-term store for tasks and events.
 ///
@@ -240,6 +258,10 @@ impl Error for BoxedSource {
 
 #[async_trait]
 impl LongTermStore for PostgresLongTermStore {
+    fn supports_hot_cold_release(&self) -> bool {
+        true
+    }
+
     async fn save_task(&self, task: Task) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.observed(|| async move {
             let params_json: Option<JsonValue> = task
@@ -427,6 +449,29 @@ impl LongTermStore for PostgresLongTermStore {
         self.observed(|| async move {
             let mode = series_mode_to_string(&SeriesMode::Latest).unwrap();
             let mut tx = self.pool.begin().await?;
+            let archive_watermark = lock_task_for_series_write_pg_tx(&mut tx, task_id).await?;
+            let committed = get_series_state_for_update_pg_tx(&mut tx, task_id, series_id).await?;
+            if archive_watermark >= event.index as i64
+                || committed
+                    .as_ref()
+                    .is_some_and(|state| state.through_index >= event.index)
+            {
+                if archive_watermark >= event.index as i64 && committed.is_none() {
+                    return Err(integrity(&format!(
+                        "Archived latest series state is missing for {task_id}:{series_id}"
+                    )));
+                }
+                tx.commit().await?;
+                return Ok(());
+            }
+            if committed.as_ref().is_some_and(|state| {
+                state.mode != SeriesMode::Latest
+                    || state.event.series_acc_field != event.series_acc_field
+            }) {
+                return Err(integrity(&format!(
+                    "Durable series semantics conflict for {task_id}:{series_id}"
+                )));
+            }
             let sql = format!(
                 r#"
             SELECT * FROM {EVENTS}
@@ -459,6 +504,17 @@ impl LongTermStore for PostgresLongTermStore {
             } else {
                 insert_event_pg_tx(&mut tx, &event).await?;
             }
+            save_series_state_pg_tx(
+                &mut tx,
+                &DurableSeriesState {
+                    task_id: task_id.to_string(),
+                    series_id: series_id.to_string(),
+                    mode: SeriesMode::Latest,
+                    event: event.clone(),
+                    through_index: event.index,
+                },
+            )
+            .await?;
 
             tx.commit().await?;
             Ok(())
@@ -475,7 +531,32 @@ impl LongTermStore for PostgresLongTermStore {
     ) -> Result<TaskEvent, Box<dyn std::error::Error + Send + Sync>> {
         self.observed(|| async move {
             let mode = series_mode_to_string(&SeriesMode::Accumulate).unwrap();
+            let source_index = event.index;
             let mut tx = self.pool.begin().await?;
+            let archive_watermark = lock_task_for_series_write_pg_tx(&mut tx, task_id).await?;
+            let committed = get_series_state_for_update_pg_tx(&mut tx, task_id, series_id).await?;
+            if archive_watermark >= event.index as i64
+                || committed
+                    .as_ref()
+                    .is_some_and(|state| state.through_index >= event.index)
+            {
+                let Some(committed) = committed else {
+                    return Err(integrity(&format!(
+                        "Archived accumulate series state is missing for {task_id}:{series_id}"
+                    )));
+                };
+                tx.commit().await?;
+                return Ok(committed.event);
+            }
+            if committed.as_ref().is_some_and(|state| {
+                state.mode != SeriesMode::Accumulate
+                    || state.event.series_acc_field.as_deref().unwrap_or("delta") != field
+                    || event.series_acc_field.as_deref().unwrap_or("delta") != field
+            }) {
+                return Err(integrity(&format!(
+                    "Durable series semantics conflict for {task_id}:{series_id}"
+                )));
+            }
             let sql = format!(
                 r#"
             SELECT * FROM {EVENTS}
@@ -516,11 +597,724 @@ impl LongTermStore for PostgresLongTermStore {
             } else {
                 insert_event_pg_tx(&mut tx, &accumulated).await?;
             }
+            save_series_state_pg_tx(
+                &mut tx,
+                &DurableSeriesState {
+                    task_id: task_id.to_string(),
+                    series_id: series_id.to_string(),
+                    mode: SeriesMode::Accumulate,
+                    event: accumulated.clone(),
+                    through_index: source_index,
+                },
+            )
+            .await?;
 
             tx.commit().await?;
             Ok(accumulated)
         })
         .await
+    }
+
+    async fn get_task_storage_metadata(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<TaskStorageMetadata>, Box<dyn std::error::Error + Send + Sync>> {
+        let sql = format!(
+            "SELECT id, storage_state, storage_epoch, active_release_generation, \
+             archive_watermark, last_event_at, cold_at, execution_deadline_at, task_version \
+             FROM {TASKS} WHERE id = $1"
+        );
+        let row = sqlx::query(&sql)
+            .bind(task_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.as_ref().map(row_to_storage_metadata).transpose()
+    }
+
+    async fn compare_and_set_task_storage_metadata(
+        &self,
+        update: TaskStorageMetadataCas,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        validate_storage_metadata_cas(&update)?;
+        let sql = format!(
+            r#"
+            UPDATE {TASKS}
+            SET storage_state = $1, storage_epoch = $2, active_release_generation = $3,
+                archive_watermark = $4, last_event_at = $5, cold_at = $6,
+                execution_deadline_at = $7, task_version = $8
+            WHERE id = $9
+              AND storage_state = $10
+              AND storage_epoch = $11
+              AND active_release_generation IS NOT DISTINCT FROM $12
+              AND archive_watermark = $4
+              AND task_version <= $8
+            "#
+        );
+        let result = sqlx::query(&sql)
+            .bind(storage_state_to_string(&update.next.storage_state)?)
+            .bind(update.next.storage_epoch as i64)
+            .bind(&update.next.active_release_generation)
+            .bind(update.next.archive_watermark)
+            .bind(update.next.last_event_at.map(|value| value as i64))
+            .bind(update.next.cold_at.map(|value| value as i64))
+            .bind(update.next.execution_deadline_at.map(|value| value as i64))
+            .bind(update.next.task_version as i64)
+            .bind(&update.task_id)
+            .bind(storage_state_to_string(&update.expected_storage_state)?)
+            .bind(update.expected_storage_epoch as i64)
+            .bind(&update.expected_release_generation)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn begin_archive(
+        &self,
+        generation: ArchiveGeneration,
+    ) -> Result<ArchiveGeneration, Box<dyn std::error::Error + Send + Sync>> {
+        validate_archive_manifest(&generation.manifest)?;
+        if generation.storage_epoch == 0 || generation.storage_epoch > i64::MAX as u64 {
+            return Err(integrity("Archive generation storage epoch is invalid"));
+        }
+        if generation.status != ArchiveGenerationStatus::Open {
+            return Err(integrity("A new archive generation must start open"));
+        }
+
+        let mut tx = self.pool.begin().await?;
+        let task_sql = format!(
+            "SELECT storage_state, storage_epoch, active_release_generation, archive_watermark \
+             FROM {TASKS} WHERE id = $1 FOR UPDATE"
+        );
+        let task = sqlx::query(&task_sql)
+            .bind(&generation.task_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| {
+                integrity(&format!(
+                    "Archive task does not exist: {}",
+                    generation.task_id
+                ))
+            })?;
+
+        let existing_sql = format!(
+            "SELECT * FROM {ARCHIVE_GENERATIONS} \
+             WHERE task_id = $1 AND generation = $2 FOR UPDATE"
+        );
+        if let Some(row) = sqlx::query(&existing_sql)
+            .bind(&generation.task_id)
+            .bind(&generation.generation)
+            .fetch_optional(&mut *tx)
+            .await?
+        {
+            let existing = row_to_archive_generation(&row)?;
+            if existing.storage_epoch != generation.storage_epoch
+                || existing.target_watermark != generation.target_watermark
+                || existing.manifest != generation.manifest
+            {
+                return Err(integrity(
+                    "Archive generation replay conflicts with durable manifest",
+                ));
+            }
+            tx.commit().await?;
+            return Ok(existing);
+        }
+
+        let task_state: String = task.get("storage_state");
+        let task_epoch: i64 = task.get("storage_epoch");
+        let active_generation: Option<String> = task.get("active_release_generation");
+        let archive_watermark: i64 = task.get("archive_watermark");
+        if task_state != "releasing"
+            || task_epoch != generation.storage_epoch as i64
+            || active_generation.as_deref() != Some(generation.generation.as_str())
+        {
+            return Err(integrity(
+                "Archive generation is stale for the active task release",
+            ));
+        }
+        if generation.manifest.target_watermark != generation.target_watermark
+            || generation.manifest.prior_watermark != archive_watermark
+            || generation.target_watermark < archive_watermark
+        {
+            return Err(integrity(
+                "Archive manifest watermark conflicts with durable task state",
+            ));
+        }
+
+        let insert_sql = format!(
+            r#"
+            INSERT INTO {ARCHIVE_GENERATIONS} (
+                task_id, generation, storage_epoch, target_watermark, manifest,
+                status, created_at, updated_at
+            ) VALUES ($1, $2, $3, $4, $5, 'uploading', $6, $7)
+            "#
+        );
+        sqlx::query(&insert_sql)
+            .bind(&generation.task_id)
+            .bind(&generation.generation)
+            .bind(generation.storage_epoch as i64)
+            .bind(generation.target_watermark)
+            .bind(serde_json::to_value(&generation.manifest)?)
+            .bind(generation.created_at as i64)
+            .bind(generation.updated_at as i64)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(generation)
+    }
+
+    async fn archive_batch(
+        &self,
+        task_id: &str,
+        generation: &str,
+        batch: ArchiveBatch,
+    ) -> Result<ArchiveBatchReceipt, Box<dyn std::error::Error + Send + Sync>> {
+        validate_batch_shape(task_id, generation, &batch)?;
+        let computed_batch_digest = compute_archive_batch_digest(
+            batch.receipt.previous_batch_digest.as_deref(),
+            &batch.events,
+            &batch.series_latest,
+        )?;
+        if computed_batch_digest != batch.receipt.batch_digest {
+            return Err(integrity(
+                "Archive batch digest does not match its contents",
+            ));
+        }
+        let source_index_digest = compute_archive_source_page_digest(&batch.events)?;
+        let source_series_digest = compute_series_state_digest(&batch.series_latest)?;
+        let series_coverage = build_batch_series_coverage(&batch)?;
+
+        let mut tx = self.pool.begin().await?;
+        let task_sql = format!(
+            "SELECT storage_state, storage_epoch, active_release_generation \
+             FROM {TASKS} WHERE id = $1 FOR UPDATE"
+        );
+        let task_row = sqlx::query(&task_sql)
+            .bind(task_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| integrity(&format!("Archive task does not exist: {task_id}")))?;
+        let generation_sql = format!(
+            "SELECT * FROM {ARCHIVE_GENERATIONS} \
+             WHERE task_id = $1 AND generation = $2 FOR UPDATE"
+        );
+        let generation_row = sqlx::query(&generation_sql)
+            .bind(task_id)
+            .bind(generation)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| integrity("Archive generation does not exist"))?;
+        let archive = row_to_archive_generation(&generation_row)?;
+        let task_state: String = task_row.get("storage_state");
+        let task_epoch: i64 = task_row.get("storage_epoch");
+        let active_generation: Option<String> = task_row.get("active_release_generation");
+        if task_state != "releasing"
+            || task_epoch != archive.storage_epoch as i64
+            || active_generation.as_deref() != Some(generation)
+        {
+            return Err(integrity(
+                "Archive batch lost its active task release fence",
+            ));
+        }
+        validate_series_state_bounds(&batch.series_latest, archive.target_watermark)?;
+
+        let existing_sql = format!(
+            "SELECT * FROM {ARCHIVE_BATCHES} \
+             WHERE task_id = $1 AND generation = $2 AND ordinal = $3"
+        );
+        if let Some(row) = sqlx::query(&existing_sql)
+            .bind(task_id)
+            .bind(generation)
+            .bind(batch.receipt.ordinal as i32)
+            .fetch_optional(&mut *tx)
+            .await?
+        {
+            let existing = row_to_archive_batch_receipt(&row);
+            let stored_source: String = row.get("source_index_digest");
+            let stored_series: String = row.get("source_series_digest");
+            let stored_coverage: JsonValue = row.get("series_coverage");
+            let stored_coverage =
+                serde_json::from_value::<Vec<ArchiveSeriesCoverage>>(stored_coverage)?;
+            if existing != batch.receipt
+                || stored_source != source_index_digest
+                || stored_series != source_series_digest
+                || stored_coverage != series_coverage
+            {
+                return Err(integrity(
+                    "Archive batch replay conflicts with durable receipt",
+                ));
+            }
+            tx.commit().await?;
+            return Ok(existing);
+        }
+        if archive.status != ArchiveGenerationStatus::Open {
+            return Err(integrity(
+                "Cannot append a batch to a finalized archive generation",
+            ));
+        }
+
+        let receipts_sql = format!(
+            "SELECT ordinal, current_digest, source_last_index FROM {ARCHIVE_BATCHES} \
+             WHERE task_id = $1 AND generation = $2 ORDER BY ordinal ASC"
+        );
+        let receipt_rows = sqlx::query(&receipts_sql)
+            .bind(task_id)
+            .bind(generation)
+            .fetch_all(&mut *tx)
+            .await?;
+        let expected_ordinal = archive
+            .manifest
+            .expected_batch_ordinals
+            .get(receipt_rows.len())
+            .copied();
+        if expected_ordinal != Some(batch.receipt.ordinal) {
+            return Err(integrity(
+                "Archive batches must be uploaded once in manifest order",
+            ));
+        }
+        let expected_previous = receipt_rows
+            .last()
+            .map(|row| row.get::<String, _>("current_digest"));
+        if batch.receipt.previous_batch_digest != expected_previous {
+            return Err(integrity(
+                "Archive batch previous digest breaks the receipt chain",
+            ));
+        }
+        let previous_last_index = receipt_rows
+            .last()
+            .and_then(|row| row.get::<Option<i64>, _>("source_last_index"))
+            .unwrap_or(archive.manifest.prior_watermark);
+        if batch
+            .receipt
+            .first_index
+            .map_or(true, |index| index as i64 <= previous_last_index)
+        {
+            return Err(integrity(
+                "Archive batch source coverage overlaps or goes backwards",
+            ));
+        }
+
+        for event in &batch.events {
+            if event.index as i64 <= archive.manifest.prior_watermark
+                || event.index as i64 > archive.manifest.target_watermark
+            {
+                return Err(integrity(
+                    "Archive batch event falls outside the sealed watermark",
+                ));
+            }
+            if matches!(
+                event.series_mode,
+                Some(SeriesMode::Latest | SeriesMode::Accumulate)
+            ) {
+                assert_compact_event_compatible_pg_tx(&mut tx, event).await?;
+                continue;
+            }
+            upsert_canonical_event_pg_tx(&mut tx, event).await?;
+        }
+
+        let insert_sql = format!(
+            r#"
+            INSERT INTO {ARCHIVE_BATCHES} (
+                task_id, generation, ordinal, previous_digest, current_digest,
+                source_first_index, source_last_index, source_index_digest,
+                source_series_digest, series_coverage, entry_count, created_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            "#
+        );
+        sqlx::query(&insert_sql)
+            .bind(task_id)
+            .bind(generation)
+            .bind(batch.receipt.ordinal as i32)
+            .bind(&batch.receipt.previous_batch_digest)
+            .bind(&batch.receipt.batch_digest)
+            .bind(batch.receipt.first_index.map(|value| value as i64))
+            .bind(batch.receipt.last_index.map(|value| value as i64))
+            .bind(&source_index_digest)
+            .bind(&source_series_digest)
+            .bind(serde_json::to_value(&series_coverage)?)
+            .bind(batch.receipt.entry_count as i32)
+            .bind(now_millis())
+            .execute(&mut *tx)
+            .await?;
+        let update_sql = format!(
+            "UPDATE {ARCHIVE_GENERATIONS} SET updated_at = $1 \
+             WHERE task_id = $2 AND generation = $3"
+        );
+        sqlx::query(&update_sql)
+            .bind(now_millis())
+            .bind(task_id)
+            .bind(generation)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(batch.receipt)
+    }
+
+    async fn finalize_archive(
+        &self,
+        task_id: &str,
+        generation: &str,
+        task: Task,
+        series_latest: Vec<DurableSeriesState>,
+    ) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+        if task.id != task_id {
+            return Err(integrity("Final archive task ID does not match"));
+        }
+        validate_series_state(task_id, &series_latest)?;
+        let series_digest = compute_series_state_digest(&series_latest)?;
+
+        let mut tx = self.pool.begin().await?;
+        let task_sql = format!("SELECT * FROM {TASKS} WHERE id = $1 FOR UPDATE");
+        let task_row = sqlx::query(&task_sql)
+            .bind(task_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| integrity(&format!("Archive task does not exist: {task_id}")))?;
+        let generation_sql = format!(
+            "SELECT * FROM {ARCHIVE_GENERATIONS} \
+             WHERE task_id = $1 AND generation = $2 FOR UPDATE"
+        );
+        let generation_row = sqlx::query(&generation_sql)
+            .bind(task_id)
+            .bind(generation)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| integrity("Archive generation does not exist"))?;
+        let archive = row_to_archive_generation(&generation_row)?;
+        validate_series_state_bounds(&series_latest, archive.target_watermark)?;
+        let durable_watermark: i64 = task_row.get("archive_watermark");
+
+        if archive.status == ArchiveGenerationStatus::Finalized {
+            if durable_watermark < archive.target_watermark
+                || series_digest != archive.manifest.series_state_digest
+            {
+                return Err(integrity(
+                    "Finalized archive response replay failed verification",
+                ));
+            }
+            tx.commit().await?;
+            return Ok(archive.target_watermark);
+        }
+        if archive.status != ArchiveGenerationStatus::Open {
+            return Err(integrity("Archive generation cannot be finalized"));
+        }
+        let task_state: String = task_row.get("storage_state");
+        let task_epoch: i64 = task_row.get("storage_epoch");
+        let active_generation: Option<String> = task_row.get("active_release_generation");
+        if task_state != "releasing"
+            || task_epoch != archive.storage_epoch as i64
+            || active_generation.as_deref() != Some(generation)
+        {
+            return Err(integrity("Archive generation lost its task release fence"));
+        }
+
+        let receipts_sql = format!(
+            "SELECT * FROM {ARCHIVE_BATCHES} WHERE task_id = $1 AND generation = $2 \
+             ORDER BY ordinal ASC"
+        );
+        let receipt_rows = sqlx::query(&receipts_sql)
+            .bind(task_id)
+            .bind(generation)
+            .fetch_all(&mut *tx)
+            .await?;
+        let receipts = receipt_rows
+            .iter()
+            .map(row_to_archive_batch_receipt)
+            .collect::<Vec<_>>();
+        let ordinals = receipts
+            .iter()
+            .map(|receipt| receipt.ordinal)
+            .collect::<Vec<_>>();
+        if ordinals != archive.manifest.expected_batch_ordinals {
+            return Err(integrity(
+                "Archive generation has missing or unexpected batch ordinals",
+            ));
+        }
+
+        let mut previous_digest: Option<String> = None;
+        let mut previous_last_index = archive.manifest.prior_watermark;
+        let mut entry_count = 0_u64;
+        let mut source_page_digests = Vec::with_capacity(receipts.len());
+        let mut staged_series = std::collections::HashMap::<String, ArchiveSeriesCoverage>::new();
+        for (receipt, row) in receipts.iter().zip(receipt_rows.iter()) {
+            if receipt.previous_batch_digest != previous_digest {
+                return Err(integrity(
+                    "Archive generation contains a broken batch digest chain",
+                ));
+            }
+            let (Some(first_index), Some(last_index)) = (receipt.first_index, receipt.last_index)
+            else {
+                return Err(integrity(
+                    "Archive generation contains invalid source coverage",
+                ));
+            };
+            if receipt.entry_count == 0
+                || first_index as i64 <= previous_last_index
+                || last_index < first_index
+                || last_index as i64 > archive.target_watermark
+            {
+                return Err(integrity(
+                    "Archive generation contains invalid source coverage",
+                ));
+            }
+            previous_digest = Some(receipt.batch_digest.clone());
+            previous_last_index = last_index as i64;
+            entry_count += receipt.entry_count;
+            source_page_digests.push(row.get::<String, _>("source_index_digest"));
+            let coverage =
+                serde_json::from_value::<Vec<ArchiveSeriesCoverage>>(row.get("series_coverage"))?;
+            for current in coverage {
+                validate_series_coverage(&current, archive.target_watermark)?;
+                if let Some(previous) = staged_series.get(&current.series_id) {
+                    if current.mode != previous.mode
+                        || current.through_index < previous.through_index
+                        || (current.through_index == previous.through_index && current != *previous)
+                    {
+                        return Err(integrity(&format!(
+                            "Archive generation contains conflicting staged state for series {}",
+                            current.series_id
+                        )));
+                    }
+                }
+                let should_replace = staged_series
+                    .get(&current.series_id)
+                    .map_or(true, |previous| {
+                        current.through_index > previous.through_index
+                    });
+                if should_replace {
+                    staged_series.insert(current.series_id.clone(), current);
+                }
+            }
+        }
+        if entry_count != archive.manifest.source_entry_count {
+            return Err(integrity(
+                "Archive generation source entry count does not match manifest",
+            ));
+        }
+        if entry_count > 0 && previous_last_index != archive.manifest.target_watermark {
+            return Err(integrity(
+                "Archive generation does not reach its target watermark",
+            ));
+        }
+        if compute_archive_source_digest(&source_page_digests) != archive.manifest.source_digest {
+            return Err(integrity(
+                "Archive generation source coverage digest does not match",
+            ));
+        }
+        if series_digest != archive.manifest.series_state_digest {
+            return Err(integrity(
+                "Archive generation series state digest does not match",
+            ));
+        }
+
+        let final_series = series_latest
+            .iter()
+            .map(|state| (state.series_id.as_str(), state))
+            .collect::<std::collections::HashMap<_, _>>();
+        for (series_id, coverage) in &staged_series {
+            let Some(final_state) = final_series.get(series_id.as_str()) else {
+                return Err(integrity(&format!(
+                    "Archive final state does not cover compact source series {series_id}"
+                )));
+            };
+            if final_state.mode != coverage.mode
+                || final_state.through_index < coverage.through_index
+            {
+                return Err(integrity(&format!(
+                    "Archive final state does not cover compact source series {series_id}"
+                )));
+            }
+        }
+
+        let committed_series_sql =
+            format!("SELECT * FROM {SERIES_STATE} WHERE task_id = $1 FOR UPDATE");
+        let committed_series_rows = sqlx::query(&committed_series_sql)
+            .bind(task_id)
+            .fetch_all(&mut *tx)
+            .await?;
+        let committed_series = committed_series_rows
+            .iter()
+            .map(row_to_durable_series_state)
+            .collect::<Result<Vec<_>, _>>()?;
+        for committed in &committed_series {
+            let Some(final_state) = final_series.get(committed.series_id.as_str()) else {
+                return Err(integrity(&format!(
+                    "Archive final state regresses committed series {}",
+                    committed.series_id
+                )));
+            };
+            if final_state.mode != committed.mode
+                || final_state.event.series_acc_field != committed.event.series_acc_field
+                || final_state.through_index < committed.through_index
+                || (final_state.through_index == committed.through_index
+                    && durable_series_state_record(final_state)?
+                        != durable_series_state_record(committed)?)
+            {
+                return Err(integrity(&format!(
+                    "Archive final state regresses committed series {}",
+                    committed.series_id
+                )));
+            }
+        }
+        let compact_event_sql = format!(
+            "SELECT * FROM {EVENTS} WHERE task_id = $1 \
+             AND series_mode IN ('latest', 'accumulate') FOR UPDATE"
+        );
+        let compact_event_rows = sqlx::query(&compact_event_sql)
+            .bind(task_id)
+            .fetch_all(&mut *tx)
+            .await?;
+        for row in &compact_event_rows {
+            let existing = PostgresLongTermStore::row_to_event(row);
+            let Some(series_id) = existing.series_id.as_deref() else {
+                return Err(integrity(
+                    "Archive final state omits committed compact series <missing>",
+                ));
+            };
+            let Some(final_state) = final_series.get(series_id) else {
+                return Err(integrity(&format!(
+                    "Archive final state omits committed compact series {series_id}"
+                )));
+            };
+            if final_state.event.series_mode != existing.series_mode
+                || final_state.event.series_acc_field != existing.series_acc_field
+                || final_state.through_index < existing.index
+            {
+                return Err(integrity(&format!(
+                    "Archive final state omits committed compact series {series_id}"
+                )));
+            }
+        }
+
+        update_task_pg_tx(&mut tx, &task).await?;
+        let delete_series_sql = format!("DELETE FROM {SERIES_STATE} WHERE task_id = $1");
+        sqlx::query(&delete_series_sql)
+            .bind(task_id)
+            .execute(&mut *tx)
+            .await?;
+        for state in &series_latest {
+            let mode = series_mode_to_string(&state.mode)
+                .ok_or_else(|| integrity("Durable series mode is not serializable"))?;
+            let insert_series_sql = format!(
+                "INSERT INTO {SERIES_STATE} \
+                 (task_id, series_id, mode, event, through_index, updated_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6)"
+            );
+            sqlx::query(&insert_series_sql)
+                .bind(task_id)
+                .bind(&state.series_id)
+                .bind(&mode)
+                .bind(serde_json::to_value(&state.event)?)
+                .bind(state.through_index as i64)
+                .bind(now_millis())
+                .execute(&mut *tx)
+                .await?;
+            let committed = committed_series
+                .iter()
+                .find(|candidate| candidate.series_id == state.series_id);
+            install_canonical_series_event_pg_tx(&mut tx, state, committed).await?;
+        }
+
+        let update_sql = format!(
+            r#"
+            UPDATE {TASKS}
+            SET archive_watermark = GREATEST(archive_watermark, $1)
+            WHERE id = $2 AND storage_state = 'releasing'
+              AND storage_epoch = $3 AND active_release_generation = $4
+            RETURNING archive_watermark
+            "#
+        );
+        let updated = sqlx::query(&update_sql)
+            .bind(archive.target_watermark)
+            .bind(task_id)
+            .bind(archive.storage_epoch as i64)
+            .bind(generation)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| integrity("Archive task fence changed during finalization"))?;
+        let watermark: i64 = updated.get("archive_watermark");
+        let finalize_sql = format!(
+            "UPDATE {ARCHIVE_GENERATIONS} SET status = 'finalized', finalized_at = $1, \
+             updated_at = $2 WHERE task_id = $3 AND generation = $4"
+        );
+        let now = now_millis();
+        sqlx::query(&finalize_sql)
+            .bind(now)
+            .bind(now)
+            .bind(task_id)
+            .bind(generation)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(watermark)
+    }
+
+    async fn get_archive_watermark(
+        &self,
+        task_id: &str,
+    ) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+        let sql = format!("SELECT archive_watermark FROM {TASKS} WHERE id = $1");
+        let row = sqlx::query(&sql)
+            .bind(task_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or_else(|| integrity(&format!("Task does not exist: {task_id}")))?;
+        Ok(row.get("archive_watermark"))
+    }
+
+    async fn get_last_event_index(
+        &self,
+        task_id: &str,
+    ) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+        let sql = format!(
+            r#"
+            SELECT GREATEST(
+                task.archive_watermark,
+                COALESCE((SELECT MAX(event.idx) FROM {EVENTS} event WHERE event.task_id = task.id), -1),
+                COALESCE((SELECT MAX(series.through_index) FROM {SERIES_STATE} series WHERE series.task_id = task.id), -1)
+            ) AS last_index
+            FROM {TASKS} task WHERE task.id = $1
+            "#
+        );
+        let row = sqlx::query(&sql)
+            .bind(task_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|row| row.get("last_index")).unwrap_or(-1))
+    }
+
+    async fn get_recent_events(
+        &self,
+        task_id: &str,
+        limit: u64,
+    ) -> Result<Vec<TaskEvent>, Box<dyn std::error::Error + Send + Sync>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let sql = format!("SELECT * FROM {EVENTS} WHERE task_id = $1 ORDER BY idx DESC LIMIT $2");
+        let mut events = sqlx::query(&sql)
+            .bind(task_id)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await?
+            .iter()
+            .map(Self::row_to_event)
+            .collect::<Vec<_>>();
+        events.reverse();
+        Ok(events)
+    }
+
+    async fn get_durable_series_state(
+        &self,
+        task_id: &str,
+    ) -> Result<Vec<DurableSeriesState>, Box<dyn std::error::Error + Send + Sync>> {
+        let sql = format!("SELECT * FROM {SERIES_STATE} WHERE task_id = $1 ORDER BY series_id ASC");
+        sqlx::query(&sql)
+            .bind(task_id)
+            .fetch_all(&self.pool)
+            .await?
+            .iter()
+            .map(row_to_durable_series_state)
+            .collect()
     }
 
     async fn get_events(
@@ -711,6 +1505,651 @@ impl LongTermStore for PostgresLongTermStore {
     }
 }
 
+fn integrity(message: &str) -> Box<dyn std::error::Error + Send + Sync> {
+    Box::new(StorageIntegrityError::new(message))
+}
+
+fn validate_archive_manifest(
+    manifest: &ArchiveSourceManifest,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if manifest.target_watermark < manifest.prior_watermark {
+        return Err(integrity("Archive manifest contains invalid source bounds"));
+    }
+    if (manifest.source_entry_count == 0 && manifest.target_watermark != manifest.prior_watermark)
+        || (manifest.source_entry_count > 0
+            && manifest.target_watermark == manifest.prior_watermark)
+        || (manifest.source_entry_count == 0 && !manifest.expected_batch_ordinals.is_empty())
+        || (manifest.source_entry_count > 0
+            && (manifest.expected_batch_ordinals.is_empty()
+                || manifest.expected_batch_ordinals.len() as u64 > manifest.source_entry_count))
+    {
+        return Err(integrity(
+            "Archive manifest batch count is inconsistent with its source",
+        ));
+    }
+    if manifest
+        .expected_batch_ordinals
+        .iter()
+        .enumerate()
+        .any(|(index, ordinal)| *ordinal != index as u64)
+    {
+        return Err(integrity(
+            "Archive manifest batch ordinals must be contiguous from zero",
+        ));
+    }
+    if !is_sha256(&manifest.source_digest) || !is_sha256(&manifest.series_state_digest) {
+        return Err(integrity(
+            "Archive manifest digests must be lowercase SHA-256",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_storage_metadata_cas(
+    update: &TaskStorageMetadataCas,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let next = &update.next;
+    if next.task_id != update.task_id {
+        return Err(integrity(
+            "Storage metadata task ID does not match CAS target",
+        ));
+    }
+    if next.storage_epoch == 0
+        || next.storage_epoch < update.expected_storage_epoch
+        || next.storage_epoch > i64::MAX as u64
+        || next.archive_watermark < -1
+        || next.task_version > i64::MAX as u64
+    {
+        return Err(integrity(
+            "Storage metadata CAS would violate a monotonic counter",
+        ));
+    }
+    if (next.storage_state == StorageState::Releasing && next.active_release_generation.is_none())
+        || (next.storage_state == StorageState::Hot && next.active_release_generation.is_some())
+    {
+        return Err(integrity(
+            "Storage metadata release generation is inconsistent",
+        ));
+    }
+    if [next.last_event_at, next.cold_at, next.execution_deadline_at]
+        .into_iter()
+        .flatten()
+        .any(|timestamp| !fits_postgres_bigint(timestamp))
+    {
+        return Err(integrity(
+            "Storage metadata timestamps must be PostgreSQL BIGINT values",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_batch_shape(
+    task_id: &str,
+    generation: &str,
+    batch: &ArchiveBatch,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let receipt = &batch.receipt;
+    if receipt.task_id != task_id
+        || receipt.generation != generation
+        || receipt.entry_count != batch.events.len() as u64
+        || receipt.ordinal > i32::MAX as u64
+        || receipt.entry_count > i32::MAX as u64
+        || batch.events.is_empty()
+    {
+        return Err(integrity(
+            "Archive batch identity, count, or ordinal is invalid",
+        ));
+    }
+    let first_index = batch.events.first().map(|event| event.index);
+    let last_index = batch.events.last().map(|event| event.index);
+    if receipt.first_index != first_index || receipt.last_index != last_index {
+        return Err(integrity(
+            "Archive batch receipt coverage does not match its events",
+        ));
+    }
+    let mut previous_index = None;
+    let mut event_ids = std::collections::HashSet::new();
+    for event in &batch.events {
+        if event.task_id != task_id
+            || event.id.is_empty()
+            || event.index > i32::MAX as u64
+            || !fits_postgres_bigint(event.timestamp)
+            || previous_index.is_some_and(|index| event.index <= index)
+            || !event_ids.insert(event.id.as_str())
+            || event.series_snapshot.is_some()
+            || event._accumulated_data.is_some()
+        {
+            return Err(integrity(
+                "Archive batch events must have unique, increasing identities",
+            ));
+        }
+        previous_index = Some(event.index);
+    }
+    validate_series_state(task_id, &batch.series_latest)
+}
+
+fn validate_series_state(
+    task_id: &str,
+    states: &[DurableSeriesState],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut series_ids = std::collections::HashSet::new();
+    for state in states {
+        if state.task_id != task_id
+            || state.event.task_id != task_id
+            || state.event.series_id.as_deref() != Some(state.series_id.as_str())
+            || state.event.series_mode.as_ref() != Some(&state.mode)
+            || state.through_index < state.event.index
+            || state.through_index > i32::MAX as u64
+            || state.series_id.is_empty()
+            || state.event.index > i32::MAX as u64
+            || !fits_postgres_bigint(state.event.timestamp)
+            || state.event.series_snapshot.is_some()
+            || state.event._accumulated_data.is_some()
+            || !matches!(state.mode, SeriesMode::Latest | SeriesMode::Accumulate)
+            || !series_ids.insert(state.series_id.as_str())
+        {
+            return Err(integrity("Archive durable series state is inconsistent"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_series_state_bounds(
+    states: &[DurableSeriesState],
+    target_watermark: i64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if states.iter().any(|state| {
+        state.event.index as i64 > target_watermark || state.through_index as i64 > target_watermark
+    }) {
+        return Err(integrity(
+            "Archive durable series state exceeds the sealed watermark",
+        ));
+    }
+    Ok(())
+}
+
+fn build_batch_series_coverage(
+    batch: &ArchiveBatch,
+) -> Result<Vec<ArchiveSeriesCoverage>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut by_series = std::collections::HashMap::<String, ArchiveSeriesCoverage>::new();
+    for event in &batch.events {
+        let Some(mode @ (SeriesMode::Latest | SeriesMode::Accumulate)) = event.series_mode.as_ref()
+        else {
+            continue;
+        };
+        let Some(series_id) = event.series_id.as_deref() else {
+            return Err(integrity("Archive compact event is missing its series ID"));
+        };
+        if by_series
+            .get(series_id)
+            .is_some_and(|previous| previous.mode != *mode)
+        {
+            return Err(integrity(&format!(
+                "Archive compact source changes mode for series {series_id}"
+            )));
+        }
+        by_series.insert(
+            series_id.to_string(),
+            ArchiveSeriesCoverage {
+                series_id: series_id.to_string(),
+                mode: mode.clone(),
+                through_index: by_series.get(series_id).map_or(event.index, |previous| {
+                    previous.through_index.max(event.index)
+                }),
+            },
+        );
+    }
+    let mut coverage = by_series.into_values().collect::<Vec<_>>();
+    coverage.sort_by(|left, right| left.series_id.cmp(&right.series_id));
+    Ok(coverage)
+}
+
+fn validate_series_coverage(
+    coverage: &ArchiveSeriesCoverage,
+    target_watermark: i64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if coverage.series_id.is_empty()
+        || !matches!(coverage.mode, SeriesMode::Latest | SeriesMode::Accumulate)
+        || coverage.through_index as i64 > target_watermark
+    {
+        return Err(integrity("Archive compact series coverage is invalid"));
+    }
+    Ok(())
+}
+
+fn row_to_storage_metadata(
+    row: &PgRow,
+) -> Result<TaskStorageMetadata, Box<dyn std::error::Error + Send + Sync>> {
+    let storage_state: String = row.get("storage_state");
+    Ok(TaskStorageMetadata {
+        task_id: row.get("id"),
+        storage_state: serde_json::from_value(JsonValue::String(storage_state))
+            .map_err(|_| integrity("Durable storage state is invalid"))?,
+        storage_epoch: row.get::<i64, _>("storage_epoch") as u64,
+        active_release_generation: row.get("active_release_generation"),
+        archive_watermark: row.get("archive_watermark"),
+        last_event_at: row
+            .get::<Option<i64>, _>("last_event_at")
+            .map(|value| value as f64),
+        cold_at: row
+            .get::<Option<i64>, _>("cold_at")
+            .map(|value| value as f64),
+        execution_deadline_at: row
+            .get::<Option<i64>, _>("execution_deadline_at")
+            .map(|value| value as f64),
+        task_version: row.get::<i64, _>("task_version") as u64,
+    })
+}
+
+fn row_to_archive_generation(
+    row: &PgRow,
+) -> Result<ArchiveGeneration, Box<dyn std::error::Error + Send + Sync>> {
+    let status: String = row.get("status");
+    let manifest: JsonValue = row.get("manifest");
+    Ok(ArchiveGeneration {
+        task_id: row.get("task_id"),
+        generation: row.get("generation"),
+        storage_epoch: row.get::<i64, _>("storage_epoch") as u64,
+        target_watermark: row.get("target_watermark"),
+        manifest: serde_json::from_value(manifest)?,
+        status: match status.as_str() {
+            "uploading" => ArchiveGenerationStatus::Open,
+            "finalized" => ArchiveGenerationStatus::Finalized,
+            _ => ArchiveGenerationStatus::Aborted,
+        },
+        created_at: row.get::<i64, _>("created_at") as f64,
+        updated_at: row.get::<i64, _>("updated_at") as f64,
+    })
+}
+
+fn row_to_archive_batch_receipt(row: &PgRow) -> ArchiveBatchReceipt {
+    ArchiveBatchReceipt {
+        task_id: row.get("task_id"),
+        generation: row.get("generation"),
+        ordinal: row.get::<i32, _>("ordinal") as u64,
+        previous_batch_digest: row.get("previous_digest"),
+        batch_digest: row.get("current_digest"),
+        entry_count: row.get::<i32, _>("entry_count") as u64,
+        first_index: row
+            .get::<Option<i64>, _>("source_first_index")
+            .map(|value| value as u64),
+        last_index: row
+            .get::<Option<i64>, _>("source_last_index")
+            .map(|value| value as u64),
+    }
+}
+
+fn row_to_durable_series_state(
+    row: &PgRow,
+) -> Result<DurableSeriesState, Box<dyn std::error::Error + Send + Sync>> {
+    let mode: String = row.get("mode");
+    let event: JsonValue = row.get("event");
+    Ok(DurableSeriesState {
+        task_id: row.get("task_id"),
+        series_id: row.get("series_id"),
+        mode: serde_json::from_value(JsonValue::String(mode))?,
+        event: serde_json::from_value(event)?,
+        through_index: row.get::<i64, _>("through_index") as u64,
+    })
+}
+
+async fn lock_task_for_series_write_pg_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    task_id: &str,
+) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+    let sql = format!("SELECT archive_watermark FROM {TASKS} WHERE id = $1 FOR UPDATE");
+    let row = sqlx::query(&sql)
+        .bind(task_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or_else(|| integrity(&format!("Series task does not exist: {task_id}")))?;
+    Ok(row.get("archive_watermark"))
+}
+
+async fn get_series_state_for_update_pg_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    task_id: &str,
+    series_id: &str,
+) -> Result<Option<DurableSeriesState>, Box<dyn std::error::Error + Send + Sync>> {
+    let sql =
+        format!("SELECT * FROM {SERIES_STATE} WHERE task_id = $1 AND series_id = $2 FOR UPDATE");
+    sqlx::query(&sql)
+        .bind(task_id)
+        .bind(series_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .as_ref()
+        .map(row_to_durable_series_state)
+        .transpose()
+}
+
+async fn save_series_state_pg_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    state: &DurableSeriesState,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let sql = format!(
+        r#"
+        INSERT INTO {SERIES_STATE} (
+            task_id, series_id, mode, event, through_index, updated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6)
+        ON CONFLICT (task_id, series_id) DO UPDATE SET
+            mode = EXCLUDED.mode,
+            event = EXCLUDED.event,
+            through_index = EXCLUDED.through_index,
+            updated_at = EXCLUDED.updated_at
+        WHERE {SERIES_STATE}.through_index < EXCLUDED.through_index
+        "#
+    );
+    let mode = series_mode_to_string(&state.mode)
+        .ok_or_else(|| integrity("Durable series mode is not serializable"))?;
+    sqlx::query(&sql)
+        .bind(&state.task_id)
+        .bind(&state.series_id)
+        .bind(mode)
+        .bind(serde_json::to_value(&state.event)?)
+        .bind(state.through_index as i64)
+        .bind(now_millis())
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+async fn update_task_pg_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    task: &Task,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let sql = format!(
+        r#"
+        UPDATE {TASKS}
+        SET status = $1, result = $2, error = $3, metadata = $4,
+            updated_at = $5, completed_at = $6, tags = $7, assign_mode = $8,
+            cost = $9, assigned_worker = $10, disconnect_policy = $11
+        WHERE id = $12
+        "#
+    );
+    let status = serde_json::to_value(&task.status)?
+        .as_str()
+        .unwrap_or("pending")
+        .to_string();
+    let assign_mode = task
+        .assign_mode
+        .as_ref()
+        .map(enum_value_string)
+        .transpose()?;
+    let disconnect_policy = task
+        .disconnect_policy
+        .as_ref()
+        .map(enum_value_string)
+        .transpose()?;
+    let result = task.result.as_ref().map(serde_json::to_value).transpose()?;
+    let error = task.error.as_ref().map(serde_json::to_value).transpose()?;
+    let metadata = task
+        .metadata
+        .as_ref()
+        .map(serde_json::to_value)
+        .transpose()?;
+    let tags = task.tags.as_ref().map(serde_json::to_value).transpose()?;
+    sqlx::query(&sql)
+        .bind(status)
+        .bind(result)
+        .bind(error)
+        .bind(metadata)
+        .bind(task.updated_at as i64)
+        .bind(task.completed_at.map(|value| value as i64))
+        .bind(tags)
+        .bind(assign_mode)
+        .bind(task.cost.map(|value| value as i32))
+        .bind(&task.assigned_worker)
+        .bind(disconnect_policy)
+        .bind(&task.id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+async fn upsert_canonical_event_pg_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    event: &TaskEvent,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let sql =
+        format!("SELECT * FROM {EVENTS} WHERE id = $1 OR (task_id = $2 AND idx = $3) FOR UPDATE");
+    let rows = sqlx::query(&sql)
+        .bind(&event.id)
+        .bind(&event.task_id)
+        .bind(event.index as i32)
+        .fetch_all(&mut **tx)
+        .await?;
+    if !rows.is_empty() {
+        validate_canonical_event_rows(&rows, event)?;
+        return Ok(());
+    }
+    if insert_canonical_event_pg_tx(tx, event).await? {
+        return Ok(());
+    }
+
+    let raced_rows = sqlx::query(&sql)
+        .bind(&event.id)
+        .bind(&event.task_id)
+        .bind(event.index as i32)
+        .fetch_all(&mut **tx)
+        .await?;
+    validate_canonical_event_rows(&raced_rows, event)
+}
+
+async fn assert_compact_event_compatible_pg_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    event: &TaskEvent,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let sql =
+        format!("SELECT * FROM {EVENTS} WHERE id = $1 OR (task_id = $2 AND idx = $3) FOR UPDATE");
+    let rows = sqlx::query(&sql)
+        .bind(&event.id)
+        .bind(&event.task_id)
+        .bind(event.index as i32)
+        .fetch_all(&mut **tx)
+        .await?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+    if rows.len() != 1 {
+        return Err(integrity(&format!(
+            "Archive compact event identity conflicts at {}:{}",
+            event.task_id, event.index
+        )));
+    }
+    let existing = PostgresLongTermStore::row_to_event(&rows[0]);
+    let field_matches = if event.series_mode == Some(SeriesMode::Accumulate) {
+        existing.series_acc_field.as_deref().unwrap_or("delta")
+            == event.series_acc_field.as_deref().unwrap_or("delta")
+    } else {
+        existing.series_acc_field == event.series_acc_field
+    };
+    if existing.task_id != event.task_id
+        || existing.series_id != event.series_id
+        || existing.series_mode != event.series_mode
+        || !field_matches
+    {
+        return Err(integrity(&format!(
+            "Archive compact event identity conflicts at {}:{}",
+            event.task_id, event.index
+        )));
+    }
+    Ok(())
+}
+
+fn validate_canonical_event_rows(
+    rows: &[PgRow],
+    event: &TaskEvent,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if rows.len() != 1
+        || archive_event_record(&PostgresLongTermStore::row_to_event(&rows[0]))?
+            != archive_event_record(event)?
+    {
+        return Err(integrity(&format!(
+            "Archive event identity conflicts at {}:{}",
+            event.task_id, event.index
+        )));
+    }
+    Ok(())
+}
+
+async fn insert_canonical_event_pg_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    event: &TaskEvent,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let sql = format!(
+        r#"
+        INSERT INTO {EVENTS} (
+            id, task_id, idx, timestamp, type, level, data, series_id, series_mode, series_acc_field
+        ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+        )
+        ON CONFLICT DO NOTHING
+        RETURNING id
+        "#
+    );
+    let level = level_to_string(&event.level)?;
+    let mode = event.series_mode.as_ref().and_then(series_mode_to_string);
+    let inserted = sqlx::query(&sql)
+        .bind(&event.id)
+        .bind(&event.task_id)
+        .bind(event.index as i32)
+        .bind(event.timestamp as i64)
+        .bind(&event.r#type)
+        .bind(level)
+        .bind(data_json_for_db(&event.data))
+        .bind(&event.series_id)
+        .bind(mode)
+        .bind(&event.series_acc_field)
+        .fetch_optional(&mut **tx)
+        .await?;
+    Ok(inserted.is_some())
+}
+
+async fn install_canonical_series_event_pg_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    state: &DurableSeriesState,
+    committed: Option<&DurableSeriesState>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let event = &state.event;
+    let select_sql = format!(
+        "SELECT * FROM {EVENTS} \
+         WHERE (task_id = $1 AND series_id = $2 \
+                AND series_mode IN ('latest', 'accumulate')) \
+            OR id = $3 OR (task_id = $1 AND idx = $4) \
+         FOR UPDATE"
+    );
+    let rows = sqlx::query(&select_sql)
+        .bind(&event.task_id)
+        .bind(&state.series_id)
+        .bind(&event.id)
+        .bind(event.index as i32)
+        .fetch_all(&mut **tx)
+        .await?;
+    let existing = rows
+        .iter()
+        .map(PostgresLongTermStore::row_to_event)
+        .collect::<Vec<_>>();
+    if existing.iter().any(|candidate| {
+        candidate.task_id == event.task_id
+            && candidate.series_id.as_deref() == Some(state.series_id.as_str())
+            && (candidate.series_mode.as_ref() != Some(&state.mode)
+                || candidate.series_acc_field != event.series_acc_field)
+    }) {
+        return Err(integrity(&format!(
+            "Archive series semantics conflict for {}",
+            state.series_id
+        )));
+    }
+
+    let identity = existing
+        .iter()
+        .filter(|candidate| {
+            candidate.id == event.id
+                || (candidate.task_id == event.task_id && candidate.index == event.index)
+        })
+        .collect::<Vec<_>>();
+    if identity.len() > 1 {
+        return Err(integrity(&format!(
+            "Archive event identity conflicts at {}:{}",
+            event.task_id, event.index
+        )));
+    }
+    if let Some(identity) = identity.first() {
+        if archive_event_record(identity)? != archive_event_record(event)? {
+            let can_advance_accumulation = state.mode == SeriesMode::Accumulate
+                && identity.task_id == event.task_id
+                && identity.id == event.id
+                && identity.index == event.index
+                && identity.series_id.as_deref() == Some(state.series_id.as_str())
+                && identity.series_mode == Some(SeriesMode::Accumulate)
+                && identity.series_acc_field == event.series_acc_field
+                && state.through_index
+                    > committed
+                        .map(|value| value.through_index)
+                        .unwrap_or(identity.index);
+            if !can_advance_accumulation {
+                return Err(integrity(&format!(
+                    "Archive event identity conflicts at {}:{}",
+                    event.task_id, event.index
+                )));
+            }
+            update_stored_series_event_pg(tx, identity, event).await?;
+        }
+    } else {
+        upsert_canonical_event_pg_tx(tx, event).await?;
+    }
+
+    let delete_sql = format!(
+        "DELETE FROM {EVENTS} WHERE task_id = $1 AND series_id = $2 \
+         AND series_mode IN ('latest', 'accumulate') AND id <> $3"
+    );
+    sqlx::query(&delete_sql)
+        .bind(&event.task_id)
+        .bind(&state.series_id)
+        .bind(&event.id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+fn storage_state_to_string(
+    state: &StorageState,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    enum_value_string(state)
+}
+
+fn enum_value_string<T: serde::Serialize>(
+    value: &T,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    serde_json::to_value(value)?
+        .as_str()
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| integrity("Enum did not serialize as a string"))
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn fits_postgres_bigint(value: f64) -> bool {
+    const JS_MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+    value.is_finite()
+        && value.fract() == 0.0
+        && value >= -JS_MAX_SAFE_INTEGER
+        && value <= JS_MAX_SAFE_INTEGER
+}
+
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
 async fn insert_event_pg_tx(
     tx: &mut Transaction<'_, Postgres>,
     event: &TaskEvent,
@@ -855,6 +2294,55 @@ mod tests {
             .unwrap_err()
             .downcast_ref::<DependencyUnavailableError>()
             .is_some());
+    }
+
+    #[test]
+    fn compact_coverage_uses_utf8_series_order() {
+        let make_event = |index, series_id: &str| TaskEvent {
+            id: format!("event-{index}"),
+            task_id: "task".to_string(),
+            index,
+            timestamp: index as f64,
+            r#type: "delta".to_string(),
+            level: Level::Info,
+            data: JsonValue::Null,
+            series_id: Some(series_id.to_string()),
+            series_mode: Some(SeriesMode::Latest),
+            series_acc_field: None,
+            series_snapshot: None,
+            _accumulated_data: None,
+        };
+        let batch = ArchiveBatch {
+            receipt: ArchiveBatchReceipt {
+                task_id: "task".to_string(),
+                generation: "generation".to_string(),
+                ordinal: 0,
+                previous_batch_digest: None,
+                batch_digest: "0".repeat(64),
+                entry_count: 2,
+                first_index: Some(0),
+                last_index: Some(1),
+            },
+            events: vec![make_event(0, "\u{10000}"), make_event(1, "\u{e000}")],
+            series_latest: vec![],
+        };
+
+        let coverage = build_batch_series_coverage(&batch).unwrap();
+        assert_eq!(
+            coverage
+                .iter()
+                .map(|entry| entry.series_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["\u{e000}", "\u{10000}"]
+        );
+    }
+
+    #[test]
+    fn bigint_validation_matches_javascript_safe_integer_domain() {
+        assert!(fits_postgres_bigint(9_007_199_254_740_991.0));
+        assert!(fits_postgres_bigint(-9_007_199_254_740_991.0));
+        assert!(!fits_postgres_bigint(9_007_199_254_740_992.0));
+        assert!(!fits_postgres_bigint(9_223_372_036_854_775_808.0));
     }
 
     #[test]

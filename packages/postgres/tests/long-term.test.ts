@@ -11,17 +11,20 @@ let sql: ReturnType<typeof postgres>
 let store: PostgresLongTermStore
 
 beforeAll(async () => {
-  container = await new GenericContainer('postgres:16-alpine')
-    .withEnvironment({
-      POSTGRES_USER: 'test',
-      POSTGRES_PASSWORD: 'test',
-      POSTGRES_DB: 'testdb',
-    })
-    .withExposedPorts(5432)
-    .withWaitStrategy(Wait.forLogMessage(/ready to accept connections/, 2))
-    .start()
-  const connUri = `postgres://test:test@localhost:${container.getMappedPort(5432)}/testdb`
-  sql = postgres(connUri)
+  let connection = process.env['TASKCAST_TEST_POSTGRES_URL']
+  if (!connection) {
+    container = await new GenericContainer('postgres:16-alpine')
+      .withEnvironment({
+        POSTGRES_USER: 'test',
+        POSTGRES_PASSWORD: 'test',
+        POSTGRES_DB: 'testdb',
+      })
+      .withExposedPorts(5432)
+      .withWaitStrategy(Wait.forLogMessage(/ready to accept connections/, 2))
+      .start()
+    connection = `postgres://test:test@localhost:${container.getMappedPort(5432)}/testdb`
+  }
+  sql = postgres(connection, { onnotice: () => {} })
   store = new PostgresLongTermStore(sql)
 
   // Run migrations
@@ -200,6 +203,30 @@ describe('PostgresLongTermStore - events', () => {
       seriesMode: 'accumulate',
       seriesAccField: 'delta',
     })
+  })
+
+  it('normalizes an omitted accumulate field to delta across writes', async () => {
+    await store.saveTask(makeTask())
+    const first: TaskEvent = {
+      ...makeEvent('task-1', 0),
+      data: { delta: 'hello ' },
+      seriesId: 'output',
+      seriesMode: 'accumulate',
+    }
+    const second: TaskEvent = {
+      ...makeEvent('task-1', 1),
+      data: { delta: 'world' },
+      seriesId: 'output',
+      seriesMode: 'accumulate',
+    }
+
+    await store.accumulateSeries('task-1', 'output', first, 'delta')
+    await expect(
+      store.accumulateSeries('task-1', 'output', second, 'delta'),
+    ).resolves.toMatchObject({ data: { delta: 'hello world' } })
+    const [state] = await store.getDurableSeriesState('task-1')
+    expect(state?.throughIndex).toBe(1)
+    expect(state?.event.seriesAccField).toBeUndefined()
   })
 
   it('preserves false event data', async () => {

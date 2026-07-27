@@ -63,7 +63,11 @@ describe('cross-compatibility: TS runner with sqlx-style pre-applied migrations'
     const result = await runMigrations(sql, MIGRATIONS_DIR)
 
     expect(result.skipped).toEqual(['001_initial.sql'])
-    expect(result.applied).toEqual(['002_workers.sql', '003_storage_lifecycle.sql'])
+    expect(result.applied).toEqual([
+      '002_workers.sql',
+      '003_storage_lifecycle.sql',
+      '004_archive_receipt_coverage.sql',
+    ])
   })
 
   it('TS-written records have correct sqlx field format', async () => {
@@ -94,5 +98,22 @@ describe('cross-compatibility: TS runner with sqlx-style pre-applied migrations'
     expect(
       Buffer.from(lifecycleRow.checksum as Uint8Array).equals(expectedLifecycleChecksum),
     ).toBe(true)
+
+    const coverageRows = await sql`SELECT * FROM _sqlx_migrations WHERE version = 4`
+    expect(coverageRows).toHaveLength(1)
+    expect(coverageRows[0]!.description).toBe('archive receipt coverage')
+
+    const receiptColumns = await sql`
+      SELECT column_name, is_nullable
+      FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = 'taskcast_archive_batches'
+        AND column_name IN ('previous_digest', 'series_coverage')
+      ORDER BY column_name
+    `
+    expect(receiptColumns).toEqual([
+      { column_name: 'previous_digest', is_nullable: 'YES' },
+      { column_name: 'series_coverage', is_nullable: 'NO' },
+    ])
   })
 })

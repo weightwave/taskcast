@@ -38,6 +38,7 @@ describe('migration runner integration', () => {
       '001_initial.sql',
       '002_workers.sql',
       '003_storage_lifecycle.sql',
+      '004_archive_receipt_coverage.sql',
     ])
     expect(result.skipped).toEqual([])
 
@@ -97,13 +98,14 @@ describe('migration runner integration', () => {
       '001_initial.sql',
       '002_workers.sql',
       '003_storage_lifecycle.sql',
+      '004_archive_receipt_coverage.sql',
     ])
   })
 
   it('writes _sqlx_migrations records with correct format', async () => {
     const rows = await sql`SELECT * FROM _sqlx_migrations ORDER BY version`
 
-    expect(rows).toHaveLength(3)
+    expect(rows).toHaveLength(4)
 
     // Verify migration 001
     const row1 = rows[0]!
@@ -137,6 +139,18 @@ describe('migration runner integration', () => {
     const file3Content = readFileSync(join(MIGRATIONS_DIR, '003_storage_lifecycle.sql'), 'utf8')
     const expectedChecksum3 = computeChecksum(file3Content)
     expect(Buffer.from(row3.checksum as Uint8Array).equals(expectedChecksum3)).toBe(true)
+
+    const row4 = rows[3]!
+    expect(Number(row4.version)).toBe(4)
+    expect(row4.description).toBe('archive receipt coverage')
+    expect(row4.success).toBe(true)
+
+    const file4Content = readFileSync(
+      join(MIGRATIONS_DIR, '004_archive_receipt_coverage.sql'),
+      'utf8',
+    )
+    const expectedChecksum4 = computeChecksum(file4Content)
+    expect(Buffer.from(row4.checksum as Uint8Array).equals(expectedChecksum4)).toBe(true)
   })
 
   it('rejects tampered checksum', async () => {

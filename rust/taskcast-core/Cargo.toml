@@ -13,6 +13,8 @@ serde_yaml = { workspace = true }
 regex = { workspace = true }
 tokio = { workspace = true }
 utoipa = { version = "5", features = ["preserve_order"] }
+sha2 = "0.10"
+ryu-js = "1"
 
 [dev-dependencies]
 tempfile = { workspace = true }

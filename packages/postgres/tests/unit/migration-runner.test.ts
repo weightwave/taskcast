@@ -247,4 +247,17 @@ describe('storage lifecycle migration', () => {
     expect(sql).toContain('taskcast_terminal_outbox')
     expect(sql).not.toMatch(/ALTER\s+TABLE\s+taskcast_events/i)
   })
+
+  it('uses a forward migration for archive receipt compatibility', () => {
+    const sql = readFileSync(
+      join(
+        import.meta.dirname,
+        '../../../../migrations/postgres/004_archive_receipt_coverage.sql',
+      ),
+      'utf8',
+    )
+
+    expect(sql).toMatch(/ALTER\s+COLUMN\s+previous_digest\s+DROP\s+NOT\s+NULL/i)
+    expect(sql).toMatch(/ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+series_coverage/i)
+  })
 })
