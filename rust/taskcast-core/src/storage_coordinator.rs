@@ -34,6 +34,12 @@ struct SourceDescription {
     max_event_timestamp: Option<f64>,
 }
 
+#[derive(Default)]
+struct ReleaseProgress {
+    fence_closed: AtomicBool,
+    hot_deleted: AtomicBool,
+}
+
 impl StorageCoordinator {
     pub fn new(
         short_term_store: Arc<dyn ShortTermStore>,
@@ -430,8 +436,7 @@ impl StorageCoordinator {
             .await?
             .ok_or_else(|| boxed(StorageBusyError::default()))?;
         let lease_lost = AtomicBool::new(false);
-        let fence_closed = AtomicBool::new(false);
-        let hot_deleted = AtomicBool::new(false);
+        let progress = ReleaseProgress::default();
 
         let result = self
             .release_owned(
@@ -440,14 +445,13 @@ impl StorageCoordinator {
                 metadata,
                 &lease,
                 &lease_lost,
-                &fence_closed,
-                &hot_deleted,
+                &progress,
             )
             .await;
         if result.is_err()
             && !lease_lost.load(Ordering::SeqCst)
-            && fence_closed.load(Ordering::SeqCst)
-            && !hot_deleted.load(Ordering::SeqCst)
+            && progress.fence_closed.load(Ordering::SeqCst)
+            && !progress.hot_deleted.load(Ordering::SeqCst)
         {
             self.reopen_after_failure(task_id, &lease).await;
         }
@@ -720,8 +724,7 @@ impl StorageCoordinator {
         mut metadata: TaskStorageMetadata,
         lease: &StorageLease,
         lease_lost: &AtomicBool,
-        fence_closed: &AtomicBool,
-        hot_deleted: &AtomicBool,
+        progress: &ReleaseProgress,
     ) -> StorageResult<ReleaseResult> {
         let writers = self.short_term_store.list_storage_writers().await?;
         let incompatible = writers
@@ -743,7 +746,7 @@ impl StorageCoordinator {
             .short_term_store
             .close_write_fence(lease, metadata.storage_epoch)
             .await?;
-        fence_closed.store(true, Ordering::SeqCst);
+        progress.fence_closed.store(true, Ordering::SeqCst);
         if closed.high_watermark != preconditions.expected_last_event_index {
             return Err(boxed(StoragePreconditionError::new(
                 "Task event index changed before storage release",
@@ -857,7 +860,7 @@ impl StorageCoordinator {
         self.short_term_store
             .delete_task_storage_fenced(lease, metadata.storage_epoch)
             .await?;
-        hot_deleted.store(true, Ordering::SeqCst);
+        progress.hot_deleted.store(true, Ordering::SeqCst);
         self.renew(lease, lease_lost).await?;
         let cold = TaskStorageMetadata {
             storage_state: StorageState::Cold,

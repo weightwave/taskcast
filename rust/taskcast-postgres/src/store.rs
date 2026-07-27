@@ -1651,7 +1651,7 @@ impl LongTermStore for PostgresLongTermStore {
         if batch
             .receipt
             .first_index
-            .map_or(true, |index| index as i64 <= previous_last_index)
+            .is_none_or(|index| index as i64 <= previous_last_index)
         {
             return Err(integrity(
                 "Archive batch source coverage overlaps or goes backwards",
@@ -1842,9 +1842,7 @@ impl LongTermStore for PostgresLongTermStore {
                 }
                 let should_replace = staged_series
                     .get(&current.series_id)
-                    .map_or(true, |previous| {
-                        current.through_index > previous.through_index
-                    });
+                    .is_none_or(|previous| current.through_index > previous.through_index);
                 if should_replace {
                     staged_series.insert(current.series_id.clone(), current);
                 }
@@ -3035,8 +3033,7 @@ fn fits_postgres_bigint(value: f64) -> bool {
     const JS_MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
     value.is_finite()
         && value.fract() == 0.0
-        && value >= -JS_MAX_SAFE_INTEGER
-        && value <= JS_MAX_SAFE_INTEGER
+        && (-JS_MAX_SAFE_INTEGER..=JS_MAX_SAFE_INTEGER).contains(&value)
 }
 
 fn now_millis() -> i64 {

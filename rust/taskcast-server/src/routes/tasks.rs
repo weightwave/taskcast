@@ -12,9 +12,9 @@ use taskcast_core::{
     AssignMode, BlockedRequest, CleanupConfig, CreateTaskInput, DisconnectPolicy, EngineError,
     EventQueryOptions, Level, PermissionScope, PublishEventInput, ReleasePreconditions,
     ReleaseResult, SeriesMode, SinceCursor, StorageBusyError, StorageFenceConflictError,
-    StorageIntegrityError, StoragePreconditionError, StorageReleaseUnsupportedError,
-    StorageUnavailableError, TaskArchive, TaskArchiveImportOptions, TaskAuthConfig, TaskEngine,
-    TaskError, TaskFilter, TaskStatus, TransitionPayload, WebhookConfig,
+    StorageIntegrityError, StoragePreconditionError, StorageReleaseUnsupportedError, TaskArchive,
+    TaskArchiveImportOptions, TaskAuthConfig, TaskEngine, TaskError, TaskFilter, TaskStatus,
+    TransitionPayload, WebhookConfig,
 };
 
 use crate::app::StorageWriterHeartbeat;
@@ -433,12 +433,6 @@ fn storage_engine_error_response(error: EngineError) -> axum::response::Response
                     StatusCode::SERVICE_UNAVAILABLE,
                     &message,
                     Some("storage_release_unsupported"),
-                )
-            } else if source.downcast_ref::<StorageUnavailableError>().is_some() {
-                storage_error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    &message,
-                    Some("storage_unavailable"),
                 )
             } else {
                 storage_error_response(
