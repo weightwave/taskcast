@@ -262,6 +262,10 @@ impl LongTermStore for PostgresLongTermStore {
         true
     }
 
+    fn supports_task_creation_claims(&self) -> bool {
+        true
+    }
+
     async fn save_task(&self, task: Task) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.observed(|| async move {
             let params_json: Option<JsonValue> = task
@@ -370,6 +374,284 @@ impl LongTermStore for PostgresLongTermStore {
             Ok(())
         })
         .await
+    }
+
+    async fn create_task_if_absent(
+        &self,
+        task: Task,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let params_json = task.params.as_ref().map(serde_json::to_value).transpose()?;
+        let result_json = task.result.as_ref().map(serde_json::to_value).transpose()?;
+        let error_json = task.error.as_ref().map(serde_json::to_value).transpose()?;
+        let metadata_json = task
+            .metadata
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()?;
+        let auth_config_json = task
+            .auth_config
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()?;
+        let webhooks_json = task
+            .webhooks
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()?;
+        let cleanup_json = task
+            .cleanup
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()?;
+        let tags_json = task.tags.as_ref().map(serde_json::to_value).transpose()?;
+        let assign_mode = task
+            .assign_mode
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()?
+            .and_then(|value| value.as_str().map(str::to_string));
+        let disconnect_policy = task
+            .disconnect_policy
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()?
+            .and_then(|value| value.as_str().map(str::to_string));
+        let status = serde_json::to_value(&task.status)?
+            .as_str()
+            .unwrap_or("pending")
+            .to_string();
+        let sql = format!(
+            r#"
+            INSERT INTO {TASKS} (
+                id, type, status, params, result, error, metadata,
+                auth_config, webhooks, cleanup, created_at, updated_at, completed_at, ttl,
+                tags, assign_mode, cost, assigned_worker, disconnect_policy
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+                $15, $16, $17, $18, $19
+            )
+            ON CONFLICT (id) DO NOTHING
+            "#
+        );
+        let result = sqlx::query(&sql)
+            .bind(&task.id)
+            .bind(&task.r#type)
+            .bind(status)
+            .bind(params_json)
+            .bind(result_json)
+            .bind(error_json)
+            .bind(metadata_json)
+            .bind(auth_config_json)
+            .bind(webhooks_json)
+            .bind(cleanup_json)
+            .bind(task.created_at as i64)
+            .bind(task.updated_at as i64)
+            .bind(task.completed_at.map(|value| value as i64))
+            .bind(task.ttl.map(|value| value as i32))
+            .bind(tags_json)
+            .bind(assign_mode)
+            .bind(task.cost.map(|value| value as i32))
+            .bind(&task.assigned_worker)
+            .bind(disconnect_policy)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn claim_task_creation(
+        &self,
+        task: Task,
+        creation_token: &str,
+        claim_ttl_ms: u64,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        if claim_ttl_ms == 0 {
+            return Err(integrity("Creation claim TTL must be positive"));
+        }
+        let params_json = task.params.as_ref().map(serde_json::to_value).transpose()?;
+        let result_json = task.result.as_ref().map(serde_json::to_value).transpose()?;
+        let error_json = task.error.as_ref().map(serde_json::to_value).transpose()?;
+        let metadata_json = task
+            .metadata
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()?;
+        let auth_config_json = task
+            .auth_config
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()?;
+        let webhooks_json = task
+            .webhooks
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()?;
+        let cleanup_json = task
+            .cleanup
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()?;
+        let tags_json = task.tags.as_ref().map(serde_json::to_value).transpose()?;
+        let assign_mode = task
+            .assign_mode
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()?
+            .and_then(|value| value.as_str().map(str::to_string));
+        let disconnect_policy = task
+            .disconnect_policy
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()?
+            .and_then(|value| value.as_str().map(str::to_string));
+        let status = serde_json::to_value(&task.status)?
+            .as_str()
+            .unwrap_or("pending")
+            .to_string();
+        let sql = format!(
+            r#"
+            INSERT INTO {TASKS} (
+                id, type, status, params, result, error, metadata,
+                auth_config, webhooks, cleanup, created_at, updated_at, completed_at, ttl,
+                tags, assign_mode, cost, assigned_worker, disconnect_policy,
+                creation_token, creation_claimed_at, creation_claim_expires_at,
+                creation_completed_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+                $15, $16, $17, $18, $19, $20,
+                FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT,
+                FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT + $21,
+                NULL
+            )
+            ON CONFLICT (id) DO UPDATE SET
+                type = EXCLUDED.type,
+                status = EXCLUDED.status,
+                params = EXCLUDED.params,
+                result = EXCLUDED.result,
+                error = EXCLUDED.error,
+                metadata = EXCLUDED.metadata,
+                auth_config = EXCLUDED.auth_config,
+                webhooks = EXCLUDED.webhooks,
+                cleanup = EXCLUDED.cleanup,
+                created_at = EXCLUDED.created_at,
+                updated_at = EXCLUDED.updated_at,
+                completed_at = EXCLUDED.completed_at,
+                ttl = EXCLUDED.ttl,
+                tags = EXCLUDED.tags,
+                assign_mode = EXCLUDED.assign_mode,
+                cost = EXCLUDED.cost,
+                assigned_worker = EXCLUDED.assigned_worker,
+                disconnect_policy = EXCLUDED.disconnect_policy,
+                creation_token = EXCLUDED.creation_token,
+                creation_claimed_at = EXCLUDED.creation_claimed_at,
+                creation_claim_expires_at = EXCLUDED.creation_claim_expires_at,
+                creation_completed_at = NULL
+            WHERE {TASKS}.creation_token IS NOT NULL
+              AND {TASKS}.creation_completed_at IS NULL
+              AND (
+                {TASKS}.creation_claim_expires_at IS NULL
+                OR {TASKS}.creation_claim_expires_at <=
+                  FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT
+              )
+              AND {TASKS}.status = 'pending'
+              AND {TASKS}.updated_at = {TASKS}.created_at
+              AND {TASKS}.result IS NULL
+              AND {TASKS}.error IS NULL
+              AND {TASKS}.completed_at IS NULL
+              AND {TASKS}.storage_state = 'hot'
+              AND {TASKS}.storage_epoch = 1
+              AND {TASKS}.active_release_generation IS NULL
+              AND {TASKS}.archive_watermark = -1
+              AND {TASKS}.last_event_at IS NULL
+              AND {TASKS}.cold_at IS NULL
+              AND {TASKS}.task_version = 0
+              AND NOT EXISTS (
+                SELECT 1 FROM {EVENTS} AS event WHERE event.task_id = {TASKS}.id
+              )
+            "#
+        );
+        let result = sqlx::query(&sql)
+            .bind(&task.id)
+            .bind(&task.r#type)
+            .bind(status)
+            .bind(params_json)
+            .bind(result_json)
+            .bind(error_json)
+            .bind(metadata_json)
+            .bind(auth_config_json)
+            .bind(webhooks_json)
+            .bind(cleanup_json)
+            .bind(task.created_at as i64)
+            .bind(task.updated_at as i64)
+            .bind(task.completed_at.map(|value| value as i64))
+            .bind(task.ttl.map(|value| value as i32))
+            .bind(tags_json)
+            .bind(assign_mode)
+            .bind(task.cost.map(|value| value as i32))
+            .bind(&task.assigned_worker)
+            .bind(disconnect_policy)
+            .bind(creation_token)
+            .bind(claim_ttl_ms as i64)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn complete_task_creation(
+        &self,
+        task_id: &str,
+        creation_token: &str,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let sql = format!(
+            "UPDATE {TASKS} \
+             SET creation_completed_at = COALESCE(\
+                   creation_completed_at, \
+                   FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT\
+                 ), \
+                 creation_claim_expires_at = NULL \
+             WHERE id = $1 AND creation_token = $2"
+        );
+        let result = sqlx::query(&sql)
+            .bind(task_id)
+            .bind(creation_token)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn abort_task_creation(
+        &self,
+        task_id: &str,
+        creation_token: &str,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let sql = format!(
+            r#"
+            DELETE FROM {TASKS} AS task
+            WHERE task.id = $1
+              AND task.creation_token = $2
+              AND task.creation_completed_at IS NULL
+              AND task.status = 'pending'
+              AND task.updated_at = task.created_at
+              AND task.result IS NULL
+              AND task.error IS NULL
+              AND task.completed_at IS NULL
+              AND task.storage_state = 'hot'
+              AND task.storage_epoch = 1
+              AND task.active_release_generation IS NULL
+              AND task.archive_watermark = -1
+              AND task.last_event_at IS NULL
+              AND task.cold_at IS NULL
+              AND task.task_version = 0
+              AND NOT EXISTS (
+                SELECT 1 FROM {EVENTS} AS event WHERE event.task_id = task.id
+              )
+            "#
+        );
+        let result = sqlx::query(&sql)
+            .bind(task_id)
+            .bind(creation_token)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() == 1)
     }
 
     async fn get_task(

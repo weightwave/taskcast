@@ -81,6 +81,177 @@ export class PostgresLongTermStore implements LongTermStore {
     })
   }
 
+  async createTaskIfAbsent(task: Task): Promise<boolean> {
+    return this.insertTaskIfAbsent(task, null)
+  }
+
+  async claimTaskCreation(
+    task: Task,
+    creationToken: string,
+    claimTtlMs: number,
+  ): Promise<boolean> {
+    if (claimTtlMs <= 0) {
+      throw new StorageIntegrityError('Creation claim TTL must be positive')
+    }
+    const t = TASKS
+    const e = EVENTS
+    const rows = await this.sql`
+      INSERT INTO ${this.sql(t)} (
+        id, type, status, params, result, error, metadata,
+        auth_config, webhooks, cleanup, created_at, updated_at, completed_at, ttl,
+        tags, assign_mode, cost, assigned_worker, disconnect_policy,
+        creation_token, creation_claimed_at, creation_claim_expires_at,
+        creation_completed_at
+      ) VALUES (
+        ${task.id}, ${task.type ?? null}, ${task.status},
+        ${task.params ? this.sql.json(task.params as never) : null},
+        ${task.result ? this.sql.json(task.result as never) : null},
+        ${task.error ? this.sql.json(task.error as never) : null},
+        ${task.metadata ? this.sql.json(task.metadata as never) : null},
+        ${task.authConfig ? this.sql.json(task.authConfig as never) : null},
+        ${task.webhooks ? this.sql.json(task.webhooks as never) : null},
+        ${task.cleanup ? this.sql.json(task.cleanup as never) : null},
+        ${task.createdAt}, ${task.updatedAt},
+        ${task.completedAt ?? null}, ${task.ttl ?? null},
+        ${task.tags ? this.sql.json(task.tags as never) : null},
+        ${task.assignMode ?? null},
+        ${task.cost ?? null},
+        ${task.assignedWorker ?? null},
+        ${task.disconnectPolicy ?? null},
+        ${creationToken},
+        FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT,
+        FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT + ${claimTtlMs},
+        NULL
+      )
+      ON CONFLICT (id) DO UPDATE SET
+        type = EXCLUDED.type,
+        status = EXCLUDED.status,
+        params = EXCLUDED.params,
+        result = EXCLUDED.result,
+        error = EXCLUDED.error,
+        metadata = EXCLUDED.metadata,
+        auth_config = EXCLUDED.auth_config,
+        webhooks = EXCLUDED.webhooks,
+        cleanup = EXCLUDED.cleanup,
+        created_at = EXCLUDED.created_at,
+        updated_at = EXCLUDED.updated_at,
+        completed_at = EXCLUDED.completed_at,
+        ttl = EXCLUDED.ttl,
+        tags = EXCLUDED.tags,
+        assign_mode = EXCLUDED.assign_mode,
+        cost = EXCLUDED.cost,
+        assigned_worker = EXCLUDED.assigned_worker,
+        disconnect_policy = EXCLUDED.disconnect_policy,
+        creation_token = EXCLUDED.creation_token,
+        creation_claimed_at = EXCLUDED.creation_claimed_at,
+        creation_claim_expires_at = EXCLUDED.creation_claim_expires_at,
+        creation_completed_at = NULL
+      WHERE ${this.sql(t)}.creation_token IS NOT NULL
+        AND ${this.sql(t)}.creation_completed_at IS NULL
+        AND (
+          ${this.sql(t)}.creation_claim_expires_at IS NULL
+          OR ${this.sql(t)}.creation_claim_expires_at <=
+            FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT
+        )
+        AND ${this.sql(t)}.status = 'pending'
+        AND ${this.sql(t)}.updated_at = ${this.sql(t)}.created_at
+        AND ${this.sql(t)}.result IS NULL
+        AND ${this.sql(t)}.error IS NULL
+        AND ${this.sql(t)}.completed_at IS NULL
+        AND ${this.sql(t)}.storage_state = 'hot'
+        AND ${this.sql(t)}.storage_epoch = 1
+        AND ${this.sql(t)}.active_release_generation IS NULL
+        AND ${this.sql(t)}.archive_watermark = -1
+        AND ${this.sql(t)}.last_event_at IS NULL
+        AND ${this.sql(t)}.cold_at IS NULL
+        AND ${this.sql(t)}.task_version = 0
+        AND NOT EXISTS (
+          SELECT 1 FROM ${this.sql(e)} AS event
+          WHERE event.task_id = ${this.sql(t)}.id
+        )
+      RETURNING id
+    `
+    return rows.length === 1
+  }
+
+  async completeTaskCreation(taskId: string, creationToken: string): Promise<boolean> {
+    const t = TASKS
+    const rows = await this.sql`
+      UPDATE ${this.sql(t)}
+      SET creation_completed_at = COALESCE(
+            creation_completed_at,
+            FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT
+          ),
+          creation_claim_expires_at = NULL
+      WHERE id = ${taskId}
+        AND creation_token = ${creationToken}
+      RETURNING id
+    `
+    return rows.length === 1
+  }
+
+  async abortTaskCreation(taskId: string, creationToken: string): Promise<boolean> {
+    const t = TASKS
+    const e = EVENTS
+    const rows = await this.sql`
+      DELETE FROM ${this.sql(t)} AS task
+      WHERE task.id = ${taskId}
+        AND task.creation_token = ${creationToken}
+        AND task.creation_completed_at IS NULL
+        AND task.status = 'pending'
+        AND task.updated_at = task.created_at
+        AND task.result IS NULL
+        AND task.error IS NULL
+        AND task.completed_at IS NULL
+        AND task.storage_state = 'hot'
+        AND task.storage_epoch = 1
+        AND task.active_release_generation IS NULL
+        AND task.archive_watermark = -1
+        AND task.last_event_at IS NULL
+        AND task.cold_at IS NULL
+        AND task.task_version = 0
+        AND NOT EXISTS (
+          SELECT 1 FROM ${this.sql(e)} AS event WHERE event.task_id = task.id
+        )
+      RETURNING task.id
+    `
+    return rows.length === 1
+  }
+
+  private async insertTaskIfAbsent(
+    task: Task,
+    creationToken: string | null,
+  ): Promise<boolean> {
+    const t = TASKS
+    const rows = await this.sql`
+      INSERT INTO ${this.sql(t)} (
+        id, type, status, params, result, error, metadata,
+        auth_config, webhooks, cleanup, created_at, updated_at, completed_at, ttl,
+        tags, assign_mode, cost, assigned_worker, disconnect_policy, creation_token
+      ) VALUES (
+        ${task.id}, ${task.type ?? null}, ${task.status},
+        ${task.params ? this.sql.json(task.params as never) : null},
+        ${task.result ? this.sql.json(task.result as never) : null},
+        ${task.error ? this.sql.json(task.error as never) : null},
+        ${task.metadata ? this.sql.json(task.metadata as never) : null},
+        ${task.authConfig ? this.sql.json(task.authConfig as never) : null},
+        ${task.webhooks ? this.sql.json(task.webhooks as never) : null},
+        ${task.cleanup ? this.sql.json(task.cleanup as never) : null},
+        ${task.createdAt}, ${task.updatedAt},
+        ${task.completedAt ?? null}, ${task.ttl ?? null},
+        ${task.tags ? this.sql.json(task.tags as never) : null},
+        ${task.assignMode ?? null},
+        ${task.cost ?? null},
+        ${task.assignedWorker ?? null},
+        ${task.disconnectPolicy ?? null},
+        ${creationToken}
+      )
+      ON CONFLICT (id) DO NOTHING
+      RETURNING id
+    `
+    return rows.length === 1
+  }
+
   private async saveTaskWithClient(sql: PostgresClient, task: Task): Promise<void> {
     const t = TASKS
     await sql`

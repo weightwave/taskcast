@@ -297,6 +297,16 @@ export interface HotWriteToken {
   storageEpoch: number
 }
 
+/**
+ * A task plus an opaque compare-and-set token for its exact hot-store record.
+ * Redis adapters use the raw serialized task so writes from older instances
+ * that do not maintain a separate revision key are still detected.
+ */
+export interface TaskMutationSnapshot {
+  task: Task
+  revision: string
+}
+
 export interface StorageLease {
   taskId: string
   lockToken: string
@@ -535,6 +545,15 @@ export interface ShortTermStore {
     event: Omit<TaskEvent, 'index'>,
     token: HotWriteToken,
   ): Promise<SeriesResult>
+  /** Atomically reads a task and the opaque token for its current mutation. */
+  getTaskMutationSnapshot?(taskId: string): Promise<TaskMutationSnapshot | null>
+  /** Atomically stores a task mutation and its derived non-series events. */
+  commitTaskEventsFenced?(
+    task: Task,
+    expectedRevision: string,
+    events: Omit<TaskEvent, 'index'>[],
+    token: HotWriteToken,
+  ): Promise<TaskEvent[] | null>
   saveTaskFenced?(task: Task, token: HotWriteToken): Promise<void>
   readArchiveSourcePage?(
     taskId: string,
@@ -583,6 +602,14 @@ export interface LongTermStore {
   /** True only when deadline claims and terminal projection are durable. */
   readonly supportsDurableTtl?: boolean
   saveTask(task: Task): Promise<void>
+  /** Atomically claims a durable task identity. Returns false when it already exists. */
+  createTaskIfAbsent?(task: Task): Promise<boolean>
+  /** Claims an explicit task identity until its hot copy is created. */
+  claimTaskCreation?(task: Task, creationToken: string, claimTtlMs: number): Promise<boolean>
+  /** Marks a claimed identity as fully created. */
+  completeTaskCreation?(taskId: string, creationToken: string): Promise<boolean>
+  /** Removes only the pristine identity owned by this creation token. */
+  abortTaskCreation?(taskId: string, creationToken: string): Promise<boolean>
   getTask(taskId: string): Promise<Task | null>
   saveEvent(event: TaskEvent): Promise<void>
   /** Optional series-aware durable write for latest-mode series. */

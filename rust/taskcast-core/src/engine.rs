@@ -9,12 +9,14 @@ use crate::archive::{
     ArchiveError, TASK_ARCHIVE_SCHEMA, TASK_ARCHIVE_VERSION,
 };
 use crate::series::process_series;
+use crate::storage_coordinator::StorageCoordinator;
 use serde::{Deserialize, Serialize};
 
 use crate::state_machine::{can_transition, is_suspended, is_terminal};
 use crate::types::{
     AssignMode, BlockedRequest, BroadcastProvider, CleanupConfig, DisconnectPolicy,
-    EventQueryOptions, Level, LongTermStore, SeriesMode, ShortTermStore, Task, TaskArchive,
+    EventQueryOptions, Level, LongTermStore, ReleasePreconditions, ReleaseResult, SeriesMode,
+    ShortTermStore, StorageFenceConflictError, StorageReleaseUnsupportedError, Task, TaskArchive,
     TaskArchiveImportOptions, TaskArchiveImportResult, TaskAuthConfig, TaskError, TaskEvent,
     TaskFilter, TaskStatus, TaskcastHooks, WebhookConfig,
 };
@@ -106,6 +108,7 @@ pub struct TaskEngine {
     short_term_store: Arc<dyn ShortTermStore>,
     broadcast: Arc<dyn BroadcastProvider>,
     long_term_store: Option<Arc<dyn LongTermStore>>,
+    storage_coordinator: Option<StorageCoordinator>,
     hooks: Option<Arc<dyn TaskcastHooks>>,
     transition_listeners: Mutex<Vec<TransitionListener>>,
     creation_listeners: Mutex<Vec<CreationListener>>,
@@ -115,11 +118,26 @@ pub struct TaskEngine {
 }
 
 impl TaskEngine {
+    const CREATION_CLAIM_TTL_MS: u64 = 30_000;
+
     pub fn new(opts: TaskEngineOptions) -> Self {
+        let storage_coordinator = opts.long_term_store.as_ref().and_then(|long_term_store| {
+            if opts.short_term_store.supports_hot_cold_release()
+                && long_term_store.supports_hot_cold_release()
+            {
+                Some(StorageCoordinator::new(
+                    Arc::clone(&opts.short_term_store),
+                    Arc::clone(long_term_store),
+                ))
+            } else {
+                None
+            }
+        });
         Self {
             short_term_store: opts.short_term_store,
             broadcast: opts.broadcast,
             long_term_store: opts.long_term_store,
+            storage_coordinator,
             hooks: opts.hooks,
             transition_listeners: Mutex::new(Vec::new()),
             creation_listeners: Mutex::new(Vec::new()),
@@ -158,26 +176,17 @@ impl TaskEngine {
             .id
             .clone()
             .unwrap_or_else(|| ulid::Ulid::new().to_string());
+        let can_fence_creation = self
+            .long_term_store
+            .as_ref()
+            .is_some_and(|store| store.supports_task_creation_claims());
 
-        // Check for duplicate user-supplied IDs
-        if input.id.is_some() {
-            let existing = self.short_term_store.get_task(&id).await?;
-            if existing.is_some() {
-                return Err(EngineError::TaskConflict(id));
-            }
-        }
-
-        let now = now_millis();
-        let id = input
-            .id
-            .clone()
-            .unwrap_or_else(|| ulid::Ulid::new().to_string());
-
-        // Check for duplicate explicit ID
-        if input.id.is_some() && self.short_term_store.get_task(&id).await?.is_some() {
+        // Explicit IDs are durable identities, including while hot state is cold.
+        if input.id.is_some() && !can_fence_creation && self.get_task(&id).await?.is_some() {
             return Err(EngineError::TaskConflict(id));
         }
 
+        let now = now_millis();
         let task = Task {
             id,
             status: TaskStatus::Pending,
@@ -203,10 +212,75 @@ impl TaskEngine {
             blocked_request: None,
         };
 
-        self.short_term_store.save_task(task.clone()).await?;
+        let mut durable_identity_claimed = false;
+        let mut creation_token = None;
+        if input.id.is_some() {
+            if let Some(ref long_term_store) = self.long_term_store {
+                if long_term_store.supports_task_creation_claims() {
+                    let token = ulid::Ulid::new().to_string();
+                    durable_identity_claimed = long_term_store
+                        .claim_task_creation(task.clone(), &token, Self::CREATION_CLAIM_TTL_MS)
+                        .await?;
+                    creation_token = Some(token);
+                } else if long_term_store.supports_hot_cold_release() {
+                    return Err(EngineError::Store(Box::new(
+                        StorageReleaseUnsupportedError::new(
+                            "Hot/cold long-term stores must support token-fenced task creation",
+                        ),
+                    )));
+                } else {
+                    durable_identity_claimed =
+                        long_term_store.create_task_if_absent(task.clone()).await?;
+                }
+                if !durable_identity_claimed {
+                    return Err(EngineError::TaskConflict(task.id.clone()));
+                }
+            }
+        }
+        if let Err(error) = self.short_term_store.save_task(task.clone()).await {
+            if let (Some(long_term_store), Some(token)) =
+                (self.long_term_store.as_ref(), creation_token.as_ref())
+            {
+                long_term_store.abort_task_creation(&task.id, token).await?;
+            }
+            return Err(EngineError::Store(error));
+        }
 
-        if let Some(ref long_term_store) = self.long_term_store {
-            long_term_store.save_task(task.clone()).await?;
+        if let (Some(long_term_store), Some(token)) =
+            (self.long_term_store.as_ref(), creation_token.as_ref())
+        {
+            let mut completed = false;
+            let mut completion_error = None;
+            for _ in 0..3 {
+                match long_term_store
+                    .complete_task_creation(&task.id, token)
+                    .await
+                {
+                    Ok(value) => {
+                        completed = value;
+                        completion_error = None;
+                        if completed {
+                            break;
+                        }
+                    }
+                    Err(error) => completion_error = Some(error),
+                }
+            }
+            if let Some(error) = completion_error {
+                return Err(EngineError::Store(error));
+            }
+            if !completed {
+                return Err(EngineError::Store(Box::new(
+                    StorageReleaseUnsupportedError::new(format!(
+                        "Durable creation claim was lost for task {}",
+                        task.id
+                    )),
+                )));
+            }
+        } else if !durable_identity_claimed {
+            if let Some(ref long_term_store) = self.long_term_store {
+                long_term_store.save_task(task.clone()).await?;
+            }
         }
 
         if let Some(ttl) = task.ttl {
@@ -255,10 +329,22 @@ impl TaskEngine {
         to: TaskStatus,
         payload: Option<TransitionPayload>,
     ) -> Result<Task, EngineError> {
-        let task = self
-            .get_task(task_id)
-            .await?
-            .ok_or_else(|| EngineError::TaskNotFound(task_id.to_string()))?;
+        let (task, expected_revision) = if let Some(coordinator) = &self.storage_coordinator {
+            coordinator.ensure_task_hot_for_write(task_id).await?;
+            let snapshot = self
+                .short_term_store
+                .get_task_mutation_snapshot(task_id)
+                .await?
+                .ok_or_else(|| EngineError::TaskNotFound(task_id.to_string()))?;
+            (snapshot.task, Some(snapshot.revision))
+        } else {
+            (
+                self.get_task(task_id)
+                    .await?
+                    .ok_or_else(|| EngineError::TaskNotFound(task_id.to_string()))?,
+                None,
+            )
+        };
 
         let from = task.status.clone();
 
@@ -349,28 +435,18 @@ impl TaskEngine {
             }
         }
 
-        self.short_term_store.save_task(updated.clone()).await?;
-
-        if let Some(ref long_term_store) = self.long_term_store {
-            long_term_store.save_task(updated.clone()).await?;
-        }
-
-        self.emit(
-            task_id,
-            PublishEventInput {
-                r#type: "taskcast:status".to_string(),
-                level: Level::Info,
-                data: serde_json::json!({
-                    "status": to,
-                    "result": updated.result,
-                    "error": updated.error,
-                }),
-                series_id: None,
-                series_mode: None,
-                series_acc_field: None,
-            },
-        )
-        .await?;
+        let mut derived_events = vec![PublishEventInput {
+            r#type: "taskcast:status".to_string(),
+            level: Level::Info,
+            data: serde_json::json!({
+                "status": to,
+                "result": updated.result,
+                "error": updated.error,
+            }),
+            series_id: None,
+            series_mode: None,
+            series_acc_field: None,
+        }];
 
         // Emit taskcast:blocked event when entering blocked with blockedRequest
         if to == TaskStatus::Blocked {
@@ -386,18 +462,14 @@ impl TaskEngine {
                     "request".to_string(),
                     serde_json::to_value(blocked_request).unwrap(),
                 );
-                self.emit(
-                    task_id,
-                    PublishEventInput {
-                        r#type: "taskcast:blocked".to_string(),
-                        level: Level::Info,
-                        data: serde_json::Value::Object(data),
-                        series_id: None,
-                        series_mode: None,
-                        series_acc_field: None,
-                    },
-                )
-                .await?;
+                derived_events.push(PublishEventInput {
+                    r#type: "taskcast:blocked".to_string(),
+                    level: Level::Info,
+                    data: serde_json::Value::Object(data),
+                    series_id: None,
+                    series_mode: None,
+                    series_acc_field: None,
+                });
             }
         }
 
@@ -407,18 +479,39 @@ impl TaskEngine {
             && task.blocked_request.is_some()
         {
             let resolution = payload.as_ref().and_then(|p| p.result.clone());
-            self.emit(
-                task_id,
-                PublishEventInput {
-                    r#type: "taskcast:resolved".to_string(),
-                    level: Level::Info,
-                    data: serde_json::json!({ "resolution": resolution }),
-                    series_id: None,
-                    series_mode: None,
-                    series_acc_field: None,
-                },
-            )
-            .await?;
+            derived_events.push(PublishEventInput {
+                r#type: "taskcast:resolved".to_string(),
+                level: Level::Info,
+                data: serde_json::json!({ "resolution": resolution }),
+                series_id: None,
+                series_mode: None,
+                series_acc_field: None,
+            });
+        }
+
+        if self.storage_coordinator.is_some() {
+            let committed = self
+                .commit_task_events_for_mutation(
+                    updated.clone(),
+                    expected_revision.as_deref().unwrap_or_default(),
+                    &from,
+                    derived_events,
+                )
+                .await?;
+            if let Some(ref long_term_store) = self.long_term_store {
+                long_term_store.save_task(updated.clone()).await?;
+            }
+            for event in committed {
+                self.finish_committed_event(event, None).await?;
+            }
+        } else {
+            self.short_term_store.save_task(updated.clone()).await?;
+            if let Some(ref long_term_store) = self.long_term_store {
+                long_term_store.save_task(updated.clone()).await?;
+            }
+            for event in derived_events {
+                self.emit(task_id, event, true).await?;
+            }
         }
 
         // Clean up per-task emit lock — no more events can be published
@@ -458,7 +551,27 @@ impl TaskEngine {
             return Err(EngineError::TaskTerminal(task.status));
         }
 
-        self.emit(task_id, input).await
+        self.emit(task_id, input, false).await
+    }
+
+    pub async fn release_task_storage(
+        &self,
+        task_id: &str,
+        preconditions: ReleasePreconditions,
+    ) -> Result<ReleaseResult, EngineError> {
+        let coordinator = self.storage_coordinator.as_ref().ok_or_else(|| {
+            EngineError::Store(Box::new(StorageReleaseUnsupportedError::default()))
+        })?;
+        Ok(coordinator
+            .release_task_storage(task_id, preconditions)
+            .await?)
+    }
+
+    pub async fn recover_task_storage(&self, task_id: &str) -> Result<ReleaseResult, EngineError> {
+        let coordinator = self.storage_coordinator.as_ref().ok_or_else(|| {
+            EngineError::Store(Box::new(StorageReleaseUnsupportedError::default()))
+        })?;
+        Ok(coordinator.recover_task_storage(task_id).await?)
     }
 
     pub async fn export_task_archive(&self, task_id: &str) -> Result<TaskArchive, EngineError> {
@@ -758,6 +871,7 @@ impl TaskEngine {
         &self,
         task_id: &str,
         input: PublishEventInput,
+        allow_terminal: bool,
     ) -> Result<TaskEvent, EngineError> {
         // Acquire per-task lock to serialize event storage + broadcast,
         // preventing race conditions where concurrent publishes could
@@ -770,6 +884,57 @@ impl TaskEngine {
                 .clone()
         };
         let _guard = emit_lock.lock().await;
+        if !allow_terminal {
+            let current = self
+                .get_task(task_id)
+                .await?
+                .ok_or_else(|| EngineError::TaskNotFound(task_id.to_string()))?;
+            if is_terminal(&current.status) {
+                return Err(EngineError::TaskTerminal(current.status));
+            }
+        }
+
+        if let Some(coordinator) = &self.storage_coordinator {
+            let raw = TaskEvent {
+                id: ulid::Ulid::new().to_string(),
+                task_id: task_id.to_string(),
+                index: 0,
+                timestamp: now_millis(),
+                r#type: input.r#type,
+                level: input.level,
+                data: input.data,
+                series_id: input.series_id,
+                series_mode: input.series_mode,
+                series_acc_field: input.series_acc_field,
+                series_snapshot: None,
+                _accumulated_data: None,
+            };
+            for attempt in 0..3 {
+                let token = coordinator.ensure_task_hot_for_write(task_id).await?;
+                match self
+                    .short_term_store
+                    .commit_event_fenced(task_id, raw.clone(), &token)
+                    .await
+                {
+                    Ok(series_result) => {
+                        let event = series_result.event;
+                        self.finish_committed_event(event.clone(), series_result.accumulated_event)
+                            .await?;
+                        return Ok(event);
+                    }
+                    Err(error)
+                        if error.downcast_ref::<StorageFenceConflictError>().is_some()
+                            && attempt < 2 =>
+                    {
+                        continue;
+                    }
+                    Err(error) => return Err(EngineError::Store(error)),
+                }
+            }
+            return Err(EngineError::Store(Box::new(
+                StorageFenceConflictError::default(),
+            )));
+        }
 
         let index = self.short_term_store.next_index(task_id).await?;
         let raw = TaskEvent {
@@ -797,8 +962,84 @@ impl TaskEngine {
                 .await?;
         }
 
-        // Attach accumulated data to broadcast event for SSE accumulated subscribers
-        let broadcast_event = if let Some(ref accumulated) = series_result.accumulated_event {
+        self.finish_committed_event(event.clone(), series_result.accumulated_event)
+            .await?;
+
+        Ok(event)
+    }
+
+    async fn commit_task_events_for_mutation(
+        &self,
+        task: Task,
+        expected_revision: &str,
+        expected_status: &TaskStatus,
+        inputs: Vec<PublishEventInput>,
+    ) -> Result<Vec<TaskEvent>, EngineError> {
+        let coordinator = self.storage_coordinator.as_ref().ok_or_else(|| {
+            EngineError::Store(Box::new(StorageReleaseUnsupportedError::default()))
+        })?;
+        let emit_lock = {
+            let mut locks = self.emit_locks.lock().unwrap();
+            locks
+                .entry(task.id.clone())
+                .or_insert_with(|| Arc::new(TokioMutex::new(())))
+                .clone()
+        };
+        let _guard = emit_lock.lock().await;
+        let events = inputs
+            .into_iter()
+            .map(|input| TaskEvent {
+                id: ulid::Ulid::new().to_string(),
+                task_id: task.id.clone(),
+                index: 0,
+                timestamp: now_millis(),
+                r#type: input.r#type,
+                level: input.level,
+                data: input.data,
+                series_id: None,
+                series_mode: None,
+                series_acc_field: None,
+                series_snapshot: None,
+                _accumulated_data: None,
+            })
+            .collect::<Vec<_>>();
+        for attempt in 0..3 {
+            let token = coordinator.ensure_task_hot_for_write(&task.id).await?;
+            match self
+                .short_term_store
+                .commit_task_events_fenced(task.clone(), expected_revision, events.clone(), &token)
+                .await
+            {
+                Ok(Some(committed)) => return Ok(committed),
+                Ok(None) => {
+                    let current = self.get_task(&task.id).await?;
+                    return Err(EngineError::InvalidTransition {
+                        from: current
+                            .map(|current| current.status)
+                            .unwrap_or_else(|| expected_status.clone()),
+                        to: task.status.clone(),
+                    });
+                }
+                Err(error)
+                    if error.downcast_ref::<StorageFenceConflictError>().is_some()
+                        && attempt < 2 =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(EngineError::Store(error)),
+            }
+        }
+        Err(EngineError::Store(Box::new(
+            StorageFenceConflictError::default(),
+        )))
+    }
+
+    async fn finish_committed_event(
+        &self,
+        event: TaskEvent,
+        accumulated_event: Option<TaskEvent>,
+    ) -> Result<(), EngineError> {
+        let broadcast_event = if let Some(ref accumulated) = accumulated_event {
             TaskEvent {
                 _accumulated_data: Some(accumulated.data.clone()),
                 ..event.clone()
@@ -806,12 +1047,13 @@ impl TaskEngine {
         } else {
             event.clone()
         };
-        self.broadcast.publish(task_id, broadcast_event).await?;
+        self.broadcast
+            .publish(&event.task_id, broadcast_event)
+            .await?;
 
         if let Some(ref long_term_store) = self.long_term_store {
             let long_term_store = Arc::clone(long_term_store);
             let raw_event = event.clone();
-            let accumulated_event = series_result.accumulated_event.clone();
             let store_event = accumulated_event
                 .clone()
                 .unwrap_or_else(|| raw_event.clone());
@@ -826,8 +1068,7 @@ impl TaskEngine {
                 }
             });
         }
-
-        Ok(event)
+        Ok(())
     }
 }
 

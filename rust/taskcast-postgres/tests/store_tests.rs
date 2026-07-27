@@ -24,6 +24,7 @@ fn storage_lifecycle_migration_avoids_event_table_rewrite() {
     let migration = include_str!("../../../migrations/postgres/003_storage_lifecycle.sql");
     let receipt_upgrade =
         include_str!("../../../migrations/postgres/004_archive_receipt_coverage.sql");
+    let creation_claim = include_str!("../../../migrations/postgres/005_task_creation_claim.sql");
     assert!(migration.contains("storage_state"));
     assert!(migration.contains("archive_watermark"));
     assert!(migration.contains("execution_deadline_at"));
@@ -36,6 +37,10 @@ fn storage_lifecycle_migration_avoids_event_table_rewrite() {
     assert!(migration.contains("previous_digest TEXT NOT NULL"));
     assert!(receipt_upgrade.contains("ALTER COLUMN previous_digest DROP NOT NULL"));
     assert!(receipt_upgrade.contains("series_coverage"));
+    assert!(creation_claim.contains("creation_token"));
+    assert!(creation_claim.contains("creation_claimed_at"));
+    assert!(creation_claim.contains("creation_claim_expires_at"));
+    assert!(creation_claim.contains("creation_completed_at"));
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -1162,6 +1167,95 @@ async fn upsert_task_on_conflict() {
     let retrieved = store.get_task("task-1").await.unwrap().unwrap();
     assert_eq!(retrieved.status, TaskStatus::Running);
     assert_eq!(retrieved.updated_at, 2000.0);
+}
+
+#[tokio::test]
+async fn atomically_claim_task_identity_once() {
+    let (store, _container) = setup().await;
+    let first = store.create_task_if_absent(make_task("task-1"));
+    let second = store.create_task_if_absent(make_task("task-1"));
+    let (first, second) = tokio::join!(first, second);
+    let mut results = vec![first.unwrap(), second.unwrap()];
+    results.sort();
+    assert_eq!(results, vec![false, true]);
+    assert!(store.get_task("task-1").await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn completes_or_aborts_only_the_matching_pristine_creation_claim() {
+    let (store, _container) = setup().await;
+    assert!(store
+        .claim_task_creation(make_task("task-1"), "token-1", 30_000)
+        .await
+        .unwrap());
+    assert!(!store
+        .abort_task_creation("task-1", "wrong-token")
+        .await
+        .unwrap());
+    let mut running = make_task("task-1");
+    running.status = TaskStatus::Running;
+    store.save_task(running).await.unwrap();
+    assert!(!store
+        .abort_task_creation("task-1", "token-1")
+        .await
+        .unwrap());
+    assert!(store
+        .complete_task_creation("task-1", "token-1")
+        .await
+        .unwrap());
+    assert!(store
+        .complete_task_creation("task-1", "token-1")
+        .await
+        .unwrap());
+    assert!(!store
+        .abort_task_creation("task-1", "token-1")
+        .await
+        .unwrap());
+    assert!(store.get_task("task-1").await.unwrap().is_some());
+
+    assert!(store
+        .claim_task_creation(make_task("task-retry"), "token-2", 30_000)
+        .await
+        .unwrap());
+    assert!(store
+        .abort_task_creation("task-retry", "token-2")
+        .await
+        .unwrap());
+    assert!(store.get_task("task-retry").await.unwrap().is_none());
+    assert!(store
+        .claim_task_creation(make_task("task-retry"), "token-3", 30_000)
+        .await
+        .unwrap());
+}
+
+#[tokio::test]
+async fn takes_over_only_an_expired_pristine_creation_claim() {
+    let (store, _container) = setup().await;
+    assert!(store
+        .claim_task_creation(make_task("task-1"), "token-1", 500)
+        .await
+        .unwrap());
+    assert!(!store
+        .claim_task_creation(make_task("task-1"), "token-2", 500)
+        .await
+        .unwrap());
+    tokio::time::sleep(std::time::Duration::from_millis(510)).await;
+    assert!(store
+        .claim_task_creation(make_task("task-1"), "token-2", 30_000)
+        .await
+        .unwrap());
+    assert!(!store
+        .complete_task_creation("task-1", "token-1")
+        .await
+        .unwrap());
+    assert!(store
+        .complete_task_creation("task-1", "token-2")
+        .await
+        .unwrap());
+    assert!(store
+        .complete_task_creation("task-1", "token-2")
+        .await
+        .unwrap());
 }
 
 #[tokio::test]

@@ -39,6 +39,7 @@ describe('migration runner integration', () => {
       '002_workers.sql',
       '003_storage_lifecycle.sql',
       '004_archive_receipt_coverage.sql',
+      '005_task_creation_claim.sql',
     ])
     expect(result.skipped).toEqual([])
 
@@ -77,12 +78,20 @@ describe('migration runner integration', () => {
           'storage_epoch',
           'archive_watermark',
           'execution_deadline_at',
-          'task_version'
+          'task_version',
+          'creation_token',
+          'creation_claimed_at',
+          'creation_claim_expires_at',
+          'creation_completed_at'
         )
       ORDER BY column_name
     `
     expect(lifecycleColumns.map((row) => row.column_name)).toEqual([
       'archive_watermark',
+      'creation_claim_expires_at',
+      'creation_claimed_at',
+      'creation_completed_at',
+      'creation_token',
       'execution_deadline_at',
       'storage_epoch',
       'storage_state',
@@ -99,13 +108,14 @@ describe('migration runner integration', () => {
       '002_workers.sql',
       '003_storage_lifecycle.sql',
       '004_archive_receipt_coverage.sql',
+      '005_task_creation_claim.sql',
     ])
   })
 
   it('writes _sqlx_migrations records with correct format', async () => {
     const rows = await sql`SELECT * FROM _sqlx_migrations ORDER BY version`
 
-    expect(rows).toHaveLength(4)
+    expect(rows).toHaveLength(5)
 
     // Verify migration 001
     const row1 = rows[0]!
@@ -151,6 +161,18 @@ describe('migration runner integration', () => {
     )
     const expectedChecksum4 = computeChecksum(file4Content)
     expect(Buffer.from(row4.checksum as Uint8Array).equals(expectedChecksum4)).toBe(true)
+
+    const row5 = rows[4]!
+    expect(Number(row5.version)).toBe(5)
+    expect(row5.description).toBe('task creation claim')
+    expect(row5.success).toBe(true)
+
+    const file5Content = readFileSync(
+      join(MIGRATIONS_DIR, '005_task_creation_claim.sql'),
+      'utf8',
+    )
+    const expectedChecksum5 = computeChecksum(file5Content)
+    expect(Buffer.from(row5.checksum as Uint8Array).equals(expectedChecksum5)).toBe(true)
   })
 
   it('rejects tampered checksum', async () => {

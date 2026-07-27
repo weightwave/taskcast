@@ -25,4 +25,8 @@ export const EMBEDDED_MIGRATIONS: readonly EmbeddedMigration[] = [
     filename: "004_archive_receipt_coverage.sql",
     sql: "-- The first archive batch has no predecessor. This forward migration repairs\n-- the original receipt schema without changing the checksum of migration 003.\nALTER TABLE taskcast_archive_batches\n  ALTER COLUMN previous_digest DROP NOT NULL;\n\n-- Compact coverage is bounded metadata only. Full event/series payloads remain\n-- in their canonical tables and are never duplicated into every receipt.\nALTER TABLE taskcast_archive_batches\n  ADD COLUMN IF NOT EXISTS series_coverage JSONB NOT NULL DEFAULT '[]'::jsonb;\n",
   },
+  {
+    filename: "005_task_creation_claim.sql",
+    sql: "-- Explicit task IDs are claimed durably before their hot Redis state is\n-- created. Claims are leased so a pristine row left by a crashed creator can\n-- be taken over, while the retained token makes completion idempotent.\nALTER TABLE taskcast_tasks ADD COLUMN IF NOT EXISTS creation_token TEXT;\nALTER TABLE taskcast_tasks ADD COLUMN IF NOT EXISTS creation_claimed_at BIGINT;\nALTER TABLE taskcast_tasks ADD COLUMN IF NOT EXISTS creation_claim_expires_at BIGINT;\nALTER TABLE taskcast_tasks ADD COLUMN IF NOT EXISTS creation_completed_at BIGINT;\n\nCREATE INDEX IF NOT EXISTS idx_taskcast_tasks_creation_token\n  ON taskcast_tasks (creation_token)\n  WHERE creation_token IS NOT NULL;\n\nCREATE INDEX IF NOT EXISTS idx_taskcast_tasks_creation_claim_expiry\n  ON taskcast_tasks (creation_claim_expires_at)\n  WHERE creation_token IS NOT NULL AND creation_completed_at IS NULL;\n",
+  },
 ]

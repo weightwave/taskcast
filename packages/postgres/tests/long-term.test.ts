@@ -98,6 +98,45 @@ describe('PostgresLongTermStore - tasks', () => {
     const task = await store.getTask('task-1')
     expect(task?.status).toBe('running')
   })
+
+  it('atomically claims an explicit task identity once', async () => {
+    const [first, second] = await Promise.all([
+      store.createTaskIfAbsent({ ...makeTask(), metadata: { creator: 1 } }),
+      store.createTaskIfAbsent({ ...makeTask(), metadata: { creator: 2 } }),
+    ])
+
+    expect([first, second].sort()).toEqual([false, true])
+    await expect(store.getTask('task-1')).resolves.toMatchObject({
+      metadata: expect.objectContaining({ creator: expect.any(Number) }),
+    })
+  })
+
+  it('completes or aborts only the matching pristine creation claim', async () => {
+    expect(await store.claimTaskCreation(makeTask(), 'token-1', 30_000)).toBe(true)
+    expect(await store.abortTaskCreation('task-1', 'wrong-token')).toBe(false)
+    await store.saveTask({ ...makeTask(), status: 'running' })
+    expect(await store.abortTaskCreation('task-1', 'token-1')).toBe(false)
+    expect(await store.completeTaskCreation('task-1', 'token-1')).toBe(true)
+    expect(await store.completeTaskCreation('task-1', 'token-1')).toBe(true)
+    expect(await store.abortTaskCreation('task-1', 'token-1')).toBe(false)
+    await expect(store.getTask('task-1')).resolves.not.toBeNull()
+
+    const retryTask = { ...makeTask(), id: 'task-retry' }
+    expect(await store.claimTaskCreation(retryTask, 'token-2', 30_000)).toBe(true)
+    expect(await store.abortTaskCreation('task-retry', 'token-2')).toBe(true)
+    await expect(store.getTask('task-retry')).resolves.toBeNull()
+    expect(await store.claimTaskCreation(retryTask, 'token-3', 30_000)).toBe(true)
+  })
+
+  it('takes over only an expired pristine creation claim', async () => {
+    expect(await store.claimTaskCreation(makeTask(), 'token-1', 500)).toBe(true)
+    expect(await store.claimTaskCreation(makeTask(), 'token-2', 500)).toBe(false)
+    await new Promise((resolve) => setTimeout(resolve, 510))
+    expect(await store.claimTaskCreation(makeTask(), 'token-2', 30_000)).toBe(true)
+    expect(await store.completeTaskCreation('task-1', 'token-1')).toBe(false)
+    expect(await store.completeTaskCreation('task-1', 'token-2')).toBe(true)
+    expect(await store.completeTaskCreation('task-1', 'token-2')).toBe(true)
+  })
 })
 
 describe('PostgresLongTermStore - events', () => {

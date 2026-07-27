@@ -8,6 +8,7 @@ import type {
   StorageLease,
   Task,
   TaskEvent,
+  Worker,
 } from '@taskcast/core'
 import { RedisShortTermStore } from '../src/short-term.js'
 
@@ -67,6 +68,12 @@ const makeEvent = (
 
 async function openTask(): Promise<void> {
   await store.saveTask(makeTask())
+}
+
+async function taskRevision(): Promise<string> {
+  const snapshot = await lifecycle.getTaskMutationSnapshot!('task-1')
+  if (!snapshot) throw new Error('task mutation snapshot is missing')
+  return snapshot.revision
 }
 
 async function acquire(
@@ -149,6 +156,31 @@ describe('RedisShortTermStore storage lifecycle', () => {
     await expect(
       lifecycle.commitEventFenced!('task-1', makeEvent('event-1'), newToken),
     ).resolves.toMatchObject({ event: { index: 1 } })
+  })
+
+  it('lets a new lock generation adopt a closed fence for recovery', async () => {
+    await openTask()
+    await lifecycle.commitEventFenced!(
+      'task-1',
+      makeEvent('event-0'),
+      { taskId: 'task-1', storageEpoch: 1 },
+    )
+    const stale = await acquire('stale-owner', 'stale-generation')
+    await lifecycle.closeWriteFence!(stale, 1)
+    await lifecycle.releaseStorageLock!(stale)
+
+    const recovery = await acquire('recovery-owner', 'recovery-generation')
+    await expect(lifecycle.closeWriteFence!(recovery, 1)).resolves.toMatchObject({
+      acceptingWrites: false,
+      storageEpoch: 1,
+      activeReleaseGeneration: 'recovery-generation',
+      highWatermark: 0,
+    })
+    await expect(lifecycle.renewStorageLock!(stale, 5_000)).resolves.toBe(false)
+    await expect(lifecycle.reopenWriteFence!(recovery, 1)).resolves.toEqual({
+      taskId: 'task-1',
+      storageEpoch: 2,
+    })
   })
 
   it('linearizes concurrent fenced commits against close without index gaps', async () => {
@@ -542,6 +574,132 @@ describe('RedisShortTermStore storage lifecycle', () => {
       lifecycle.saveTaskFenced!(makeTask({ status: 'completed' }), token),
     ).rejects.toMatchObject({ code: 'storage_fence_conflict' })
     await expect(store.getTask('task-1')).resolves.toMatchObject({ status: 'running' })
+  })
+
+  it('commits a task transition and all derived events in one fenced operation', async () => {
+    await openTask()
+    const token = { taskId: 'task-1', storageEpoch: 1 }
+    const committed = await lifecycle.commitTaskEventsFenced!(
+      makeTask({ status: 'blocked', reason: 'approval' }),
+      await taskRevision(),
+      [
+        makeEvent('status', {
+          type: 'taskcast:status',
+          data: { status: 'blocked' },
+        }),
+        makeEvent('blocked', {
+          type: 'taskcast:blocked',
+          data: { reason: 'approval' },
+        }),
+      ],
+      token,
+    )
+    if (!committed) throw new Error('transition unexpectedly lost its status CAS')
+
+    expect(committed.map((event) => event.index)).toEqual([0, 1])
+    await expect(store.getTask('task-1')).resolves.toMatchObject({
+      status: 'blocked',
+      reason: 'approval',
+    })
+    await expect(store.getEvents('task-1')).resolves.toEqual(committed)
+
+    const lease = await acquire()
+    await lifecycle.closeWriteFence!(lease, 1)
+    await expect(
+      lifecycle.commitTaskEventsFenced!(
+        makeTask({ status: 'completed' }),
+        await taskRevision(),
+        [makeEvent('completed', { type: 'taskcast:status' })],
+        token,
+      ),
+    ).rejects.toMatchObject({ code: 'storage_fence_conflict' })
+    await expect(store.getTask('task-1')).resolves.toMatchObject({
+      status: 'blocked',
+    })
+    await expect(store.getEvents('task-1')).resolves.toHaveLength(2)
+  })
+
+  it('rejects an overflowing task-event batch without partial mutation', async () => {
+    await openTask()
+    const token = { taskId: 'task-1', storageEpoch: 1 }
+    await redis.set(`${prefix}:idx:task-1`, '9007199254740990')
+
+    await expect(
+      lifecycle.commitTaskEventsFenced!(
+        makeTask({ status: 'blocked' }),
+        await taskRevision(),
+        [makeEvent('status'), makeEvent('blocked')],
+        token,
+      ),
+    ).rejects.toMatchObject({ code: 'storage_integrity_error' })
+    await expect(store.getTask('task-1')).resolves.toMatchObject({
+      status: 'running',
+    })
+    await expect(store.getEvents('task-1')).resolves.toEqual([])
+    await expect(redis.get(`${prefix}:idx:task-1`)).resolves.toBe(
+      '9007199254740990',
+    )
+  })
+
+  it('allows only one task transition from the same expected status', async () => {
+    await openTask()
+    const token = { taskId: 'task-1', storageEpoch: 1 }
+    const revision = await taskRevision()
+
+    const results = await Promise.all([
+      lifecycle.commitTaskEventsFenced!(
+        makeTask({ status: 'completed' }),
+        revision,
+        [makeEvent('completed', { type: 'taskcast:status' })],
+        token,
+      ),
+      lifecycle.commitTaskEventsFenced!(
+        makeTask({ status: 'failed' }),
+        revision,
+        [makeEvent('failed', { type: 'taskcast:status' })],
+        token,
+      ),
+    ])
+
+    expect(results.filter((result) => result !== null)).toHaveLength(1)
+    expect(results.filter((result) => result === null)).toHaveLength(1)
+    await expect(store.getEvents('task-1')).resolves.toHaveLength(1)
+    await expect(store.getTask('task-1')).resolves.toMatchObject({
+      status: expect.stringMatching(/^(completed|failed)$/),
+    })
+  })
+
+  it('rejects a stale task revision after an assigned task is reclaimed', async () => {
+    await store.saveTask(makeTask({ status: 'pending' }))
+    const makeWorker = (id: string): Worker => ({
+      id,
+      status: 'idle',
+      matchRule: {},
+      capacity: 2,
+      usedSlots: 0,
+      weight: 1,
+      connectionMode: 'pull',
+      connectedAt: 1_000,
+      lastHeartbeatAt: 1_000,
+    })
+    await store.saveWorker(makeWorker('worker-a'))
+    await store.saveWorker(makeWorker('worker-b'))
+    await expect(store.claimTask('task-1', 'worker-a', 1)).resolves.toBe(true)
+    const snapshot = await lifecycle.getTaskMutationSnapshot!('task-1')
+    if (!snapshot) throw new Error('task mutation snapshot is missing')
+    await expect(store.claimTask('task-1', 'worker-b', 1)).resolves.toBe(true)
+
+    await expect(lifecycle.commitTaskEventsFenced!(
+      { ...snapshot.task, status: 'running' },
+      snapshot.revision,
+      [makeEvent('status', { type: 'taskcast:status' })],
+      { taskId: 'task-1', storageEpoch: 1 },
+    )).resolves.toBeNull()
+    await expect(store.getTask('task-1')).resolves.toMatchObject({
+      status: 'assigned',
+      assignedWorker: 'worker-b',
+    })
+    await expect(store.getEvents('task-1')).resolves.toEqual([])
   })
 
   it('reads bounded sparse source pages using opaque list cursors', async () => {

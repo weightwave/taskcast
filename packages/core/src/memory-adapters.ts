@@ -12,6 +12,7 @@ import type {
   TaskArchiveImportOptions,
   TaskArchiveRestoreData,
   StorageLease,
+  TaskMutationSnapshot,
   TaskWriteFence,
   ClosedWriteFence,
   HotWriteToken,
@@ -20,9 +21,24 @@ import type {
   RehydrateSnapshot,
   TaskStoragePresence,
   StorageWriterRegistration,
+  LongTermStore,
+  ArchiveBatch,
+  ArchiveBatchReceipt,
+  ArchiveGeneration,
+  DurableSeriesState,
+  TaskStorageMetadata,
+  TaskStorageMetadataCas,
+  WorkerAuditEvent,
 } from './types.js'
-import { StorageFenceConflictError } from './types.js'
+import { StorageFenceConflictError, StorageIntegrityError } from './types.js'
 import { TaskConflictError } from './engine.js'
+import {
+  canonicalJson,
+  computeArchiveBatchDigest,
+  computeArchiveSourceDigest,
+  computeArchiveSourcePageDigest,
+  computeSeriesStateDigest,
+} from './storage-digest.js'
 
 export class MemoryBroadcastProvider implements BroadcastProvider {
   private listeners = new Map<string, Set<(event: TaskEvent) => void>>()
@@ -49,6 +65,7 @@ export class MemoryBroadcastProvider implements BroadcastProvider {
 export class MemoryShortTermStore implements ShortTermStore {
   readonly supportsHotColdRelease = true
   private tasks = new Map<string, Task>()
+  private taskRevisions = new Map<string, number>()
   private events = new Map<string, TaskEvent[]>()
   private seriesLatest = new Map<string, TaskEvent>()
   private indexCounters = new Map<string, number>()
@@ -63,6 +80,7 @@ export class MemoryShortTermStore implements ShortTermStore {
 
   async saveTask(task: Task): Promise<void> {
     this.tasks.set(task.id, { ...task })
+    this.bumpTaskRevision(task.id)
     if (!this.writeFences.has(task.id)) {
       this.writeFences.set(task.id, {
         taskId: task.id,
@@ -75,6 +93,15 @@ export class MemoryShortTermStore implements ShortTermStore {
 
   async getTask(taskId: string): Promise<Task | null> {
     return this.tasks.get(taskId) ?? null
+  }
+
+  async getTaskMutationSnapshot(taskId: string): Promise<TaskMutationSnapshot | null> {
+    const task = this.tasks.get(taskId)
+    if (!task) return null
+    return {
+      task: structuredClone(task),
+      revision: String(this.taskRevisions.get(taskId) ?? 0),
+    }
   }
 
   async nextIndex(taskId: string): Promise<number> {
@@ -114,6 +141,7 @@ export class MemoryShortTermStore implements ShortTermStore {
     }
 
     this.tasks.set(taskId, { ...data.task })
+    this.bumpTaskRevision(taskId)
     this.events.set(taskId, data.events.map((event) => ({ ...event })))
     this.indexCounters.set(taskId, data.nextIndex - 1)
 
@@ -169,7 +197,7 @@ export class MemoryShortTermStore implements ShortTermStore {
   async closeWriteFence(lease: StorageLease, expectedEpoch: number): Promise<ClosedWriteFence> {
     this.assertOwnedStorageLock(lease)
     const fence = this.writeFences.get(lease.taskId)
-    if (!fence || !fence.acceptingWrites || fence.storageEpoch !== expectedEpoch) {
+    if (!fence || fence.storageEpoch !== expectedEpoch) {
       throw new StorageFenceConflictError()
     }
 
@@ -177,6 +205,16 @@ export class MemoryShortTermStore implements ShortTermStore {
       this.indexCounters.get(lease.taskId) ?? -1,
       ...(this.events.get(lease.taskId) ?? []).map((event) => event.index),
     )
+    if (!fence.acceptingWrites) {
+      const adopted: ClosedWriteFence = {
+        ...fence,
+        acceptingWrites: false,
+        activeReleaseGeneration: lease.generation,
+        highWatermark,
+      }
+      this.writeFences.set(lease.taskId, adopted)
+      return { ...adopted }
+    }
     const closed: ClosedWriteFence = {
       ...fence,
       acceptingWrites: false,
@@ -257,6 +295,39 @@ export class MemoryShortTermStore implements ShortTermStore {
       throw new StorageFenceConflictError()
     }
     this.tasks.set(task.id, { ...task })
+    this.bumpTaskRevision(task.id)
+  }
+
+  async commitTaskEventsFenced(
+    task: Task,
+    expectedRevision: string,
+    events: Omit<TaskEvent, 'index'>[],
+    token: HotWriteToken,
+  ): Promise<TaskEvent[] | null> {
+    const fence = this.writeFences.get(task.id)
+    if (
+      token.taskId !== task.id ||
+      !fence?.acceptingWrites ||
+      fence.storageEpoch !== token.storageEpoch ||
+      events.some(
+        (event) =>
+          event.taskId !== task.id ||
+          event.seriesId !== undefined ||
+          event.seriesMode !== undefined,
+      )
+    ) {
+      throw new StorageFenceConflictError()
+    }
+    if (String(this.taskRevisions.get(task.id) ?? 0) !== expectedRevision) return null
+    const committed = events.map((event) => {
+      const index = (this.indexCounters.get(task.id) ?? -1) + 1
+      this.indexCounters.set(task.id, index)
+      return { ...event, taskId: task.id, index } as TaskEvent
+    })
+    this.tasks.set(task.id, structuredClone(task))
+    this.bumpTaskRevision(task.id)
+    for (const event of committed) this.appendEventSync(task.id, event)
+    return structuredClone(committed)
   }
 
   async readArchiveSourcePage(
@@ -295,6 +366,7 @@ export class MemoryShortTermStore implements ShortTermStore {
     }
 
     this.tasks.delete(lease.taskId)
+    this.taskRevisions.delete(lease.taskId)
     this.events.delete(lease.taskId)
     this.indexCounters.delete(lease.taskId)
     this.writeFences.delete(lease.taskId)
@@ -316,6 +388,7 @@ export class MemoryShortTermStore implements ShortTermStore {
 
     const taskId = snapshot.task.id
     this.tasks.set(taskId, { ...snapshot.task })
+    this.taskRevisions.set(taskId, 1)
     this.events.set(
       taskId,
       snapshot.replayEvents.map((event) => ({ ...event })),
@@ -558,9 +631,14 @@ export class MemoryShortTermStore implements ShortTermStore {
     task.assignedWorker = workerId
     task.cost = cost
     task.updatedAt = Date.now()
+    this.bumpTaskRevision(taskId)
 
     worker.usedSlots += cost
     return true
+  }
+
+  private bumpTaskRevision(taskId: string): void {
+    this.taskRevisions.set(taskId, (this.taskRevisions.get(taskId) ?? 0) + 1)
   }
 
   // Worker assignments
@@ -588,5 +666,527 @@ export class MemoryShortTermStore implements ShortTermStore {
   // Task query by status
   async listByStatus(statuses: TaskStatus[]): Promise<Task[]> {
     return Array.from(this.tasks.values()).filter((t) => statuses.includes(t.status))
+  }
+}
+
+export class MemoryLongTermStore implements LongTermStore {
+  readonly supportsHotColdRelease = true
+  private tasks = new Map<string, Task>()
+  private events = new Map<string, TaskEvent[]>()
+  private metadata = new Map<string, TaskStorageMetadata>()
+  private generations = new Map<string, ArchiveGeneration>()
+  private batches = new Map<string, Map<number, ArchiveBatch>>()
+  private series = new Map<string, DurableSeriesState[]>()
+  private workerEvents = new Map<string, WorkerAuditEvent[]>()
+  private creationClaims = new Map<
+    string,
+    { token: string; claimedAt: number; expiresAt: number | null; completedAt: number | null }
+  >()
+
+  async saveTask(task: Task): Promise<void> {
+    this.tasks.set(task.id, structuredClone(task))
+    if (!this.metadata.has(task.id)) {
+      this.metadata.set(task.id, {
+        taskId: task.id,
+        storageState: 'hot',
+        storageEpoch: 1,
+        activeReleaseGeneration: null,
+        archiveWatermark: -1,
+        lastEventAt: null,
+        coldAt: null,
+        executionDeadlineAt:
+          task.ttl === undefined ? null : task.createdAt + task.ttl * 1_000,
+        taskVersion: 0,
+      })
+    }
+  }
+
+  async createTaskIfAbsent(task: Task): Promise<boolean> {
+    if (this.tasks.has(task.id)) return false
+    await this.saveTask(task)
+    return true
+  }
+
+  async claimTaskCreation(
+    task: Task,
+    creationToken: string,
+    claimTtlMs: number,
+  ): Promise<boolean> {
+    if (claimTtlMs <= 0) throw new StorageIntegrityError('Creation claim TTL must be positive')
+    const now = Date.now()
+    const existingClaim = this.creationClaims.get(task.id)
+    if (this.tasks.has(task.id)) {
+      if (
+        !existingClaim ||
+        existingClaim.completedAt !== null ||
+        (existingClaim.expiresAt !== null && existingClaim.expiresAt > now) ||
+        !this.isPristineCreationClaim(task.id)
+      ) {
+        return false
+      }
+    }
+    this.tasks.set(task.id, structuredClone(task))
+    this.metadata.set(task.id, {
+      taskId: task.id,
+      storageState: 'hot',
+      storageEpoch: 1,
+      activeReleaseGeneration: null,
+      archiveWatermark: -1,
+      lastEventAt: null,
+      coldAt: null,
+      executionDeadlineAt:
+        task.ttl === undefined ? null : task.createdAt + task.ttl * 1_000,
+      taskVersion: 0,
+    })
+    this.creationClaims.set(task.id, {
+      token: creationToken,
+      claimedAt: now,
+      expiresAt: now + claimTtlMs,
+      completedAt: null,
+    })
+    return true
+  }
+
+  async completeTaskCreation(taskId: string, creationToken: string): Promise<boolean> {
+    const claim = this.creationClaims.get(taskId)
+    if (claim?.token !== creationToken) return false
+    claim.completedAt ??= Date.now()
+    claim.expiresAt = null
+    return true
+  }
+
+  async abortTaskCreation(taskId: string, creationToken: string): Promise<boolean> {
+    const claim = this.creationClaims.get(taskId)
+    if (
+      claim?.token !== creationToken ||
+      claim.completedAt !== null ||
+      !this.isPristineCreationClaim(taskId)
+    ) return false
+    this.creationClaims.delete(taskId)
+    this.tasks.delete(taskId)
+    this.metadata.delete(taskId)
+    return true
+  }
+
+  private isPristineCreationClaim(taskId: string): boolean {
+    const metadata = this.metadata.get(taskId)
+    const task = this.tasks.get(taskId)
+    return Boolean(
+      task &&
+      task.status === 'pending' &&
+      task.updatedAt === task.createdAt &&
+      task.result === undefined &&
+      task.error === undefined &&
+      task.completedAt === undefined &&
+      metadata &&
+      metadata.storageState === 'hot' &&
+      metadata.storageEpoch === 1 &&
+      metadata.activeReleaseGeneration === null &&
+      metadata.archiveWatermark === -1 &&
+      metadata.lastEventAt === null &&
+      metadata.coldAt === null &&
+      metadata.taskVersion === 0 &&
+      (this.events.get(taskId)?.length ?? 0) === 0
+    )
+  }
+
+  async getTask(taskId: string): Promise<Task | null> {
+    return structuredClone(this.tasks.get(taskId) ?? null)
+  }
+
+  async saveEvent(event: TaskEvent): Promise<void> {
+    this.upsertEvent(event)
+    const metadata = this.metadata.get(event.taskId)
+    if (metadata) metadata.lastEventAt = event.timestamp
+  }
+
+  async replaceLastSeriesEvent(
+    taskId: string,
+    seriesId: string,
+    event: TaskEvent,
+  ): Promise<void> {
+    const states = this.series.get(taskId) ?? []
+    const existing = states.find((state) => state.seriesId === seriesId)
+    const metadata = this.metadata.get(taskId)
+    if (!metadata) {
+      throw new StorageIntegrityError(`Series task does not exist: ${taskId}`)
+    }
+    if (
+      metadata.archiveWatermark >= event.index ||
+      (existing?.throughIndex ?? -1) >= event.index
+    ) {
+      if (metadata.archiveWatermark >= event.index && !existing) {
+        throw new StorageIntegrityError(
+          `Archived latest series state is missing for ${taskId}:${seriesId}`,
+        )
+      }
+      return
+    }
+    if (
+      existing &&
+      (existing.mode !== 'latest' ||
+        existing.event.seriesAccField !== event.seriesAccField)
+    ) {
+      throw new StorageIntegrityError(
+        `Durable series semantics conflict for ${taskId}:${seriesId}`,
+      )
+    }
+    if (existing) {
+      const events = this.events.get(taskId) ?? []
+      this.events.set(
+        taskId,
+        events.filter((candidate) => candidate.id !== existing.event.id),
+      )
+    }
+    this.upsertEvent(event)
+    this.upsertSeriesState({
+      taskId,
+      seriesId,
+      mode: 'latest',
+      event: structuredClone(event),
+      throughIndex: event.index,
+    })
+  }
+
+  async accumulateSeries(
+    taskId: string,
+    seriesId: string,
+    event: TaskEvent,
+    field: string,
+  ): Promise<TaskEvent> {
+    const previous = (this.series.get(taskId) ?? []).find(
+      (state) => state.seriesId === seriesId,
+    )
+    const metadata = this.metadata.get(taskId)
+    if (!metadata) {
+      throw new StorageIntegrityError(`Series task does not exist: ${taskId}`)
+    }
+    if (
+      metadata.archiveWatermark >= event.index ||
+      (previous?.throughIndex ?? -1) >= event.index
+    ) {
+      if (!previous) {
+        throw new StorageIntegrityError(
+          `Archived accumulate series state is missing for ${taskId}:${seriesId}`,
+        )
+      }
+      return structuredClone(previous.event)
+    }
+    if (
+      previous &&
+      (previous.mode !== 'accumulate' ||
+        (previous.event.seriesAccField ?? 'delta') !== field ||
+        (event.seriesAccField ?? 'delta') !== field)
+    ) {
+      throw new StorageIntegrityError(
+        `Durable series semantics conflict for ${taskId}:${seriesId}`,
+      )
+    }
+    let accumulated = structuredClone(event)
+    const previousData = previous?.event.data
+    const previousField =
+      previousData && typeof previousData === 'object' && !Array.isArray(previousData)
+        ? (previousData as Record<string, unknown>)[field]
+        : undefined
+    const nextField =
+      event.data && typeof event.data === 'object' && !Array.isArray(event.data)
+        ? (event.data as Record<string, unknown>)[field]
+        : undefined
+    if (
+      previousData &&
+      typeof previousData === 'object' &&
+      !Array.isArray(previousData) &&
+      event.data &&
+      typeof event.data === 'object' &&
+      !Array.isArray(event.data) &&
+      typeof previousField === 'string' &&
+      typeof nextField === 'string'
+    ) {
+      accumulated = {
+        ...structuredClone(event),
+        data: {
+          ...(event.data as Record<string, unknown>),
+          [field]: previousField + nextField,
+        },
+      }
+    }
+    if (previous) {
+      const events = this.events.get(taskId) ?? []
+      this.events.set(
+        taskId,
+        events.filter((candidate) => candidate.id !== previous.event.id),
+      )
+    }
+    this.upsertEvent(accumulated)
+    this.upsertSeriesState({
+      taskId,
+      seriesId,
+      mode: 'accumulate',
+      event: structuredClone(accumulated),
+      throughIndex: event.index,
+    })
+    return accumulated
+  }
+
+  async getEvents(
+    taskId: string,
+    opts?: EventQueryOptions,
+  ): Promise<TaskEvent[]> {
+    let result = structuredClone(this.events.get(taskId) ?? [])
+    if (opts?.since?.id) {
+      const index = result.findIndex((event) => event.id === opts.since!.id)
+      if (index >= 0) result = result.slice(index + 1)
+    } else if (opts?.since?.index !== undefined) {
+      result = result.filter((event) => event.index > opts.since!.index!)
+    } else if (opts?.since?.timestamp !== undefined) {
+      result = result.filter(
+        (event) => event.timestamp > opts.since!.timestamp!,
+      )
+    }
+    if (opts?.limit !== undefined) result = result.slice(0, opts.limit)
+    return result
+  }
+
+  async getTaskStorageMetadata(
+    taskId: string,
+  ): Promise<TaskStorageMetadata | null> {
+    return structuredClone(this.metadata.get(taskId) ?? null)
+  }
+
+  async compareAndSetTaskStorageMetadata(
+    update: TaskStorageMetadataCas,
+  ): Promise<boolean> {
+    const current = this.metadata.get(update.taskId)
+    if (
+      !current ||
+      current.storageState !== update.expectedStorageState ||
+      current.storageEpoch !== update.expectedStorageEpoch ||
+      current.activeReleaseGeneration !== update.expectedReleaseGeneration
+    ) {
+      return false
+    }
+    this.metadata.set(update.taskId, structuredClone(update.next))
+    return true
+  }
+
+  async beginArchive(generation: ArchiveGeneration): Promise<ArchiveGeneration> {
+    const metadata = this.metadata.get(generation.taskId)
+    if (
+      !metadata ||
+      metadata.storageState !== 'releasing' ||
+      metadata.storageEpoch !== generation.storageEpoch ||
+      metadata.activeReleaseGeneration !== generation.generation ||
+      metadata.archiveWatermark !== generation.manifest.priorWatermark
+    ) {
+      throw new StorageIntegrityError(
+        'Archive generation lost its durable release fence',
+      )
+    }
+    const key = this.archiveKey(generation.taskId, generation.generation)
+    const existing = this.generations.get(key)
+    if (existing) {
+      if (
+        existing.storageEpoch !== generation.storageEpoch ||
+        existing.targetWatermark !== generation.targetWatermark ||
+        canonicalJson(existing.manifest) !== canonicalJson(generation.manifest)
+      ) {
+        throw new StorageIntegrityError('Archive generation replay conflicts')
+      }
+      return structuredClone(existing)
+    }
+    this.generations.set(key, structuredClone(generation))
+    return structuredClone(generation)
+  }
+
+  async archiveBatch(
+    taskId: string,
+    generation: string,
+    batch: ArchiveBatch,
+  ): Promise<ArchiveBatchReceipt> {
+    const expectedDigest = await computeArchiveBatchDigest(
+      batch.receipt.previousBatchDigest,
+      batch.events,
+      batch.seriesLatest,
+    )
+    if (expectedDigest !== batch.receipt.batchDigest) {
+      throw new StorageIntegrityError('Archive batch digest mismatch')
+    }
+    const key = this.archiveKey(taskId, generation)
+    const archive = this.generations.get(key)
+    if (!archive || archive.status !== 'open') {
+      throw new StorageIntegrityError('Archive generation is not open')
+    }
+    const metadata = this.metadata.get(taskId)
+    if (
+      !metadata ||
+      metadata.storageState !== 'releasing' ||
+      metadata.storageEpoch !== archive.storageEpoch ||
+      metadata.activeReleaseGeneration !== generation
+    ) {
+      throw new StorageIntegrityError(
+        'Archive batch lost its durable release fence',
+      )
+    }
+    const batches = this.batches.get(key) ?? new Map<number, ArchiveBatch>()
+    this.batches.set(key, batches)
+    const existing = batches.get(batch.receipt.ordinal)
+    if (existing) {
+      if (canonicalJson(existing) !== canonicalJson(batch)) {
+        throw new StorageIntegrityError('Archive batch replay conflicts')
+      }
+      return structuredClone(existing.receipt)
+    }
+    if (
+      archive.manifest.expectedBatchOrdinals[batches.size] !==
+      batch.receipt.ordinal
+    ) {
+      throw new StorageIntegrityError('Archive batch ordinal is out of order')
+    }
+    batches.set(batch.receipt.ordinal, structuredClone(batch))
+    for (const event of batch.events) this.upsertEvent(event)
+    return structuredClone(batch.receipt)
+  }
+
+  async finalizeArchive(
+    taskId: string,
+    generation: string,
+    task: Task,
+    seriesLatest: DurableSeriesState[],
+  ): Promise<number> {
+    const key = this.archiveKey(taskId, generation)
+    const archive = this.generations.get(key)
+    if (!archive) throw new StorageIntegrityError('Archive generation is missing')
+    const batches = Array.from(this.batches.get(key)?.values() ?? []).sort(
+      (left, right) => left.receipt.ordinal - right.receipt.ordinal,
+    )
+    if (
+      canonicalJson(batches.map((batch) => batch.receipt.ordinal)) !==
+      canonicalJson(archive.manifest.expectedBatchOrdinals)
+    ) {
+      throw new StorageIntegrityError('Archive generation is missing batches')
+    }
+    const pageDigests = await Promise.all(
+      batches.map((batch) => computeArchiveSourcePageDigest(batch.events)),
+    )
+    const sourceEntryCount = batches.reduce(
+      (total, batch) => total + batch.events.length,
+      0,
+    )
+    if (
+      sourceEntryCount !== archive.manifest.sourceEntryCount ||
+      (await computeArchiveSourceDigest(pageDigests)) !==
+        archive.manifest.sourceDigest ||
+      (await computeSeriesStateDigest(seriesLatest)) !==
+        archive.manifest.seriesStateDigest
+    ) {
+      throw new StorageIntegrityError(
+        'Archive generation manifest verification failed',
+      )
+    }
+    const metadata = this.metadata.get(taskId)
+    if (
+      !metadata ||
+      metadata.storageState !== 'releasing' ||
+      metadata.storageEpoch !== archive.storageEpoch ||
+      metadata.activeReleaseGeneration !== generation
+    ) {
+      throw new StorageIntegrityError(
+        'Archive finalization lost its durable release fence',
+      )
+    }
+    metadata.archiveWatermark = archive.targetWatermark
+    this.tasks.set(taskId, structuredClone(task))
+    this.series.set(taskId, structuredClone(seriesLatest))
+    const compactSeriesIds = new Set(
+      seriesLatest.map((state) => state.seriesId),
+    )
+    const events = (this.events.get(taskId) ?? []).filter(
+      (event) =>
+        !event.seriesId ||
+        !compactSeriesIds.has(event.seriesId) ||
+        !(
+          event.seriesMode === 'latest' ||
+          event.seriesMode === 'accumulate'
+        ),
+    )
+    events.push(...seriesLatest.map((state) => structuredClone(state.event)))
+    events.sort((left, right) => left.index - right.index)
+    this.events.set(taskId, events)
+    archive.status = 'finalized'
+    archive.updatedAt = Date.now()
+    return archive.targetWatermark
+  }
+
+  async getArchiveWatermark(taskId: string): Promise<number> {
+    const metadata = this.metadata.get(taskId)
+    if (!metadata) throw new StorageIntegrityError('Task does not exist')
+    return metadata.archiveWatermark
+  }
+
+  async getLastEventIndex(taskId: string): Promise<number> {
+    const events = this.events.get(taskId) ?? []
+    const series = this.series.get(taskId) ?? []
+    return Math.max(
+      this.metadata.get(taskId)?.archiveWatermark ?? -1,
+      ...events.map((event) => event.index),
+      ...series.map((state) => state.throughIndex),
+    )
+  }
+
+  async getRecentEvents(taskId: string, limit: number): Promise<TaskEvent[]> {
+    return structuredClone((this.events.get(taskId) ?? []).slice(-limit))
+  }
+
+  async getDurableSeriesState(taskId: string): Promise<DurableSeriesState[]> {
+    return structuredClone(this.series.get(taskId) ?? [])
+  }
+
+  async saveWorkerEvent(event: WorkerAuditEvent): Promise<void> {
+    const events = this.workerEvents.get(event.workerId) ?? []
+    events.push(structuredClone(event))
+    this.workerEvents.set(event.workerId, events)
+  }
+
+  async getWorkerEvents(
+    workerId: string,
+    opts?: EventQueryOptions,
+  ): Promise<WorkerAuditEvent[]> {
+    let events = structuredClone(this.workerEvents.get(workerId) ?? [])
+    if (opts?.since?.id) {
+      const index = events.findIndex((event) => event.id === opts.since!.id)
+      if (index >= 0) events = events.slice(index + 1)
+    } else if (opts?.since?.timestamp !== undefined) {
+      events = events.filter(
+        (event) => event.timestamp > opts.since!.timestamp!,
+      )
+    }
+    if (opts?.limit !== undefined) events = events.slice(0, opts.limit)
+    return events
+  }
+
+  private upsertEvent(event: TaskEvent): void {
+    const events = this.events.get(event.taskId) ?? []
+    const existing = events.findIndex(
+      (candidate) => candidate.index === event.index,
+    )
+    if (existing >= 0) events[existing] = structuredClone(event)
+    else events.push(structuredClone(event))
+    events.sort((left, right) => left.index - right.index)
+    this.events.set(event.taskId, events)
+  }
+
+  private upsertSeriesState(state: DurableSeriesState): void {
+    const states = this.series.get(state.taskId) ?? []
+    const existing = states.findIndex(
+      (candidate) => candidate.seriesId === state.seriesId,
+    )
+    if (existing >= 0) states[existing] = structuredClone(state)
+    else states.push(structuredClone(state))
+    states.sort((left, right) => left.seriesId.localeCompare(right.seriesId))
+    this.series.set(state.taskId, states)
+  }
+
+  private archiveKey(taskId: string, generation: string): string {
+    return `${taskId}\u0000${generation}`
   }
 }

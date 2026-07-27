@@ -1519,6 +1519,53 @@ async fn storage_lifecycle_closes_writes_without_consuming_an_index_and_reopens(
 }
 
 #[tokio::test]
+async fn storage_lifecycle_new_generation_adopts_a_closed_fence_for_recovery() {
+    let (_container, redis_url) = start_redis().await;
+    flush_redis(&redis_url).await;
+    let store = make_store(&redis_url).await;
+    store.save_task(make_task("task-1")).await.unwrap();
+    store
+        .commit_event_fenced(
+            "task-1",
+            make_event("task-1", 0),
+            &HotWriteToken {
+                task_id: "task-1".to_string(),
+                storage_epoch: 1,
+            },
+        )
+        .await
+        .unwrap();
+    let stale = store
+        .acquire_storage_lock("task-1", "stale-owner", "stale-generation", 5_000)
+        .await
+        .unwrap()
+        .unwrap();
+    store.close_write_fence(&stale, 1).await.unwrap();
+    store.release_storage_lock(&stale).await.unwrap();
+
+    let recovery = store
+        .acquire_storage_lock("task-1", "recovery-owner", "recovery-generation", 5_000)
+        .await
+        .unwrap()
+        .unwrap();
+    let adopted = store.close_write_fence(&recovery, 1).await.unwrap();
+    assert_eq!(
+        adopted.active_release_generation.as_deref(),
+        Some("recovery-generation")
+    );
+    assert_eq!(adopted.high_watermark, 0);
+    assert!(!store.renew_storage_lock(&stale, 5_000).await.unwrap());
+    assert_eq!(
+        store
+            .reopen_write_fence(&recovery, 1)
+            .await
+            .unwrap()
+            .storage_epoch,
+        2
+    );
+}
+
+#[tokio::test]
 async fn storage_lifecycle_commits_series_atomically_and_pages_sparse_history() {
     let (_container, redis_url) = start_redis().await;
     flush_redis(&redis_url).await;
@@ -1528,7 +1575,6 @@ async fn storage_lifecycle_commits_series_atomically_and_pages_sparse_history() 
         task_id: "task-1".to_string(),
         storage_epoch: 1,
     };
-
     let mut keep_zero = make_event("task-1", 100);
     keep_zero.id = "keep-0".to_string();
     store
@@ -2214,6 +2260,159 @@ async fn storage_lifecycle_restores_a_bounded_window_and_preserves_the_next_inde
         token
     );
     assert_eq!(store.get_events("task-1", None).await.unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn storage_lifecycle_commits_task_and_derived_events_atomically() {
+    let (_container, redis_url) = start_redis().await;
+    flush_redis(&redis_url).await;
+    let store = make_store(&redis_url).await;
+    store.save_task(make_task("task-1")).await.unwrap();
+    let token = HotWriteToken {
+        task_id: "task-1".to_string(),
+        storage_epoch: 1,
+    };
+    let revision = store
+        .get_task_mutation_snapshot("task-1")
+        .await
+        .unwrap()
+        .unwrap()
+        .revision;
+    let mut blocked = make_task("task-1");
+    blocked.status = TaskStatus::Blocked;
+    blocked.reason = Some("approval".to_string());
+    let mut status = make_event("task-1", 999);
+    status.r#type = "taskcast:status".to_string();
+    status.series_id = None;
+    status.series_mode = None;
+    let mut blocked_event = make_event("task-1", 999);
+    blocked_event.r#type = "taskcast:blocked".to_string();
+    blocked_event.series_id = None;
+    blocked_event.series_mode = None;
+    let committed = store
+        .commit_task_events_fenced(blocked, &revision, vec![status, blocked_event], &token)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        committed
+            .iter()
+            .map(|event| event.index)
+            .collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+    assert_eq!(
+        store.get_task("task-1").await.unwrap().unwrap().status,
+        TaskStatus::Blocked
+    );
+    assert_eq!(store.get_events("task-1", None).await.unwrap(), committed);
+
+    let lease = store
+        .acquire_storage_lock("task-1", "owner", "generation", 5_000)
+        .await
+        .unwrap()
+        .unwrap();
+    store.close_write_fence(&lease, 1).await.unwrap();
+    let mut completed = make_task("task-1");
+    completed.status = TaskStatus::Completed;
+    let error = store
+        .commit_task_events_fenced(
+            completed,
+            &store
+                .get_task_mutation_snapshot("task-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .revision,
+            vec![make_event("task-1", 999)],
+            &token,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.downcast_ref::<StorageFenceConflictError>().is_some());
+    assert_eq!(
+        store.get_task("task-1").await.unwrap().unwrap().status,
+        TaskStatus::Blocked
+    );
+    assert_eq!(store.get_events("task-1", None).await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn storage_lifecycle_allows_only_one_transition_from_the_same_status() {
+    let (_container, redis_url) = start_redis().await;
+    flush_redis(&redis_url).await;
+    let store = make_store(&redis_url).await;
+    store.save_task(make_task("task-1")).await.unwrap();
+    let token = HotWriteToken {
+        task_id: "task-1".to_string(),
+        storage_epoch: 1,
+    };
+    let revision = store
+        .get_task_mutation_snapshot("task-1")
+        .await
+        .unwrap()
+        .unwrap()
+        .revision;
+    let mut completed = make_task("task-1");
+    completed.status = TaskStatus::Completed;
+    let mut failed = make_task("task-1");
+    failed.status = TaskStatus::Failed;
+    let first = store.commit_task_events_fenced(
+        completed,
+        &revision,
+        vec![make_event("task-1", 999)],
+        &token,
+    );
+    let second =
+        store.commit_task_events_fenced(failed, &revision, vec![make_event("task-1", 999)], &token);
+
+    let (first, second) = tokio::join!(first, second);
+    let results = [first.unwrap(), second.unwrap()];
+    assert_eq!(results.iter().filter(|result| result.is_some()).count(), 1);
+    assert_eq!(results.iter().filter(|result| result.is_none()).count(), 1);
+    assert_eq!(store.get_events("task-1", None).await.unwrap().len(), 1);
+    assert!(matches!(
+        store.get_task("task-1").await.unwrap().unwrap().status,
+        TaskStatus::Completed | TaskStatus::Failed
+    ));
+}
+
+#[tokio::test]
+async fn storage_lifecycle_rejects_stale_revision_after_same_status_reclaim() {
+    let (_container, redis_url) = start_redis().await;
+    flush_redis(&redis_url).await;
+    let store = make_store(&redis_url).await;
+    store.save_task(make_task("task-1")).await.unwrap();
+    store.save_worker(make_worker("worker-a")).await.unwrap();
+    store.save_worker(make_worker("worker-b")).await.unwrap();
+    assert!(store.claim_task("task-1", "worker-a", 1).await.unwrap());
+    let snapshot = store
+        .get_task_mutation_snapshot("task-1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(store.claim_task("task-1", "worker-b", 1).await.unwrap());
+    let mut running = snapshot.task;
+    running.status = TaskStatus::Running;
+    let token = HotWriteToken {
+        task_id: "task-1".to_string(),
+        storage_epoch: 1,
+    };
+    let result = store
+        .commit_task_events_fenced(
+            running,
+            &snapshot.revision,
+            vec![make_event("task-1", 999)],
+            &token,
+        )
+        .await
+        .unwrap();
+
+    assert!(result.is_none());
+    let current = store.get_task("task-1").await.unwrap().unwrap();
+    assert_eq!(current.status, TaskStatus::Assigned);
+    assert_eq!(current.assigned_worker.as_deref(), Some("worker-b"));
+    assert!(store.get_events("task-1", None).await.unwrap().is_empty());
 }
 
 #[tokio::test]

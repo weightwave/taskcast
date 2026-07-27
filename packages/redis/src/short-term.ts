@@ -9,6 +9,7 @@ import type {
   StorageWriterRegistration,
   Task,
   TaskEvent,
+  TaskMutationSnapshot,
   TaskStatus,
   ShortTermStore,
   TaskStoragePresence,
@@ -31,6 +32,7 @@ import {
 function makeKeys(prefix: string) {
   return {
     task: (id: string) => `${prefix}:task:${id}`,
+    taskStatus: (id: string) => `${prefix}:taskStatus:${id}`,
     taskSet: `${prefix}:tasks`,
     events: (id: string) => `${prefix}:events:${id}`,
     idx: (id: string) => `${prefix}:idx:${id}`,
@@ -88,10 +90,11 @@ export class RedisShortTermStore implements ShortTermStore {
   async saveTask(task: Task): Promise<void> {
     await this.redis.eval(
       RedisShortTermStore.SAVE_TASK_LUA,
-      3,
+      4,
       this.KEY.task(task.id),
       this.KEY.taskSet,
       this.KEY.fence(task.id),
+      this.KEY.taskStatus(task.id),
       JSON.stringify(task),
       task.id,
       JSON.stringify({
@@ -100,12 +103,19 @@ export class RedisShortTermStore implements ShortTermStore {
         storageEpoch: 1,
         activeReleaseGeneration: null,
       } satisfies TaskWriteFence),
+      task.status,
     )
   }
 
   async getTask(taskId: string): Promise<Task | null> {
     const raw = await this.redis.get(this.KEY.task(taskId))
     return raw ? (JSON.parse(raw) as Task) : null
+  }
+
+  async getTaskMutationSnapshot(taskId: string): Promise<TaskMutationSnapshot | null> {
+    const raw = await this.redis.get(this.KEY.task(taskId))
+    if (!raw) return null
+    return { task: JSON.parse(raw) as Task, revision: raw }
   }
 
   async acquireStorageLock(
@@ -319,12 +329,64 @@ export class RedisShortTermStore implements ShortTermStore {
     if (token.taskId !== task.id) throw new StorageFenceConflictError()
     await this.evalFenced<number>(
       RedisShortTermStore.SAVE_TASK_FENCED_LUA,
-      2,
+      3,
       this.KEY.fence(task.id),
       this.KEY.task(task.id),
+      this.KEY.taskStatus(task.id),
       String(token.storageEpoch),
       JSON.stringify(task),
+      task.status,
     )
+  }
+
+  async commitTaskEventsFenced(
+    task: Task,
+    expectedRevision: string,
+    events: Omit<TaskEvent, 'index'>[],
+    token: HotWriteToken,
+  ): Promise<TaskEvent[] | null> {
+    if (
+      token.taskId !== task.id ||
+      events.length === 0 ||
+      events.some(
+        (event) =>
+          event.taskId !== task.id ||
+          event.seriesId !== undefined ||
+          event.seriesMode !== undefined,
+      )
+    ) {
+      throw new StorageFenceConflictError()
+    }
+    const templates = events.flatMap((event) => {
+      const template = this.makeIndexedEventTemplate(event)
+      return [template.prefix, template.suffix]
+    })
+    const raw = await this.evalFenced<string[]>(
+      RedisShortTermStore.COMMIT_TASK_EVENTS_FENCED_LUA,
+      6,
+      this.KEY.fence(task.id),
+      this.KEY.task(task.id),
+      this.KEY.idx(task.id),
+      this.KEY.events(task.id),
+      this.KEY.hotWindow(task.id),
+      this.KEY.taskStatus(task.id),
+      String(token.storageEpoch),
+      JSON.stringify(task),
+      expectedRevision,
+      task.status,
+      String(events.length),
+      ...templates,
+    )
+    if (raw[0] === 'TASK_CONFLICT') return null
+    if (
+      raw[0] !== 'COMMITTED' ||
+      raw.length !== events.length + 2
+    ) {
+      throw new StorageIntegrityError(
+        'Redis returned an invalid fenced task-event commit result',
+      )
+    }
+    return raw.slice(2).map((eventJson) => JSON.parse(eventJson) as TaskEvent)
   }
 
   async readArchiveSourcePage(
@@ -400,6 +462,7 @@ export class RedisShortTermStore implements ShortTermStore {
       this.KEY.storageLock(lease.taskId),
       this.KEY.fence(lease.taskId),
       this.KEY.task(lease.taskId),
+      this.KEY.taskStatus(lease.taskId),
       this.KEY.events(lease.taskId),
       this.KEY.idx(lease.taskId),
       this.KEY.seriesState(lease.taskId),
@@ -438,7 +501,7 @@ export class RedisShortTermStore implements ShortTermStore {
     )
     await this.evalFenced<number>(
       RedisShortTermStore.RESTORE_HOT_TASK_LUA,
-      9,
+      10,
       this.KEY.storageLock(taskId),
       this.KEY.fence(taskId),
       this.KEY.task(taskId),
@@ -448,6 +511,7 @@ export class RedisShortTermStore implements ShortTermStore {
       this.KEY.seriesListEntries(taskId),
       this.KEY.taskSet,
       this.KEY.hotWindow(taskId),
+      this.KEY.taskStatus(taskId),
       taskId,
       lease.lockToken,
       lease.generation,
@@ -474,6 +538,7 @@ export class RedisShortTermStore implements ShortTermStore {
         storageEpoch: nextEpoch,
         activeReleaseGeneration: null,
       } satisfies TaskWriteFence),
+      snapshot.task.status,
     )
     return { taskId, storageEpoch: nextEpoch }
   }
@@ -482,7 +547,7 @@ export class RedisShortTermStore implements ShortTermStore {
     const legacySeriesKeys = await this.scanSeriesKeys(taskId)
     const results = await this.redis
       .pipeline()
-      .exists(this.KEY.task(taskId))
+      .exists(this.KEY.task(taskId), this.KEY.taskStatus(taskId))
       .llen(this.KEY.events(taskId))
       .exists(this.KEY.idx(taskId))
       .hlen(this.KEY.seriesState(taskId))
@@ -492,7 +557,7 @@ export class RedisShortTermStore implements ShortTermStore {
       throw new Error(`Redis pipeline failed while inspecting task storage ${taskId}`)
     }
     return {
-      task: results[0]![1] === 1,
+      task: Number(results[0]![1]) > 0,
       eventCount: Number(results[1]![1]),
       nextIndex: results[2]![1] === 1,
       seriesStateCount: Number(results[3]![1]) + legacySeriesKeys.length,
@@ -567,6 +632,7 @@ export class RedisShortTermStore implements ShortTermStore {
     await this.assertRedisType(this.KEY.events(taskId), await this.redis.type(this.KEY.events(taskId)), ['none', 'list'])
     await this.assertRedisType(this.KEY.idx(taskId), await this.redis.type(this.KEY.idx(taskId)), ['none', 'string'])
     await this.assertRedisType(this.KEY.fence(taskId), await this.redis.type(this.KEY.fence(taskId)), ['none', 'string'])
+    await this.assertRedisType(this.KEY.taskStatus(taskId), await this.redis.type(this.KEY.taskStatus(taskId)), ['none', 'string'])
     await this.assertRedisType(this.KEY.hotWindow(taskId), await this.redis.type(this.KEY.hotWindow(taskId)), ['none', 'string'])
 
     await this.assertRedisType(
@@ -606,6 +672,7 @@ export class RedisShortTermStore implements ShortTermStore {
     const pipeline = this.redis.pipeline()
 
     pipeline.set(taskKey, JSON.stringify(data.task))
+    pipeline.set(this.KEY.taskStatus(taskId), data.task.status)
     pipeline.sadd(this.KEY.taskSet, taskId)
     pipeline.del(this.KEY.events(taskId))
     for (const event of data.events) {
@@ -694,6 +761,7 @@ export class RedisShortTermStore implements ShortTermStore {
 
   async setTTL(taskId: string, ttlSeconds: number): Promise<void> {
     await this.redis.expire(this.KEY.task(taskId), ttlSeconds)
+    await this.redis.expire(this.KEY.taskStatus(taskId), ttlSeconds)
     await this.redis.expire(this.KEY.events(taskId), ttlSeconds)
     await this.redis.expire(this.KEY.idx(taskId), ttlSeconds)
     await this.redis.expire(this.KEY.fence(taskId), ttlSeconds)
@@ -1232,6 +1300,7 @@ export class RedisShortTermStore implements ShortTermStore {
     redis.call('SET', KEYS[1], ARGV[1])
     redis.call('SADD', KEYS[2], ARGV[2])
     redis.call('SETNX', KEYS[3], ARGV[3])
+    redis.call('SET', KEYS[4], ARGV[4])
     return 1
   `
 
@@ -1305,7 +1374,8 @@ export class RedisShortTermStore implements ShortTermStore {
        or lease.lockToken ~= ARGV[2]
        or lease.generation ~= ARGV[3]
        or lease.storageEpoch ~= tonumber(ARGV[4])
-       or fence.acceptingWrites ~= true
+       or fence.taskId ~= ARGV[1]
+       or (fence.acceptingWrites ~= true and fence.acceptingWrites ~= false)
        or fence.storageEpoch ~= tonumber(ARGV[5]) then
       return redis.error_reply('STORAGE_FENCE_CONFLICT')
     end
@@ -1487,7 +1557,109 @@ export class RedisShortTermStore implements ShortTermStore {
       return redis.error_reply('STORAGE_FENCE_CONFLICT')
     end
     redis.call('SET', KEYS[2], ARGV[2])
+    redis.call('SET', KEYS[3], ARGV[3])
     return 1
+  `
+
+  private static COMMIT_TASK_EVENTS_FENCED_LUA = `
+    local function validType(key, expected)
+      local actual = redis.call('TYPE', key).ok
+      return actual == 'none' or actual == expected
+    end
+    local function validIndex(value, maximum)
+      return string.match(value, '^[0-9]+$')
+        and (#value == 1 or string.sub(value, 1, 1) ~= '0')
+        and (#value < #maximum or (#value == #maximum and value <= maximum))
+    end
+    local function increment(value)
+      local carry = 1
+      local result = ''
+      for position = #value, 1, -1 do
+        local digit = tonumber(string.sub(value, position, position)) + carry
+        if digit >= 10 then
+          digit = digit - 10
+          carry = 1
+        else
+          carry = 0
+        end
+        result = tostring(digit) .. result
+      end
+      if carry == 1 then result = '1' .. result end
+      return result
+    end
+
+    if not validType(KEYS[1], 'string')
+       or not validType(KEYS[2], 'string')
+       or not validType(KEYS[3], 'string')
+       or not validType(KEYS[4], 'list')
+       or not validType(KEYS[5], 'string')
+       or not validType(KEYS[6], 'string') then
+      return redis.error_reply('STORAGE_INTEGRITY_ERROR')
+    end
+    local fenceJson = redis.call('GET', KEYS[1])
+    if not fenceJson then
+      return redis.error_reply('STORAGE_FENCE_CONFLICT')
+    end
+    local fence = cjson.decode(fenceJson)
+    if fence.acceptingWrites ~= true or fence.storageEpoch ~= tonumber(ARGV[1]) then
+      return redis.error_reply('STORAGE_FENCE_CONFLICT')
+    end
+    local currentTaskJson = redis.call('GET', KEYS[2])
+    if not currentTaskJson then
+      return redis.error_reply('STORAGE_INTEGRITY_ERROR')
+    end
+    if currentTaskJson ~= ARGV[3] then
+      return { 'TASK_CONFLICT' }
+    end
+    local eventCount = tonumber(ARGV[5])
+    if not eventCount or eventCount < 1 or eventCount > 16
+       or eventCount ~= math.floor(eventCount)
+       or #ARGV ~= 5 + eventCount * 2 then
+      return redis.error_reply('STORAGE_INTEGRITY_ERROR')
+    end
+    local indexJson = redis.call('GET', KEYS[3]) or '0'
+    if not validIndex(indexJson, '9007199254740990') then
+      return redis.error_reply('STORAGE_INTEGRITY_ERROR')
+    end
+    local finalIndex = indexJson
+    for _ = 1, eventCount do
+      finalIndex = increment(finalIndex)
+    end
+    if not validIndex(finalIndex, '9007199254740991') then
+      return redis.error_reply('STORAGE_INTEGRITY_ERROR')
+    end
+    local originalIndex = indexJson
+    local committed = { 'COMMITTED', '' }
+    redis.call('SET', KEYS[2], ARGV[2])
+    redis.call('SET', KEYS[6], ARGV[4])
+    for ordinal = 0, eventCount - 1 do
+      if not validIndex(indexJson, '9007199254740991') then
+        return redis.error_reply('STORAGE_INTEGRITY_ERROR')
+      end
+      local eventJson = ARGV[6 + ordinal * 2] .. indexJson
+        .. ARGV[7 + ordinal * 2]
+      redis.call('RPUSH', KEYS[4], eventJson)
+      table.insert(committed, eventJson)
+      indexJson = increment(indexJson)
+    end
+    redis.call('SET', KEYS[3], indexJson)
+    committed[2] = indexJson
+
+    local firstIndex = originalIndex
+    local existingWindow = redis.call('GET', KEYS[5])
+    if existingWindow then
+      local decoded = cjson.decode(existingWindow)
+      if decoded.firstIndex ~= cjson.null then
+        firstIndex = tostring(decoded.firstIndex)
+      end
+    end
+    local lastIndex = tostring(tonumber(indexJson) - 1)
+    redis.call(
+      'SET',
+      KEYS[5],
+      '{"firstIndex":' .. firstIndex .. ',"lastIndex":' .. lastIndex .. '}'
+    )
+    return committed
   `
 
   private static DELETE_TASK_STORAGE_LUA = `
@@ -1498,16 +1670,17 @@ export class RedisShortTermStore implements ShortTermStore {
     if not validType(KEYS[1], 'string')
        or not validType(KEYS[2], 'string')
        or not validType(KEYS[3], 'string')
-       or not validType(KEYS[4], 'list')
-       or not validType(KEYS[5], 'string')
-       or not validType(KEYS[6], 'hash')
+       or not validType(KEYS[4], 'string')
+       or not validType(KEYS[5], 'list')
+       or not validType(KEYS[6], 'string')
        or not validType(KEYS[7], 'hash')
-       or not validType(KEYS[8], 'set')
+       or not validType(KEYS[8], 'hash')
        or not validType(KEYS[9], 'set')
-       or not validType(KEYS[10], 'string') then
+       or not validType(KEYS[10], 'set')
+       or not validType(KEYS[11], 'string') then
       return redis.error_reply('STORAGE_INTEGRITY_ERROR')
     end
-    for index = 11, #KEYS do
+    for index = 12, #KEYS do
       if not validType(KEYS[index], 'string') then
         return redis.error_reply('STORAGE_INTEGRITY_ERROR')
       end
@@ -1530,7 +1703,7 @@ export class RedisShortTermStore implements ShortTermStore {
       return redis.error_reply('STORAGE_FENCE_CONFLICT')
     end
 
-    for index = 11, #KEYS do
+    for index = 12, #KEYS do
       redis.call('UNLINK', KEYS[index])
     end
     redis.call(
@@ -1542,9 +1715,10 @@ export class RedisShortTermStore implements ShortTermStore {
       KEYS[6],
       KEYS[7],
       KEYS[8],
-      KEYS[10]
+      KEYS[9],
+      KEYS[11]
     )
-    redis.call('SREM', KEYS[9], ARGV[1])
+    redis.call('SREM', KEYS[10], ARGV[1])
     return 1
   `
 
@@ -1561,7 +1735,8 @@ export class RedisShortTermStore implements ShortTermStore {
        or not validType(KEYS[6], 'hash')
        or not validType(KEYS[7], 'hash')
        or not validType(KEYS[8], 'set')
-       or not validType(KEYS[9], 'string') then
+       or not validType(KEYS[9], 'string')
+       or not validType(KEYS[10], 'string') then
       return redis.error_reply('STORAGE_INTEGRITY_ERROR')
     end
 
@@ -1584,6 +1759,7 @@ export class RedisShortTermStore implements ShortTermStore {
       if existingFence.acceptingWrites == true
          and existingFence.storageEpoch == tonumber(ARGV[6])
          and redis.call('EXISTS', KEYS[3]) == 1 then
+        redis.call('SET', KEYS[10], ARGV[13])
         return 2
       end
       return redis.error_reply('STORAGE_FENCE_CONFLICT')
@@ -1623,6 +1799,7 @@ export class RedisShortTermStore implements ShortTermStore {
     redis.call('SET', KEYS[5], ARGV[10])
     redis.call('SET', KEYS[9], ARGV[11])
     redis.call('SET', KEYS[2], ARGV[12])
+    redis.call('SET', KEYS[10], ARGV[13])
     return 1
   `
 
@@ -1690,6 +1867,7 @@ export class RedisShortTermStore implements ShortTermStore {
     task.cost = cost
     task.updatedAt = tonumber(ARGV[3])
     redis.call('SET', KEYS[1], cjson.encode(task))
+    redis.call('SET', KEYS[3], 'assigned')
 
     return 1
   `
@@ -1697,9 +1875,10 @@ export class RedisShortTermStore implements ShortTermStore {
   async claimTask(taskId: string, workerId: string, cost: number): Promise<boolean> {
     const result = await this.redis.eval(
       RedisShortTermStore.CLAIM_LUA,
-      2,
+      3,
       this.KEY.task(taskId),
       this.KEY.worker(workerId),
+      this.KEY.taskStatus(taskId),
       String(cost),
       workerId,
       String(Date.now()),
@@ -1752,6 +1931,7 @@ export class RedisShortTermStore implements ShortTermStore {
   // TTL management — remove expiry from task-related keys
   async clearTTL(taskId: string): Promise<void> {
     await this.redis.persist(this.KEY.task(taskId))
+    await this.redis.persist(this.KEY.taskStatus(taskId))
     await this.redis.persist(this.KEY.events(taskId))
     await this.redis.persist(this.KEY.idx(taskId))
     await this.redis.persist(this.KEY.fence(taskId))

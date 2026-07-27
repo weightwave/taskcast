@@ -260,4 +260,20 @@ describe('storage lifecycle migration', () => {
     expect(sql).toMatch(/ALTER\s+COLUMN\s+previous_digest\s+DROP\s+NOT\s+NULL/i)
     expect(sql).toMatch(/ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+series_coverage/i)
   })
+
+  it('adds a token-fenced task creation claim', () => {
+    const sql = readFileSync(
+      join(
+        import.meta.dirname,
+        '../../../../migrations/postgres/005_task_creation_claim.sql',
+      ),
+      'utf8',
+    )
+
+    expect(sql).toMatch(/ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+creation_token/i)
+    expect(sql).toMatch(/ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+creation_claimed_at/i)
+    expect(sql).toMatch(/ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+creation_claim_expires_at/i)
+    expect(sql).toMatch(/ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+creation_completed_at/i)
+    expect(sql).toMatch(/WHERE\s+creation_token\s+IS\s+NOT\s+NULL/i)
+  })
 })

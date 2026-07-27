@@ -67,6 +67,7 @@ describe('cross-compatibility: TS runner with sqlx-style pre-applied migrations'
       '002_workers.sql',
       '003_storage_lifecycle.sql',
       '004_archive_receipt_coverage.sql',
+      '005_task_creation_claim.sql',
     ])
   })
 
@@ -102,6 +103,10 @@ describe('cross-compatibility: TS runner with sqlx-style pre-applied migrations'
     const coverageRows = await sql`SELECT * FROM _sqlx_migrations WHERE version = 4`
     expect(coverageRows).toHaveLength(1)
     expect(coverageRows[0]!.description).toBe('archive receipt coverage')
+
+    const creationClaimRows = await sql`SELECT * FROM _sqlx_migrations WHERE version = 5`
+    expect(creationClaimRows).toHaveLength(1)
+    expect(creationClaimRows[0]!.description).toBe('task creation claim')
 
     const receiptColumns = await sql`
       SELECT column_name, is_nullable

@@ -624,6 +624,14 @@ pub struct HotWriteToken {
     pub storage_epoch: u64,
 }
 
+/// A task plus an opaque compare-and-set token for its exact hot-store record.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskMutationSnapshot {
+    pub task: Task,
+    pub revision: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct StorageLease {
@@ -1040,6 +1048,24 @@ pub trait ShortTermStore: Send + Sync {
         Err(Box::new(StorageReleaseUnsupportedError::default()))
     }
 
+    async fn get_task_mutation_snapshot(
+        &self,
+        _task_id: &str,
+    ) -> Result<Option<TaskMutationSnapshot>, Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(StorageReleaseUnsupportedError::default()))
+    }
+
+    /// Atomically stores a task mutation and all of its derived non-series events.
+    async fn commit_task_events_fenced(
+        &self,
+        _task: Task,
+        _expected_revision: &str,
+        _events: Vec<TaskEvent>,
+        _token: &HotWriteToken,
+    ) -> Result<Option<Vec<TaskEvent>>, Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(StorageReleaseUnsupportedError::default()))
+    }
+
     async fn save_task_fenced(
         &self,
         _task: Task,
@@ -1175,7 +1201,51 @@ pub trait LongTermStore: Send + Sync {
         false
     }
 
+    /// True only when explicit task creation has token-fenced complete/abort.
+    fn supports_task_creation_claims(&self) -> bool {
+        false
+    }
+
     async fn save_task(&self, task: Task) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    /// Atomically claims a durable task identity.
+    async fn create_task_if_absent(
+        &self,
+        task: Task,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        if self.get_task(&task.id).await?.is_some() {
+            return Ok(false);
+        }
+        self.save_task(task).await?;
+        Ok(true)
+    }
+    async fn claim_task_creation(
+        &self,
+        _task: Task,
+        _creation_token: &str,
+        _claim_ttl_ms: u64,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(StorageReleaseUnsupportedError::new(
+            "Token-fenced task creation is not supported",
+        )))
+    }
+    async fn complete_task_creation(
+        &self,
+        _task_id: &str,
+        _creation_token: &str,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(StorageReleaseUnsupportedError::new(
+            "Token-fenced task creation is not supported",
+        )))
+    }
+    async fn abort_task_creation(
+        &self,
+        _task_id: &str,
+        _creation_token: &str,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(StorageReleaseUnsupportedError::new(
+            "Token-fenced task creation is not supported",
+        )))
+    }
     async fn get_task(
         &self,
         task_id: &str,

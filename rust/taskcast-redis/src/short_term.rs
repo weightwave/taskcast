@@ -6,8 +6,8 @@ use std::sync::Arc;
 use taskcast_core::types::{
     ArchiveSourcePage, ClosedWriteFence, EventQueryOptions, HotWriteToken, RehydrateSnapshot,
     SeriesMode, SeriesResult, ShortTermStore, StorageFenceConflictError, StorageIntegrityError,
-    StorageLease, StorageWriterRegistration, Task, TaskEvent, TaskFilter, TaskStoragePresence,
-    TaskWriteFence, Worker, WorkerAssignment, WorkerFilter,
+    StorageLease, StorageWriterRegistration, Task, TaskEvent, TaskFilter, TaskMutationSnapshot,
+    TaskStoragePresence, TaskWriteFence, Worker, WorkerAssignment, WorkerFilter,
 };
 use taskcast_core::DependencyObserver;
 
@@ -35,6 +35,10 @@ impl Keys {
     /// `{prefix}:task:{id}` -- stores the full Task JSON.
     fn task(&self, id: &str) -> String {
         format!("{}:task:{}", self.prefix, id)
+    }
+
+    fn task_status(&self, id: &str) -> String {
+        format!("{}:taskStatus:{}", self.prefix, id)
     }
 
     /// `{prefix}:events:{id}` -- a Redis list of event JSONs.
@@ -477,6 +481,7 @@ const SAVE_TASK_LUA: &str = r#"
     redis.call('SET', KEYS[1], ARGV[1])
     redis.call('SADD', KEYS[2], ARGV[2])
     redis.call('SETNX', KEYS[3], ARGV[3])
+    redis.call('SET', KEYS[4], ARGV[4])
     return 1
 "#;
 
@@ -550,7 +555,8 @@ const CLOSE_WRITE_FENCE_LUA: &str = r#"
        or lease.lockToken ~= ARGV[2]
        or lease.generation ~= ARGV[3]
        or lease.storageEpoch ~= tonumber(ARGV[4])
-       or fence.acceptingWrites ~= true
+       or fence.taskId ~= ARGV[1]
+       or (fence.acceptingWrites ~= true and fence.acceptingWrites ~= false)
        or fence.storageEpoch ~= tonumber(ARGV[5]) then
       return redis.error_reply('STORAGE_FENCE_CONFLICT')
     end
@@ -732,7 +738,109 @@ const SAVE_TASK_FENCED_LUA: &str = r#"
       return redis.error_reply('STORAGE_FENCE_CONFLICT')
     end
     redis.call('SET', KEYS[2], ARGV[2])
+    redis.call('SET', KEYS[3], ARGV[3])
     return 1
+"#;
+
+const COMMIT_TASK_EVENTS_FENCED_LUA: &str = r#"
+local function validType(key, expected)
+  local actual = redis.call('TYPE', key).ok
+  return actual == 'none' or actual == expected
+end
+local function validIndex(value, maximum)
+  return string.match(value, '^[0-9]+$')
+    and (#value == 1 or string.sub(value, 1, 1) ~= '0')
+    and (#value < #maximum or (#value == #maximum and value <= maximum))
+end
+local function increment(value)
+  local carry = 1
+  local result = ''
+  for position = #value, 1, -1 do
+    local digit = tonumber(string.sub(value, position, position)) + carry
+    if digit >= 10 then
+      digit = digit - 10
+      carry = 1
+    else
+      carry = 0
+    end
+    result = tostring(digit) .. result
+  end
+  if carry == 1 then result = '1' .. result end
+  return result
+end
+
+if not validType(KEYS[1], 'string')
+   or not validType(KEYS[2], 'string')
+   or not validType(KEYS[3], 'string')
+   or not validType(KEYS[4], 'list')
+   or not validType(KEYS[5], 'string')
+   or not validType(KEYS[6], 'string') then
+  return redis.error_reply('STORAGE_INTEGRITY_ERROR')
+end
+local fenceJson = redis.call('GET', KEYS[1])
+if not fenceJson then
+  return redis.error_reply('STORAGE_FENCE_CONFLICT')
+end
+local fence = cjson.decode(fenceJson)
+if fence.acceptingWrites ~= true or fence.storageEpoch ~= tonumber(ARGV[1]) then
+  return redis.error_reply('STORAGE_FENCE_CONFLICT')
+end
+local currentTaskJson = redis.call('GET', KEYS[2])
+if not currentTaskJson then
+  return redis.error_reply('STORAGE_INTEGRITY_ERROR')
+end
+if currentTaskJson ~= ARGV[3] then
+  return { 'TASK_CONFLICT' }
+end
+local eventCount = tonumber(ARGV[5])
+if not eventCount or eventCount < 1 or eventCount > 16
+   or eventCount ~= math.floor(eventCount)
+   or #ARGV ~= 5 + eventCount * 2 then
+  return redis.error_reply('STORAGE_INTEGRITY_ERROR')
+end
+local indexJson = redis.call('GET', KEYS[3]) or '0'
+if not validIndex(indexJson, '9007199254740990') then
+  return redis.error_reply('STORAGE_INTEGRITY_ERROR')
+end
+local finalIndex = indexJson
+for _ = 1, eventCount do
+  finalIndex = increment(finalIndex)
+end
+if not validIndex(finalIndex, '9007199254740991') then
+  return redis.error_reply('STORAGE_INTEGRITY_ERROR')
+end
+local originalIndex = indexJson
+local committed = { 'COMMITTED', '' }
+redis.call('SET', KEYS[2], ARGV[2])
+redis.call('SET', KEYS[6], ARGV[4])
+for ordinal = 0, eventCount - 1 do
+  if not validIndex(indexJson, '9007199254740991') then
+    return redis.error_reply('STORAGE_INTEGRITY_ERROR')
+  end
+  local eventJson = ARGV[6 + ordinal * 2] .. indexJson
+    .. ARGV[7 + ordinal * 2]
+  redis.call('RPUSH', KEYS[4], eventJson)
+  table.insert(committed, eventJson)
+  indexJson = increment(indexJson)
+end
+redis.call('SET', KEYS[3], indexJson)
+committed[2] = indexJson
+
+local firstIndex = originalIndex
+local existingWindow = redis.call('GET', KEYS[5])
+if existingWindow then
+  local decoded = cjson.decode(existingWindow)
+  if decoded.firstIndex ~= cjson.null then
+    firstIndex = tostring(decoded.firstIndex)
+  end
+end
+local lastIndex = tostring(tonumber(indexJson) - 1)
+redis.call(
+  'SET',
+  KEYS[5],
+  '{"firstIndex":' .. firstIndex .. ',"lastIndex":' .. lastIndex .. '}'
+)
+return committed
 "#;
 
 const DELETE_TASK_STORAGE_LUA: &str = r#"
@@ -743,16 +851,17 @@ const DELETE_TASK_STORAGE_LUA: &str = r#"
     if not validType(KEYS[1], 'string')
        or not validType(KEYS[2], 'string')
        or not validType(KEYS[3], 'string')
-       or not validType(KEYS[4], 'list')
-       or not validType(KEYS[5], 'string')
-       or not validType(KEYS[6], 'hash')
+       or not validType(KEYS[4], 'string')
+       or not validType(KEYS[5], 'list')
+       or not validType(KEYS[6], 'string')
        or not validType(KEYS[7], 'hash')
-       or not validType(KEYS[8], 'set')
+       or not validType(KEYS[8], 'hash')
        or not validType(KEYS[9], 'set')
-       or not validType(KEYS[10], 'string') then
+       or not validType(KEYS[10], 'set')
+       or not validType(KEYS[11], 'string') then
       return redis.error_reply('STORAGE_INTEGRITY_ERROR')
     end
-    for index = 11, #KEYS do
+    for index = 12, #KEYS do
       if not validType(KEYS[index], 'string') then
         return redis.error_reply('STORAGE_INTEGRITY_ERROR')
       end
@@ -775,7 +884,7 @@ const DELETE_TASK_STORAGE_LUA: &str = r#"
       return redis.error_reply('STORAGE_FENCE_CONFLICT')
     end
 
-    for index = 11, #KEYS do
+    for index = 12, #KEYS do
       redis.call('UNLINK', KEYS[index])
     end
     redis.call(
@@ -787,9 +896,10 @@ const DELETE_TASK_STORAGE_LUA: &str = r#"
       KEYS[6],
       KEYS[7],
       KEYS[8],
-      KEYS[10]
+      KEYS[9],
+      KEYS[11]
     )
-    redis.call('SREM', KEYS[9], ARGV[1])
+    redis.call('SREM', KEYS[10], ARGV[1])
     return 1
 "#;
 
@@ -806,7 +916,8 @@ const RESTORE_HOT_TASK_LUA: &str = r#"
        or not validType(KEYS[6], 'hash')
        or not validType(KEYS[7], 'hash')
        or not validType(KEYS[8], 'set')
-       or not validType(KEYS[9], 'string') then
+       or not validType(KEYS[9], 'string')
+       or not validType(KEYS[10], 'string') then
       return redis.error_reply('STORAGE_INTEGRITY_ERROR')
     end
 
@@ -829,6 +940,7 @@ const RESTORE_HOT_TASK_LUA: &str = r#"
       if existingFence.acceptingWrites == true
          and existingFence.storageEpoch == tonumber(ARGV[6])
          and redis.call('EXISTS', KEYS[3]) == 1 then
+        redis.call('SET', KEYS[10], ARGV[13])
         return 2
       end
       return redis.error_reply('STORAGE_FENCE_CONFLICT')
@@ -868,6 +980,7 @@ const RESTORE_HOT_TASK_LUA: &str = r#"
     redis.call('SET', KEYS[5], ARGV[10])
     redis.call('SET', KEYS[9], ARGV[11])
     redis.call('SET', KEYS[2], ARGV[12])
+    redis.call('SET', KEYS[10], ARGV[13])
     return 1
 "#;
 
@@ -931,9 +1044,15 @@ impl ShortTermStore for RedisShortTermStore {
                 .key(self.keys.task(&task_id))
                 .key(self.keys.tasks_set())
                 .key(self.keys.write_fence(&task_id))
+                .key(self.keys.task_status(&task_id))
                 .arg(json)
                 .arg(&task_id)
                 .arg(fence)
+                .arg(
+                    serde_json::to_value(&task.status)?
+                        .as_str()
+                        .unwrap_or("pending"),
+                )
                 .invoke_async::<()>(&mut conn)
         );
         Ok(())
@@ -948,6 +1067,22 @@ impl ShortTermStore for RedisShortTermStore {
         let result: Option<String> = redis_call!(conn, conn.get(&key));
         match result {
             Some(json) => Ok(Some(serde_json::from_str(&json)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn get_task_mutation_snapshot(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<TaskMutationSnapshot>, Box<dyn std::error::Error + Send + Sync>> {
+        let key = self.keys.task(task_id);
+        let mut conn = self.conn.clone();
+        let result: Option<String> = conn.get(&key).await?;
+        match result {
+            Some(json) => Ok(Some(TaskMutationSnapshot {
+                task: serde_json::from_str(&json)?,
+                revision: json,
+            })),
             None => Ok(None),
         }
     }
@@ -1246,12 +1381,79 @@ impl ShortTermStore for RedisShortTermStore {
         redis::Script::new(SAVE_TASK_FENCED_LUA)
             .key(self.keys.write_fence(&task.id))
             .key(self.keys.task(&task.id))
+            .key(self.keys.task_status(&task.id))
             .arg(token.storage_epoch)
             .arg(serde_json::to_string(&task)?)
+            .arg(
+                serde_json::to_value(&task.status)?
+                    .as_str()
+                    .unwrap_or("pending"),
+            )
             .invoke_async::<()>(&mut conn)
             .await
             .map_err(Self::map_fence_error)?;
         Ok(())
+    }
+
+    async fn commit_task_events_fenced(
+        &self,
+        task: Task,
+        expected_revision: &str,
+        events: Vec<TaskEvent>,
+        token: &HotWriteToken,
+    ) -> Result<Option<Vec<TaskEvent>>, Box<dyn std::error::Error + Send + Sync>> {
+        if token.task_id != task.id
+            || events.is_empty()
+            || events.iter().any(|event| {
+                event.task_id != task.id || event.series_id.is_some() || event.series_mode.is_some()
+            })
+        {
+            return Err(Box::new(StorageFenceConflictError::default()));
+        }
+        let templates = events
+            .iter()
+            .map(Self::make_indexed_event_template)
+            .collect::<Result<Vec<_>, _>>()?;
+        let script = redis::Script::new(COMMIT_TASK_EVENTS_FENCED_LUA);
+        let mut invocation = script.prepare_invoke();
+        invocation
+            .key(self.keys.write_fence(&task.id))
+            .key(self.keys.task(&task.id))
+            .key(self.keys.idx(&task.id))
+            .key(self.keys.events(&task.id))
+            .key(self.keys.hot_window(&task.id))
+            .key(self.keys.task_status(&task.id))
+            .arg(token.storage_epoch)
+            .arg(serde_json::to_string(&task)?)
+            .arg(expected_revision)
+            .arg(
+                serde_json::to_value(&task.status)?
+                    .as_str()
+                    .unwrap_or("pending"),
+            )
+            .arg(events.len());
+        for (prefix, suffix) in &templates {
+            invocation.arg(prefix).arg(suffix);
+        }
+        let mut conn = self.conn.clone();
+        let raw = invocation
+            .invoke_async::<Vec<String>>(&mut conn)
+            .await
+            .map_err(Self::map_fence_error)?;
+        if raw.first().map(String::as_str) == Some("TASK_CONFLICT") {
+            return Ok(None);
+        }
+        if raw.first().map(String::as_str) != Some("COMMITTED") || raw.len() != events.len() + 2 {
+            return Err(Box::new(StorageIntegrityError::new(
+                "Redis returned an invalid fenced task-event commit result",
+            )));
+        }
+        let committed = raw
+            .into_iter()
+            .skip(2)
+            .map(|event| serde_json::from_str(&event).map_err(Into::into))
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error + Send + Sync>>>()?;
+        Ok(Some(committed))
     }
 
     async fn read_archive_source_page(
@@ -1337,6 +1539,7 @@ impl ShortTermStore for RedisShortTermStore {
             .key(self.keys.storage_lock(&lease.task_id))
             .key(self.keys.write_fence(&lease.task_id))
             .key(self.keys.task(&lease.task_id))
+            .key(self.keys.task_status(&lease.task_id))
             .key(self.keys.events(&lease.task_id))
             .key(self.keys.idx(&lease.task_id))
             .key(self.keys.series_state(&lease.task_id))
@@ -1416,6 +1619,7 @@ impl ShortTermStore for RedisShortTermStore {
             .key(self.keys.series_list_entries(&task_id))
             .key(self.keys.tasks_set())
             .key(self.keys.hot_window(&task_id))
+            .key(self.keys.task_status(&task_id))
             .arg(&task_id)
             .arg(&lease.lock_token)
             .arg(&lease.generation)
@@ -1428,6 +1632,11 @@ impl ShortTermStore for RedisShortTermStore {
             .arg(snapshot.max_event_index + 1)
             .arg(serde_json::to_string(&hot_window)?)
             .arg(serde_json::to_string(&fence)?)
+            .arg(
+                serde_json::to_value(&snapshot.task.status)?
+                    .as_str()
+                    .unwrap_or("pending"),
+            )
             .invoke_async::<()>(&mut conn)
             .await
             .map_err(Self::map_fence_error)?;
@@ -1452,6 +1661,7 @@ impl ShortTermStore for RedisShortTermStore {
         ) = redis::pipe()
             .cmd("EXISTS")
             .arg(self.keys.task(task_id))
+            .arg(self.keys.task_status(task_id))
             .cmd("LLEN")
             .arg(self.keys.events(task_id))
             .cmd("EXISTS")
@@ -1463,7 +1673,7 @@ impl ShortTermStore for RedisShortTermStore {
             .query_async(&mut conn)
             .await?;
         Ok(TaskStoragePresence {
-            task: task == 1,
+            task: task > 0,
             event_count,
             next_index: next_index == 1,
             series_state_count: series_state_count + legacy_series_count,
@@ -1586,6 +1796,10 @@ impl ShortTermStore for RedisShortTermStore {
         redis_call!(
             conn,
             conn.expire::<_, ()>(&self.keys.task(task_id), ttl_secs)
+        );
+        redis_call!(
+            conn,
+            conn.expire::<_, ()>(&self.keys.task_status(task_id), ttl_secs)
         );
 
         // Expire events list
@@ -1996,6 +2210,7 @@ impl ShortTermStore for RedisShortTermStore {
             task.cost = cost
             task.updatedAt = tonumber(ARGV[3])
             redis.call('SET', KEYS[1], cjson.encode(task))
+            redis.call('SET', KEYS[3], 'assigned')
 
             return 1
         "#;
@@ -2012,6 +2227,7 @@ impl ShortTermStore for RedisShortTermStore {
             script
                 .key(&task_key)
                 .key(&worker_key)
+                .key(self.keys.task_status(task_id))
                 .arg(cost)
                 .arg(worker_id)
                 .arg(timestamp_ms)

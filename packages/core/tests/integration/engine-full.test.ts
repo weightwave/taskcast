@@ -41,16 +41,19 @@ beforeAll(async () => {
   sql = postgres(`postgres://test:test@localhost:${pgPort}/testdb`)
 
   // Run migrations
-  const migration001 = readFileSync(
-    join(import.meta.dirname, '../../../../migrations/postgres/001_initial.sql'),
-    'utf8',
-  )
-  await sql.unsafe(migration001)
-  const migration002 = readFileSync(
-    join(import.meta.dirname, '../../../../migrations/postgres/002_workers.sql'),
-    'utf8',
-  )
-  await sql.unsafe(migration002)
+  for (const filename of [
+    '001_initial.sql',
+    '002_workers.sql',
+    '003_storage_lifecycle.sql',
+    '004_archive_receipt_coverage.sql',
+    '005_task_creation_claim.sql',
+  ]) {
+    const migration = readFileSync(
+      join(import.meta.dirname, '../../../../migrations/postgres', filename),
+      'utf8',
+    )
+    await sql.unsafe(migration)
+  }
 
   const broadcast = new RedisBroadcastProvider(pubClient, subClient)
   const shortTermStore = new RedisShortTermStore(storeClient)
