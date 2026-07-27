@@ -426,7 +426,11 @@ impl WorkerManager {
             assigned_at: now_millis(),
             status: WorkerAssignmentStatus::Assigned,
         };
-        if let Some(ref long_term_store) = self.long_term_store {
+        if let Some(long_term_store) = self
+            .long_term_store
+            .as_ref()
+            .filter(|store| store.supports_durable_ttl())
+        {
             long_term_store
                 .save_durable_assignment(assignment.clone())
                 .await?;
@@ -436,7 +440,11 @@ impl WorkerManager {
             .add_assignment(assignment.clone())
             .await
         {
-            if let Some(ref long_term_store) = self.long_term_store {
+            if let Some(long_term_store) = self
+                .long_term_store
+                .as_ref()
+                .filter(|store| store.supports_durable_ttl())
+            {
                 let assignment_id = durable_assignment_id(&assignment);
                 let _ = long_term_store
                     .delete_durable_assignment(task_id, Some(&assignment_id))
@@ -478,7 +486,11 @@ impl WorkerManager {
         };
 
         // Remove assignment
-        if let Some(ref long_term_store) = self.long_term_store {
+        if let Some(long_term_store) = self
+            .long_term_store
+            .as_ref()
+            .filter(|store| store.supports_durable_ttl())
+        {
             let assignment_id = durable_assignment_id(&assignment);
             long_term_store
                 .delete_durable_assignment(task_id, Some(&assignment_id))
@@ -585,7 +597,11 @@ impl WorkerManager {
     pub async fn release_task(&self, task_id: &str) -> ManagerResult<()> {
         let assignment = self.short_term_store.get_task_assignment(task_id).await?;
         let Some(assignment) = assignment else {
-            if let Some(ref long_term_store) = self.long_term_store {
+            if let Some(long_term_store) = self
+                .long_term_store
+                .as_ref()
+                .filter(|store| store.supports_durable_ttl())
+            {
                 long_term_store
                     .delete_durable_assignment(task_id, None)
                     .await?;
@@ -593,7 +609,11 @@ impl WorkerManager {
             return Ok(());
         };
 
-        if let Some(ref long_term_store) = self.long_term_store {
+        if let Some(long_term_store) = self
+            .long_term_store
+            .as_ref()
+            .filter(|store| store.supports_durable_ttl())
+        {
             let assignment_id = durable_assignment_id(&assignment);
             long_term_store
                 .delete_durable_assignment(task_id, Some(&assignment_id))
