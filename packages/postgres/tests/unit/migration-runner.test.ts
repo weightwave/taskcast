@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { mkdtempSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { parseMigrationFilename, computeChecksum, loadMigrationFiles, buildMigrationFiles } from '../../src/migration-runner.js'
@@ -227,5 +227,24 @@ describe('buildMigrationFiles', () => {
     expect(result.map((f) => f.version)).toEqual([1, 2])
     // Input is unchanged
     expect(embedded).toEqual(snapshot)
+  })
+})
+
+describe('storage lifecycle migration', () => {
+  it('adds coordination metadata without rewriting the production event table', () => {
+    const sql = readFileSync(
+      join(import.meta.dirname, '../../../../migrations/postgres/003_storage_lifecycle.sql'),
+      'utf8',
+    )
+
+    expect(sql).toContain('storage_state')
+    expect(sql).toContain('archive_watermark')
+    expect(sql).toContain('execution_deadline_at')
+    expect(sql).toContain('taskcast_archive_generations')
+    expect(sql).toContain('taskcast_archive_batches')
+    expect(sql).toContain('taskcast_series_state')
+    expect(sql).toContain('taskcast_durable_assignments')
+    expect(sql).toContain('taskcast_terminal_outbox')
+    expect(sql).not.toMatch(/ALTER\s+TABLE\s+taskcast_events/i)
   })
 })

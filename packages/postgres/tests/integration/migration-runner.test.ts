@@ -34,33 +34,76 @@ describe('migration runner integration', () => {
   it('applies all migrations on fresh database', async () => {
     const result = await runMigrations(sql, MIGRATIONS_DIR)
 
-    expect(result.applied).toEqual(['001_initial.sql', '002_workers.sql'])
+    expect(result.applied).toEqual([
+      '001_initial.sql',
+      '002_workers.sql',
+      '003_storage_lifecycle.sql',
+    ])
     expect(result.skipped).toEqual([])
 
     // Verify tables were actually created
     const tables = await sql`
       SELECT table_name FROM information_schema.tables
       WHERE table_schema = 'public'
-        AND table_name IN ('taskcast_tasks', 'taskcast_events', 'taskcast_worker_events')
+        AND table_name IN (
+          'taskcast_tasks',
+          'taskcast_events',
+          'taskcast_worker_events',
+          'taskcast_archive_generations',
+          'taskcast_archive_batches',
+          'taskcast_series_state',
+          'taskcast_durable_assignments',
+          'taskcast_terminal_outbox'
+        )
       ORDER BY table_name
     `
     const tableNames = tables.map((r) => r.table_name)
     expect(tableNames).toContain('taskcast_tasks')
     expect(tableNames).toContain('taskcast_events')
     expect(tableNames).toContain('taskcast_worker_events')
+    expect(tableNames).toContain('taskcast_archive_generations')
+    expect(tableNames).toContain('taskcast_archive_batches')
+    expect(tableNames).toContain('taskcast_series_state')
+    expect(tableNames).toContain('taskcast_durable_assignments')
+    expect(tableNames).toContain('taskcast_terminal_outbox')
+
+    const lifecycleColumns = await sql`
+      SELECT column_name FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = 'taskcast_tasks'
+        AND column_name IN (
+          'storage_state',
+          'storage_epoch',
+          'archive_watermark',
+          'execution_deadline_at',
+          'task_version'
+        )
+      ORDER BY column_name
+    `
+    expect(lifecycleColumns.map((row) => row.column_name)).toEqual([
+      'archive_watermark',
+      'execution_deadline_at',
+      'storage_epoch',
+      'storage_state',
+      'task_version',
+    ])
   })
 
   it('skips already-applied on second run', async () => {
     const result = await runMigrations(sql, MIGRATIONS_DIR)
 
     expect(result.applied).toEqual([])
-    expect(result.skipped).toEqual(['001_initial.sql', '002_workers.sql'])
+    expect(result.skipped).toEqual([
+      '001_initial.sql',
+      '002_workers.sql',
+      '003_storage_lifecycle.sql',
+    ])
   })
 
   it('writes _sqlx_migrations records with correct format', async () => {
     const rows = await sql`SELECT * FROM _sqlx_migrations ORDER BY version`
 
-    expect(rows).toHaveLength(2)
+    expect(rows).toHaveLength(3)
 
     // Verify migration 001
     const row1 = rows[0]!
@@ -83,6 +126,17 @@ describe('migration runner integration', () => {
     const file2Content = readFileSync(join(MIGRATIONS_DIR, '002_workers.sql'), 'utf8')
     const expectedChecksum2 = computeChecksum(file2Content)
     expect(Buffer.from(row2.checksum as Uint8Array).equals(expectedChecksum2)).toBe(true)
+
+    // Verify migration 003
+    const row3 = rows[2]!
+    expect(Number(row3.version)).toBe(3)
+    expect(row3.description).toBe('storage_lifecycle')
+    expect(row3.success).toBe(true)
+    expect(Number(row3.execution_time)).toBeGreaterThanOrEqual(0)
+
+    const file3Content = readFileSync(join(MIGRATIONS_DIR, '003_storage_lifecycle.sql'), 'utf8')
+    const expectedChecksum3 = computeChecksum(file3Content)
+    expect(Buffer.from(row3.checksum as Uint8Array).equals(expectedChecksum3)).toBe(true)
   })
 
   it('rejects tampered checksum', async () => {

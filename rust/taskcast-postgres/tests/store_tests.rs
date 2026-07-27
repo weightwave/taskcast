@@ -10,6 +10,20 @@ use taskcast_postgres::PostgresLongTermStore;
 
 use std::collections::HashMap;
 
+#[test]
+fn storage_lifecycle_migration_avoids_event_table_rewrite() {
+    let migration = include_str!("../../../migrations/postgres/003_storage_lifecycle.sql");
+    assert!(migration.contains("storage_state"));
+    assert!(migration.contains("archive_watermark"));
+    assert!(migration.contains("execution_deadline_at"));
+    assert!(migration.contains("taskcast_archive_generations"));
+    assert!(migration.contains("taskcast_archive_batches"));
+    assert!(migration.contains("taskcast_series_state"));
+    assert!(migration.contains("taskcast_durable_assignments"));
+    assert!(migration.contains("taskcast_terminal_outbox"));
+    assert!(!migration.contains("ALTER TABLE taskcast_events"));
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 async fn setup() -> (

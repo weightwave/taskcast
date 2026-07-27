@@ -72,6 +72,15 @@ describe('generated-migrations', () => {
     expect(workersMigration!.sql).toContain('taskcast_worker_events')
   })
 
+  it('includes the storage lifecycle migration (003_storage_lifecycle.sql)', () => {
+    const lifecycleMigration = EMBEDDED_MIGRATIONS.find(
+      (m) => m.filename === '003_storage_lifecycle.sql',
+    )
+    expect(lifecycleMigration).toBeDefined()
+    expect(lifecycleMigration!.sql).toContain('taskcast_archive_generations')
+    expect(lifecycleMigration!.sql).toContain('taskcast_terminal_outbox')
+  })
+
   it('001_initial.sql creates tables with IF NOT EXISTS', () => {
     const initialMigration = EMBEDDED_MIGRATIONS.find((m) => m.filename === '001_initial.sql')
     expect(initialMigration).toBeDefined()

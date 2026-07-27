@@ -59,11 +59,11 @@ describe('cross-compatibility: TS runner with sqlx-style pre-applied migrations'
     const migration001Sql = readFileSync(join(MIGRATIONS_DIR, '001_initial.sql'), 'utf8')
     await sql.unsafe(migration001Sql)
 
-    // Now run the TS migration runner — it should skip 001 and apply only 002
+    // Now run the TS migration runner — it should skip 001 and apply the remaining migrations
     const result = await runMigrations(sql, MIGRATIONS_DIR)
 
     expect(result.skipped).toEqual(['001_initial.sql'])
-    expect(result.applied).toEqual(['002_workers.sql'])
+    expect(result.applied).toEqual(['002_workers.sql', '003_storage_lifecycle.sql'])
   })
 
   it('TS-written records have correct sqlx field format', async () => {
@@ -81,5 +81,18 @@ describe('cross-compatibility: TS runner with sqlx-style pre-applied migrations'
     const file2Content = readFileSync(join(MIGRATIONS_DIR, '002_workers.sql'), 'utf8')
     const expectedChecksum = computeChecksum(file2Content)
     expect(Buffer.from(row.checksum as Uint8Array).equals(expectedChecksum)).toBe(true)
+
+    const lifecycleRows = await sql`SELECT * FROM _sqlx_migrations WHERE version = 3`
+    expect(lifecycleRows).toHaveLength(1)
+
+    const lifecycleRow = lifecycleRows[0]!
+    expect(lifecycleRow.description).toBe('storage_lifecycle')
+    expect(lifecycleRow.success).toBe(true)
+
+    const file3Content = readFileSync(join(MIGRATIONS_DIR, '003_storage_lifecycle.sql'), 'utf8')
+    const expectedLifecycleChecksum = computeChecksum(file3Content)
+    expect(
+      Buffer.from(lifecycleRow.checksum as Uint8Array).equals(expectedLifecycleChecksum),
+    ).toBe(true)
   })
 })
