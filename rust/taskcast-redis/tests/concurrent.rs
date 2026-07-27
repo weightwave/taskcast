@@ -14,8 +14,9 @@ use std::time::{Duration, Instant};
 
 use support::TcpFaultProxy;
 use taskcast_core::{
-    BroadcastProvider, CreateTaskInput, Level, MemoryBroadcastProvider, PublishEventInput,
-    TaskEngine, TaskEngineOptions, TaskEvent, TaskStatus,
+    BroadcastProvider, CreateTaskInput, HotWriteToken, Level, MemoryBroadcastProvider,
+    PublishEventInput, SeriesMode, ShortTermStore, TaskEngine, TaskEngineOptions, TaskEvent,
+    TaskStatus,
 };
 use taskcast_redis::{create_managed_redis_adapters, RedisBroadcastProvider, RedisShortTermStore};
 use testcontainers::core::{IntoContainerPort, WaitFor};
@@ -54,7 +55,7 @@ async fn make_redis_broadcast(redis_url: &str) -> RedisBroadcastProvider {
 async fn make_redis_engine(redis_url: &str) -> TaskEngine {
     let client = redis::Client::open(redis_url).unwrap();
     let conn = client.get_multiplexed_async_connection().await.unwrap();
-    let store = RedisShortTermStore::new(conn, Some("test"));
+    let store = RedisShortTermStore::new(conn, Some("test")).with_legacy_series_writes(false);
     TaskEngine::new(TaskEngineOptions {
         short_term_store: Arc::new(store),
         broadcast: Arc::new(MemoryBroadcastProvider::new()),
@@ -87,10 +88,10 @@ async fn eventually(timeout: Duration, mut condition: impl FnMut() -> bool) {
     }
 }
 
-#[tokio::test]
-async fn two_engine_instances_produce_no_duplicate_event_indices() {
-    // This is the Rust equivalent of the TS regression test that found 37/60 index
-    // collisions before nextIndex was moved to RedisShortTermStore with INCR.
+async fn start_redis() -> (Option<testcontainers::ContainerAsync<GenericImage>>, String) {
+    if let Ok(url) = std::env::var("TASKCAST_TEST_REDIS_URL") {
+        return (None, url);
+    }
     let container = GenericImage::new("redis", "7-alpine")
         .with_exposed_port(6379.tcp())
         .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
@@ -99,6 +100,14 @@ async fn two_engine_instances_produce_no_duplicate_event_indices() {
         .unwrap();
     let port = container.get_host_port_ipv4(6379).await.unwrap();
     let redis_url = format!("redis://127.0.0.1:{port}");
+    (Some(container), redis_url)
+}
+
+#[tokio::test]
+async fn two_engine_instances_produce_no_duplicate_event_indices() {
+    // This is the Rust equivalent of the TS regression test that found 37/60 index
+    // collisions before nextIndex was moved to RedisShortTermStore with INCR.
+    let (_container, redis_url) = start_redis().await;
 
     flush_redis(&redis_url).await;
 
@@ -183,14 +192,7 @@ async fn two_engine_instances_produce_no_duplicate_event_indices() {
 
 #[tokio::test]
 async fn concurrent_publish_to_redis_maintains_monotonic_index() {
-    let container = GenericImage::new("redis", "7-alpine")
-        .with_exposed_port(6379.tcp())
-        .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
-        .start()
-        .await
-        .unwrap();
-    let port = container.get_host_port_ipv4(6379).await.unwrap();
-    let redis_url = format!("redis://127.0.0.1:{port}");
+    let (_container, redis_url) = start_redis().await;
 
     flush_redis(&redis_url).await;
 
@@ -241,23 +243,12 @@ async fn concurrent_publish_to_redis_maintains_monotonic_index() {
 
     let min = *indices.first().unwrap();
     let max = *indices.last().unwrap();
-    assert_eq!(
-        max - min,
-        (count - 1) as u64,
-        "indices must be consecutive"
-    );
+    assert_eq!(max - min, (count - 1) as u64, "indices must be consecutive");
 }
 
 #[tokio::test]
 async fn redis_store_100_concurrent_tasks_all_get_unique_ids() {
-    let container = GenericImage::new("redis", "7-alpine")
-        .with_exposed_port(6379.tcp())
-        .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
-        .start()
-        .await
-        .unwrap();
-    let port = container.get_host_port_ipv4(6379).await.unwrap();
-    let redis_url = format!("redis://127.0.0.1:{port}");
+    let (_container, redis_url) = start_redis().await;
 
     flush_redis(&redis_url).await;
 
@@ -268,7 +259,10 @@ async fn redis_store_100_concurrent_tasks_all_get_unique_ids() {
     for _ in 0..count {
         let engine = Arc::clone(&engine);
         handles.push(tokio::spawn(async move {
-            engine.create_task(CreateTaskInput::default()).await.unwrap()
+            engine
+                .create_task(CreateTaskInput::default())
+                .await
+                .unwrap()
         }));
     }
 
@@ -280,6 +274,136 @@ async fn redis_store_100_concurrent_tasks_all_get_unique_ids() {
 
     let ids: std::collections::HashSet<_> = tasks.iter().map(|t| t.id.clone()).collect();
     assert_eq!(ids.len(), count, "all task IDs must be unique");
+}
+
+#[tokio::test]
+async fn fenced_commit_and_close_are_linearizable_without_index_gaps() {
+    let (_container, redis_url) = start_redis().await;
+    flush_redis(&redis_url).await;
+    let engine = make_redis_engine(&redis_url).await;
+    let task = engine
+        .create_task(CreateTaskInput {
+            id: Some("fenced-task".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let client = redis::Client::open(redis_url.as_str()).unwrap();
+    let conn = client.get_multiplexed_async_connection().await.unwrap();
+    let store =
+        Arc::new(RedisShortTermStore::new(conn, Some("test")).with_legacy_series_writes(false));
+    let lease = store
+        .acquire_storage_lock(&task.id, "owner", "generation", 5000)
+        .await
+        .unwrap()
+        .unwrap();
+    let token = HotWriteToken {
+        task_id: task.id.clone(),
+        storage_epoch: 1,
+    };
+    let writer_count = 50;
+    let barrier = Arc::new(tokio::sync::Barrier::new(writer_count + 1));
+    let mut writers = Vec::new();
+    for index in 0..writer_count {
+        let store = Arc::clone(&store);
+        let token = token.clone();
+        let barrier = Arc::clone(&barrier);
+        let task_id = task.id.clone();
+        writers.push(tokio::spawn(async move {
+            let mut event = make_test_event(&task_id, &format!("writer-{index}"));
+            event.index = 999;
+            barrier.wait().await;
+            store.commit_event_fenced(&task_id, event, &token).await
+        }));
+    }
+    let closer = {
+        let store = Arc::clone(&store);
+        let barrier = Arc::clone(&barrier);
+        let lease = lease.clone();
+        tokio::spawn(async move {
+            barrier.wait().await;
+            store.close_write_fence(&lease, 1).await
+        })
+    };
+
+    let closed = closer.await.unwrap().unwrap();
+    let mut committed = Vec::new();
+    let mut rejected = 0;
+    for writer in writers {
+        match writer.await.unwrap() {
+            Ok(result) => committed.push(result.event.index),
+            Err(_) => rejected += 1,
+        }
+    }
+    committed.sort_unstable();
+    assert_eq!(
+        committed,
+        (0..committed.len() as u64).collect::<Vec<_>>(),
+        "successful fenced commits must be gap-free"
+    );
+    assert_eq!(committed.len() + rejected, writer_count);
+    assert_eq!(
+        closed.high_watermark,
+        committed.last().map(|index| *index as i64).unwrap_or(-1)
+    );
+
+    let mut raw = client.get_multiplexed_async_connection().await.unwrap();
+    let next_index: Option<u64> = redis::cmd("GET")
+        .arg("test:idx:fenced-task")
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    assert_eq!(next_index.unwrap_or(0), committed.len() as u64);
+}
+
+#[tokio::test]
+async fn concurrent_fenced_accumulation_loses_no_deltas() {
+    let (_container, redis_url) = start_redis().await;
+    flush_redis(&redis_url).await;
+    let engine = make_redis_engine(&redis_url).await;
+    let task = engine
+        .create_task(CreateTaskInput {
+            id: Some("accumulate-task".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let client = redis::Client::open(redis_url.as_str()).unwrap();
+    let conn = client.get_multiplexed_async_connection().await.unwrap();
+    let store =
+        Arc::new(RedisShortTermStore::new(conn, Some("test")).with_legacy_series_writes(false));
+    let token = HotWriteToken {
+        task_id: task.id.clone(),
+        storage_epoch: 1,
+    };
+    let mut writers = Vec::new();
+    for index in 0..50 {
+        let store = Arc::clone(&store);
+        let token = token.clone();
+        let task_id = task.id.clone();
+        writers.push(tokio::spawn(async move {
+            let mut event = make_test_event(&task_id, &format!("delta-{index}"));
+            event.series_id = Some("output".to_string());
+            event.series_mode = Some(SeriesMode::Accumulate);
+            event.data = serde_json::json!({ "delta": "x" });
+            store.commit_event_fenced(&task_id, event, &token).await
+        }));
+    }
+
+    let mut indexes = std::collections::HashSet::new();
+    for writer in writers {
+        indexes.insert(writer.await.unwrap().unwrap().event.index);
+    }
+    assert_eq!(indexes.len(), 50);
+    let latest = store
+        .get_series_latest(&task.id, "output")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(latest.data["delta"], "x".repeat(50));
+    assert_eq!(store.get_events(&task.id, None).await.unwrap().len(), 50);
 }
 
 // ── RedisBroadcastProvider regression tests ───────────────────────────────────
@@ -400,14 +524,7 @@ async fn cross_instance_broadcast_delivers_to_subscriber_on_other_instance() {
 async fn cross_instance_broadcast_wildcard_covers_multiple_task_channels() {
     // PSUBSCRIBE uses a wildcard so all task IDs are covered by a single
     // Redis subscription — no per-task SUBSCRIBE call needed.
-    let container = GenericImage::new("redis", "7-alpine")
-        .with_exposed_port(6379.tcp())
-        .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
-        .start()
-        .await
-        .unwrap();
-    let port = container.get_host_port_ipv4(6379).await.unwrap();
-    let redis_url = format!("redis://127.0.0.1:{port}");
+    let (_container, redis_url) = start_redis().await;
 
     let provider_a = make_redis_broadcast(&redis_url).await;
     let provider_b = make_redis_broadcast(&redis_url).await;
@@ -440,8 +557,15 @@ async fn cross_instance_broadcast_wildcard_covers_multiple_task_channels() {
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
     let events = received.lock().unwrap();
-    assert_eq!(events.len(), 2, "both task channels must be covered by the wildcard PSUBSCRIBE");
+    assert_eq!(
+        events.len(),
+        2,
+        "both task channels must be covered by the wildcard PSUBSCRIBE"
+    );
     let types: Vec<&str> = events.iter().map(|e| e.r#type.as_str()).collect();
-    assert!(types.contains(&"alpha.event"), "alpha.event must be received");
+    assert!(
+        types.contains(&"alpha.event"),
+        "alpha.event must be received"
+    );
     assert!(types.contains(&"beta.event"), "beta.event must be received");
 }

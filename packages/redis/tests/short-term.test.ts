@@ -4,15 +4,19 @@ import { GenericContainer, type StartedTestContainer } from 'testcontainers'
 import { RedisShortTermStore } from '../src/short-term.js'
 import type { Task, TaskArchiveRestoreData, TaskEvent, Worker, WorkerAssignment } from '@taskcast/core'
 
-let container: StartedTestContainer
+let container: StartedTestContainer | undefined
 let redis: Redis
 let store: RedisShortTermStore
 
 beforeAll(async () => {
-  container = await new GenericContainer('redis:7-alpine')
-    .withExposedPorts(6379)
-    .start()
-  redis = new Redis(`redis://localhost:${container.getMappedPort(6379)}`)
+  let connection = process.env['TASKCAST_TEST_REDIS_URL']
+  if (!connection) {
+    container = await new GenericContainer('redis:7-alpine')
+      .withExposedPorts(6379)
+      .start()
+    connection = `redis://localhost:${container.getMappedPort(6379)}`
+  }
+  redis = new Redis(connection)
   store = new RedisShortTermStore(redis)
 }, 60000)
 
@@ -22,7 +26,20 @@ afterAll(async () => {
 })
 
 beforeEach(async () => {
-  await redis.flushall()
+  for (const pattern of ['taskcast:*', 'myapp:*']) {
+    let cursor = '0'
+    do {
+      const [nextCursor, keys] = await redis.scan(
+        cursor,
+        'MATCH',
+        pattern,
+        'COUNT',
+        1000,
+      )
+      if (keys.length > 0) await redis.del(...keys)
+      cursor = nextCursor
+    } while (cursor !== '0')
+  }
 })
 
 const makeTask = (id = 'task-1', overrides: Partial<Task> = {}): Task => ({
@@ -248,7 +265,7 @@ describe('RedisShortTermStore - TTL', () => {
     await store.setTTL('task-1', 60)
     const taskTtl = await redis.ttl('taskcast:task:task-1')
     const eventsTtl = await redis.ttl('taskcast:events:task-1')
-    const seriesTtl = await redis.ttl('taskcast:series:task-1:s1')
+    const seriesTtl = await redis.ttl('taskcast:seriesState:task-1')
     expect(taskTtl).toBeGreaterThan(0)
     expect(eventsTtl).toBeGreaterThan(0)
     expect(seriesTtl).toBeGreaterThan(0)
