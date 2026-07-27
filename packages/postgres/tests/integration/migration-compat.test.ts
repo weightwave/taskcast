@@ -91,7 +91,7 @@ describe('cross-compatibility: TS runner with sqlx-style pre-applied migrations'
     expect(lifecycleRows).toHaveLength(1)
 
     const lifecycleRow = lifecycleRows[0]!
-    expect(lifecycleRow.description).toBe('storage_lifecycle')
+    expect(lifecycleRow.description).toBe('storage lifecycle')
     expect(lifecycleRow.success).toBe(true)
 
     const file3Content = readFileSync(join(MIGRATIONS_DIR, '003_storage_lifecycle.sql'), 'utf8')

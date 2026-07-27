@@ -142,7 +142,7 @@ describe('migration runner integration', () => {
     // Verify migration 003
     const row3 = rows[2]!
     expect(Number(row3.version)).toBe(3)
-    expect(row3.description).toBe('storage_lifecycle')
+    expect(row3.description).toBe('storage lifecycle')
     expect(row3.success).toBe(true)
     expect(Number(row3.execution_time)).toBeGreaterThanOrEqual(0)
 
