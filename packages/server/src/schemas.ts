@@ -144,8 +144,25 @@ export const WorkerSchema = z
 export const ErrorSchema = z
   .object({
     error: z.string(),
+    code: z.string().optional(),
   })
   .openapi('Error')
+
+export const StorageReleaseRequestSchema = z
+  .object({
+    expectedLastEventIndex: z.number().int().min(-1),
+    inactiveSince: z.number().int().nonnegative(),
+  })
+  .openapi('StorageReleaseRequest')
+
+export const StorageReleaseResultSchema = z
+  .object({
+    taskId: z.string(),
+    storageState: z.enum(['hot', 'releasing', 'cold']),
+    archiveWatermark: z.number().int().min(-1),
+    released: z.boolean(),
+  })
+  .openapi('StorageReleaseResult')
 
 // ─── Request Body Schemas ───────────────────────────────────────────────────
 

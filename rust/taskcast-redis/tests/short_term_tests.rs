@@ -5,12 +5,18 @@
 //!
 //! Run with: `cargo test -p taskcast-redis --test short_term_tests`
 
+use std::sync::Arc;
 use taskcast_core::types::{
-    AssignMode, ConnectionMode, EventQueryOptions, Level, SeriesMode, ShortTermStore, SinceCursor,
-    Task, TaskError, TaskFilter, TaskStatus, Worker, WorkerAssignment, WorkerAssignmentStatus,
-    WorkerFilter, WorkerMatchRule, WorkerStatus,
+    AssignMode, ConnectionMode, DurableSeriesState, EventQueryOptions, HotWriteToken, Level,
+    RehydrateSnapshot, SeriesMode, ShortTermStore, SinceCursor, StorageFenceConflictError,
+    StorageIntegrityError, StorageWriterRegistration, Task, TaskError, TaskFilter, TaskStatus,
+    TerminalProjection, Worker, WorkerAssignment, WorkerAssignmentStatus, WorkerFilter,
+    WorkerMatchRule, WorkerStatus,
 };
-use taskcast_core::TaskEvent;
+use taskcast_core::{
+    BroadcastProvider, CreateTaskInput, LongTermStore, MemoryBroadcastProvider,
+    MemoryLongTermStore, TaskEngine, TaskEngineOptions, TaskEvent,
+};
 use taskcast_redis::RedisShortTermStore;
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
@@ -70,7 +76,7 @@ fn make_event(task_id: &str, index: u64) -> TaskEvent {
 async fn make_store(redis_url: &str) -> RedisShortTermStore {
     let client = redis::Client::open(redis_url).unwrap();
     let conn = client.get_multiplexed_async_connection().await.unwrap();
-    RedisShortTermStore::new(conn, Some("test"))
+    RedisShortTermStore::new(conn, Some("test")).with_legacy_series_writes(false)
 }
 
 /// Flush the test Redis instance.
@@ -84,7 +90,10 @@ async fn flush_redis(redis_url: &str) {
 }
 
 /// Start a Redis container and return (container, redis_url).
-async fn start_redis() -> (testcontainers::ContainerAsync<GenericImage>, String) {
+async fn start_redis() -> (Option<testcontainers::ContainerAsync<GenericImage>>, String) {
+    if let Ok(url) = std::env::var("TASKCAST_TEST_REDIS_URL") {
+        return (None, url);
+    }
     let container = GenericImage::new("redis", "7-alpine")
         .with_exposed_port(6379.tcp())
         .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
@@ -93,7 +102,7 @@ async fn start_redis() -> (testcontainers::ContainerAsync<GenericImage>, String)
         .unwrap();
     let port = container.get_host_port_ipv4(6379).await.unwrap();
     let url = format!("redis://127.0.0.1:{port}");
-    (container, url)
+    (Some(container), url)
 }
 
 // ── Task CRUD Tests ─────────────────────────────────────────────────────────
@@ -323,7 +332,10 @@ async fn return_empty_vec_when_no_events_exist() {
     let store = make_store(&redis_url).await;
 
     let events = store.get_events("no-events-here", None).await.unwrap();
-    assert!(events.is_empty(), "get_events for missing task must return empty vec");
+    assert!(
+        events.is_empty(),
+        "get_events for missing task must return empty vec"
+    );
 }
 
 // ── Event Filtering Tests ───────────────────────────────────────────────────
@@ -392,7 +404,11 @@ async fn filter_events_by_since_timestamp() {
         .await
         .unwrap();
 
-    assert_eq!(events.len(), 2, "should return events with timestamp > 1200.0");
+    assert_eq!(
+        events.len(),
+        2,
+        "should return events with timestamp > 1200.0"
+    );
     assert_eq!(events[0].index, 3);
     assert_eq!(events[1].index, 4);
 }
@@ -525,7 +541,11 @@ async fn apply_limit_after_since_filter() {
         .await
         .unwrap();
 
-    assert_eq!(events.len(), 2, "limit should be applied after since filter");
+    assert_eq!(
+        events.len(),
+        2,
+        "limit should be applied after since filter"
+    );
     assert_eq!(events[0].index, 6);
     assert_eq!(events[1].index, 7);
 }
@@ -637,7 +657,11 @@ async fn replace_last_series_event_in_event_list() {
 
     // Check that the event list has the replacement in place of e1
     let events = store.get_events("task-rse", None).await.unwrap();
-    assert_eq!(events.len(), 3, "event count should stay at 3 (replaced, not appended)");
+    assert_eq!(
+        events.len(),
+        3,
+        "event count should stay at 3 (replaced, not appended)"
+    );
     assert_eq!(events[0].id, e0.id, "first event should be unchanged");
     assert_eq!(
         events[1].id, replacement.id,
@@ -777,10 +801,7 @@ async fn preserve_series_id_and_series_mode_on_events() {
     event.series_id = Some("progress-stream".to_string());
     event.series_mode = Some(SeriesMode::Accumulate);
 
-    store
-        .append_event("task-srt", event.clone())
-        .await
-        .unwrap();
+    store.append_event("task-srt", event.clone()).await.unwrap();
 
     let events = store.get_events("task-srt", None).await.unwrap();
     assert_eq!(events.len(), 1);
@@ -868,7 +889,10 @@ async fn get_nonexistent_worker_returns_none() {
     let store = make_store(&redis_url).await;
 
     let result = store.get_worker("nonexistent").await.unwrap();
-    assert!(result.is_none(), "get_worker for missing ID must return None");
+    assert!(
+        result.is_none(),
+        "get_worker for missing ID must return None"
+    );
 }
 
 #[tokio::test]
@@ -984,7 +1008,10 @@ async fn claim_task_succeeds_for_pending_task_with_capacity() {
     store.save_worker(worker).await.unwrap();
 
     let result = store.claim_task("t-claim", "w-claim", 1).await.unwrap();
-    assert!(result, "claim should succeed for pending task with available capacity");
+    assert!(
+        result,
+        "claim should succeed for pending task with available capacity"
+    );
 
     // Verify task was updated
     let task = store.get_task("t-claim").await.unwrap().unwrap();
@@ -1012,7 +1039,10 @@ async fn claim_task_fails_when_worker_has_no_capacity() {
     store.save_worker(worker).await.unwrap();
 
     let result = store.claim_task("t-nocap", "w-nocap", 1).await.unwrap();
-    assert!(!result, "claim should fail when worker has no remaining capacity");
+    assert!(
+        !result,
+        "claim should fail when worker has no remaining capacity"
+    );
 
     // Task should remain pending
     let task = store.get_task("t-nocap").await.unwrap().unwrap();
@@ -1033,7 +1063,10 @@ async fn claim_task_fails_for_non_pending_task() {
     store.save_worker(worker).await.unwrap();
 
     let result = store.claim_task("t-running", "w-run", 1).await.unwrap();
-    assert!(!result, "claim should fail for a running (non-pending) task");
+    assert!(
+        !result,
+        "claim should fail for a running (non-pending) task"
+    );
 }
 
 // ── Assignment Tests ────────────────────────────────────────────────────────
@@ -1074,7 +1107,10 @@ async fn remove_assignment() {
     store.remove_assignment("t-rem").await.unwrap();
 
     let task_assignment = store.get_task_assignment("t-rem").await.unwrap();
-    assert!(task_assignment.is_none(), "assignment should be gone after remove");
+    assert!(
+        task_assignment.is_none(),
+        "assignment should be gone after remove"
+    );
 
     let worker_assignments = store.get_worker_assignments("w-rem").await.unwrap();
     assert!(
@@ -1108,7 +1144,10 @@ async fn get_task_assignment_returns_none_for_missing() {
     let store = make_store(&redis_url).await;
 
     let result = store.get_task_assignment("nonexistent").await.unwrap();
-    assert!(result.is_none(), "get_task_assignment for missing task must return None");
+    assert!(
+        result.is_none(),
+        "get_task_assignment for missing task must return None"
+    );
 }
 
 // ── list_tasks Filter Tests ─────────────────────────────────────────────────
@@ -1215,7 +1254,12 @@ async fn list_tasks_with_exclude_task_ids() {
 
 // ── accumulate_series Tests ─────────────────────────────────────────────────
 
-fn make_accumulate_event(task_id: &str, index: u64, field: &str, value: serde_json::Value) -> TaskEvent {
+fn make_accumulate_event(
+    task_id: &str,
+    index: u64,
+    field: &str,
+    value: serde_json::Value,
+) -> TaskEvent {
     TaskEvent {
         id: format!("evt-{}-{}", task_id, index),
         task_id: task_id.to_string(),
@@ -1256,11 +1300,17 @@ async fn accumulate_series_concatenates_string_field() {
     let store = make_store(&redis_url).await;
 
     let e0 = make_accumulate_event("task-acc2", 0, "delta", serde_json::json!("hello"));
-    store.accumulate_series("task-acc2", "s", e0, "delta").await.unwrap();
+    store
+        .accumulate_series("task-acc2", "s", e0, "delta")
+        .await
+        .unwrap();
 
     let e1 = make_accumulate_event("task-acc2", 1, "delta", serde_json::json!(" world"));
 
-    let result = store.accumulate_series("task-acc2", "s", e1.clone(), "delta").await.unwrap();
+    let result = store
+        .accumulate_series("task-acc2", "s", e1.clone(), "delta")
+        .await
+        .unwrap();
     assert_eq!(result.data, serde_json::json!({"delta": "hello world"}));
     assert_eq!(result.id, e1.id);
 }
@@ -1273,7 +1323,10 @@ async fn accumulate_series_three_events_chain() {
 
     for (i, text) in ["A", "B", "C"].iter().enumerate() {
         let e = make_accumulate_event("task-acc3", i as u64, "delta", serde_json::json!(text));
-        let r = store.accumulate_series("task-acc3", "s", e, "delta").await.unwrap();
+        let r = store
+            .accumulate_series("task-acc3", "s", e, "delta")
+            .await
+            .unwrap();
         if i == 2 {
             assert_eq!(r.data, serde_json::json!({"delta": "ABC"}));
         }
@@ -1287,11 +1340,17 @@ async fn accumulate_series_non_string_field_no_concat() {
     let store = make_store(&redis_url).await;
 
     let e0 = make_accumulate_event("task-acc4", 0, "delta", serde_json::json!(42));
-    store.accumulate_series("task-acc4", "s", e0, "delta").await.unwrap();
+    store
+        .accumulate_series("task-acc4", "s", e0, "delta")
+        .await
+        .unwrap();
 
     let e1 = make_accumulate_event("task-acc4", 1, "delta", serde_json::json!(99));
 
-    let result = store.accumulate_series("task-acc4", "s", e1, "delta").await.unwrap();
+    let result = store
+        .accumulate_series("task-acc4", "s", e1, "delta")
+        .await
+        .unwrap();
     // Non-string field: no concatenation, returns the new event as-is
     assert_eq!(result.data, serde_json::json!({"delta": 99}));
 }
@@ -1303,11 +1362,17 @@ async fn accumulate_series_missing_field_no_concat() {
     let store = make_store(&redis_url).await;
 
     let e0 = make_accumulate_event("task-acc5", 0, "other", serde_json::json!("value"));
-    store.accumulate_series("task-acc5", "s", e0, "delta").await.unwrap();
+    store
+        .accumulate_series("task-acc5", "s", e0, "delta")
+        .await
+        .unwrap();
 
     let e1 = make_accumulate_event("task-acc5", 1, "other", serde_json::json!("value2"));
 
-    let result = store.accumulate_series("task-acc5", "s", e1, "delta").await.unwrap();
+    let result = store
+        .accumulate_series("task-acc5", "s", e1, "delta")
+        .await
+        .unwrap();
     // Field "delta" missing from both events — no concatenation
     assert_eq!(result.data, serde_json::json!({"other": "value2"}));
 }
@@ -1319,11 +1384,17 @@ async fn accumulate_series_custom_field_name() {
     let store = make_store(&redis_url).await;
 
     let e0 = make_accumulate_event("task-acc6", 0, "content", serde_json::json!("foo"));
-    store.accumulate_series("task-acc6", "s", e0, "content").await.unwrap();
+    store
+        .accumulate_series("task-acc6", "s", e0, "content")
+        .await
+        .unwrap();
 
     let e1 = make_accumulate_event("task-acc6", 1, "content", serde_json::json!("bar"));
 
-    let result = store.accumulate_series("task-acc6", "s", e1, "content").await.unwrap();
+    let result = store
+        .accumulate_series("task-acc6", "s", e1, "content")
+        .await
+        .unwrap();
     assert_eq!(result.data, serde_json::json!({"content": "foobar"}));
 }
 
@@ -1334,12 +1405,1172 @@ async fn accumulate_series_updates_series_latest() {
     let store = make_store(&redis_url).await;
 
     let e0 = make_accumulate_event("task-acc7", 0, "delta", serde_json::json!("first"));
-    store.accumulate_series("task-acc7", "s", e0, "delta").await.unwrap();
+    store
+        .accumulate_series("task-acc7", "s", e0, "delta")
+        .await
+        .unwrap();
 
     let e1 = make_accumulate_event("task-acc7", 1, "delta", serde_json::json!("second"));
-    store.accumulate_series("task-acc7", "s", e1.clone(), "delta").await.unwrap();
+    store
+        .accumulate_series("task-acc7", "s", e1.clone(), "delta")
+        .await
+        .unwrap();
 
-    let latest = store.get_series_latest("task-acc7", "s").await.unwrap().unwrap();
+    let latest = store
+        .get_series_latest("task-acc7", "s")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(latest.data, serde_json::json!({"delta": "firstsecond"}));
     assert_eq!(latest.id, e1.id);
+}
+
+// ── Hot/cold storage lifecycle ──────────────────────────────────────────────
+
+#[tokio::test]
+async fn storage_lifecycle_uses_epoch_fences_and_tokenized_expiring_locks() {
+    let (_container, redis_url) = start_redis().await;
+    flush_redis(&redis_url).await;
+    let store = make_store(&redis_url).await;
+    store.save_task(make_task("task-1")).await.unwrap();
+
+    assert!(store.supports_hot_cold_release());
+    let fence = store.get_write_fence("task-1").await.unwrap().unwrap();
+    assert!(fence.accepting_writes);
+    assert_eq!(fence.storage_epoch, 1);
+
+    let lease = store
+        .acquire_storage_lock("task-1", "owner-a", "generation-a", 1000)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(store
+        .acquire_storage_lock("task-1", "owner-b", "generation-b", 1000)
+        .await
+        .unwrap()
+        .is_none());
+    let mut stale = lease.clone();
+    stale.lock_token = "stale".to_string();
+    assert!(!store.renew_storage_lock(&stale, 1000).await.unwrap());
+    assert!(!store.release_storage_lock(&stale).await.unwrap());
+    assert!(store.renew_storage_lock(&lease, 1000).await.unwrap());
+    assert!(store.release_storage_lock(&lease).await.unwrap());
+    assert!(!store.release_storage_lock(&lease).await.unwrap());
+
+    let expired = store
+        .acquire_storage_lock("task-1", "expiring", "generation-expiring", 30)
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let recovered = store
+        .acquire_storage_lock("task-1", "recovered", "generation-recovered", 1000)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.lock_token, "recovered");
+    assert!(!store.renew_storage_lock(&expired, 1000).await.unwrap());
+}
+
+#[tokio::test]
+async fn storage_lifecycle_closes_writes_without_consuming_an_index_and_reopens() {
+    let (_container, redis_url) = start_redis().await;
+    flush_redis(&redis_url).await;
+    let store = make_store(&redis_url).await;
+    store.save_task(make_task("task-1")).await.unwrap();
+    let old_token = HotWriteToken {
+        task_id: "task-1".to_string(),
+        storage_epoch: 1,
+    };
+
+    let first = store
+        .commit_event_fenced("task-1", make_event("task-1", 999), &old_token)
+        .await
+        .unwrap();
+    assert_eq!(first.event.index, 0);
+    let lease = store
+        .acquire_storage_lock("task-1", "owner", "generation", 5000)
+        .await
+        .unwrap()
+        .unwrap();
+    let closed = store.close_write_fence(&lease, 1).await.unwrap();
+    assert_eq!(closed.high_watermark, 0);
+
+    let error = store
+        .commit_event_fenced("task-1", make_event("task-1", 998), &old_token)
+        .await
+        .unwrap_err();
+    assert!(error.downcast_ref::<StorageFenceConflictError>().is_some());
+    let client = redis::Client::open(redis_url.as_str()).unwrap();
+    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+    let index: String = redis::cmd("GET")
+        .arg("test:idx:task-1")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(index, "1");
+
+    let new_token = store.reopen_write_fence(&lease, 1).await.unwrap();
+    assert_eq!(new_token.storage_epoch, 2);
+    assert!(store
+        .commit_event_fenced("task-1", make_event("task-1", 997), &old_token)
+        .await
+        .is_err());
+    let second = store
+        .commit_event_fenced("task-1", make_event("task-1", 996), &new_token)
+        .await
+        .unwrap();
+    assert_eq!(second.event.index, 1);
+}
+
+#[tokio::test]
+async fn storage_lifecycle_new_generation_adopts_a_closed_fence_for_recovery() {
+    let (_container, redis_url) = start_redis().await;
+    flush_redis(&redis_url).await;
+    let store = make_store(&redis_url).await;
+    store.save_task(make_task("task-1")).await.unwrap();
+    store
+        .commit_event_fenced(
+            "task-1",
+            make_event("task-1", 0),
+            &HotWriteToken {
+                task_id: "task-1".to_string(),
+                storage_epoch: 1,
+            },
+        )
+        .await
+        .unwrap();
+    let stale = store
+        .acquire_storage_lock("task-1", "stale-owner", "stale-generation", 5_000)
+        .await
+        .unwrap()
+        .unwrap();
+    store.close_write_fence(&stale, 1).await.unwrap();
+    store.release_storage_lock(&stale).await.unwrap();
+
+    let recovery = store
+        .acquire_storage_lock("task-1", "recovery-owner", "recovery-generation", 5_000)
+        .await
+        .unwrap()
+        .unwrap();
+    let adopted = store.close_write_fence(&recovery, 1).await.unwrap();
+    assert_eq!(
+        adopted.active_release_generation.as_deref(),
+        Some("recovery-generation")
+    );
+    assert_eq!(adopted.high_watermark, 0);
+    assert!(!store.renew_storage_lock(&stale, 5_000).await.unwrap());
+    assert_eq!(
+        store
+            .reopen_write_fence(&recovery, 1)
+            .await
+            .unwrap()
+            .storage_epoch,
+        2
+    );
+}
+
+#[tokio::test]
+async fn storage_lifecycle_commits_series_atomically_and_pages_sparse_history() {
+    let (_container, redis_url) = start_redis().await;
+    flush_redis(&redis_url).await;
+    let store = make_store(&redis_url).await;
+    store.save_task(make_task("task-1")).await.unwrap();
+    let token = HotWriteToken {
+        task_id: "task-1".to_string(),
+        storage_epoch: 1,
+    };
+    let mut keep_zero = make_event("task-1", 100);
+    keep_zero.id = "keep-0".to_string();
+    store
+        .commit_event_fenced("task-1", keep_zero, &token)
+        .await
+        .unwrap();
+    let mut latest_one = make_event("task-1", 101);
+    latest_one.id = "latest-1".to_string();
+    latest_one.series_id = Some("status".to_string());
+    latest_one.series_mode = Some(SeriesMode::Latest);
+    store
+        .commit_event_fenced("task-1", latest_one, &token)
+        .await
+        .unwrap();
+    let mut keep_two = make_event("task-1", 102);
+    keep_two.id = "keep-2".to_string();
+    store
+        .commit_event_fenced("task-1", keep_two, &token)
+        .await
+        .unwrap();
+    let mut latest_three = make_event("task-1", 103);
+    latest_three.id = "latest-3".to_string();
+    latest_three.series_id = Some("status".to_string());
+    latest_three.series_mode = Some(SeriesMode::Latest);
+    store
+        .commit_event_fenced("task-1", latest_three, &token)
+        .await
+        .unwrap();
+    let mut first_delta = make_event("task-1", 104);
+    first_delta.id = "delta-4".to_string();
+    first_delta.series_id = Some("output".to_string());
+    first_delta.series_mode = Some(SeriesMode::Accumulate);
+    first_delta.series_acc_field = Some("delta".to_string());
+    first_delta.data = serde_json::json!({ "delta": "hello" });
+    store
+        .commit_event_fenced("task-1", first_delta, &token)
+        .await
+        .unwrap();
+    let mut second_delta = make_event("task-1", 105);
+    second_delta.id = "delta-5".to_string();
+    second_delta.series_id = Some("output".to_string());
+    second_delta.series_mode = Some(SeriesMode::Accumulate);
+    second_delta.series_acc_field = Some("delta".to_string());
+    second_delta.data = serde_json::json!({ "delta": " world" });
+    let result = store
+        .commit_event_fenced("task-1", second_delta, &token)
+        .await
+        .unwrap();
+    assert_eq!(result.event.data, serde_json::json!({ "delta": " world" }));
+    assert_eq!(
+        result.accumulated_event.unwrap().data,
+        serde_json::json!({ "delta": "hello world" })
+    );
+
+    let events = store.get_events("task-1", None).await.unwrap();
+    assert_eq!(
+        events.iter().map(|event| event.index).collect::<Vec<_>>(),
+        vec![0, 2, 3, 4, 5]
+    );
+    assert!(!events.iter().any(|event| event.id == "latest-1"));
+
+    let first_page = store
+        .read_archive_source_page("task-1", 5, None, 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        first_page
+            .events
+            .iter()
+            .map(|event| event.index)
+            .collect::<Vec<_>>(),
+        vec![0, 2]
+    );
+    assert_ne!(first_page.next_cursor.as_deref(), Some("2"));
+    let second_page = store
+        .read_archive_source_page("task-1", 5, first_page.next_cursor.as_deref(), 3)
+        .await
+        .unwrap();
+    assert_eq!(
+        second_page
+            .events
+            .iter()
+            .map(|event| event.index)
+            .collect::<Vec<_>>(),
+        vec![3, 4, 5]
+    );
+    assert!(second_page.done);
+}
+
+#[tokio::test]
+async fn storage_lifecycle_preserves_opaque_event_json() {
+    let (_container, redis_url) = start_redis().await;
+    flush_redis(&redis_url).await;
+    let store = make_store(&redis_url).await;
+    store.save_task(make_task("task-1")).await.unwrap();
+    let token = HotWriteToken {
+        task_id: "task-1".to_string(),
+        storage_epoch: 1,
+    };
+    let fragile = serde_json::json!({
+        "empty": [],
+        "nested": [[], { "empty": [] }],
+        "precise": 1.2345678901234567,
+        "maxSafe": 9007199254740991_u64,
+    });
+    let mut keep = make_event("task-1", 100);
+    keep.id = "opaque-0".to_string();
+    keep.data = fragile.clone();
+    let committed = store
+        .commit_event_fenced("task-1", keep, &token)
+        .await
+        .unwrap();
+    assert_eq!(committed.event.data, fragile);
+
+    let mut first_delta = make_event("task-1", 101);
+    first_delta.id = "opaque-delta-1".to_string();
+    first_delta.series_id = Some("output".to_string());
+    first_delta.series_mode = Some(SeriesMode::Accumulate);
+    first_delta.series_acc_field = Some("delta".to_string());
+    first_delta.data = serde_json::json!({
+        "empty": [],
+        "nested": [[], { "empty": [] }],
+        "precise": 1.2345678901234567,
+        "maxSafe": 9007199254740991_u64,
+        "delta": "hello",
+    });
+    store
+        .commit_event_fenced("task-1", first_delta, &token)
+        .await
+        .unwrap();
+    let mut second_delta = make_event("task-1", 102);
+    second_delta.id = "opaque-delta-2".to_string();
+    second_delta.series_id = Some("output".to_string());
+    second_delta.series_mode = Some(SeriesMode::Accumulate);
+    second_delta.series_acc_field = Some("delta".to_string());
+    second_delta.data = serde_json::json!({
+        "empty": [],
+        "nested": [[], { "empty": [] }],
+        "precise": 1.2345678901234567,
+        "maxSafe": 9007199254740991_u64,
+        "delta": " world",
+    });
+    let accumulated = store
+        .commit_event_fenced("task-1", second_delta.clone(), &token)
+        .await
+        .unwrap();
+    assert_eq!(accumulated.event.data, second_delta.data);
+    let accumulated_data = accumulated.accumulated_event.unwrap().data;
+    assert_eq!(accumulated_data["empty"], serde_json::json!([]));
+    assert_eq!(
+        accumulated_data["nested"],
+        serde_json::json!([[], { "empty": [] }])
+    );
+    assert_eq!(
+        accumulated_data["precise"],
+        serde_json::json!(1.2345678901234567)
+    );
+    assert_eq!(
+        accumulated_data["maxSafe"],
+        serde_json::json!(9007199254740991_u64)
+    );
+    assert_eq!(accumulated_data["delta"], "hello world");
+}
+
+#[tokio::test]
+async fn storage_lifecycle_preserves_accumulation_during_legacy_writer_rollout() {
+    let (_container, redis_url) = start_redis().await;
+    flush_redis(&redis_url).await;
+    let client = redis::Client::open(redis_url.as_str()).unwrap();
+    let compatible = RedisShortTermStore::new(
+        client.get_multiplexed_async_connection().await.unwrap(),
+        Some("test"),
+    )
+    .with_legacy_series_writes(true);
+    let fixed = RedisShortTermStore::new(
+        client.get_multiplexed_async_connection().await.unwrap(),
+        Some("test"),
+    )
+    .with_legacy_series_writes(false);
+    compatible.save_task(make_task("task-1")).await.unwrap();
+    let token = HotWriteToken {
+        task_id: "task-1".to_string(),
+        storage_epoch: 1,
+    };
+
+    let mut new_a = make_event("task-1", 0);
+    new_a.id = "new-a".to_string();
+    new_a.series_id = Some("output".to_string());
+    new_a.series_mode = Some(SeriesMode::Accumulate);
+    new_a.data = serde_json::json!({ "delta": "A" });
+    compatible
+        .commit_event_fenced("task-1", new_a, &token)
+        .await
+        .unwrap();
+
+    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+    let next_index: u64 = redis::cmd("INCR")
+        .arg("test:idx:task-1")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    let mut old_delta = make_event("task-1", next_index - 1);
+    old_delta.id = "old-b".to_string();
+    old_delta.series_id = Some("output".to_string());
+    old_delta.series_mode = Some(SeriesMode::Accumulate);
+    old_delta.data = serde_json::json!({ "delta": "B" });
+    let mut old_accumulated = old_delta.clone();
+    old_accumulated.data = serde_json::json!({ "delta": "AB" });
+    redis::pipe()
+        .cmd("RPUSH")
+        .arg("test:events:task-1")
+        .arg(serde_json::to_string(&old_delta).unwrap())
+        .cmd("SET")
+        .arg("test:series:task-1:output")
+        .arg(serde_json::to_string(&old_accumulated).unwrap())
+        .cmd("SADD")
+        .arg("test:seriesIds:task-1")
+        .arg("output")
+        .query_async::<()>(&mut conn)
+        .await
+        .unwrap();
+
+    let mut new_c = make_event("task-1", 0);
+    new_c.id = "new-c".to_string();
+    new_c.series_id = Some("output".to_string());
+    new_c.series_mode = Some(SeriesMode::Accumulate);
+    new_c.data = serde_json::json!({ "delta": "C" });
+    let committed = compatible
+        .commit_event_fenced("task-1", new_c, &token)
+        .await
+        .unwrap();
+    assert_eq!(
+        committed.accumulated_event.unwrap().data,
+        serde_json::json!({ "delta": "ABC" })
+    );
+
+    let mut fixed_d = make_event("task-1", 0);
+    fixed_d.id = "fixed-d".to_string();
+    fixed_d.series_id = Some("output".to_string());
+    fixed_d.series_mode = Some(SeriesMode::Accumulate);
+    fixed_d.data = serde_json::json!({ "delta": "D" });
+    let committed = fixed
+        .commit_event_fenced("task-1", fixed_d, &token)
+        .await
+        .unwrap();
+    assert_eq!(
+        committed.accumulated_event.unwrap().data,
+        serde_json::json!({ "delta": "ABCD" })
+    );
+    let legacy_exists: u64 = redis::cmd("EXISTS")
+        .arg("test:series:task-1:output")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(legacy_exists, 0);
+    assert_eq!(fixed.get_events("task-1", None).await.unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn storage_lifecycle_replaces_latest_event_from_legacy_writer_during_rollout() {
+    let (_container, redis_url) = start_redis().await;
+    flush_redis(&redis_url).await;
+    let client = redis::Client::open(redis_url.as_str()).unwrap();
+    let compatible = RedisShortTermStore::new(
+        client.get_multiplexed_async_connection().await.unwrap(),
+        Some("test"),
+    )
+    .with_legacy_series_writes(true);
+    compatible.save_task(make_task("task-1")).await.unwrap();
+    let token = HotWriteToken {
+        task_id: "task-1".to_string(),
+        storage_epoch: 1,
+    };
+
+    let mut new_a = make_event("task-1", 0);
+    new_a.id = "new-a".to_string();
+    new_a.series_id = Some("status".to_string());
+    new_a.series_mode = Some(SeriesMode::Latest);
+    compatible
+        .commit_event_fenced("task-1", new_a, &token)
+        .await
+        .unwrap();
+
+    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+    let next_index: u64 = redis::cmd("INCR")
+        .arg("test:idx:task-1")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    let mut old_latest = make_event("task-1", next_index - 1);
+    old_latest.id = "old-b".to_string();
+    old_latest.series_id = Some("status".to_string());
+    old_latest.series_mode = Some(SeriesMode::Latest);
+    let old_latest_json = serde_json::to_string(&old_latest).unwrap();
+    redis::pipe()
+        .cmd("LSET")
+        .arg("test:events:task-1")
+        .arg(0)
+        .arg(&old_latest_json)
+        .cmd("SET")
+        .arg("test:series:task-1:status")
+        .arg(&old_latest_json)
+        .cmd("SADD")
+        .arg("test:seriesIds:task-1")
+        .arg("status")
+        .query_async::<()>(&mut conn)
+        .await
+        .unwrap();
+
+    let mut new_c = make_event("task-1", 0);
+    new_c.id = "new-c".to_string();
+    new_c.series_id = Some("status".to_string());
+    new_c.series_mode = Some(SeriesMode::Latest);
+    compatible
+        .commit_event_fenced("task-1", new_c, &token)
+        .await
+        .unwrap();
+
+    let events = compatible.get_events("task-1", None).await.unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["new-c"]
+    );
+    assert_eq!(
+        compatible
+            .get_series_latest("task-1", "status")
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        "new-c"
+    );
+}
+
+#[tokio::test]
+async fn storage_lifecycle_preserves_the_maximum_writable_safe_index() {
+    let (_container, redis_url) = start_redis().await;
+    flush_redis(&redis_url).await;
+    let store = make_store(&redis_url).await;
+    store.save_task(make_task("task-1")).await.unwrap();
+    let maximum_writable_index = 9_007_199_254_740_990_u64;
+    let client = redis::Client::open(redis_url.as_str()).unwrap();
+    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+    redis::cmd("SET")
+        .arg("test:idx:task-1")
+        .arg(maximum_writable_index.to_string())
+        .query_async::<()>(&mut conn)
+        .await
+        .unwrap();
+    let token = HotWriteToken {
+        task_id: "task-1".to_string(),
+        storage_epoch: 1,
+    };
+
+    let committed = store
+        .commit_event_fenced("task-1", make_event("task-1", 0), &token)
+        .await
+        .unwrap();
+    assert_eq!(committed.event.index, maximum_writable_index);
+    let next_index: String = redis::cmd("GET")
+        .arg("test:idx:task-1")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(next_index, "9007199254740991");
+    let raw_event: String = redis::cmd("LINDEX")
+        .arg("test:events:task-1")
+        .arg(0)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert!(raw_event.contains("\"index\":9007199254740990"));
+    let round_trip: TaskEvent = serde_json::from_str(&raw_event).unwrap();
+    assert_eq!(round_trip.index, maximum_writable_index);
+    let hot_window: String = redis::cmd("GET")
+        .arg("test:hotWindow:task-1")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(
+        hot_window,
+        "{\"firstIndex\":9007199254740990,\"lastIndex\":9007199254740990}"
+    );
+
+    let error = store
+        .commit_event_fenced("task-1", make_event("task-1", 1), &token)
+        .await
+        .unwrap_err();
+    assert!(error.downcast_ref::<StorageIntegrityError>().is_some());
+    let event_count: u64 = redis::cmd("LLEN")
+        .arg("test:events:task-1")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(event_count, 1);
+    let next_index: String = redis::cmd("GET")
+        .arg("test:idx:task-1")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(next_index, "9007199254740991");
+
+    let lease = store
+        .acquire_storage_lock("task-1", "owner", "generation", 5000)
+        .await
+        .unwrap()
+        .unwrap();
+    let closed = store.close_write_fence(&lease, 1).await.unwrap();
+    assert_eq!(closed.high_watermark, maximum_writable_index as i64);
+}
+
+#[tokio::test]
+async fn storage_lifecycle_uses_fixed_keys_for_large_series_cardinality() {
+    let (_container, redis_url) = start_redis().await;
+    flush_redis(&redis_url).await;
+    let store = make_store(&redis_url).await;
+    store.save_task(make_task("task-1")).await.unwrap();
+    let token = HotWriteToken {
+        task_id: "task-1".to_string(),
+        storage_epoch: 1,
+    };
+
+    for index in 0..200 {
+        let mut event = make_event("task-1", index);
+        event.id = format!("series-{index}");
+        event.series_id = Some(format!("series-{index}"));
+        event.series_mode = Some(SeriesMode::Latest);
+        store
+            .commit_event_fenced("task-1", event, &token)
+            .await
+            .unwrap();
+    }
+
+    let client = redis::Client::open(redis_url.as_str()).unwrap();
+    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+    let series_count: u64 = redis::cmd("HLEN")
+        .arg("test:seriesState:task-1")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(series_count, 200);
+    let legacy_keys: Vec<String> = redis::cmd("KEYS")
+        .arg("test:series:task-1:*")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert!(legacy_keys.is_empty());
+    let legacy_set: u64 = redis::cmd("EXISTS")
+        .arg("test:seriesIds:task-1")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(legacy_set, 0);
+}
+
+#[tokio::test]
+async fn storage_lifecycle_rejects_an_out_of_order_archive_source() {
+    let (_container, redis_url) = start_redis().await;
+    flush_redis(&redis_url).await;
+    let store = make_store(&redis_url).await;
+    store.save_task(make_task("task-1")).await.unwrap();
+
+    let client = redis::Client::open(redis_url.as_str()).unwrap();
+    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+    redis::cmd("RPUSH")
+        .arg("test:events:task-1")
+        .arg(serde_json::to_string(&make_event("task-1", 2)).unwrap())
+        .arg(serde_json::to_string(&make_event("task-1", 1)).unwrap())
+        .query_async::<()>(&mut conn)
+        .await
+        .unwrap();
+
+    let error = store
+        .read_archive_source_page("task-1", 2, None, 10)
+        .await
+        .unwrap_err();
+    assert!(error.downcast_ref::<StorageIntegrityError>().is_some());
+}
+
+#[tokio::test]
+async fn storage_lifecycle_rejects_stale_delete_and_removes_all_task_keys() {
+    let (_container, redis_url) = start_redis().await;
+    flush_redis(&redis_url).await;
+    let store = make_store(&redis_url).await;
+    store.save_task(make_task("task-1")).await.unwrap();
+    let token = HotWriteToken {
+        task_id: "task-1".to_string(),
+        storage_epoch: 1,
+    };
+    let mut latest = make_event("task-1", 100);
+    latest.series_id = Some("status".to_string());
+    latest.series_mode = Some(SeriesMode::Latest);
+    store
+        .commit_event_fenced("task-1", latest, &token)
+        .await
+        .unwrap();
+    let client = redis::Client::open(redis_url.as_str()).unwrap();
+    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+    redis::cmd("SET")
+        .arg("test:series:task-1:orphan")
+        .arg(serde_json::to_string(&make_event("task-1", 0)).unwrap())
+        .query_async::<()>(&mut conn)
+        .await
+        .unwrap();
+    let lease = store
+        .acquire_storage_lock("task-1", "owner", "generation", 5000)
+        .await
+        .unwrap()
+        .unwrap();
+    store.close_write_fence(&lease, 1).await.unwrap();
+
+    let mut stale = lease.clone();
+    stale.lock_token = "stale".to_string();
+    assert!(store.delete_task_storage_fenced(&stale, 1).await.is_err());
+    let before_delete = store.get_task_storage_presence("task-1").await.unwrap();
+    assert!(before_delete.task);
+    assert_eq!(before_delete.series_state_count, 2);
+
+    store.delete_task_storage_fenced(&lease, 1).await.unwrap();
+    let presence = store.get_task_storage_presence("task-1").await.unwrap();
+    assert!(!presence.task);
+    assert_eq!(presence.event_count, 0);
+    assert!(!presence.next_index);
+    assert_eq!(presence.series_state_count, 0);
+    assert!(!presence.write_fence);
+    let remaining: u64 = redis::cmd("EXISTS")
+        .arg("test:hotWindow:task-1")
+        .arg("test:seriesIds:task-1")
+        .arg("test:series:task-1:orphan")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(remaining, 0);
+    assert!(store.reopen_write_fence(&lease, 1).await.is_err());
+}
+
+#[tokio::test]
+async fn storage_lifecycle_isolates_wildcard_and_prefix_colliding_task_ids() {
+    let (_container, redis_url) = start_redis().await;
+    flush_redis(&redis_url).await;
+    let store = make_store(&redis_url).await;
+
+    for task_id in ["*", "victim", "parent", "parent:child"] {
+        store.save_task(make_task(task_id)).await.unwrap();
+        let mut event = make_event(task_id, 0);
+        event.id = format!("{task_id}-latest");
+        event.series_id = Some("status".to_string());
+        event.series_mode = Some(SeriesMode::Latest);
+        store
+            .commit_event_fenced(
+                task_id,
+                event,
+                &HotWriteToken {
+                    task_id: task_id.to_string(),
+                    storage_epoch: 1,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    for task_id in ["*", "parent"] {
+        let lease = store
+            .acquire_storage_lock(
+                task_id,
+                &format!("{task_id}-owner"),
+                &format!("{task_id}-generation"),
+                5000,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        store.close_write_fence(&lease, 1).await.unwrap();
+        store.delete_task_storage_fenced(&lease, 1).await.unwrap();
+    }
+
+    assert_eq!(
+        store
+            .get_series_latest("victim", "status")
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        "victim-latest"
+    );
+    assert_eq!(
+        store
+            .get_series_latest("parent:child", "status")
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        "parent:child-latest"
+    );
+    assert_eq!(
+        store
+            .get_task_storage_presence("victim")
+            .await
+            .unwrap()
+            .series_state_count,
+        1
+    );
+    assert_eq!(
+        store
+            .get_task_storage_presence("parent:child")
+            .await
+            .unwrap()
+            .series_state_count,
+        1
+    );
+}
+
+#[tokio::test]
+async fn storage_lifecycle_restores_a_bounded_window_and_preserves_the_next_index() {
+    let (_container, redis_url) = start_redis().await;
+    flush_redis(&redis_url).await;
+    let store = make_store(&redis_url).await;
+    store.save_task(make_task("task-1")).await.unwrap();
+    let lease = store
+        .acquire_storage_lock("task-1", "owner", "generation", 5000)
+        .await
+        .unwrap()
+        .unwrap();
+    store.close_write_fence(&lease, 1).await.unwrap();
+    store.delete_task_storage_fenced(&lease, 1).await.unwrap();
+
+    let mut event_seven = make_event("task-1", 7);
+    event_seven.id = "event-7".to_string();
+    let mut event_nine = make_event("task-1", 9);
+    event_nine.id = "event-9".to_string();
+    event_nine.series_id = Some("status".to_string());
+    event_nine.series_mode = Some(SeriesMode::Latest);
+    event_nine.data = serde_json::json!({
+        "status": "ready",
+        "empty": [],
+        "nested": [[], { "empty": [] }],
+        "precise": 1.2345678901234567,
+        "maxSafe": 9007199254740991_u64,
+    });
+    let snapshot = RehydrateSnapshot {
+        task: make_task("task-1"),
+        archive_watermark: 9,
+        max_event_index: 9,
+        replay_events: vec![event_seven.clone(), event_nine.clone()],
+        series_latest: vec![DurableSeriesState {
+            task_id: "task-1".to_string(),
+            series_id: "status".to_string(),
+            mode: SeriesMode::Latest,
+            event: event_nine,
+            through_index: 9,
+        }],
+        storage_epoch: 1,
+    };
+    let token = store
+        .restore_hot_task_fenced(snapshot.clone(), &lease, 2)
+        .await
+        .unwrap();
+    assert_eq!(token.storage_epoch, 2);
+    assert_eq!(
+        store.get_events("task-1", None).await.unwrap(),
+        snapshot.replay_events
+    );
+    let committed = store
+        .commit_event_fenced("task-1", make_event("task-1", 999), &token)
+        .await
+        .unwrap();
+    assert_eq!(committed.event.index, 10);
+
+    let mut stale = lease.clone();
+    stale.lock_token = "stale".to_string();
+    assert!(store
+        .restore_hot_task_fenced(snapshot.clone(), &stale, 2)
+        .await
+        .is_err());
+    assert_eq!(
+        store
+            .restore_hot_task_fenced(snapshot, &lease, 2)
+            .await
+            .unwrap(),
+        token
+    );
+    assert_eq!(store.get_events("task-1", None).await.unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn storage_lifecycle_commits_task_and_derived_events_atomically() {
+    let (_container, redis_url) = start_redis().await;
+    flush_redis(&redis_url).await;
+    let store = make_store(&redis_url).await;
+    store.save_task(make_task("task-1")).await.unwrap();
+    let token = HotWriteToken {
+        task_id: "task-1".to_string(),
+        storage_epoch: 1,
+    };
+    let revision = store
+        .get_task_mutation_snapshot("task-1")
+        .await
+        .unwrap()
+        .unwrap()
+        .revision;
+    let mut blocked = make_task("task-1");
+    blocked.status = TaskStatus::Blocked;
+    blocked.reason = Some("approval".to_string());
+    let mut status = make_event("task-1", 999);
+    status.r#type = "taskcast:status".to_string();
+    status.series_id = None;
+    status.series_mode = None;
+    let mut blocked_event = make_event("task-1", 999);
+    blocked_event.r#type = "taskcast:blocked".to_string();
+    blocked_event.series_id = None;
+    blocked_event.series_mode = None;
+    let committed = store
+        .commit_task_events_fenced(blocked, &revision, vec![status, blocked_event], &token)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        committed
+            .iter()
+            .map(|event| event.index)
+            .collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+    assert_eq!(
+        store.get_task("task-1").await.unwrap().unwrap().status,
+        TaskStatus::Blocked
+    );
+    assert_eq!(store.get_events("task-1", None).await.unwrap(), committed);
+
+    let lease = store
+        .acquire_storage_lock("task-1", "owner", "generation", 5_000)
+        .await
+        .unwrap()
+        .unwrap();
+    store.close_write_fence(&lease, 1).await.unwrap();
+    let mut completed = make_task("task-1");
+    completed.status = TaskStatus::Completed;
+    let error = store
+        .commit_task_events_fenced(
+            completed,
+            &store
+                .get_task_mutation_snapshot("task-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .revision,
+            vec![make_event("task-1", 999)],
+            &token,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.downcast_ref::<StorageFenceConflictError>().is_some());
+    assert_eq!(
+        store.get_task("task-1").await.unwrap().unwrap().status,
+        TaskStatus::Blocked
+    );
+    assert_eq!(store.get_events("task-1", None).await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn storage_lifecycle_allows_only_one_transition_from_the_same_status() {
+    let (_container, redis_url) = start_redis().await;
+    flush_redis(&redis_url).await;
+    let store = make_store(&redis_url).await;
+    store.save_task(make_task("task-1")).await.unwrap();
+    let token = HotWriteToken {
+        task_id: "task-1".to_string(),
+        storage_epoch: 1,
+    };
+    let revision = store
+        .get_task_mutation_snapshot("task-1")
+        .await
+        .unwrap()
+        .unwrap()
+        .revision;
+    let mut completed = make_task("task-1");
+    completed.status = TaskStatus::Completed;
+    let mut failed = make_task("task-1");
+    failed.status = TaskStatus::Failed;
+    let first = store.commit_task_events_fenced(
+        completed,
+        &revision,
+        vec![make_event("task-1", 999)],
+        &token,
+    );
+    let second =
+        store.commit_task_events_fenced(failed, &revision, vec![make_event("task-1", 999)], &token);
+
+    let (first, second) = tokio::join!(first, second);
+    let results = [first.unwrap(), second.unwrap()];
+    assert_eq!(results.iter().filter(|result| result.is_some()).count(), 1);
+    assert_eq!(results.iter().filter(|result| result.is_none()).count(), 1);
+    assert_eq!(store.get_events("task-1", None).await.unwrap().len(), 1);
+    assert!(matches!(
+        store.get_task("task-1").await.unwrap().unwrap().status,
+        TaskStatus::Completed | TaskStatus::Failed
+    ));
+}
+
+#[tokio::test]
+async fn storage_lifecycle_rejects_stale_revision_after_same_status_reclaim() {
+    let (_container, redis_url) = start_redis().await;
+    flush_redis(&redis_url).await;
+    let store = make_store(&redis_url).await;
+    store.save_task(make_task("task-1")).await.unwrap();
+    store.save_worker(make_worker("worker-a")).await.unwrap();
+    store.save_worker(make_worker("worker-b")).await.unwrap();
+    assert!(store.claim_task("task-1", "worker-a", 1).await.unwrap());
+    let snapshot = store
+        .get_task_mutation_snapshot("task-1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(store.claim_task("task-1", "worker-b", 1).await.unwrap());
+    let mut running = snapshot.task;
+    running.status = TaskStatus::Running;
+    let token = HotWriteToken {
+        task_id: "task-1".to_string(),
+        storage_epoch: 1,
+    };
+    let result = store
+        .commit_task_events_fenced(
+            running,
+            &snapshot.revision,
+            vec![make_event("task-1", 999)],
+            &token,
+        )
+        .await
+        .unwrap();
+
+    assert!(result.is_none());
+    let current = store.get_task("task-1").await.unwrap().unwrap();
+    assert_eq!(current.status, TaskStatus::Assigned);
+    assert_eq!(current.assigned_worker.as_deref(), Some("worker-b"));
+    assert!(store.get_events("task-1", None).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn storage_writer_readiness_expires_without_a_heartbeat() {
+    let (_container, redis_url) = start_redis().await;
+    flush_redis(&redis_url).await;
+    let store = make_store(&redis_url).await;
+    store
+        .register_storage_writer(
+            StorageWriterRegistration {
+                instance_id: "writer-a".to_string(),
+                storage_protocol_version: 1,
+                build: "test-build".to_string(),
+                expires_at: 0.0,
+            },
+            40,
+        )
+        .await
+        .unwrap();
+    let writers = store.list_storage_writers().await.unwrap();
+    assert_eq!(writers.len(), 1);
+    assert_eq!(writers[0].instance_id, "writer-a");
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    assert!(store.list_storage_writers().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn terminal_projection_is_atomic_and_releases_worker_capacity_once() {
+    let (_container, redis_url) = start_redis().await;
+    flush_redis(&redis_url).await;
+    let store = make_store(&redis_url).await;
+    let mut task = make_task("ttl-projection");
+    task.status = TaskStatus::Assigned;
+    task.assigned_worker = Some("worker-1".to_string());
+    task.cost = Some(3);
+    store.save_task(task.clone()).await.unwrap();
+    let mut worker = make_worker("worker-1");
+    worker.status = WorkerStatus::Busy;
+    worker.used_slots = 3;
+    store.save_worker(worker).await.unwrap();
+    let mut assignment = make_assignment("ttl-projection", "worker-1");
+    assignment.cost = 3;
+    assignment.status = WorkerAssignmentStatus::Running;
+    store.add_assignment(assignment.clone()).await.unwrap();
+
+    let first_lease = store
+        .acquire_storage_lock("ttl-projection", "owner-1", "ttl-generation-1", 5_000)
+        .await
+        .unwrap()
+        .unwrap();
+    store.close_write_fence(&first_lease, 1).await.unwrap();
+    let mut timeout = task;
+    timeout.status = TaskStatus::Timeout;
+    timeout.updated_at = 3_000.0;
+    timeout.completed_at = Some(3_000.0);
+    timeout.assigned_worker = None;
+    let event = TaskEvent {
+        id: "ttl-timeout-event".to_string(),
+        task_id: "ttl-projection".to_string(),
+        index: 0,
+        timestamp: 3_000.0,
+        r#type: "taskcast:status".to_string(),
+        level: Level::Info,
+        data: serde_json::json!({"status": "timeout"}),
+        series_id: None,
+        series_mode: None,
+        series_acc_field: None,
+        series_snapshot: None,
+        _accumulated_data: None,
+    };
+    let projection = TerminalProjection {
+        projection_id: "ttl:ttl-timeout-event".to_string(),
+        task: timeout,
+        event: event.clone(),
+        assignment: Some(assignment),
+        claim_token: Some("claim-1".to_string()),
+        claim_until: Some(10_000.0),
+    };
+
+    let first = store
+        .project_terminal_fenced(&projection, &first_lease, 1, 2)
+        .await
+        .unwrap();
+    assert!(first.projected);
+    assert_eq!(first.token.storage_epoch, 2);
+    assert!(store.release_storage_lock(&first_lease).await.unwrap());
+
+    let retry_lease = store
+        .acquire_storage_lock("ttl-projection", "owner-2", "ttl-generation-2", 5_000)
+        .await
+        .unwrap()
+        .unwrap();
+    store.close_write_fence(&retry_lease, 2).await.unwrap();
+    let retry = store
+        .project_terminal_fenced(&projection, &retry_lease, 2, 3)
+        .await
+        .unwrap();
+    assert!(!retry.projected);
+    assert_eq!(retry.token.storage_epoch, 3);
+
+    assert_eq!(
+        store
+            .get_task("ttl-projection")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        TaskStatus::Timeout
+    );
+    assert_eq!(
+        store.get_events("ttl-projection", None).await.unwrap(),
+        vec![event]
+    );
+    assert!(store
+        .get_task_assignment("ttl-projection")
+        .await
+        .unwrap()
+        .is_none());
+    let settled_worker = store.get_worker("worker-1").await.unwrap().unwrap();
+    assert_eq!(settled_worker.used_slots, 0);
+    assert_eq!(settled_worker.status, WorkerStatus::Idle);
+}
+
+#[tokio::test]
+async fn durable_ttl_engine_does_not_expire_redis_hot_storage() {
+    let (_container, redis_url) = start_redis().await;
+    flush_redis(&redis_url).await;
+    let store = Arc::new(make_store(&redis_url).await);
+    let durable = Arc::new(MemoryLongTermStore::new());
+    let short: Arc<dyn ShortTermStore> = store;
+    let long: Arc<dyn LongTermStore> = durable;
+    let broadcast: Arc<dyn BroadcastProvider> = Arc::new(MemoryBroadcastProvider::new());
+    let engine = TaskEngine::new(TaskEngineOptions {
+        short_term_store: short,
+        long_term_store: Some(long),
+        broadcast,
+        hooks: None,
+    });
+    engine
+        .create_task(CreateTaskInput {
+            id: Some("durable-no-expiry".to_string()),
+            ttl: Some(60),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let client = redis::Client::open(redis_url).unwrap();
+    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+    let ttl: i64 = redis::cmd("TTL")
+        .arg("test:task:durable-no-expiry")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(ttl, -1);
 }

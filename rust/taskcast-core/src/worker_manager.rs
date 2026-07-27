@@ -426,7 +426,32 @@ impl WorkerManager {
             assigned_at: now_millis(),
             status: WorkerAssignmentStatus::Assigned,
         };
-        self.short_term_store.add_assignment(assignment).await?;
+        if let Some(long_term_store) = self
+            .long_term_store
+            .as_ref()
+            .filter(|store| store.supports_durable_ttl())
+        {
+            long_term_store
+                .save_durable_assignment(assignment.clone())
+                .await?;
+        }
+        if let Err(error) = self
+            .short_term_store
+            .add_assignment(assignment.clone())
+            .await
+        {
+            if let Some(long_term_store) = self
+                .long_term_store
+                .as_ref()
+                .filter(|store| store.supports_durable_ttl())
+            {
+                let assignment_id = durable_assignment_id(&assignment);
+                let _ = long_term_store
+                    .delete_durable_assignment(task_id, Some(&assignment_id))
+                    .await;
+            }
+            return Err(error);
+        }
 
         // Update worker status (used_slots already updated by claim_task)
         let worker = self.short_term_store.get_worker(worker_id).await?;
@@ -461,6 +486,16 @@ impl WorkerManager {
         };
 
         // Remove assignment
+        if let Some(long_term_store) = self
+            .long_term_store
+            .as_ref()
+            .filter(|store| store.supports_durable_ttl())
+        {
+            let assignment_id = durable_assignment_id(&assignment);
+            long_term_store
+                .delete_durable_assignment(task_id, Some(&assignment_id))
+                .await?;
+        }
         self.short_term_store.remove_assignment(task_id).await?;
 
         // Restore worker capacity
@@ -562,9 +597,28 @@ impl WorkerManager {
     pub async fn release_task(&self, task_id: &str) -> ManagerResult<()> {
         let assignment = self.short_term_store.get_task_assignment(task_id).await?;
         let Some(assignment) = assignment else {
+            if let Some(long_term_store) = self
+                .long_term_store
+                .as_ref()
+                .filter(|store| store.supports_durable_ttl())
+            {
+                long_term_store
+                    .delete_durable_assignment(task_id, None)
+                    .await?;
+            }
             return Ok(());
         };
 
+        if let Some(long_term_store) = self
+            .long_term_store
+            .as_ref()
+            .filter(|store| store.supports_durable_ttl())
+        {
+            let assignment_id = durable_assignment_id(&assignment);
+            long_term_store
+                .delete_durable_assignment(task_id, Some(&assignment_id))
+                .await?;
+        }
         self.short_term_store.remove_assignment(task_id).await?;
 
         // Restore worker capacity
@@ -776,6 +830,13 @@ fn now_millis() -> f64 {
         .duration_since(UNIX_EPOCH)
         .expect("system time before UNIX epoch")
         .as_millis() as f64
+}
+
+fn durable_assignment_id(assignment: &WorkerAssignment) -> String {
+    format!(
+        "{}:{}:{}",
+        assignment.task_id, assignment.worker_id, assignment.assigned_at as i64
+    )
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────

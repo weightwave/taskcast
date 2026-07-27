@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -337,6 +338,9 @@ pub async fn run(args: StartArgs) -> Result<(), Box<dyn std::error::Error>> {
     // 1. Load config file
     let file_config =
         taskcast_core::config::load_config_file(config.as_deref()).unwrap_or_default();
+    let env = std::env::vars().collect::<HashMap<_, _>>();
+    let storage_lifecycle =
+        taskcast_core::config::resolve_storage_lifecycle_config(&file_config, &env)?;
 
     // 2. Resolve port: CLI flag > config file > default
     let port = resolve_port(port, file_config.port);
@@ -529,16 +533,19 @@ pub async fn run(args: StartArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     // 5. Build engine (clone adapters for WorkerManager before moving into engine)
     let short_term_for_wm = Arc::clone(&short_term_store);
+    let short_term_for_services = Arc::clone(&short_term_store);
     let broadcast_for_wm = Arc::clone(&broadcast);
     let long_term_for_wm = long_term_store.clone();
 
-    let engine = Arc::new(taskcast_core::TaskEngine::new(
+    let engine = Arc::new(taskcast_core::TaskEngine::new_with_storage_lifecycle(
         taskcast_core::TaskEngineOptions {
             short_term_store,
             broadcast,
             long_term_store,
             hooks: None,
         },
+        storage_lifecycle.storage_lock_ttl_seconds * 1_000,
+        storage_lifecycle.rehydrate_replay_events,
     ));
 
     // 6. Create WorkerManager if workers enabled in config
@@ -618,9 +625,9 @@ pub async fn run(args: StartArgs) -> Result<(), Box<dyn std::error::Error>> {
         effective_adapters: Some(effective_adapters),
     };
     let (app, _ws_registry) = taskcast_server::create_app_with_runtime_health_and_routes(
-        engine,
+        Arc::clone(&engine),
         auth_mode,
-        worker_manager,
+        worker_manager.clone(),
         Some(file_config.clone()),
         taskcast_server::CorsConfig::default(),
         Arc::clone(&failure_logger),
@@ -628,6 +635,12 @@ pub async fn run(args: StartArgs) -> Result<(), Box<dyn std::error::Error>> {
             runtime_health,
             additional_routes,
         },
+    );
+    let mut background_services = taskcast_server::start_background_services_with_config(
+        engine,
+        short_term_for_services,
+        worker_manager,
+        storage_lifecycle,
     );
 
     // Apply verbose request logging middleware if --verbose
@@ -655,6 +668,7 @@ pub async fn run(args: StartArgs) -> Result<(), Box<dyn std::error::Error>> {
     let serve_result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await;
+    background_services.stop();
     close_runtime_dependencies(redis_pubsub.as_ref(), postgres_pool.as_ref()).await;
     drop(redis_command_manager);
     serve_result?;

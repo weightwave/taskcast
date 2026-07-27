@@ -15,13 +15,21 @@ import {
   TaskSchema,
   TaskEventSchema,
   ErrorSchema,
+  StorageReleaseRequestSchema,
+  StorageReleaseResultSchema,
 } from '../schemas.js'
 import {
   TaskConflictError,
   InvalidTaskArchiveError,
   InvalidTransitionError,
-  collapseAccumulateSeries,
   findDependencyUnavailableError,
+  StorageBusyError,
+  StorageFenceConflictError,
+  StorageIntegrityError,
+  StoragePreconditionError,
+  StorageReleaseUnsupportedError,
+  StorageUnavailableError,
+  collapseAccumulateSeries,
 } from '@taskcast/core'
 import type { TaskArchive, TaskEngine, CreateTaskInput, PublishEventInput, SinceCursor, TaskError, BlockedRequest, TaskFilter, TaskStatus, EventQueryOptions } from '@taskcast/core'
 
@@ -181,6 +189,32 @@ const eventHistoryRoute = createRoute({
   },
 })
 
+const releaseStorageRoute = createRoute({
+  method: 'post',
+  path: '/{taskId}/storage/release',
+  tags: ['Tasks'],
+  summary: 'Release verified hot task storage',
+  description:
+    'Persist a guarded release request, archive through the expected event index, and release short-term storage.',
+  security: [{ Bearer: [] }],
+  request: {
+    params: z.object({ taskId: z.string() }),
+    body: { content: { 'application/json': { schema: StorageReleaseRequestSchema } } },
+  },
+  responses: {
+    200: {
+      description: 'Storage release result',
+      content: { 'application/json': { schema: StorageReleaseResultSchema } },
+    },
+    400: { description: 'Validation error', content: { 'application/json': { schema: ErrorSchema } } },
+    403: { description: 'Forbidden', content: { 'application/json': { schema: ErrorSchema } } },
+    404: { description: 'Task not found', content: { 'application/json': { schema: ErrorSchema } } },
+    409: { description: 'Stale precondition or lifecycle busy', content: { 'application/json': { schema: ErrorSchema } } },
+    500: { description: 'Storage integrity error', content: { 'application/json': { schema: ErrorSchema } } },
+    503: { description: 'Storage lifecycle unavailable', content: { 'application/json': { schema: ErrorSchema } } },
+  },
+})
+
 // ─── Router Factory ────────────────────────────────────────────────────────
 
 // Engine types (Task, TaskEvent) are structurally compatible with the Zod schema
@@ -204,7 +238,15 @@ export function dependencyErrorResponse(
   return c.json({ error: message }, fallbackStatus)
 }
 
-export function createTasksRouter(engine: TaskEngine, subscriberCounts: SubscriberCounts): Hono {
+export interface StorageReleaseReadiness {
+  ensureReady(): Promise<void>
+}
+
+export function createTasksRouter(
+  engine: TaskEngine,
+  subscriberCounts: SubscriberCounts,
+  storageReadiness?: StorageReleaseReadiness,
+): Hono {
   const router = new OpenAPIHono()
   const register = router.openapi.bind(router) as OpenAPIRegister
 
@@ -427,6 +469,41 @@ export function createTasksRouter(engine: TaskEngine, subscriberCounts: Subscrib
     }
 
     return c.json(events)
+  })
+
+  register(releaseStorageRoute, async (c) => {
+    const taskId = c.req.param('taskId') as string
+    const auth = c.get('auth')
+    if (!checkScope(auth, 'task:manage', taskId)) return c.json({ error: 'Forbidden' }, 403)
+
+    const task = await engine.getTask(taskId)
+    if (!task) return c.json({ error: 'Task not found' }, 404)
+
+    const parsed = StorageReleaseRequestSchema.safeParse(await c.req.json())
+    if (!parsed.success) return c.json({ error: 'Invalid storage release request' }, 400)
+
+    try {
+      await storageReadiness?.ensureReady()
+      return c.json(await engine.releaseTaskStorage(taskId, parsed.data))
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      if (error instanceof StoragePreconditionError) {
+        return c.json({ error: message, code: error.code }, 409)
+      }
+      if (error instanceof StorageBusyError || error instanceof StorageFenceConflictError) {
+        return c.json({ error: message, code: 'storage_busy' }, 409)
+      }
+      if (error instanceof StorageIntegrityError) {
+        return c.json({ error: message, code: error.code }, 500)
+      }
+      if (error instanceof StorageReleaseUnsupportedError) {
+        return c.json({ error: message, code: error.code }, 503)
+      }
+      if (error instanceof StorageUnavailableError) {
+        return c.json({ error: message, code: error.code }, 503)
+      }
+      return c.json({ error: message, code: 'storage_unavailable' }, 503)
+    }
   })
 
   // ─── POST /tasks/:taskId/resolve — Resolve a blocked task ─────────────────

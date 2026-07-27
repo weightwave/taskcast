@@ -59,11 +59,16 @@ describe('cross-compatibility: TS runner with sqlx-style pre-applied migrations'
     const migration001Sql = readFileSync(join(MIGRATIONS_DIR, '001_initial.sql'), 'utf8')
     await sql.unsafe(migration001Sql)
 
-    // Now run the TS migration runner — it should skip 001 and apply only 002
+    // Now run the TS migration runner — it should skip 001 and apply the remaining migrations
     const result = await runMigrations(sql, MIGRATIONS_DIR)
 
     expect(result.skipped).toEqual(['001_initial.sql'])
-    expect(result.applied).toEqual(['002_workers.sql'])
+    expect(result.applied).toEqual([
+      '002_workers.sql',
+      '003_storage_lifecycle.sql',
+      '004_archive_receipt_coverage.sql',
+      '005_task_creation_claim.sql',
+    ])
   })
 
   it('TS-written records have correct sqlx field format', async () => {
@@ -81,5 +86,39 @@ describe('cross-compatibility: TS runner with sqlx-style pre-applied migrations'
     const file2Content = readFileSync(join(MIGRATIONS_DIR, '002_workers.sql'), 'utf8')
     const expectedChecksum = computeChecksum(file2Content)
     expect(Buffer.from(row.checksum as Uint8Array).equals(expectedChecksum)).toBe(true)
+
+    const lifecycleRows = await sql`SELECT * FROM _sqlx_migrations WHERE version = 3`
+    expect(lifecycleRows).toHaveLength(1)
+
+    const lifecycleRow = lifecycleRows[0]!
+    expect(lifecycleRow.description).toBe('storage lifecycle')
+    expect(lifecycleRow.success).toBe(true)
+
+    const file3Content = readFileSync(join(MIGRATIONS_DIR, '003_storage_lifecycle.sql'), 'utf8')
+    const expectedLifecycleChecksum = computeChecksum(file3Content)
+    expect(
+      Buffer.from(lifecycleRow.checksum as Uint8Array).equals(expectedLifecycleChecksum),
+    ).toBe(true)
+
+    const coverageRows = await sql`SELECT * FROM _sqlx_migrations WHERE version = 4`
+    expect(coverageRows).toHaveLength(1)
+    expect(coverageRows[0]!.description).toBe('archive receipt coverage')
+
+    const creationClaimRows = await sql`SELECT * FROM _sqlx_migrations WHERE version = 5`
+    expect(creationClaimRows).toHaveLength(1)
+    expect(creationClaimRows[0]!.description).toBe('task creation claim')
+
+    const receiptColumns = await sql`
+      SELECT column_name, is_nullable
+      FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = 'taskcast_archive_batches'
+        AND column_name IN ('previous_digest', 'series_coverage')
+      ORDER BY column_name
+    `
+    expect(receiptColumns).toEqual([
+      { column_name: 'previous_digest', is_nullable: 'YES' },
+      { column_name: 'series_coverage', is_nullable: 'NO' },
+    ])
   })
 })

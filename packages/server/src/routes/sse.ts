@@ -2,7 +2,14 @@ import type { Hono } from 'hono'
 import { OpenAPIHono, createRoute, z } from '@hono/zod-openapi'
 import type { Context } from 'hono'
 import { streamSSE } from 'hono/streaming'
-import { applyFilteredIndex, matchesFilter, matchesType, TERMINAL_STATUSES, collapseAccumulateSeries } from '@taskcast/core'
+import {
+  applyFilteredIndex,
+  archiveEventRecord,
+  matchesFilter,
+  matchesType,
+  TERMINAL_STATUSES,
+  collapseAccumulateSeries,
+} from '@taskcast/core'
 import { checkScope } from '../auth.js'
 import { ErrorSchema } from '../schemas.js'
 import type { TaskEngine, TaskEvent, Task, SubscribeFilter, SSEEnvelope, Level } from '@taskcast/core'
@@ -119,6 +126,38 @@ function toEnvelope(event: TaskEvent, filteredIndex: number): SSEEnvelope {
 
 const TERMINAL: Set<string> = new Set(TERMINAL_STATUSES)
 
+function terminalReason(event: TaskEvent): string | null {
+  if (event.type !== 'taskcast:status') return null
+  const status = (event.data as { status?: unknown })?.status
+  return typeof status === 'string' && TERMINAL.has(status) ? status : null
+}
+
+function replayEventsMatch(left: TaskEvent, right: TaskEvent): boolean {
+  if (archiveEventRecord(left) === archiveEventRecord(right)) return true
+  if (left.id !== right.id || left.index !== right.index) return false
+  if (
+    left.seriesId === right.seriesId &&
+    left.seriesMode === 'accumulate' &&
+    right.seriesMode === 'accumulate' &&
+    (left.seriesSnapshot === true || right.seriesSnapshot === true)
+  ) {
+    return true
+  }
+  if (right._accumulatedData !== undefined) {
+    return archiveEventRecord(left) === archiveEventRecord({
+      ...right,
+      data: right._accumulatedData,
+    })
+  }
+  if (left._accumulatedData !== undefined) {
+    return archiveEventRecord({
+      ...left,
+      data: left._accumulatedData,
+    }) === archiveEventRecord(right)
+  }
+  return false
+}
+
 // ─── Router Factory ────────────────────────────────────────────────────────
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -186,12 +225,50 @@ export function createSSERouter(engine: TaskEngine, subscriberCounts: Subscriber
         ? { ...(storageSince && { since: storageSince }), ...(limit !== undefined && { limit }) }
         : undefined
 
-      // Replay history
+      const buffered: TaskEvent[] = []
+      let phase: 'buffering' | 'live' | 'closed' = 'buffering'
+      let nextFilteredIndex = 0
+      let doneSent = false
+      let resolveDone!: () => void
+      const done = new Promise<void>((resolve) => { resolveDone = resolve })
+      let liveQueue = Promise.resolve()
+      let unsub = engine.subscribe(taskId, (event) => {
+        if (phase === 'buffering') {
+          buffered.push(event)
+          return
+        }
+        if (phase !== 'live') return
+        liveQueue = liveQueue.then(async () => {
+          if (phase !== 'live') return
+          if (matchesFilter(event, filter)) {
+            await sendEvent(event, nextFilteredIndex++)
+          }
+          const reason = terminalReason(event)
+          if (reason) await finish(reason)
+        }).catch(() => finish())
+      })
+
+      const finish = async (reason?: string): Promise<void> => {
+        if (phase === 'closed') return
+        phase = 'closed'
+        if (reason && !doneSent) {
+          doneSent = true
+          await sendDone(reason)
+        }
+        unsub()
+        cleanup()
+        resolveDone()
+      }
+
+      stream.onAbort(() => {
+        void finish()
+      })
+
       let history: TaskEvent[]
       try {
         history = await engine.getEvents(taskId, historyOpts)
       } catch {
-        cleanup()
+        await finish()
         return
       }
 
@@ -209,44 +286,75 @@ export function createSSERouter(engine: TaskEngine, subscriberCounts: Subscriber
       }
 
       const filtered = applyFilteredIndex(replayEvents, filter)
+      const filterWithoutSince: SubscribeFilter = { ...filter }
+      delete filterWithoutSince.since
+      nextFilteredIndex = applyFilteredIndex(
+        replayEvents,
+        filterWithoutSince,
+      ).length
       for (const { event, filteredIndex } of filtered) {
         await sendEvent(event, filteredIndex)
       }
 
-      // If task is already terminal, send done and close
-      if (TERMINAL.has(task.status)) {
-        await sendDone(task.status)
-        cleanup()
+      const seen = new Map<number, TaskEvent>()
+      for (const event of history) seen.set(event.index, event)
+      for (const event of replayEvents) {
+        const existing = seen.get(event.index)
+        if (existing && !replayEventsMatch(existing, event)) {
+          await finish()
+          return
+        }
+        seen.set(event.index, event)
+      }
+      let snapshotBoundary = -1
+      for (const index of seen.keys()) {
+        if (index > snapshotBoundary) snapshotBoundary = index
+      }
+
+      const drainBuffered = async (): Promise<void> => {
+        while (buffered.length > 0 && phase === 'buffering') {
+          const batch = buffered.splice(0).sort((left, right) => left.index - right.index)
+          for (const event of batch) {
+            const existing = seen.get(event.index)
+            if (existing) {
+              if (!replayEventsMatch(existing, event)) {
+                await finish()
+                return
+              }
+              continue
+            }
+            if (event.index <= snapshotBoundary) continue
+            seen.set(event.index, event)
+            snapshotBoundary = event.index
+            if (matchesFilter(event, filter)) {
+              await sendEvent(event, nextFilteredIndex++)
+            }
+            const reason = terminalReason(event)
+            if (reason) {
+              await finish(reason)
+              return
+            }
+          }
+        }
+      }
+
+      await drainBuffered()
+      if (isClosed()) return
+      const currentTask = await engine.getTask(taskId)
+      await drainBuffered()
+      if (isClosed()) return
+      if (currentTask && TERMINAL.has(currentTask.status)) {
+        await finish(currentTask.status)
         return
       }
 
-      // Subscribe to live events
-      let nextFilteredIndex = filtered.length > 0
-        ? (filtered[filtered.length - 1]!.filteredIndex + 1)
-        : 0
+      phase = 'live'
+      await done
+      await liveQueue
 
-      await new Promise<void>((resolve) => {
-        const unsub = engine.subscribe(taskId, async (event) => {
-          if (!matchesFilter(event, filter)) return
-          await sendEvent(event, nextFilteredIndex++)
-
-          if (event.type === 'taskcast:status') {
-            const status = (event.data as { status: string }).status
-            if (TERMINAL.has(status)) {
-              await sendDone(status)
-              cleanup()
-              unsub()
-              resolve()
-            }
-          }
-        })
-
-        stream.onAbort(() => {
-          cleanup()
-          unsub()
-          resolve()
-        })
-      })
+      function isClosed(): boolean {
+        return phase === 'closed'
+      }
     })
   })
 

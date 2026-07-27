@@ -271,7 +271,7 @@ async fn managed_paths_recover_store_and_new_pubsub_messages_after_long_outage()
         interrupted_managed
             .adapters
             .short_term_store
-            .get_task("taskcast:managed:interrupted")
+            .get_task_mutation_snapshot("taskcast:managed:interrupted")
             .await
     });
     eventually(Duration::from_secs(2), || {
@@ -303,7 +303,7 @@ async fn managed_paths_recover_store_and_new_pubsub_messages_after_long_outage()
         managed
             .adapters
             .short_term_store
-            .get_task("taskcast:managed:second-refused-round"),
+            .get_write_fence("taskcast:managed:second-refused-round"),
     )
     .await
     .expect("the second refused command round did not settle before the deadline");

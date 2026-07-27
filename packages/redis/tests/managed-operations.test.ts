@@ -35,7 +35,7 @@ describe('managed Redis business operations', () => {
     const error = resetError()
     const observations: DependencyObservation[] = []
     const redis = {
-      set: vi.fn().mockRejectedValue(error),
+      eval: vi.fn().mockRejectedValue(error),
     } as unknown as Redis
     const store = new RedisShortTermStore(redis, {
       managed: true,
@@ -52,7 +52,7 @@ describe('managed Redis business operations', () => {
       state: 'reconnecting',
       errorKind: 'connection_reset',
     })
-    expect(redis.set).toHaveBeenCalledOnce()
+    expect(redis.eval).toHaveBeenCalledOnce()
   })
 
   it('wraps a pipeline per-command connection error without changing ordinary pipeline errors', async () => {

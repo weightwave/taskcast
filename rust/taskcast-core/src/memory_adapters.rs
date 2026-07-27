@@ -1,12 +1,23 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use async_trait::async_trait;
 
 use crate::types::{
-    BroadcastProvider, EventQueryOptions, ShortTermStore, Task, TaskEvent, TaskFilter, TaskStatus,
-    TaskArchiveImportOptions, TaskArchiveRestoreData, Worker, WorkerAssignment, WorkerFilter,
+    ArchiveBatch, ArchiveBatchReceipt, ArchiveGeneration, ArchiveGenerationStatus,
+    ArchiveSourcePage, BroadcastProvider, ClosedWriteFence, DurableSeriesState, EventQueryOptions,
+    HotWriteToken, LongTermStore, RehydrateSnapshot, SeriesMode, SeriesResult, ShortTermStore,
+    StorageFenceConflictError, StorageIntegrityError, StorageLease, StorageReleaseRequest,
+    StorageState, StorageWriterRegistration, Task, TaskArchiveImportOptions,
+    TaskArchiveRestoreData, TaskEvent, TaskFilter, TaskMutationSnapshot, TaskStatus,
+    TaskStorageMetadata, TaskStorageMetadataCas, TaskStoragePresence, TaskWriteFence, Worker,
+    WorkerAssignment, WorkerAuditEvent, WorkerFilter, WorkerStatus, TerminalProjection,
+    TerminalProjectionResult, TtlClaim,
+};
+use crate::{
+    compute_archive_batch_digest, compute_archive_source_digest,
+    compute_archive_source_page_digest, compute_series_state_digest,
 };
 
 // ─── MemoryBroadcastProvider ────────────────────────────────────────────────
@@ -55,7 +66,8 @@ impl BroadcastProvider for MemoryBroadcastProvider {
         channel: &str,
         handler: Box<dyn Fn(TaskEvent) + Send + Sync>,
     ) -> Box<dyn Fn() + Send + Sync> {
-        self.subscribe_sync(channel, handler).expect("MemoryBroadcastProvider::subscribe_sync should never fail")
+        self.subscribe_sync(channel, handler)
+            .expect("MemoryBroadcastProvider::subscribe_sync should never fail")
     }
 
     fn subscribe_sync(
@@ -90,23 +102,87 @@ impl BroadcastProvider for MemoryBroadcastProvider {
 // ─── MemoryShortTermStore ───────────────────────────────────────────────────
 
 pub struct MemoryShortTermStore {
+    task_event_guard: Mutex<()>,
     tasks: RwLock<HashMap<String, Task>>,
+    task_revisions: RwLock<HashMap<String, u64>>,
     events: RwLock<HashMap<String, Vec<TaskEvent>>>,
     series_latest: RwLock<HashMap<String, TaskEvent>>,
     index_counters: RwLock<HashMap<String, Arc<AtomicU64>>>,
     workers: RwLock<HashMap<String, Worker>>,
     assignments: RwLock<Vec<WorkerAssignment>>,
+    storage_locks: RwLock<HashMap<String, MemoryStorageLock>>,
+    write_fences: RwLock<HashMap<String, TaskWriteFence>>,
+    storage_writers: RwLock<HashMap<String, StorageWriterRegistration>>,
+}
+
+#[derive(Clone)]
+struct MemoryStorageLock {
+    lock_token: String,
+    generation: String,
+    storage_epoch: u64,
+    expires_at: u128,
+}
+
+#[derive(Clone)]
+struct MemoryCreationClaim {
+    token: String,
+    expires_at: Option<u128>,
+    completed_at: Option<u128>,
+}
+
+#[derive(Clone)]
+struct MemoryTerminalProjection {
+    projection: TerminalProjection,
+    projected_at: Option<u128>,
 }
 
 impl MemoryShortTermStore {
     pub fn new() -> Self {
         Self {
+            task_event_guard: Mutex::new(()),
             tasks: RwLock::new(HashMap::new()),
+            task_revisions: RwLock::new(HashMap::new()),
             events: RwLock::new(HashMap::new()),
             series_latest: RwLock::new(HashMap::new()),
             index_counters: RwLock::new(HashMap::new()),
             workers: RwLock::new(HashMap::new()),
             assignments: RwLock::new(Vec::new()),
+            storage_locks: RwLock::new(HashMap::new()),
+            write_fences: RwLock::new(HashMap::new()),
+            storage_writers: RwLock::new(HashMap::new()),
+        }
+    }
+
+    fn now_ms() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    }
+
+    fn owns_storage_lock(&self, lease: &StorageLease) -> bool {
+        let now = Self::now_ms();
+        let locks = self.storage_locks.read().unwrap();
+        matches!(
+            locks.get(&lease.task_id),
+            Some(current)
+                if current.expires_at > now
+                    && current.lock_token == lease.lock_token
+                    && current.generation == lease.generation
+                    && current.storage_epoch == lease.storage_epoch
+        )
+    }
+
+    fn assert_owned_storage_lock(
+        &self,
+        lease: &StorageLease,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if self.owns_storage_lock(lease) {
+            Ok(())
+        } else {
+            Err(Box::new(StorageFenceConflictError::new(
+                "Storage lease is stale",
+            )))
         }
     }
 }
@@ -117,14 +193,1203 @@ impl Default for MemoryShortTermStore {
     }
 }
 
+// ─── MemoryLongTermStore ───────────────────────────────────────────────────
+
+pub struct MemoryLongTermStore {
+    lifecycle_guard: Mutex<()>,
+    tasks: RwLock<HashMap<String, Task>>,
+    events: RwLock<HashMap<String, Vec<TaskEvent>>>,
+    metadata: RwLock<HashMap<String, TaskStorageMetadata>>,
+    generations: RwLock<HashMap<(String, String), ArchiveGeneration>>,
+    batches: RwLock<HashMap<(String, String), BTreeMap<u64, ArchiveBatch>>>,
+    series: RwLock<HashMap<String, Vec<DurableSeriesState>>>,
+    worker_events: RwLock<HashMap<String, Vec<WorkerAuditEvent>>>,
+    creation_claims: RwLock<HashMap<String, MemoryCreationClaim>>,
+    release_requests: RwLock<HashMap<String, StorageReleaseRequest>>,
+    ttl_claims: RwLock<HashMap<String, TtlClaim>>,
+    durable_assignments: RwLock<HashMap<String, WorkerAssignment>>,
+    terminal_projections: RwLock<HashMap<String, MemoryTerminalProjection>>,
+}
+
+impl MemoryLongTermStore {
+    pub fn new() -> Self {
+        Self {
+            lifecycle_guard: Mutex::new(()),
+            tasks: RwLock::new(HashMap::new()),
+            events: RwLock::new(HashMap::new()),
+            metadata: RwLock::new(HashMap::new()),
+            generations: RwLock::new(HashMap::new()),
+            batches: RwLock::new(HashMap::new()),
+            series: RwLock::new(HashMap::new()),
+            worker_events: RwLock::new(HashMap::new()),
+            creation_claims: RwLock::new(HashMap::new()),
+            release_requests: RwLock::new(HashMap::new()),
+            ttl_claims: RwLock::new(HashMap::new()),
+            durable_assignments: RwLock::new(HashMap::new()),
+            terminal_projections: RwLock::new(HashMap::new()),
+        }
+    }
+
+    fn upsert_event(&self, event: TaskEvent) {
+        let mut all_events = self.events.write().unwrap();
+        let events = all_events.entry(event.task_id.clone()).or_default();
+        if let Some(existing) = events
+            .iter_mut()
+            .find(|candidate| candidate.index == event.index)
+        {
+            *existing = event;
+        } else {
+            events.push(event);
+        }
+        events.sort_by_key(|candidate| candidate.index);
+    }
+
+    fn upsert_series_state(&self, state: DurableSeriesState) {
+        let mut all_series = self.series.write().unwrap();
+        let states = all_series.entry(state.task_id.clone()).or_default();
+        if let Some(existing) = states
+            .iter_mut()
+            .find(|candidate| candidate.series_id == state.series_id)
+        {
+            *existing = state;
+        } else {
+            states.push(state);
+        }
+        states.sort_by(|left, right| left.series_id.cmp(&right.series_id));
+    }
+
+    fn is_pristine_creation_claim(&self, task_id: &str) -> bool {
+        let pristine_task = self.tasks.read().unwrap().get(task_id).is_some_and(|task| {
+            task.status == TaskStatus::Pending
+                && task.updated_at == task.created_at
+                && task.result.is_none()
+                && task.error.is_none()
+                && task.completed_at.is_none()
+        });
+        pristine_task
+            && self
+                .metadata
+                .read()
+                .unwrap()
+                .get(task_id)
+                .is_some_and(|metadata| {
+                    metadata.storage_state == StorageState::Hot
+                        && metadata.storage_epoch == 1
+                        && metadata.active_release_generation.is_none()
+                        && metadata.archive_watermark == -1
+                        && metadata.last_event_at.is_none()
+                        && metadata.cold_at.is_none()
+                        && metadata.task_version == 0
+                })
+            && self
+                .events
+                .read()
+                .unwrap()
+                .get(task_id)
+                .is_none_or(Vec::is_empty)
+    }
+}
+
+impl Default for MemoryLongTermStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[async_trait]
-impl ShortTermStore for MemoryShortTermStore {
-    async fn save_task(
+impl LongTermStore for MemoryLongTermStore {
+    fn supports_hot_cold_release(&self) -> bool {
+        true
+    }
+
+    fn supports_durable_ttl(&self) -> bool {
+        true
+    }
+
+    fn supports_task_creation_claims(&self) -> bool {
+        true
+    }
+
+    async fn save_task(&self, task: Task) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let _lifecycle = self.lifecycle_guard.lock().unwrap();
+        let task_id = task.id.clone();
+        let now = MemoryShortTermStore::now_ms() as f64;
+        let deadline = if has_memory_execution_deadline(&task) {
+            Some(now + task.ttl.unwrap_or(0) as f64 * 1_000.0)
+        } else {
+            None
+        };
+        let existing = self.tasks.read().unwrap().get(&task_id).cloned();
+        if existing.as_ref().is_some_and(|existing| {
+            is_memory_terminal(&existing.status) && existing.status != task.status
+        }) {
+            return Err(Box::new(StorageFenceConflictError::new(format!(
+                "Durable terminal task cannot be overwritten: {task_id}"
+            ))));
+        }
+        self.tasks
+            .write()
+            .unwrap()
+            .insert(task_id.clone(), task.clone());
+        let mut metadata = self.metadata.write().unwrap();
+        if let Some(current) = metadata.get_mut(&task_id) {
+            current.execution_deadline_at = if has_memory_execution_deadline(&task) {
+                if current.execution_deadline_at.is_none()
+                    || existing
+                        .as_ref()
+                        .is_some_and(|existing| existing.status == TaskStatus::Paused)
+                    || existing.as_ref().and_then(|existing| existing.ttl) != task.ttl
+                {
+                    deadline
+                } else {
+                    current.execution_deadline_at
+                }
+            } else {
+                None
+            };
+            current.task_version += 1;
+            self.ttl_claims.write().unwrap().remove(&task_id);
+        } else {
+            metadata.insert(task_id.clone(), TaskStorageMetadata {
+                task_id,
+                storage_state: StorageState::Hot,
+                storage_epoch: 1,
+                active_release_generation: None,
+                archive_watermark: -1,
+                last_event_at: None,
+                cold_at: None,
+                execution_deadline_at: deadline,
+                task_version: 0,
+            });
+        }
+        Ok(())
+    }
+
+    async fn create_task_if_absent(
         &self,
         task: Task,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let _lifecycle = self.lifecycle_guard.lock().unwrap();
+        let task_id = task.id.clone();
+        let now = MemoryShortTermStore::now_ms() as f64;
+        let deadline = if has_memory_execution_deadline(&task) {
+            task.ttl.map(|ttl| now + ttl as f64 * 1_000.0)
+        } else {
+            None
+        };
+        {
+            let mut tasks = self.tasks.write().unwrap();
+            if tasks.contains_key(&task_id) {
+                return Ok(false);
+            }
+            tasks.insert(task_id.clone(), task);
+        }
+        self.metadata
+            .write()
+            .unwrap()
+            .entry(task_id.clone())
+            .or_insert(TaskStorageMetadata {
+                task_id,
+                storage_state: StorageState::Hot,
+                storage_epoch: 1,
+                active_release_generation: None,
+                archive_watermark: -1,
+                last_event_at: None,
+                cold_at: None,
+                execution_deadline_at: deadline,
+                task_version: 0,
+            });
+        Ok(true)
+    }
+
+    async fn claim_task_creation(
+        &self,
+        task: Task,
+        creation_token: &str,
+        claim_ttl_ms: u64,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        if claim_ttl_ms == 0 {
+            return Err(Box::new(StorageIntegrityError::new(
+                "Creation claim TTL must be positive",
+            )));
+        }
+        let _lifecycle = self.lifecycle_guard.lock().unwrap();
+        let task_id = task.id.clone();
+        let now = MemoryShortTermStore::now_ms();
+        let deadline = if has_memory_execution_deadline(&task) {
+            task.ttl.map(|ttl| now as f64 + ttl as f64 * 1_000.0)
+        } else {
+            None
+        };
+        if self.tasks.read().unwrap().contains_key(&task_id) {
+            let claims = self.creation_claims.read().unwrap();
+            let can_take_over = claims.get(&task_id).is_some_and(|claim| {
+                claim.completed_at.is_none()
+                    && claim.expires_at.is_none_or(|expires_at| expires_at <= now)
+            });
+            drop(claims);
+            if !can_take_over || !self.is_pristine_creation_claim(&task_id) {
+                return Ok(false);
+            }
+        }
+        self.tasks.write().unwrap().insert(task_id.clone(), task);
+        self.metadata.write().unwrap().insert(
+            task_id.clone(),
+            TaskStorageMetadata {
+                task_id: task_id.clone(),
+                storage_state: StorageState::Hot,
+                storage_epoch: 1,
+                active_release_generation: None,
+                archive_watermark: -1,
+                last_event_at: None,
+                cold_at: None,
+                execution_deadline_at: deadline,
+                task_version: 0,
+            },
+        );
+        self.creation_claims.write().unwrap().insert(
+            task_id,
+            MemoryCreationClaim {
+                token: creation_token.to_string(),
+                expires_at: Some(now + claim_ttl_ms as u128),
+                completed_at: None,
+            },
+        );
+        Ok(true)
+    }
+
+    async fn complete_task_creation(
+        &self,
+        task_id: &str,
+        creation_token: &str,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let _lifecycle = self.lifecycle_guard.lock().unwrap();
+        let mut claims = self.creation_claims.write().unwrap();
+        let Some(claim) = claims.get_mut(task_id) else {
+            return Ok(false);
+        };
+        if claim.token != creation_token {
+            return Ok(false);
+        }
+        claim
+            .completed_at
+            .get_or_insert_with(MemoryShortTermStore::now_ms);
+        claim.expires_at = None;
+        Ok(true)
+    }
+
+    async fn abort_task_creation(
+        &self,
+        task_id: &str,
+        creation_token: &str,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let _lifecycle = self.lifecycle_guard.lock().unwrap();
+        let claims = self.creation_claims.read().unwrap();
+        let owns_incomplete_claim = claims
+            .get(task_id)
+            .is_some_and(|claim| claim.token == creation_token && claim.completed_at.is_none());
+        drop(claims);
+        if !owns_incomplete_claim {
+            return Ok(false);
+        }
+        if !self.is_pristine_creation_claim(task_id) {
+            return Ok(false);
+        }
+        self.creation_claims.write().unwrap().remove(task_id);
+        self.tasks.write().unwrap().remove(task_id);
+        self.metadata.write().unwrap().remove(task_id);
+        Ok(true)
+    }
+
+    async fn get_task(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<Task>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self.tasks.read().unwrap().get(task_id).cloned())
+    }
+
+    async fn save_event(
+        &self,
+        event: TaskEvent,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let _lifecycle = self.lifecycle_guard.lock().unwrap();
+        let task_id = event.task_id.clone();
+        let timestamp = event.timestamp;
+        self.upsert_event(event);
+        if let Some(metadata) = self.metadata.write().unwrap().get_mut(&task_id) {
+            metadata.last_event_at = Some(timestamp);
+        }
+        Ok(())
+    }
+
+    async fn replace_last_series_event(
+        &self,
+        task_id: &str,
+        series_id: &str,
+        event: TaskEvent,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let _lifecycle = self.lifecycle_guard.lock().unwrap();
+        let previous = self.series.read().unwrap().get(task_id).and_then(|states| {
+            states
+                .iter()
+                .find(|state| state.series_id == series_id)
+                .cloned()
+        });
+        let archive_watermark = self
+            .metadata
+            .read()
+            .unwrap()
+            .get(task_id)
+            .map(|metadata| metadata.archive_watermark)
+            .ok_or_else(|| {
+                Box::new(StorageIntegrityError::new(format!(
+                    "Series task does not exist: {task_id}"
+                ))) as Box<dyn std::error::Error + Send + Sync>
+            })?;
+        if archive_watermark >= event.index as i64
+            || previous
+                .as_ref()
+                .is_some_and(|state| state.through_index >= event.index)
+        {
+            if archive_watermark >= event.index as i64 && previous.is_none() {
+                return Err(Box::new(StorageIntegrityError::new(format!(
+                    "Archived latest series state is missing for {task_id}:{series_id}"
+                ))));
+            }
+            return Ok(());
+        }
+        if previous.as_ref().is_some_and(|state| {
+            state.mode != SeriesMode::Latest
+                || state.event.series_acc_field != event.series_acc_field
+        }) {
+            return Err(Box::new(StorageIntegrityError::new(format!(
+                "Durable series semantics conflict for {task_id}:{series_id}"
+            ))));
+        }
+        if let Some(previous) = previous {
+            if let Some(events) = self.events.write().unwrap().get_mut(task_id) {
+                events.retain(|candidate| candidate.id != previous.event.id);
+            }
+        }
+        self.upsert_event(event.clone());
+        self.upsert_series_state(DurableSeriesState {
+            task_id: task_id.to_string(),
+            series_id: series_id.to_string(),
+            mode: SeriesMode::Latest,
+            through_index: event.index,
+            event,
+        });
+        Ok(())
+    }
+
+    async fn accumulate_series(
+        &self,
+        task_id: &str,
+        series_id: &str,
+        event: TaskEvent,
+        field: &str,
+    ) -> Result<TaskEvent, Box<dyn std::error::Error + Send + Sync>> {
+        let _lifecycle = self.lifecycle_guard.lock().unwrap();
+        let previous = self.series.read().unwrap().get(task_id).and_then(|states| {
+            states
+                .iter()
+                .find(|state| state.series_id == series_id)
+                .cloned()
+        });
+        let archive_watermark = self
+            .metadata
+            .read()
+            .unwrap()
+            .get(task_id)
+            .map(|metadata| metadata.archive_watermark)
+            .ok_or_else(|| {
+                Box::new(StorageIntegrityError::new(format!(
+                    "Series task does not exist: {task_id}"
+                ))) as Box<dyn std::error::Error + Send + Sync>
+            })?;
+        if archive_watermark >= event.index as i64
+            || previous
+                .as_ref()
+                .is_some_and(|state| state.through_index >= event.index)
+        {
+            let Some(previous) = previous else {
+                return Err(Box::new(StorageIntegrityError::new(format!(
+                    "Archived accumulate series state is missing for {task_id}:{series_id}"
+                ))));
+            };
+            return Ok(previous.event);
+        }
+        if previous.as_ref().is_some_and(|state| {
+            state.mode != SeriesMode::Accumulate
+                || state.event.series_acc_field.as_deref().unwrap_or("delta") != field
+                || event.series_acc_field.as_deref().unwrap_or("delta") != field
+        }) {
+            return Err(Box::new(StorageIntegrityError::new(format!(
+                "Durable series semantics conflict for {task_id}:{series_id}"
+            ))));
+        }
+        let mut accumulated = event.clone();
+        if let Some(previous_state) = &previous {
+            if let (Some(previous_value), Some(next_value)) = (
+                previous_state
+                    .event
+                    .data
+                    .as_object()
+                    .and_then(|data| data.get(field))
+                    .and_then(|value| value.as_str()),
+                event
+                    .data
+                    .as_object()
+                    .and_then(|data| data.get(field))
+                    .and_then(|value| value.as_str()),
+            ) {
+                if let Some(data) = accumulated.data.as_object_mut() {
+                    data.insert(
+                        field.to_string(),
+                        serde_json::Value::String(format!("{previous_value}{next_value}")),
+                    );
+                }
+            }
+            if let Some(events) = self.events.write().unwrap().get_mut(task_id) {
+                events.retain(|candidate| candidate.id != previous_state.event.id);
+            }
+        }
+        self.upsert_event(accumulated.clone());
+        self.upsert_series_state(DurableSeriesState {
+            task_id: task_id.to_string(),
+            series_id: series_id.to_string(),
+            mode: SeriesMode::Accumulate,
+            through_index: event.index,
+            event: accumulated.clone(),
+        });
+        Ok(accumulated)
+    }
+
+    fn supports_series_compaction(&self) -> bool {
+        true
+    }
+
+    async fn get_events(
+        &self,
+        task_id: &str,
+        opts: Option<EventQueryOptions>,
+    ) -> Result<Vec<TaskEvent>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut events = self
+            .events
+            .read()
+            .unwrap()
+            .get(task_id)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(options) = opts {
+            if let Some(since) = options.since {
+                if let Some(id) = since.id {
+                    if let Some(position) = events.iter().position(|event| event.id == id) {
+                        events = events.into_iter().skip(position + 1).collect();
+                    }
+                } else if let Some(index) = since.index {
+                    events.retain(|event| event.index > index);
+                } else if let Some(timestamp) = since.timestamp {
+                    events.retain(|event| event.timestamp > timestamp);
+                }
+            }
+            if let Some(limit) = options.limit {
+                events.truncate(limit as usize);
+            }
+        }
+        Ok(events)
+    }
+
+    async fn get_task_storage_metadata(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<TaskStorageMetadata>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self.metadata.read().unwrap().get(task_id).cloned())
+    }
+
+    async fn persist_storage_release_request(
+        &self,
+        request: StorageReleaseRequest,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        if !self.tasks.read().unwrap().contains_key(&request.task_id) {
+            return Ok(false);
+        }
+        self.release_requests
+            .write()
+            .unwrap()
+            .insert(request.task_id.clone(), request);
+        Ok(true)
+    }
+
+    async fn clear_storage_release_request(
+        &self,
+        request: &StorageReleaseRequest,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let mut requests = self.release_requests.write().unwrap();
+        if requests.get(&request.task_id) != Some(request) {
+            return Ok(false);
+        }
+        requests.remove(&request.task_id);
+        Ok(true)
+    }
+
+    async fn list_storage_release_requests(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<StorageReleaseRequest>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut requests = self
+            .release_requests
+            .read()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        requests.sort_by(|left, right| {
+            left.requested_at
+                .total_cmp(&right.requested_at)
+                .then_with(|| left.task_id.cmp(&right.task_id))
+        });
+        requests.truncate(limit as usize);
+        Ok(requests)
+    }
+
+    async fn compare_and_set_task_storage_metadata(
+        &self,
+        update: TaskStorageMetadataCas,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let _lifecycle = self.lifecycle_guard.lock().unwrap();
+        let mut metadata = self.metadata.write().unwrap();
+        let Some(current) = metadata.get(&update.task_id) else {
+            return Ok(false);
+        };
+        if current.storage_state != update.expected_storage_state
+            || current.storage_epoch != update.expected_storage_epoch
+            || current.active_release_generation != update.expected_release_generation
+        {
+            return Ok(false);
+        }
+        metadata.insert(update.task_id, update.next);
+        Ok(true)
+    }
+
+    async fn begin_archive(
+        &self,
+        generation: ArchiveGeneration,
+    ) -> Result<ArchiveGeneration, Box<dyn std::error::Error + Send + Sync>> {
+        let _lifecycle = self.lifecycle_guard.lock().unwrap();
+        let metadata = self.metadata.read().unwrap();
+        let current = metadata.get(&generation.task_id).ok_or_else(|| {
+            Box::new(StorageIntegrityError::new("Archive task does not exist"))
+                as Box<dyn std::error::Error + Send + Sync>
+        })?;
+        if current.storage_state != StorageState::Releasing
+            || current.storage_epoch != generation.storage_epoch
+            || current.active_release_generation.as_deref() != Some(generation.generation.as_str())
+            || current.archive_watermark != generation.manifest.prior_watermark
+        {
+            return Err(Box::new(StorageIntegrityError::new(
+                "Archive generation lost its durable release fence",
+            )));
+        }
+        drop(metadata);
+        let key = (generation.task_id.clone(), generation.generation.clone());
+        let mut generations = self.generations.write().unwrap();
+        if let Some(existing) = generations.get(&key) {
+            if existing != &generation {
+                return Err(Box::new(StorageIntegrityError::new(
+                    "Archive generation replay conflicts",
+                )));
+            }
+            return Ok(existing.clone());
+        }
+        generations.insert(key, generation.clone());
+        Ok(generation)
+    }
+
+    async fn archive_batch(
+        &self,
+        task_id: &str,
+        generation: &str,
+        batch: ArchiveBatch,
+    ) -> Result<ArchiveBatchReceipt, Box<dyn std::error::Error + Send + Sync>> {
+        let _lifecycle = self.lifecycle_guard.lock().unwrap();
+        let expected_digest = compute_archive_batch_digest(
+            batch.receipt.previous_batch_digest.as_deref(),
+            &batch.events,
+            &batch.series_latest,
+        )?;
+        if expected_digest != batch.receipt.batch_digest {
+            return Err(Box::new(StorageIntegrityError::new(
+                "Archive batch digest mismatch",
+            )));
+        }
+        let key = (task_id.to_string(), generation.to_string());
+        let archive = self
+            .generations
+            .read()
+            .unwrap()
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| {
+                Box::new(StorageIntegrityError::new(
+                    "Archive generation does not exist",
+                )) as Box<dyn std::error::Error + Send + Sync>
+            })?;
+        if archive.status != ArchiveGenerationStatus::Open {
+            return Err(Box::new(StorageIntegrityError::new(
+                "Archive generation is not open",
+            )));
+        }
+        let metadata = self.metadata.read().unwrap();
+        let current = metadata.get(task_id).ok_or_else(|| {
+            Box::new(StorageIntegrityError::new("Archive task does not exist"))
+                as Box<dyn std::error::Error + Send + Sync>
+        })?;
+        if current.storage_state != StorageState::Releasing
+            || current.storage_epoch != archive.storage_epoch
+            || current.active_release_generation.as_deref() != Some(generation)
+        {
+            return Err(Box::new(StorageIntegrityError::new(
+                "Archive batch lost its durable release fence",
+            )));
+        }
+        drop(metadata);
+        let mut all_batches = self.batches.write().unwrap();
+        let batches = all_batches.entry(key).or_default();
+        if let Some(existing) = batches.get(&batch.receipt.ordinal) {
+            if existing.receipt != batch.receipt || existing.events != batch.events {
+                return Err(Box::new(StorageIntegrityError::new(
+                    "Archive batch replay conflicts",
+                )));
+            }
+            return Ok(existing.receipt.clone());
+        }
+        let expected_ordinal = archive
+            .manifest
+            .expected_batch_ordinals
+            .get(batches.len())
+            .copied();
+        if expected_ordinal != Some(batch.receipt.ordinal) {
+            return Err(Box::new(StorageIntegrityError::new(
+                "Archive batch ordinal is out of order",
+            )));
+        }
+        for event in &batch.events {
+            self.upsert_event(event.clone());
+        }
+        let receipt = batch.receipt.clone();
+        batches.insert(receipt.ordinal, batch);
+        Ok(receipt)
+    }
+
+    async fn finalize_archive(
+        &self,
+        task_id: &str,
+        generation: &str,
+        task: Task,
+        series_latest: Vec<DurableSeriesState>,
+    ) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+        let _lifecycle = self.lifecycle_guard.lock().unwrap();
+        let key = (task_id.to_string(), generation.to_string());
+        let archive = self
+            .generations
+            .read()
+            .unwrap()
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| {
+                Box::new(StorageIntegrityError::new(
+                    "Archive generation does not exist",
+                )) as Box<dyn std::error::Error + Send + Sync>
+            })?;
+        let batches = self
+            .batches
+            .read()
+            .unwrap()
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
+        let ordinals = batches.keys().copied().collect::<Vec<_>>();
+        if ordinals != archive.manifest.expected_batch_ordinals {
+            return Err(Box::new(StorageIntegrityError::new(
+                "Archive generation is missing batches",
+            )));
+        }
+        let source_entry_count = batches
+            .values()
+            .map(|batch| batch.events.len() as u64)
+            .sum::<u64>();
+        let page_digests = batches
+            .values()
+            .map(|batch| compute_archive_source_page_digest(&batch.events))
+            .collect::<Result<Vec<_>, _>>()?;
+        if source_entry_count != archive.manifest.source_entry_count
+            || compute_archive_source_digest(&page_digests) != archive.manifest.source_digest
+            || compute_series_state_digest(&series_latest)? != archive.manifest.series_state_digest
+        {
+            return Err(Box::new(StorageIntegrityError::new(
+                "Archive generation manifest verification failed",
+            )));
+        }
+        let mut metadata = self.metadata.write().unwrap();
+        let current = metadata.get_mut(task_id).ok_or_else(|| {
+            Box::new(StorageIntegrityError::new("Archive task does not exist"))
+                as Box<dyn std::error::Error + Send + Sync>
+        })?;
+        if current.storage_state != StorageState::Releasing
+            || current.storage_epoch != archive.storage_epoch
+            || current.active_release_generation.as_deref() != Some(generation)
+        {
+            return Err(Box::new(StorageIntegrityError::new(
+                "Archive finalization lost its durable release fence",
+            )));
+        }
+        current.archive_watermark = archive.target_watermark;
+        drop(metadata);
+        self.tasks
+            .write()
+            .unwrap()
+            .insert(task_id.to_string(), task);
+        let compact_series_ids = series_latest
+            .iter()
+            .map(|state| state.series_id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        if let Some(events) = self.events.write().unwrap().get_mut(task_id) {
+            events.retain(|event| {
+                event.series_id.as_ref().is_none_or(|series_id| {
+                    !compact_series_ids.contains(series_id)
+                        || !matches!(
+                            event.series_mode,
+                            Some(SeriesMode::Latest) | Some(SeriesMode::Accumulate)
+                        )
+                })
+            });
+            events.extend(series_latest.iter().map(|state| state.event.clone()));
+            events.sort_by_key(|event| event.index);
+        }
+        self.series
+            .write()
+            .unwrap()
+            .insert(task_id.to_string(), series_latest);
+        if let Some(generation) = self.generations.write().unwrap().get_mut(&key) {
+            generation.status = ArchiveGenerationStatus::Finalized;
+        }
+        Ok(archive.target_watermark)
+    }
+
+    async fn get_archive_watermark(
+        &self,
+        task_id: &str,
+    ) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+        self.metadata
+            .read()
+            .unwrap()
+            .get(task_id)
+            .map(|metadata| metadata.archive_watermark)
+            .ok_or_else(|| {
+                Box::new(StorageIntegrityError::new("Task does not exist"))
+                    as Box<dyn std::error::Error + Send + Sync>
+            })
+    }
+
+    async fn get_last_event_index(
+        &self,
+        task_id: &str,
+    ) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+        let event_index = self
+            .events
+            .read()
+            .unwrap()
+            .get(task_id)
+            .into_iter()
+            .flatten()
+            .map(|event| event.index as i64)
+            .max()
+            .unwrap_or(-1);
+        let series_index = self
+            .series
+            .read()
+            .unwrap()
+            .get(task_id)
+            .into_iter()
+            .flatten()
+            .map(|state| state.through_index as i64)
+            .max()
+            .unwrap_or(-1);
+        let watermark = self
+            .metadata
+            .read()
+            .unwrap()
+            .get(task_id)
+            .map(|metadata| metadata.archive_watermark)
+            .unwrap_or(-1);
+        Ok(event_index.max(series_index).max(watermark))
+    }
+
+    async fn get_recent_events(
+        &self,
+        task_id: &str,
+        limit: u64,
+    ) -> Result<Vec<TaskEvent>, Box<dyn std::error::Error + Send + Sync>> {
+        let events = self
+            .events
+            .read()
+            .unwrap()
+            .get(task_id)
+            .cloned()
+            .unwrap_or_default();
+        Ok(events
+            .into_iter()
+            .rev()
+            .take(limit as usize)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect())
+    }
+
+    async fn get_durable_series_state(
+        &self,
+        task_id: &str,
+    ) -> Result<Vec<DurableSeriesState>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self
+            .series
+            .read()
+            .unwrap()
+            .get(task_id)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn claim_overdue_tasks(
+        &self,
+        limit: u64,
+        claim_ttl_ms: u64,
+    ) -> Result<Vec<TtlClaim>, Box<dyn std::error::Error + Send + Sync>> {
+        if limit == 0 || claim_ttl_ms == 0 {
+            return Err(Box::new(StorageIntegrityError::new(
+                "TTL claim bounds are invalid",
+            )));
+        }
+        let _lifecycle = self.lifecycle_guard.lock().unwrap();
+        let now = MemoryShortTermStore::now_ms() as f64;
+        let tasks = self.tasks.read().unwrap();
+        let active_claims = self.ttl_claims.read().unwrap();
+        let mut due = self
+            .metadata
+            .read()
+            .unwrap()
+            .values()
+            .filter(|metadata| {
+                tasks
+                    .get(&metadata.task_id)
+                    .is_some_and(|task| !is_memory_terminal(&task.status))
+                    && metadata
+                        .execution_deadline_at
+                        .is_some_and(|deadline| deadline <= now)
+                    && active_claims
+                        .get(&metadata.task_id)
+                        .is_none_or(|claim| claim.claim_until <= now)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        drop(active_claims);
+        drop(tasks);
+        due.sort_by(|left, right| {
+            left.execution_deadline_at
+                .partial_cmp(&right.execution_deadline_at)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.task_id.cmp(&right.task_id))
+        });
+        due.truncate(limit as usize);
+        let mut claims = self.ttl_claims.write().unwrap();
+        Ok(due
+            .into_iter()
+            .map(|metadata| {
+                let claim = TtlClaim {
+                    task_id: metadata.task_id.clone(),
+                    claim_token: ulid::Ulid::new().to_string(),
+                    claim_until: now + claim_ttl_ms as f64,
+                    task_version: metadata.task_version,
+                    execution_deadline_at: metadata.execution_deadline_at.unwrap(),
+                };
+                claims.insert(metadata.task_id, claim.clone());
+                claim
+            })
+            .collect())
+    }
+
+    async fn terminalize_ttl_claim(
+        &self,
+        claim: TtlClaim,
+        task: Task,
+        event: TaskEvent,
+        assignment: Option<WorkerAssignment>,
+    ) -> Result<Option<TerminalProjection>, Box<dyn std::error::Error + Send + Sync>> {
+        let _lifecycle = self.lifecycle_guard.lock().unwrap();
+        let now = MemoryShortTermStore::now_ms() as f64;
+        let current_claim = self.ttl_claims.read().unwrap().get(&claim.task_id).cloned();
+        let current_task = self.tasks.read().unwrap().get(&claim.task_id).cloned();
+        let metadata = self.metadata.read().unwrap().get(&claim.task_id).cloned();
+        if current_claim.as_ref() != Some(&claim)
+            || claim.claim_until <= now
+            || current_task
+                .as_ref()
+                .is_none_or(|task| is_memory_terminal(&task.status))
+            || metadata.as_ref().is_none_or(|metadata| {
+                metadata.task_version != claim.task_version
+                    || metadata.execution_deadline_at != Some(claim.execution_deadline_at)
+            })
+        {
+            return Ok(None);
+        }
+        if task.id != claim.task_id
+            || task.status != TaskStatus::Timeout
+            || event.task_id != claim.task_id
+            || event.r#type != "taskcast:status"
+        {
+            return Err(Box::new(StorageIntegrityError::new(
+                "TTL terminalization input is invalid",
+            )));
+        }
+        let durable_assignment = self
+            .durable_assignments
+            .read()
+            .unwrap()
+            .get(&claim.task_id)
+            .cloned();
+        if durable_assignment != assignment {
+            return Err(Box::new(StorageIntegrityError::new(format!(
+                "Durable assignment changed before TTL terminalization: {}",
+                claim.task_id
+            ))));
+        }
+        let last_index = self
+            .events
+            .read()
+            .unwrap()
+            .get(&claim.task_id)
+            .into_iter()
+            .flatten()
+            .map(|event| event.index as i64)
+            .chain(
+                self.series
+                    .read()
+                    .unwrap()
+                    .get(&claim.task_id)
+                    .into_iter()
+                    .flatten()
+                    .map(|state| state.through_index as i64),
+            )
+            .chain(std::iter::once(metadata.unwrap().archive_watermark))
+            .max()
+            .unwrap_or(-1);
+        if event.index as i64 != last_index + 1 {
+            return Err(Box::new(StorageIntegrityError::new(format!(
+                "TTL timeout event index is not contiguous for {}",
+                claim.task_id
+            ))));
+        }
+
+        self.tasks
+            .write()
+            .unwrap()
+            .insert(claim.task_id.clone(), task.clone());
+        self.upsert_event(event.clone());
+        if let Some(metadata) = self.metadata.write().unwrap().get_mut(&claim.task_id) {
+            metadata.execution_deadline_at = None;
+            metadata.task_version += 1;
+            metadata.last_event_at = Some(event.timestamp);
+        }
+        self.ttl_claims.write().unwrap().remove(&claim.task_id);
+        self.durable_assignments
+            .write()
+            .unwrap()
+            .remove(&claim.task_id);
+        let projection = TerminalProjection {
+            projection_id: format!("ttl:{}", event.id),
+            task,
+            event,
+            assignment: durable_assignment,
+            claim_token: Some(claim.claim_token),
+            claim_until: Some(claim.claim_until),
+        };
+        self.terminal_projections.write().unwrap().insert(
+            projection.projection_id.clone(),
+            MemoryTerminalProjection {
+                projection: projection.clone(),
+                projected_at: None,
+            },
+        );
+        Ok(Some(projection))
+    }
+
+    async fn claim_terminal_projections(
+        &self,
+        limit: u64,
+        claim_token: &str,
+        claim_ttl_ms: u64,
+    ) -> Result<Vec<TerminalProjection>, Box<dyn std::error::Error + Send + Sync>> {
+        if limit == 0 || claim_token.is_empty() || claim_ttl_ms == 0 {
+            return Err(Box::new(StorageIntegrityError::new(
+                "Terminal projection claim bounds are invalid",
+            )));
+        }
+        let now = MemoryShortTermStore::now_ms() as f64;
+        let mut rows = self.terminal_projections.write().unwrap();
+        let mut claimed = Vec::new();
+        for row in rows.values_mut() {
+            if row.projected_at.is_some()
+                || row
+                    .projection
+                    .claim_until
+                    .is_some_and(|claim_until| claim_until > now)
+            {
+                continue;
+            }
+            row.projection.claim_token = Some(claim_token.to_string());
+            row.projection.claim_until = Some(now + claim_ttl_ms as f64);
+            claimed.push(row.projection.clone());
+            if claimed.len() == limit as usize {
+                break;
+            }
+        }
+        Ok(claimed)
+    }
+
+    async fn complete_terminal_projection(
+        &self,
+        projection: &TerminalProjection,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut rows = self.terminal_projections.write().unwrap();
+        let Some(row) = rows.get_mut(&projection.projection_id) else {
+            return Err(Box::new(StorageFenceConflictError::new(
+                "Terminal projection claim was lost",
+            )));
+        };
+        if row.projected_at.is_some() {
+            return Ok(());
+        }
+        if projection.claim_token.is_none()
+            || projection.claim_until.is_none()
+            || projection
+                .claim_until
+                .is_some_and(|claim_until| claim_until <= MemoryShortTermStore::now_ms() as f64)
+            || row.projection.claim_token != projection.claim_token
+            || row.projection.claim_until != projection.claim_until
+        {
+            return Err(Box::new(StorageFenceConflictError::new(
+                "Terminal projection claim was lost",
+            )));
+        }
+        row.projected_at = Some(MemoryShortTermStore::now_ms());
+        row.projection.claim_token = None;
+        row.projection.claim_until = None;
+        Ok(())
+    }
+
+    async fn save_durable_assignment(
+        &self,
+        assignment: WorkerAssignment,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.durable_assignments
+            .write()
+            .unwrap()
+            .insert(assignment.task_id.clone(), assignment);
+        Ok(())
+    }
+
+    async fn delete_durable_assignment(
+        &self,
+        task_id: &str,
+        assignment_id: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut assignments = self.durable_assignments.write().unwrap();
+        let should_delete = assignments.get(task_id).is_some_and(|assignment| {
+            assignment_id.is_none_or(|assignment_id| {
+                assignment_id == memory_assignment_id(assignment)
+            })
+        });
+        if should_delete {
+            assignments.remove(task_id);
+        }
+        Ok(())
+    }
+
+    async fn save_worker_event(
+        &self,
+        event: WorkerAuditEvent,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.worker_events
+            .write()
+            .unwrap()
+            .entry(event.worker_id.clone())
+            .or_default()
+            .push(event);
+        Ok(())
+    }
+
+    async fn get_worker_events(
+        &self,
+        worker_id: &str,
+        _opts: Option<EventQueryOptions>,
+    ) -> Result<Vec<WorkerAuditEvent>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self
+            .worker_events
+            .read()
+            .unwrap()
+            .get(worker_id)
+            .cloned()
+            .unwrap_or_default())
+    }
+}
+
+fn is_memory_terminal(status: &TaskStatus) -> bool {
+    matches!(
+        status,
+        TaskStatus::Completed
+            | TaskStatus::Failed
+            | TaskStatus::Timeout
+            | TaskStatus::Cancelled
+    )
+}
+
+fn has_memory_execution_deadline(task: &Task) -> bool {
+    task.ttl.is_some() && task.status != TaskStatus::Paused && !is_memory_terminal(&task.status)
+}
+
+fn memory_assignment_id(assignment: &WorkerAssignment) -> String {
+    format!(
+        "{}:{}:{}",
+        assignment.task_id, assignment.worker_id, assignment.assigned_at as i64
+    )
+}
+
+#[async_trait]
+impl ShortTermStore for MemoryShortTermStore {
+    fn supports_hot_cold_release(&self) -> bool {
+        true
+    }
+
+    async fn save_task(&self, task: Task) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let _mutation = self.task_event_guard.lock().unwrap();
         let mut tasks = self.tasks.write().unwrap();
-        tasks.insert(task.id.clone(), task);
+        let task_id = task.id.clone();
+        tasks.insert(task_id.clone(), task);
+        drop(tasks);
+        let mut revisions = self.task_revisions.write().unwrap();
+        *revisions.entry(task_id.clone()).or_insert(0) += 1;
+        drop(revisions);
+        self.write_fences
+            .write()
+            .unwrap()
+            .entry(task_id.clone())
+            .or_insert(TaskWriteFence {
+                task_id,
+                accepting_writes: true,
+                storage_epoch: 1,
+                active_release_generation: None,
+            });
         Ok(())
     }
 
@@ -136,16 +1401,35 @@ impl ShortTermStore for MemoryShortTermStore {
         Ok(tasks.get(task_id).cloned())
     }
 
+    async fn get_task_mutation_snapshot(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<TaskMutationSnapshot>, Box<dyn std::error::Error + Send + Sync>> {
+        let _mutation = self.task_event_guard.lock().unwrap();
+        let tasks = self.tasks.read().unwrap();
+        let Some(task) = tasks.get(task_id).cloned() else {
+            return Ok(None);
+        };
+        let revision = self
+            .task_revisions
+            .read()
+            .unwrap()
+            .get(task_id)
+            .copied()
+            .unwrap_or(0);
+        Ok(Some(TaskMutationSnapshot {
+            task,
+            revision: revision.to_string(),
+        }))
+    }
+
     async fn append_event(
         &self,
         task_id: &str,
         event: TaskEvent,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut events = self.events.write().unwrap();
-        events
-            .entry(task_id.to_string())
-            .or_default()
-            .push(event);
+        events.entry(task_id.to_string()).or_default().push(event);
         Ok(())
     }
 
@@ -332,6 +1616,7 @@ impl ShortTermStore for MemoryShortTermStore {
         options: Option<TaskArchiveImportOptions>,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
         self.validate_task_archive_restore(&data, options).await?;
+        let _mutation = self.task_event_guard.lock().unwrap();
 
         let task_id = data.task.id.clone();
         let overwritten = {
@@ -351,14 +1636,633 @@ impl ShortTermStore for MemoryShortTermStore {
             }
         }
 
-        self.tasks.write().unwrap().insert(task_id.clone(), data.task);
-        self.events.write().unwrap().insert(task_id.clone(), data.events);
-        self.index_counters.write().unwrap().insert(
-            task_id,
-            Arc::new(AtomicU64::new(data.next_index)),
-        );
+        self.tasks
+            .write()
+            .unwrap()
+            .insert(task_id.clone(), data.task);
+        let mut revisions = self.task_revisions.write().unwrap();
+        *revisions.entry(task_id.clone()).or_insert(0) += 1;
+        drop(revisions);
+        self.events
+            .write()
+            .unwrap()
+            .insert(task_id.clone(), data.events);
+        self.index_counters
+            .write()
+            .unwrap()
+            .insert(task_id, Arc::new(AtomicU64::new(data.next_index)));
 
         Ok(overwritten)
+    }
+
+    async fn acquire_storage_lock(
+        &self,
+        task_id: &str,
+        lock_token: &str,
+        generation: &str,
+        ttl_ms: u64,
+    ) -> Result<Option<StorageLease>, Box<dyn std::error::Error + Send + Sync>> {
+        let now = Self::now_ms();
+        let mut locks = self.storage_locks.write().unwrap();
+        if let Some(current) = locks.get_mut(task_id) {
+            if current.expires_at > now {
+                if current.lock_token != lock_token || current.generation != generation {
+                    return Ok(None);
+                }
+                current.expires_at = now + ttl_ms as u128;
+                return Ok(Some(StorageLease {
+                    task_id: task_id.to_string(),
+                    lock_token: lock_token.to_string(),
+                    generation: generation.to_string(),
+                    storage_epoch: current.storage_epoch,
+                }));
+            }
+        }
+
+        let storage_epoch = self
+            .write_fences
+            .read()
+            .unwrap()
+            .get(task_id)
+            .map(|fence| fence.storage_epoch)
+            .unwrap_or(1);
+        locks.insert(
+            task_id.to_string(),
+            MemoryStorageLock {
+                lock_token: lock_token.to_string(),
+                generation: generation.to_string(),
+                storage_epoch,
+                expires_at: now + ttl_ms as u128,
+            },
+        );
+        Ok(Some(StorageLease {
+            task_id: task_id.to_string(),
+            lock_token: lock_token.to_string(),
+            generation: generation.to_string(),
+            storage_epoch,
+        }))
+    }
+
+    async fn renew_storage_lock(
+        &self,
+        lease: &StorageLease,
+        ttl_ms: u64,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let now = Self::now_ms();
+        let mut locks = self.storage_locks.write().unwrap();
+        let Some(current) = locks.get_mut(&lease.task_id) else {
+            return Ok(false);
+        };
+        if current.expires_at <= now
+            || current.lock_token != lease.lock_token
+            || current.generation != lease.generation
+            || current.storage_epoch != lease.storage_epoch
+        {
+            return Ok(false);
+        }
+        current.expires_at = now + ttl_ms as u128;
+        Ok(true)
+    }
+
+    async fn release_storage_lock(
+        &self,
+        lease: &StorageLease,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        if !self.owns_storage_lock(lease) {
+            return Ok(false);
+        }
+        self.storage_locks.write().unwrap().remove(&lease.task_id);
+        Ok(true)
+    }
+
+    async fn get_write_fence(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<TaskWriteFence>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self.write_fences.read().unwrap().get(task_id).cloned())
+    }
+
+    async fn close_write_fence(
+        &self,
+        lease: &StorageLease,
+        expected_epoch: u64,
+    ) -> Result<ClosedWriteFence, Box<dyn std::error::Error + Send + Sync>> {
+        self.assert_owned_storage_lock(lease)?;
+        let mut fences = self.write_fences.write().unwrap();
+        let Some(fence) = fences.get_mut(&lease.task_id) else {
+            return Err(Box::new(StorageFenceConflictError::default()));
+        };
+        if fence.storage_epoch != expected_epoch {
+            return Err(Box::new(StorageFenceConflictError::default()));
+        }
+
+        let counter_watermark = self
+            .index_counters
+            .read()
+            .unwrap()
+            .get(&lease.task_id)
+            .map(|counter| counter.load(Ordering::SeqCst) as i64 - 1)
+            .unwrap_or(-1);
+        let event_watermark = self
+            .events
+            .read()
+            .unwrap()
+            .get(&lease.task_id)
+            .and_then(|events| events.iter().map(|event| event.index as i64).max())
+            .unwrap_or(-1);
+        let high_watermark = counter_watermark.max(event_watermark);
+        fence.accepting_writes = false;
+        fence.active_release_generation = Some(lease.generation.clone());
+        Ok(ClosedWriteFence {
+            task_id: lease.task_id.clone(),
+            accepting_writes: false,
+            storage_epoch: fence.storage_epoch,
+            active_release_generation: fence.active_release_generation.clone(),
+            high_watermark,
+        })
+    }
+
+    async fn reopen_write_fence(
+        &self,
+        lease: &StorageLease,
+        expected_epoch: u64,
+    ) -> Result<HotWriteToken, Box<dyn std::error::Error + Send + Sync>> {
+        self.assert_owned_storage_lock(lease)?;
+        let mut fences = self.write_fences.write().unwrap();
+        let Some(fence) = fences.get_mut(&lease.task_id) else {
+            return Err(Box::new(StorageFenceConflictError::default()));
+        };
+        if fence.accepting_writes
+            || fence.storage_epoch != expected_epoch
+            || fence.active_release_generation.as_deref() != Some(lease.generation.as_str())
+        {
+            return Err(Box::new(StorageFenceConflictError::default()));
+        }
+        fence.accepting_writes = true;
+        fence.storage_epoch = expected_epoch + 1;
+        fence.active_release_generation = None;
+        Ok(HotWriteToken {
+            task_id: lease.task_id.clone(),
+            storage_epoch: fence.storage_epoch,
+        })
+    }
+
+    async fn commit_event_fenced(
+        &self,
+        task_id: &str,
+        mut event: TaskEvent,
+        token: &HotWriteToken,
+    ) -> Result<SeriesResult, Box<dyn std::error::Error + Send + Sync>> {
+        let fences = self.write_fences.read().unwrap();
+        let Some(fence) = fences.get(task_id) else {
+            return Err(Box::new(StorageFenceConflictError::default()));
+        };
+        if token.task_id != task_id
+            || !fence.accepting_writes
+            || fence.storage_epoch != token.storage_epoch
+        {
+            return Err(Box::new(StorageFenceConflictError::default()));
+        }
+
+        let counter = {
+            let mut counters = self.index_counters.write().unwrap();
+            counters
+                .entry(task_id.to_string())
+                .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+                .clone()
+        };
+        event.task_id = task_id.to_string();
+        event.index = counter.fetch_add(1, Ordering::SeqCst);
+
+        if let (Some(series_id), Some(SeriesMode::Latest)) =
+            (event.series_id.as_deref(), event.series_mode.as_ref())
+        {
+            let key = format!("{task_id}:{series_id}");
+            let mut series = self.series_latest.write().unwrap();
+            let previous = series.get(&key).cloned();
+            let mut events = self.events.write().unwrap();
+            let task_events = events.entry(task_id.to_string()).or_default();
+            if let Some(previous) = previous {
+                if let Some(position) = task_events
+                    .iter()
+                    .rposition(|candidate| candidate.id == previous.id)
+                {
+                    task_events[position] = event.clone();
+                } else {
+                    task_events.push(event.clone());
+                }
+            } else {
+                task_events.push(event.clone());
+            }
+            series.insert(key, event.clone());
+            return Ok(SeriesResult {
+                event,
+                accumulated_event: None,
+                stored: true,
+            });
+        }
+
+        self.events
+            .write()
+            .unwrap()
+            .entry(task_id.to_string())
+            .or_default()
+            .push(event.clone());
+
+        let accumulated_event = if let (Some(series_id), Some(SeriesMode::Accumulate)) =
+            (event.series_id.as_deref(), event.series_mode.as_ref())
+        {
+            let key = format!("{task_id}:{series_id}");
+            let field = event.series_acc_field.as_deref().unwrap_or("delta");
+            let mut series = self.series_latest.write().unwrap();
+            let accumulated = if let Some(previous) = series.get(&key) {
+                let previous_value = previous.data.get(field).and_then(|value| value.as_str());
+                let delta = event.data.get(field).and_then(|value| value.as_str());
+                if let (Some(previous_value), Some(delta)) = (previous_value, delta) {
+                    let mut accumulated = event.clone();
+                    let mut data = event.data.as_object().cloned().unwrap_or_default();
+                    data.insert(
+                        field.to_string(),
+                        serde_json::Value::String(format!("{previous_value}{delta}")),
+                    );
+                    accumulated.data = serde_json::Value::Object(data);
+                    accumulated
+                } else {
+                    event.clone()
+                }
+            } else {
+                event.clone()
+            };
+            series.insert(key, accumulated.clone());
+            Some(accumulated)
+        } else {
+            None
+        };
+
+        Ok(SeriesResult {
+            event,
+            accumulated_event,
+            stored: true,
+        })
+    }
+
+    async fn commit_task_events_fenced(
+        &self,
+        task: Task,
+        expected_revision: &str,
+        mut events: Vec<TaskEvent>,
+        token: &HotWriteToken,
+    ) -> Result<Option<Vec<TaskEvent>>, Box<dyn std::error::Error + Send + Sync>> {
+        let _mutation = self.task_event_guard.lock().unwrap();
+        let fences = self.write_fences.read().unwrap();
+        let Some(fence) = fences.get(&task.id) else {
+            return Err(Box::new(StorageFenceConflictError::default()));
+        };
+        if token.task_id != task.id
+            || !fence.accepting_writes
+            || fence.storage_epoch != token.storage_epoch
+            || events.iter().any(|event| {
+                event.task_id != task.id || event.series_id.is_some() || event.series_mode.is_some()
+            })
+        {
+            return Err(Box::new(StorageFenceConflictError::default()));
+        }
+        if self
+            .task_revisions
+            .read()
+            .unwrap()
+            .get(&task.id)
+            .copied()
+            .unwrap_or(0)
+            .to_string()
+            != expected_revision
+        {
+            return Ok(None);
+        }
+        let counter = {
+            let mut counters = self.index_counters.write().unwrap();
+            counters
+                .entry(task.id.clone())
+                .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+                .clone()
+        };
+        for event in &mut events {
+            event.index = counter.fetch_add(1, Ordering::SeqCst);
+        }
+        self.tasks.write().unwrap().insert(task.id.clone(), task);
+        let mut revisions = self.task_revisions.write().unwrap();
+        *revisions.entry(token.task_id.clone()).or_insert(0) += 1;
+        drop(revisions);
+        self.events
+            .write()
+            .unwrap()
+            .entry(token.task_id.clone())
+            .or_default()
+            .extend(events.iter().cloned());
+        Ok(Some(events))
+    }
+
+    async fn save_task_fenced(
+        &self,
+        task: Task,
+        token: &HotWriteToken,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let _mutation = self.task_event_guard.lock().unwrap();
+        let fences = self.write_fences.read().unwrap();
+        let Some(fence) = fences.get(&task.id) else {
+            return Err(Box::new(StorageFenceConflictError::default()));
+        };
+        if token.task_id != task.id
+            || !fence.accepting_writes
+            || fence.storage_epoch != token.storage_epoch
+        {
+            return Err(Box::new(StorageFenceConflictError::default()));
+        }
+        self.tasks.write().unwrap().insert(task.id.clone(), task);
+        let mut revisions = self.task_revisions.write().unwrap();
+        *revisions.entry(token.task_id.clone()).or_insert(0) += 1;
+        Ok(())
+    }
+
+    async fn read_archive_source_page(
+        &self,
+        task_id: &str,
+        watermark: i64,
+        cursor: Option<&str>,
+        limit: u64,
+    ) -> Result<ArchiveSourcePage, Box<dyn std::error::Error + Send + Sync>> {
+        let offset = cursor
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        let mut source = self
+            .events
+            .read()
+            .unwrap()
+            .get(task_id)
+            .cloned()
+            .unwrap_or_default();
+        source.retain(|event| event.index as i64 <= watermark);
+        source.sort_by_key(|event| event.index);
+        let events = source
+            .iter()
+            .skip(offset)
+            .take(limit.max(1) as usize)
+            .cloned()
+            .collect::<Vec<_>>();
+        let next_offset = offset + events.len();
+        let done = next_offset >= source.len();
+        Ok(ArchiveSourcePage {
+            task_id: task_id.to_string(),
+            watermark,
+            cursor: cursor.map(str::to_string),
+            next_cursor: (!done).then(|| next_offset.to_string()),
+            events,
+            done,
+        })
+    }
+
+    async fn delete_task_storage_fenced(
+        &self,
+        lease: &StorageLease,
+        expected_epoch: u64,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.assert_owned_storage_lock(lease)?;
+        {
+            let fences = self.write_fences.read().unwrap();
+            let Some(fence) = fences.get(&lease.task_id) else {
+                return Err(Box::new(StorageFenceConflictError::default()));
+            };
+            if fence.accepting_writes
+                || fence.storage_epoch != expected_epoch
+                || fence.active_release_generation.as_deref() != Some(lease.generation.as_str())
+            {
+                return Err(Box::new(StorageFenceConflictError::default()));
+            }
+        }
+
+        self.tasks.write().unwrap().remove(&lease.task_id);
+        self.task_revisions.write().unwrap().remove(&lease.task_id);
+        self.events.write().unwrap().remove(&lease.task_id);
+        self.index_counters.write().unwrap().remove(&lease.task_id);
+        self.write_fences.write().unwrap().remove(&lease.task_id);
+        let prefix = format!("{}:", lease.task_id);
+        self.series_latest
+            .write()
+            .unwrap()
+            .retain(|key, _| !key.starts_with(&prefix));
+        Ok(())
+    }
+
+    async fn restore_hot_task_fenced(
+        &self,
+        snapshot: RehydrateSnapshot,
+        lease: &StorageLease,
+        next_epoch: u64,
+    ) -> Result<HotWriteToken, Box<dyn std::error::Error + Send + Sync>> {
+        self.assert_owned_storage_lock(lease)?;
+        if snapshot.task.id != lease.task_id || next_epoch <= snapshot.storage_epoch {
+            return Err(Box::new(StorageFenceConflictError::default()));
+        }
+
+        let task_id = snapshot.task.id.clone();
+        self.tasks
+            .write()
+            .unwrap()
+            .insert(task_id.clone(), snapshot.task);
+        self.task_revisions
+            .write()
+            .unwrap()
+            .insert(task_id.clone(), 1);
+        self.events
+            .write()
+            .unwrap()
+            .insert(task_id.clone(), snapshot.replay_events);
+        self.index_counters.write().unwrap().insert(
+            task_id.clone(),
+            Arc::new(AtomicU64::new((snapshot.max_event_index + 1).max(0) as u64)),
+        );
+        let prefix = format!("{task_id}:");
+        let mut series = self.series_latest.write().unwrap();
+        series.retain(|key, _| !key.starts_with(&prefix));
+        for entry in snapshot.series_latest {
+            series.insert(format!("{task_id}:{}", entry.series_id), entry.event);
+        }
+        drop(series);
+        self.write_fences.write().unwrap().insert(
+            task_id.clone(),
+            TaskWriteFence {
+                task_id: task_id.clone(),
+                accepting_writes: true,
+                storage_epoch: next_epoch,
+                active_release_generation: None,
+            },
+        );
+        Ok(HotWriteToken {
+            task_id,
+            storage_epoch: next_epoch,
+        })
+    }
+
+    async fn project_terminal_fenced(
+        &self,
+        projection: &TerminalProjection,
+        lease: &StorageLease,
+        expected_epoch: u64,
+        next_epoch: u64,
+    ) -> Result<TerminalProjectionResult, Box<dyn std::error::Error + Send + Sync>> {
+        let _mutation = self.task_event_guard.lock().unwrap();
+        self.assert_owned_storage_lock(lease)?;
+        let task_id = &projection.task.id;
+        let mut fences = self.write_fences.write().unwrap();
+        let Some(fence) = fences.get_mut(task_id) else {
+            return Err(Box::new(StorageFenceConflictError::default()));
+        };
+        if task_id != &lease.task_id
+            || projection.event.task_id != *task_id
+            || projection
+                .assignment
+                .as_ref()
+                .is_some_and(|assignment| assignment.task_id != *task_id)
+            || fence.accepting_writes
+            || fence.storage_epoch != expected_epoch
+            || fence.active_release_generation.as_deref() != Some(lease.generation.as_str())
+            || next_epoch != expected_epoch + 1
+        {
+            return Err(Box::new(StorageFenceConflictError::default()));
+        }
+
+        let mut events = self.events.write().unwrap();
+        let task_events = events.entry(task_id.clone()).or_default();
+        let existing = task_events
+            .iter()
+            .find(|event| event.index == projection.event.index);
+        let projected = if let Some(existing) = existing {
+            if existing != &projection.event {
+                return Err(Box::new(StorageIntegrityError::new(
+                    "Terminal projection conflicts with the hot event at its index",
+                )));
+            }
+            false
+        } else {
+            let next_index = self
+                .index_counters
+                .read()
+                .unwrap()
+                .get(task_id)
+                .map(|counter| counter.load(Ordering::SeqCst))
+                .unwrap_or(0);
+            if next_index != projection.event.index {
+                return Err(Box::new(StorageIntegrityError::new(
+                    "Terminal projection event index is not contiguous in hot storage",
+                )));
+            }
+            task_events.push(projection.event.clone());
+            self.index_counters.write().unwrap().insert(
+                task_id.clone(),
+                Arc::new(AtomicU64::new(projection.event.index + 1)),
+            );
+            true
+        };
+        drop(events);
+
+        self.tasks
+            .write()
+            .unwrap()
+            .insert(task_id.clone(), projection.task.clone());
+        let mut revisions = self.task_revisions.write().unwrap();
+        *revisions.entry(task_id.clone()).or_insert(0) += 1;
+        drop(revisions);
+
+        if let Some(assignment) = &projection.assignment {
+            let mut assignments = self.assignments.write().unwrap();
+            let current = assignments
+                .iter()
+                .find(|candidate| candidate.task_id == *task_id)
+                .cloned();
+            if current.as_ref().is_some_and(|current| current != assignment) {
+                return Err(Box::new(StorageIntegrityError::new(
+                    "Terminal projection conflicts with the hot assignment",
+                )));
+            }
+            if current.is_some() {
+                assignments.retain(|candidate| candidate.task_id != *task_id);
+                drop(assignments);
+                if let Some(worker) = self
+                    .workers
+                    .write()
+                    .unwrap()
+                    .get_mut(&assignment.worker_id)
+                {
+                    worker.used_slots = worker.used_slots.saturating_sub(assignment.cost);
+                    if !matches!(worker.status, WorkerStatus::Offline | WorkerStatus::Draining) {
+                        worker.status = if worker.used_slots >= worker.capacity {
+                            WorkerStatus::Busy
+                        } else {
+                            WorkerStatus::Idle
+                        };
+                    }
+                }
+            }
+        }
+
+        fence.accepting_writes = true;
+        fence.storage_epoch = next_epoch;
+        fence.active_release_generation = None;
+        Ok(TerminalProjectionResult {
+            token: HotWriteToken {
+                task_id: task_id.clone(),
+                storage_epoch: next_epoch,
+            },
+            projected,
+        })
+    }
+
+    async fn get_task_storage_presence(
+        &self,
+        task_id: &str,
+    ) -> Result<TaskStoragePresence, Box<dyn std::error::Error + Send + Sync>> {
+        let prefix = format!("{task_id}:");
+        Ok(TaskStoragePresence {
+            task: self.tasks.read().unwrap().contains_key(task_id),
+            event_count: self
+                .events
+                .read()
+                .unwrap()
+                .get(task_id)
+                .map(|events| events.len() as u64)
+                .unwrap_or(0),
+            next_index: self.index_counters.read().unwrap().contains_key(task_id),
+            series_state_count: self
+                .series_latest
+                .read()
+                .unwrap()
+                .keys()
+                .filter(|key| key.starts_with(&prefix))
+                .count() as u64,
+            write_fence: self.write_fences.read().unwrap().contains_key(task_id),
+        })
+    }
+
+    async fn register_storage_writer(
+        &self,
+        mut registration: StorageWriterRegistration,
+        ttl_ms: u64,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        registration.expires_at = (Self::now_ms() + ttl_ms as u128) as f64;
+        self.storage_writers
+            .write()
+            .unwrap()
+            .insert(registration.instance_id.clone(), registration);
+        Ok(())
+    }
+
+    async fn list_storage_writers(
+        &self,
+    ) -> Result<Vec<StorageWriterRegistration>, Box<dyn std::error::Error + Send + Sync>> {
+        let now = Self::now_ms() as f64;
+        let mut writers = self.storage_writers.write().unwrap();
+        writers.retain(|_, registration| registration.expires_at > now);
+        Ok(writers.values().cloned().collect())
     }
 
     async fn list_tasks(
@@ -467,6 +2371,7 @@ impl ShortTermStore for MemoryShortTermStore {
         worker_id: &str,
         cost: u32,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let _mutation = self.task_event_guard.lock().unwrap();
         // Phase 1: Check and update worker capacity (write lock, then release)
         {
             let mut workers = self.workers.write().unwrap();
@@ -498,6 +2403,8 @@ impl ShortTermStore for MemoryShortTermStore {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as f64;
+        let mut revisions = self.task_revisions.write().unwrap();
+        *revisions.entry(task_id.to_string()).or_insert(0) += 1;
 
         Ok(true)
     }
@@ -1021,10 +2928,7 @@ mod tests {
         store.append_event("t1", e3).await.unwrap();
 
         // Set e2 as latest for series s1
-        store
-            .set_series_latest("t1", "s1", e2)
-            .await
-            .unwrap();
+        store.set_series_latest("t1", "s1", e2).await.unwrap();
 
         // Replace
         let replacement = make_event("e2_replaced", "t1", 1, 2500.0);
@@ -1534,9 +3438,18 @@ mod tests {
     async fn remove_assignment_removes_by_task_id() {
         let store = MemoryShortTermStore::new();
 
-        store.add_assignment(make_assignment("t1", "w1")).await.unwrap();
-        store.add_assignment(make_assignment("t2", "w1")).await.unwrap();
-        store.add_assignment(make_assignment("t3", "w2")).await.unwrap();
+        store
+            .add_assignment(make_assignment("t1", "w1"))
+            .await
+            .unwrap();
+        store
+            .add_assignment(make_assignment("t2", "w1"))
+            .await
+            .unwrap();
+        store
+            .add_assignment(make_assignment("t3", "w2"))
+            .await
+            .unwrap();
 
         store.remove_assignment("t2").await.unwrap();
 
@@ -1562,8 +3475,14 @@ mod tests {
     async fn get_task_assignment_returns_assignment() {
         let store = MemoryShortTermStore::new();
 
-        store.add_assignment(make_assignment("t1", "w1")).await.unwrap();
-        store.add_assignment(make_assignment("t2", "w2")).await.unwrap();
+        store
+            .add_assignment(make_assignment("t1", "w1"))
+            .await
+            .unwrap();
+        store
+            .add_assignment(make_assignment("t2", "w2"))
+            .await
+            .unwrap();
 
         let assignment = store.get_task_assignment("t1").await.unwrap();
         assert!(assignment.is_some());

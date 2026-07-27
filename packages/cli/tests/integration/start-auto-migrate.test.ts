@@ -5,11 +5,16 @@ import { MemoryBroadcastProvider, MemoryShortTermStore } from '@taskcast/core'
 import { createSqliteAdapters } from '@taskcast/sqlite'
 import { PostgresLongTermStore } from '@taskcast/postgres'
 import { runStart, type RunStartOptions } from '../../src/commands/start.js'
+import { EMBEDDED_MIGRATIONS } from '../../src/generated-migrations.js'
 import { readFileSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 
 // ─── Test Infrastructure ──────────────────────────────────────────────────────
+
+const EXPECTED_MIGRATION_VERSIONS = EMBEDDED_MIGRATIONS.map(({ filename }) =>
+  Number.parseInt(filename, 10),
+)
 
 let pgContainer: StartedTestContainer | undefined
 let pgSql: ReturnType<typeof postgres> | undefined
@@ -118,7 +123,7 @@ describe('CLI start command with auto-migrate', () => {
 
       // Verify migrations were applied
       appliedVersions = await getAppliedMigrationVersions(pgSql!)
-      expect(appliedVersions).toEqual([1, 2])
+      expect(appliedVersions).toEqual(EXPECTED_MIGRATION_VERSIONS)
 
       // Verify tables exist
       await verifyPostgresTables(pgSql!, [
@@ -152,12 +157,12 @@ describe('CLI start command with auto-migrate', () => {
       // First run: apply migrations
       await performAutoMigrateIfEnabled(pgSql!, pgUrl, env)
       const firstVersions = await getAppliedMigrationVersions(pgSql!)
-      expect(firstVersions).toEqual([1, 2])
+      expect(firstVersions).toEqual(EXPECTED_MIGRATION_VERSIONS)
 
       // Second run: should be no-op
       await performAutoMigrateIfEnabled(pgSql!, pgUrl, env)
       const secondVersions = await getAppliedMigrationVersions(pgSql!)
-      expect(secondVersions).toEqual([1, 2]) // No additional migrations applied
+      expect(secondVersions).toEqual(EXPECTED_MIGRATION_VERSIONS) // No additional migrations applied
     })
   })
 
@@ -324,7 +329,7 @@ describe('CLI start command with auto-migrate', () => {
 
         // Verify migrations were applied
         const versions = await getAppliedMigrationVersions(sql)
-        expect(versions).toEqual([1, 2])
+        expect(versions).toEqual(EXPECTED_MIGRATION_VERSIONS)
 
         // Verify tables exist
         await verifyPostgresTables(sql, ['taskcast_tasks', 'taskcast_events', 'taskcast_worker_events'])
@@ -453,7 +458,7 @@ describe('CLI start command with auto-migrate', () => {
       await performAutoMigrateIfEnabled(pgSql!, pgUrl, env)
 
       const migrationRows = await pgSql!`SELECT * FROM _sqlx_migrations ORDER BY version`
-      expect(migrationRows).toHaveLength(2)
+      expect(migrationRows).toHaveLength(EXPECTED_MIGRATION_VERSIONS.length)
 
       // Verify migration 1
       const m1 = migrationRows[0]!

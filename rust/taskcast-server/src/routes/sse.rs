@@ -70,10 +70,12 @@ pub struct SseQuery {
 // ─── Filter Parsing ─────────────────────────────────────────────────────────
 
 fn parse_filter(query: &SseQuery) -> SubscribeFilter {
-    let types = query
-        .types
-        .as_ref()
-        .map(|t| t.split(',').filter(|s| !s.is_empty()).map(String::from).collect());
+    let types = query.types.as_ref().map(|t| {
+        t.split(',')
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect()
+    });
 
     let levels = query.levels.as_ref().map(|l| {
         l.split(',')
@@ -139,6 +141,91 @@ fn is_terminal_status(status: &TaskStatus) -> bool {
     taskcast_core::state_machine::is_terminal(status)
 }
 
+fn terminal_reason(event: &TaskEvent) -> Option<&str> {
+    if event.r#type != "taskcast:status" {
+        return None;
+    }
+    event
+        .data
+        .get("status")
+        .and_then(|status| status.as_str())
+        .filter(|status| matches!(*status, "completed" | "failed" | "timeout" | "cancelled"))
+}
+
+fn replay_events_match(left: &TaskEvent, right: &TaskEvent) -> bool {
+    if same_persisted_event(left, right) {
+        return true;
+    }
+    if left.id != right.id || left.index != right.index {
+        return false;
+    }
+    if left.series_id == right.series_id
+        && left.series_mode == Some(taskcast_core::SeriesMode::Accumulate)
+        && right.series_mode == Some(taskcast_core::SeriesMode::Accumulate)
+        && (left.series_snapshot == Some(true) || right.series_snapshot == Some(true))
+    {
+        return true;
+    }
+    if let Some(data) = right._accumulated_data.as_ref() {
+        let mut accumulated = right.clone();
+        accumulated.data = data.clone();
+        if same_persisted_event(left, &accumulated) {
+            return true;
+        }
+    }
+    if let Some(data) = left._accumulated_data.as_ref() {
+        let mut accumulated = left.clone();
+        accumulated.data = data.clone();
+        if same_persisted_event(&accumulated, right) {
+            return true;
+        }
+    }
+    false
+}
+
+fn same_persisted_event(left: &TaskEvent, right: &TaskEvent) -> bool {
+    left.id == right.id
+        && left.task_id == right.task_id
+        && left.index == right.index
+        && left.timestamp == right.timestamp
+        && left.r#type == right.r#type
+        && left.level == right.level
+        && left.data == right.data
+        && left.series_id == right.series_id
+        && left.series_mode == right.series_mode
+        && left.series_acc_field == right.series_acc_field
+}
+
+fn task_sse_event(
+    event: &TaskEvent,
+    filtered_index: u64,
+    wrap: bool,
+    series_format: &SeriesFormat,
+) -> Event {
+    let mut event_to_send = event.clone();
+    if *series_format == SeriesFormat::Accumulated {
+        if let Some(ref accumulated_data) = event._accumulated_data {
+            event_to_send.data = accumulated_data.clone();
+        }
+    }
+    event_to_send._accumulated_data = None;
+    let payload = if wrap {
+        serde_json::to_value(to_envelope(&event_to_send, filtered_index)).unwrap()
+    } else {
+        serde_json::to_value(&event_to_send).unwrap()
+    };
+    Event::default()
+        .event("taskcast.event")
+        .data(serde_json::to_string(&payload).unwrap())
+        .id(event.id.clone())
+}
+
+fn done_sse_event(reason: &str) -> Event {
+    Event::default()
+        .event("taskcast.done")
+        .data(serde_json::to_string(&serde_json::json!({ "reason": reason })).unwrap())
+}
+
 // ─── SSE Handler ────────────────────────────────────────────────────────────
 
 #[utoipa::path(
@@ -184,53 +271,10 @@ pub async fn sse_events(
     let task_id_clone = task_id.clone();
     let sub_counts = subscriber_counts.clone();
 
-    let series_format = filter
-        .series_format
-        .clone()
-        .unwrap_or(SeriesFormat::Delta);
+    let series_format = filter.series_format.clone().unwrap_or(SeriesFormat::Delta);
 
     tokio::spawn(async move {
         increment_subscriber_count(&sub_counts, &task_id_clone).await;
-
-        let series_format_for_send = series_format.clone();
-
-        // Helper closures
-        let send_event = move |tx: &tokio::sync::mpsc::Sender<Result<Event, Infallible>>,
-                          event: &TaskEvent,
-                          filtered_index: u64,
-                          wrap: bool| {
-            let mut event_to_send = event.clone();
-
-            // For accumulated format, swap data with accumulated data if present
-            if series_format_for_send == SeriesFormat::Accumulated {
-                if let Some(ref acc_data) = event._accumulated_data {
-                    event_to_send.data = acc_data.clone();
-                }
-            }
-            // Strip transient field before sending
-            event_to_send._accumulated_data = None;
-
-            let payload: serde_json::Value = if wrap {
-                serde_json::to_value(to_envelope(&event_to_send, filtered_index)).unwrap()
-            } else {
-                serde_json::to_value(&event_to_send).unwrap()
-            };
-            let sse_event = Event::default()
-                .event("taskcast.event")
-                .data(serde_json::to_string(&payload).unwrap())
-                .id(event.id.clone());
-            let _ = tx.try_send(Ok(sse_event));
-        };
-
-        let send_done =
-            |tx: &tokio::sync::mpsc::Sender<Result<Event, Infallible>>, reason: &str| {
-                let data = serde_json::json!({ "reason": reason });
-                let sse_event = Event::default()
-                    .event("taskcast.done")
-                    .data(serde_json::to_string(&data).unwrap());
-                let _ = tx.try_send(Ok(sse_event));
-            };
-
         // Build storage-level query options (since cursor + limit)
         let limit = query.limit.as_ref().and_then(|s| s.parse::<u64>().ok());
         let since = filter.since.as_ref().and_then(|s| {
@@ -250,10 +294,22 @@ pub async fn sse_events(
             None
         };
 
-        // Replay history
+        // Subscribe before reading history. The callback only appends to this
+        // unbounded boundary buffer; the async task below owns all SSE writes.
+        let (live_tx, mut live_rx) = tokio::sync::mpsc::unbounded_channel::<TaskEvent>();
+        let unsub = engine
+            .subscribe(
+                &task_id_clone,
+                Box::new(move |event| {
+                    let _ = live_tx.send(event);
+                }),
+            )
+            .await;
+
         let history = match engine.get_events(&task_id_clone, history_opts).await {
             Ok(events) => events,
             Err(_) => {
+                unsub();
                 decrement_subscriber_count(&sub_counts, &task_id_clone).await;
                 return;
             }
@@ -264,86 +320,185 @@ pub async fn sse_events(
         // Build replay events with late-join snapshot collapse
         let replay_events = if !has_since_cursor {
             let engine_ref = Arc::clone(&engine);
-            taskcast_core::series::collapse_accumulate_series(
-                &history,
-                |tid: &str, sid: &str| {
-                    let eng = Arc::clone(&engine_ref);
-                    let tid = tid.to_string();
-                    let sid = sid.to_string();
-                    async move {
-                        eng.get_series_latest(&tid, &sid).await
-                            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
-                    }
-                },
-            ).await.unwrap_or(history)
+            taskcast_core::series::collapse_accumulate_series(&history, |tid: &str, sid: &str| {
+                let eng = Arc::clone(&engine_ref);
+                let tid = tid.to_string();
+                let sid = sid.to_string();
+                async move {
+                    eng.get_series_latest(&tid, &sid)
+                        .await
+                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+                }
+            })
+            .await
+            .unwrap_or_else(|_| history.clone())
         } else {
-            history
+            history.clone()
         };
 
         let filtered = apply_filtered_index(&replay_events, &filter);
+        let mut filter_without_since = filter.clone();
+        filter_without_since.since = None;
+        let mut next_filtered_index =
+            apply_filtered_index(&replay_events, &filter_without_since).len() as u64;
         for fe in &filtered {
-            send_event(&tx, &fe.event, fe.filtered_index, wrap);
+            if tx
+                .send(Ok(task_sse_event(
+                    &fe.event,
+                    fe.filtered_index,
+                    wrap,
+                    &series_format,
+                )))
+                .await
+                .is_err()
+            {
+                unsub();
+                decrement_subscriber_count(&sub_counts, &task_id_clone).await;
+                return;
+            }
         }
 
-        // If already terminal, send done and return
-        if is_terminal_status(&task_status) {
-            let status_str =
-                serde_json::to_value(&task_status).unwrap_or(serde_json::Value::Null);
-            send_done(&tx, status_str.as_str().unwrap_or("completed"));
+        let mut seen = HashMap::<u64, TaskEvent>::new();
+        for event in &history {
+            seen.insert(event.index, event.clone());
+        }
+        for event in &replay_events {
+            if seen
+                .get(&event.index)
+                .is_some_and(|existing| !replay_events_match(existing, event))
+            {
+                unsub();
+                decrement_subscriber_count(&sub_counts, &task_id_clone).await;
+                return;
+            }
+            seen.insert(event.index, event.clone());
+        }
+        let mut snapshot_boundary = seen.keys().copied().max();
+
+        let mut terminal = None;
+        let mut drain_buffer = |events: &mut Vec<TaskEvent>| {
+            while let Ok(event) = live_rx.try_recv() {
+                events.push(event);
+            }
+            events.sort_by_key(|event| event.index);
+        };
+        let mut buffered = Vec::new();
+        drain_buffer(&mut buffered);
+        for event in buffered.drain(..) {
+            if let Some(existing) = seen.get(&event.index) {
+                if !replay_events_match(existing, &event) {
+                    unsub();
+                    decrement_subscriber_count(&sub_counts, &task_id_clone).await;
+                    return;
+                }
+                continue;
+            }
+            if snapshot_boundary.is_some_and(|boundary| event.index <= boundary) {
+                continue;
+            }
+            snapshot_boundary = Some(event.index);
+            seen.insert(event.index, event.clone());
+            if matches_filter(&event, &filter) {
+                let idx = next_filtered_index;
+                next_filtered_index += 1;
+                if tx
+                    .send(Ok(task_sse_event(&event, idx, wrap, &series_format)))
+                    .await
+                    .is_err()
+                {
+                    unsub();
+                    decrement_subscriber_count(&sub_counts, &task_id_clone).await;
+                    return;
+                }
+            }
+            if let Some(reason) = terminal_reason(&event) {
+                terminal = Some(reason.to_string());
+                break;
+            }
+        }
+
+        let current_status = engine
+            .get_task(&task_id_clone)
+            .await
+            .ok()
+            .flatten()
+            .map(|task| task.status)
+            .unwrap_or(task_status);
+        drain_buffer(&mut buffered);
+        for event in buffered.drain(..) {
+            if let Some(existing) = seen.get(&event.index) {
+                if !replay_events_match(existing, &event) {
+                    unsub();
+                    decrement_subscriber_count(&sub_counts, &task_id_clone).await;
+                    return;
+                }
+                continue;
+            }
+            if snapshot_boundary.is_some_and(|boundary| event.index <= boundary) {
+                continue;
+            }
+            snapshot_boundary = Some(event.index);
+            seen.insert(event.index, event.clone());
+            if matches_filter(&event, &filter) {
+                let idx = next_filtered_index;
+                next_filtered_index += 1;
+                if tx
+                    .send(Ok(task_sse_event(&event, idx, wrap, &series_format)))
+                    .await
+                    .is_err()
+                {
+                    unsub();
+                    decrement_subscriber_count(&sub_counts, &task_id_clone).await;
+                    return;
+                }
+            }
+            if let Some(reason) = terminal_reason(&event) {
+                terminal = Some(reason.to_string());
+                break;
+            }
+        }
+
+        if terminal.is_none() && is_terminal_status(&current_status) {
+            terminal = serde_json::to_value(&current_status)
+                .ok()
+                .and_then(|status| status.as_str().map(str::to_string));
+        }
+        if let Some(reason) = terminal {
+            let _ = tx.send(Ok(done_sse_event(&reason))).await;
+            unsub();
             decrement_subscriber_count(&sub_counts, &task_id_clone).await;
             return;
         }
 
-        // Subscribe to live events
-        let next_filtered_index = if let Some(last) = filtered.last() {
-            last.filtered_index + 1
-        } else {
-            0
-        };
-
-        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
-        let done_tx = Arc::new(tokio::sync::Mutex::new(Some(done_tx)));
-
-        let filter_for_sub = filter.clone();
-        let tx_for_sub = tx.clone();
-        let done_tx_for_sub = Arc::clone(&done_tx);
-
-        // We need to use a shared mutable counter for the subscription callback
-        let next_idx = Arc::new(std::sync::atomic::AtomicU64::new(next_filtered_index));
-
-        let unsub = engine
-            .subscribe(
-                &task_id_clone,
-                Box::new(move |event| {
-                    if !matches_filter(&event, &filter_for_sub) {
-                        return;
+        loop {
+            tokio::select! {
+                _ = tx.closed() => break,
+                event = live_rx.recv() => {
+                    let Some(event) = event else { break };
+                    if let Some(existing) = seen.get(&event.index) {
+                        if !replay_events_match(existing, &event) {
+                            break;
+                        }
+                        continue;
                     }
-                    let idx = next_idx.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    send_event(&tx_for_sub, &event, idx, wrap);
-
-                    if event.r#type == "taskcast:status" {
-                        if let Some(status) = event.data.get("status").and_then(|s| s.as_str()) {
-                            if matches!(
-                                status,
-                                "completed" | "failed" | "timeout" | "cancelled"
-                            ) {
-                                send_done(&tx_for_sub, status);
-                                if let Ok(mut guard) = done_tx_for_sub.try_lock() {
-                                    if let Some(sender) = guard.take() {
-                                        let _ = sender.send(());
-                                    }
-                                }
-                            }
+                    if snapshot_boundary.is_some_and(|boundary| event.index <= boundary) {
+                        continue;
+                    }
+                    snapshot_boundary = Some(event.index);
+                    seen.insert(event.index, event.clone());
+                    if matches_filter(&event, &filter) {
+                        let idx = next_filtered_index;
+                        next_filtered_index += 1;
+                        if tx.send(Ok(task_sse_event(&event, idx, wrap, &series_format))).await.is_err() {
+                            break;
                         }
                     }
-                }),
-            )
-            .await;
-
-        // Wait for terminal event OR client disconnect (tx.closed() resolves when rx is dropped)
-        tokio::select! {
-            _ = done_rx => {}
-            _ = tx.closed() => {}
+                    if let Some(reason) = terminal_reason(&event) {
+                        let _ = tx.send(Ok(done_sse_event(reason))).await;
+                        break;
+                    }
+                }
+            }
         }
         unsub();
         decrement_subscriber_count(&sub_counts, &task_id_clone).await;
@@ -382,18 +537,16 @@ pub async fn global_sse_events(
     Extension(auth): Extension<AuthContext>,
     Query(query): Query<GlobalSseQuery>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
-    if !check_scope(
-        &auth,
-        taskcast_core::PermissionScope::EventSubscribe,
-        None,
-    ) {
+    if !check_scope(&auth, taskcast_core::PermissionScope::EventSubscribe, None) {
         return Err(AppError::Forbidden);
     }
 
-    let types: Option<Vec<String>> = query
-        .types
-        .as_ref()
-        .map(|t| t.split(',').filter(|s| !s.is_empty()).map(String::from).collect());
+    let types: Option<Vec<String>> = query.types.as_ref().map(|t| {
+        t.split(',')
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect()
+    });
     let levels: Option<Vec<Level>> = query.levels.as_ref().map(|l| {
         l.split(',')
             .filter(|s| !s.is_empty())

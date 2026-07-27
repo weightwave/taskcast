@@ -4,24 +4,33 @@ import { GenericContainer, Wait, type StartedTestContainer } from 'testcontainer
 import { PostgresLongTermStore } from '../src/long-term.js'
 import { join } from 'node:path'
 import { runMigrations } from '../src/migration-runner.js'
-import type { Task, TaskArchiveRestoreData, TaskEvent, WorkerAuditEvent } from '@taskcast/core'
+import type {
+  StorageReleaseRequest,
+  Task,
+  TaskArchiveRestoreData,
+  TaskEvent,
+  WorkerAuditEvent,
+} from '@taskcast/core'
 
 let container: StartedTestContainer
 let sql: ReturnType<typeof postgres>
 let store: PostgresLongTermStore
 
 beforeAll(async () => {
-  container = await new GenericContainer('postgres:16-alpine')
-    .withEnvironment({
-      POSTGRES_USER: 'test',
-      POSTGRES_PASSWORD: 'test',
-      POSTGRES_DB: 'testdb',
-    })
-    .withExposedPorts(5432)
-    .withWaitStrategy(Wait.forLogMessage(/ready to accept connections/, 2))
-    .start()
-  const connUri = `postgres://test:test@localhost:${container.getMappedPort(5432)}/testdb`
-  sql = postgres(connUri)
+  let connection = process.env['TASKCAST_TEST_POSTGRES_URL']
+  if (!connection) {
+    container = await new GenericContainer('postgres:16-alpine')
+      .withEnvironment({
+        POSTGRES_USER: 'test',
+        POSTGRES_PASSWORD: 'test',
+        POSTGRES_DB: 'testdb',
+      })
+      .withExposedPorts(5432)
+      .withWaitStrategy(Wait.forLogMessage(/ready to accept connections/, 2))
+      .start()
+    connection = `postgres://test:test@localhost:${container.getMappedPort(5432)}/testdb`
+  }
+  sql = postgres(connection, { onnotice: () => {} })
   store = new PostgresLongTermStore(sql)
 
   // Run migrations
@@ -94,6 +103,74 @@ describe('PostgresLongTermStore - tasks', () => {
     await store.saveTask({ ...makeTask(), status: 'running' })
     const task = await store.getTask('task-1')
     expect(task?.status).toBe('running')
+  })
+
+  it('atomically claims an explicit task identity once', async () => {
+    const [first, second] = await Promise.all([
+      store.createTaskIfAbsent({ ...makeTask(), metadata: { creator: 1 } }),
+      store.createTaskIfAbsent({ ...makeTask(), metadata: { creator: 2 } }),
+    ])
+
+    expect([first, second].sort()).toEqual([false, true])
+    await expect(store.getTask('task-1')).resolves.toMatchObject({
+      metadata: expect.objectContaining({ creator: expect.any(Number) }),
+    })
+  })
+
+  it('completes or aborts only the matching pristine creation claim', async () => {
+    expect(await store.claimTaskCreation(makeTask(), 'token-1', 30_000)).toBe(true)
+    expect(await store.abortTaskCreation('task-1', 'wrong-token')).toBe(false)
+    await store.saveTask({ ...makeTask(), status: 'running' })
+    expect(await store.abortTaskCreation('task-1', 'token-1')).toBe(false)
+    expect(await store.completeTaskCreation('task-1', 'token-1')).toBe(true)
+    expect(await store.completeTaskCreation('task-1', 'token-1')).toBe(true)
+    expect(await store.abortTaskCreation('task-1', 'token-1')).toBe(false)
+    await expect(store.getTask('task-1')).resolves.not.toBeNull()
+
+    const retryTask = { ...makeTask(), id: 'task-retry' }
+    expect(await store.claimTaskCreation(retryTask, 'token-2', 30_000)).toBe(true)
+    expect(await store.abortTaskCreation('task-retry', 'token-2')).toBe(true)
+    await expect(store.getTask('task-retry')).resolves.toBeNull()
+    expect(await store.claimTaskCreation(retryTask, 'token-3', 30_000)).toBe(true)
+  })
+
+  it('takes over only an expired pristine creation claim', async () => {
+    expect(await store.claimTaskCreation(makeTask(), 'token-1', 500)).toBe(true)
+    expect(await store.claimTaskCreation(makeTask(), 'token-2', 500)).toBe(false)
+    await new Promise((resolve) => setTimeout(resolve, 510))
+    expect(await store.claimTaskCreation(makeTask(), 'token-2', 30_000)).toBe(true)
+    expect(await store.completeTaskCreation('task-1', 'token-1')).toBe(false)
+    expect(await store.completeTaskCreation('task-1', 'token-2')).toBe(true)
+    expect(await store.completeTaskCreation('task-1', 'token-2')).toBe(true)
+  })
+})
+
+describe('PostgresLongTermStore - storage release requests', () => {
+  it('persists, lists, and compare-clears bounded release intent', async () => {
+    await store.saveTask(makeTask('release-request'))
+    const request: StorageReleaseRequest = {
+      taskId: 'release-request',
+      requestedAt: 2_000,
+      expectedLastEventIndex: 7,
+      inactiveSince: 1_500,
+    }
+
+    expect(await store.persistStorageReleaseRequest(request)).toBe(true)
+    expect(await store.listStorageReleaseRequests(10)).toEqual([request])
+    expect(await store.clearStorageReleaseRequest({
+      ...request,
+      requestedAt: request.requestedAt + 1,
+    })).toBe(false)
+    expect(await store.listStorageReleaseRequests(10)).toEqual([request])
+    expect(await store.clearStorageReleaseRequest(request)).toBe(true)
+    expect(await store.listStorageReleaseRequests(10)).toEqual([])
+    expect(await store.persistStorageReleaseRequest({
+      ...request,
+      taskId: 'missing',
+    })).toBe(false)
+    await expect(store.listStorageReleaseRequests(0)).rejects.toThrow(
+      'Storage release request limit must be positive',
+    )
   })
 })
 
@@ -200,6 +277,30 @@ describe('PostgresLongTermStore - events', () => {
       seriesMode: 'accumulate',
       seriesAccField: 'delta',
     })
+  })
+
+  it('normalizes an omitted accumulate field to delta across writes', async () => {
+    await store.saveTask(makeTask())
+    const first: TaskEvent = {
+      ...makeEvent('task-1', 0),
+      data: { delta: 'hello ' },
+      seriesId: 'output',
+      seriesMode: 'accumulate',
+    }
+    const second: TaskEvent = {
+      ...makeEvent('task-1', 1),
+      data: { delta: 'world' },
+      seriesId: 'output',
+      seriesMode: 'accumulate',
+    }
+
+    await store.accumulateSeries('task-1', 'output', first, 'delta')
+    await expect(
+      store.accumulateSeries('task-1', 'output', second, 'delta'),
+    ).resolves.toMatchObject({ data: { delta: 'hello world' } })
+    const [state] = await store.getDurableSeriesState('task-1')
+    expect(state?.throughIndex).toBe(1)
+    expect(state?.event.seriesAccField).toBeUndefined()
   })
 
   it('preserves false event data', async () => {

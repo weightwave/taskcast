@@ -5,8 +5,23 @@ import {
   MemoryShortTermStore,
 } from '@taskcast/core'
 import { createTaskcastApp, TASKCAST_SERVER_VERSION } from '@taskcast/server'
+import { runStart } from '../src/commands/start.js'
 
 describe('CLI — startup scenarios', () => {
+  it('fails before listening when storage lifecycle env is invalid', async () => {
+    const store = new MemoryShortTermStore()
+    const broadcast = new MemoryBroadcastProvider()
+    await expect(runStart({
+      broadcast,
+      shortTermStore: store,
+      port: 0,
+      config: {},
+      verbose: false,
+      playground: false,
+      env: { TASKCAST_TTL_SWEEP_INTERVAL_SECONDS: '0' },
+    })).rejects.toThrow('TASKCAST_TTL_SWEEP_INTERVAL_SECONDS')
+  })
+
   it('memory mode: /health responds ok', async () => {
     const store = new MemoryShortTermStore()
     const broadcast = new MemoryBroadcastProvider()

@@ -64,6 +64,54 @@ describe('createSqliteAdapters', () => {
     expect(names).toContain('taskcast_index_counters')
   })
 
+  it('adds lifecycle metadata and local durable coordination tables idempotently', () => {
+    dir = mkdtempSync(join(tmpdir(), 'taskcast-factory-'))
+    const path = join(dir, 'test.db')
+    const first = createSqliteAdapters({ path })
+    first.db.close()
+    const second = makeFactory(path)
+
+    const columns = second.db.pragma('table_info(taskcast_tasks)') as { name: string }[]
+    const names = columns.map((column) => column.name)
+    expect(names).toEqual(
+      expect.arrayContaining([
+        'storage_state',
+        'storage_epoch',
+        'archive_watermark',
+        'last_event_at',
+        'execution_deadline_at',
+        'task_version',
+        'ttl_claim_token',
+        'ttl_claim_until',
+      ]),
+    )
+    const tables = second.db
+      .prepare(
+        `SELECT name FROM sqlite_master
+         WHERE type = 'table'
+           AND name IN (
+             'taskcast_storage_locks',
+             'taskcast_durable_assignments',
+             'taskcast_terminal_outbox'
+           )
+         ORDER BY name`,
+      )
+      .all() as { name: string }[]
+    expect(tables.map((table) => table.name)).toEqual([
+      'taskcast_durable_assignments',
+      'taskcast_storage_locks',
+      'taskcast_terminal_outbox',
+    ])
+  })
+
+  it('reports split-tier release unsupported for shared SQLite storage', () => {
+    dir = mkdtempSync(join(tmpdir(), 'taskcast-factory-'))
+    const { shortTermStore, longTermStore } = makeFactory(join(dir, 'test.db'))
+
+    expect(shortTermStore.supportsHotColdRelease).toBe(false)
+    expect(longTermStore.supportsHotColdRelease).toBe(false)
+  })
+
   it('should produce working adapters (round-trip)', async () => {
     dir = mkdtempSync(join(tmpdir(), 'taskcast-factory-'))
     const { shortTermStore, longTermStore } = makeFactory(join(dir, 'test.db'))

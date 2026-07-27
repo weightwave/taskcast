@@ -178,6 +178,20 @@ fn make_rs256_token(issuer: &str, audience: &str) -> String {
 // ─── JWT auth via env var ──────────────────────────────────────────────────────
 
 #[tokio::test]
+async fn rejects_invalid_storage_lifecycle_env_before_listening() {
+    let _env = EnvGuard::new(&[("TASKCAST_TTL_SWEEP_INTERVAL_SECONDS", "0")]);
+    let error = taskcast_cli::commands::start::run(StartArgs {
+        port: find_available_port().await,
+        ..Default::default()
+    })
+    .await
+    .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("TASKCAST_TTL_SWEEP_INTERVAL_SECONDS"));
+}
+
+#[tokio::test]
 async fn run_jwt_auth_rejects_unauthenticated_requests() {
     let _env = EnvGuard::new(&[
         ("TASKCAST_AUTH_MODE", "jwt"),

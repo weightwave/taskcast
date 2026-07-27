@@ -10,11 +10,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use taskcast_core::{
     AssignMode, BlockedRequest, CleanupConfig, CreateTaskInput, DisconnectPolicy, EngineError,
-    EventQueryOptions, Level, PermissionScope, PublishEventInput, SeriesMode, SinceCursor,
-    TaskArchive, TaskArchiveImportOptions, TaskAuthConfig, TaskEngine, TaskError, TaskFilter,
-    TaskStatus, TransitionPayload, WebhookConfig,
+    EventQueryOptions, Level, PermissionScope, PublishEventInput, ReleasePreconditions,
+    ReleaseResult, SeriesMode, SinceCursor, StorageBusyError, StorageFenceConflictError,
+    StorageIntegrityError, StoragePreconditionError, StorageReleaseUnsupportedError, TaskArchive,
+    TaskArchiveImportOptions, TaskAuthConfig, TaskEngine, TaskError, TaskFilter, TaskStatus,
+    TransitionPayload, WebhookConfig,
 };
 
+use crate::app::StorageWriterHeartbeat;
 use crate::auth::{check_scope, AuthContext};
 use crate::error::AppError;
 use crate::routes::sse::{get_subscriber_count, SubscriberCounts};
@@ -90,6 +93,13 @@ pub struct ImportTaskArchiveResponse {
     pub task_id: String,
     pub event_count: usize,
     pub overwritten: bool,
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageReleaseBody {
+    pub expected_last_event_index: i64,
+    pub inactive_since: f64,
 }
 
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
@@ -329,6 +339,127 @@ pub async fn get_task(
     }
 
     Ok(axum::Json(task_json))
+}
+
+#[utoipa::path(
+    post,
+    path = "/tasks/{taskId}/storage/release",
+    tag = "Tasks",
+    summary = "Release verified hot task storage",
+    description = "Persist a guarded release request, archive through the expected event index, and release short-term storage.",
+    security(("Bearer" = [])),
+    params(("taskId" = String, Path, description = "Task ID")),
+    request_body = StorageReleaseBody,
+    responses(
+        (status = 200, description = "Storage release result", body = ReleaseResult),
+        (status = 400, description = "Validation error"),
+        (status = 403, description = "Forbidden"),
+        (status = 404, description = "Task not found"),
+        (status = 409, description = "Stale precondition or lifecycle busy"),
+        (status = 500, description = "Storage integrity error"),
+        (status = 503, description = "Storage lifecycle unavailable"),
+    )
+)]
+pub async fn release_task_storage(
+    State(engine): State<Arc<TaskEngine>>,
+    Extension(auth): Extension<AuthContext>,
+    Extension(storage_readiness): Extension<Arc<StorageWriterHeartbeat>>,
+    Path(task_id): Path<String>,
+    body: Result<Json<StorageReleaseBody>, JsonRejection>,
+) -> axum::response::Response {
+    if !check_scope(&auth, PermissionScope::TaskManage, Some(&task_id)) {
+        return storage_error_response(StatusCode::FORBIDDEN, "Forbidden", None);
+    }
+    match engine.get_task(&task_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return storage_error_response(StatusCode::NOT_FOUND, "Task not found", None);
+        }
+        Err(error) => {
+            return storage_engine_error_response(error);
+        }
+    }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(_) => {
+            return storage_error_response(
+                StatusCode::BAD_REQUEST,
+                "Invalid storage release request",
+                None,
+            );
+        }
+    };
+    let preconditions = ReleasePreconditions {
+        expected_last_event_index: body.expected_last_event_index,
+        inactive_since: body.inactive_since,
+    };
+    if let Err(error) = storage_readiness.ensure_ready().await {
+        return storage_engine_error_response(error);
+    }
+    match engine.release_task_storage(&task_id, preconditions).await {
+        Ok(result) => Json(result).into_response(),
+        Err(error) => storage_engine_error_response(error),
+    }
+}
+
+fn storage_engine_error_response(error: EngineError) -> axum::response::Response {
+    match error {
+        EngineError::TaskNotFound(_) => {
+            storage_error_response(StatusCode::NOT_FOUND, "Task not found", None)
+        }
+        EngineError::Store(source) => {
+            let message = source.to_string();
+            if source.downcast_ref::<StoragePreconditionError>().is_some() {
+                storage_error_response(
+                    StatusCode::CONFLICT,
+                    &message,
+                    Some("storage_precondition_failed"),
+                )
+            } else if source.downcast_ref::<StorageBusyError>().is_some()
+                || source.downcast_ref::<StorageFenceConflictError>().is_some()
+            {
+                storage_error_response(StatusCode::CONFLICT, &message, Some("storage_busy"))
+            } else if source.downcast_ref::<StorageIntegrityError>().is_some() {
+                storage_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &message,
+                    Some("storage_integrity_error"),
+                )
+            } else if source
+                .downcast_ref::<StorageReleaseUnsupportedError>()
+                .is_some()
+            {
+                storage_error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &message,
+                    Some("storage_release_unsupported"),
+                )
+            } else {
+                storage_error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &message,
+                    Some("storage_unavailable"),
+                )
+            }
+        }
+        other => storage_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &other.to_string(),
+            Some("storage_unavailable"),
+        ),
+    }
+}
+
+fn storage_error_response(
+    status: StatusCode,
+    message: &str,
+    code: Option<&str>,
+) -> axum::response::Response {
+    let mut body = json!({ "error": message });
+    if let Some(code) = code {
+        body["code"] = json!(code);
+    }
+    (status, Json(body)).into_response()
 }
 
 #[utoipa::path(

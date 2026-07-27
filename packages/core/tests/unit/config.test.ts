@@ -2,7 +2,13 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { writeFileSync, unlinkSync, mkdirSync, rmSync, existsSync } from 'fs'
 import { join, resolve } from 'path'
 import { tmpdir } from 'os'
-import { interpolateEnvVars, parseConfig, loadConfigFile, resolveAdminToken } from '../../src/config.js'
+import {
+  interpolateEnvVars,
+  parseConfig,
+  loadConfigFile,
+  resolveAdminToken,
+  resolveStorageLifecycleConfig,
+} from '../../src/config.js'
 import type { TaskcastConfig } from '../../src/config.js'
 
 describe('interpolateEnvVars', () => {
@@ -35,6 +41,79 @@ describe('parseConfig - JSON', () => {
     const json = JSON.stringify({ port: '8080' })
     const config = parseConfig(json, 'json')
     expect(config.port).toBe(8080)
+  })
+})
+
+describe('resolveStorageLifecycleConfig', () => {
+  it('uses conservative defaults with automatic retention disabled', () => {
+    expect(resolveStorageLifecycleConfig({}, {})).toEqual({
+      hotRetentionEnabled: false,
+      hotRetentionTerminalSeconds: 86_400,
+      hotRetentionIdleSeconds: 3_600,
+      rehydrateReplayEvents: 1_000,
+      storageLockTtlSeconds: 30,
+      ttlSweepIntervalSeconds: 5,
+      ttlSweepBatchSize: 100,
+    })
+  })
+
+  it('loads config-file values and lets environment variables override them', () => {
+    const config = parseConfig(`
+storageLifecycle:
+  hotRetentionEnabled: true
+  hotRetentionTerminalSeconds: 7200
+  hotRetentionIdleSeconds: 1800
+  rehydrateReplayEvents: 250
+  storageLockTtlSeconds: 45
+  ttlSweepIntervalSeconds: 10
+  ttlSweepBatchSize: 25
+`, 'yaml')
+
+    expect(resolveStorageLifecycleConfig(config, {
+      TASKCAST_HOT_RETENTION_ENABLED: 'false',
+      TASKCAST_REHYDRATE_REPLAY_EVENTS: '500',
+      TASKCAST_TTL_SWEEP_BATCH_SIZE: '50',
+    })).toEqual({
+      hotRetentionEnabled: false,
+      hotRetentionTerminalSeconds: 7_200,
+      hotRetentionIdleSeconds: 1_800,
+      rehydrateReplayEvents: 500,
+      storageLockTtlSeconds: 45,
+      ttlSweepIntervalSeconds: 10,
+      ttlSweepBatchSize: 50,
+    })
+  })
+
+  it.each([
+    ['TASKCAST_HOT_RETENTION_ENABLED', 'yes'],
+    ['TASKCAST_HOT_RETENTION_TERMINAL_SECONDS', '0'],
+    ['TASKCAST_HOT_RETENTION_IDLE_SECONDS', '-1'],
+    ['TASKCAST_REHYDRATE_REPLAY_EVENTS', 'NaN'],
+    ['TASKCAST_STORAGE_LOCK_TTL_SECONDS', '1.5'],
+    ['TASKCAST_TTL_SWEEP_INTERVAL_SECONDS', '0'],
+    ['TASKCAST_TTL_SWEEP_BATCH_SIZE', ''],
+  ])('rejects invalid %s=%s', (key, value) => {
+    expect(() => resolveStorageLifecycleConfig({}, { [key]: value })).toThrow(
+      key,
+    )
+  })
+
+  it('rejects invalid file booleans and seconds that overflow milliseconds', () => {
+    expect(() =>
+      resolveStorageLifecycleConfig({
+        storageLifecycle: {
+          hotRetentionEnabled: 'yes' as unknown as boolean,
+        },
+      }, {}),
+    ).toThrow('storageLifecycle.hotRetentionEnabled must be true or false')
+
+    expect(() =>
+      resolveStorageLifecycleConfig({}, {
+        TASKCAST_STORAGE_LOCK_TTL_SECONDS: String(Number.MAX_SAFE_INTEGER),
+      }),
+    ).toThrow(
+      'TASKCAST_STORAGE_LOCK_TTL_SECONDS must be a positive integer no greater than',
+    )
   })
 })
 

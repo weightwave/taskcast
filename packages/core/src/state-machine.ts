@@ -13,11 +13,11 @@ export const SUSPENDED_STATUSES: readonly TaskStatus[] = [
 ] as const
 
 const ALLOWED_TRANSITIONS: Record<TaskStatus, TaskStatus[]> = {
-  pending: ['assigned', 'running', 'paused', 'cancelled'],
-  assigned: ['running', 'pending', 'paused', 'cancelled'],
+  pending: ['assigned', 'running', 'paused', 'timeout', 'cancelled'],
+  assigned: ['running', 'pending', 'paused', 'timeout', 'cancelled'],
   running: ['paused', 'blocked', 'completed', 'failed', 'timeout', 'cancelled'],
-  paused: ['running', 'assigned', 'blocked', 'cancelled'],
-  blocked: ['running', 'assigned', 'paused', 'cancelled', 'failed'],
+  paused: ['running', 'assigned', 'blocked', 'timeout', 'cancelled'],
+  blocked: ['running', 'assigned', 'paused', 'cancelled', 'failed', 'timeout'],
   completed: [],
   failed: [],
   timeout: [],

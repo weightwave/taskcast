@@ -1,6 +1,7 @@
 use crate::PermissionScope;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::Path;
 
 // ─── Config Types ────────────────────────────────────────────────────────────
@@ -31,6 +32,38 @@ pub struct TaskcastConfig {
     pub cleanup: Option<CleanupGlobalConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workers: Option<WorkersConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_lifecycle: Option<StorageLifecycleConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageLifecycleConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hot_retention_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hot_retention_terminal_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hot_retention_idle_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rehydrate_replay_events: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_lock_ttl_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl_sweep_interval_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl_sweep_batch_size: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedStorageLifecycleConfig {
+    pub hot_retention_enabled: bool,
+    pub hot_retention_terminal_seconds: u64,
+    pub hot_retention_idle_seconds: u64,
+    pub rehydrate_replay_events: u64,
+    pub storage_lock_ttl_seconds: u64,
+    pub ttl_sweep_interval_seconds: u64,
+    pub ttl_sweep_batch_size: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -213,6 +246,88 @@ pub enum ConfigError {
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("{0}")]
+    InvalidValue(String),
+}
+
+pub fn resolve_storage_lifecycle_config(
+    config: &TaskcastConfig,
+    env: &HashMap<String, String>,
+) -> Result<ResolvedStorageLifecycleConfig, ConfigError> {
+    let file = config.storage_lifecycle.as_ref();
+    let parse_positive = |key: &str, file_value: Option<u64>, default: u64, maximum: u64| {
+        let value = match env.get(key) {
+            Some(value) => value.parse::<u64>().map_err(|_| {
+                ConfigError::InvalidValue(format!("{key} must be a positive integer"))
+            })?,
+            None => file_value.unwrap_or(default),
+        };
+        if value == 0 {
+            return Err(ConfigError::InvalidValue(format!(
+                "{key} must be a positive integer"
+            )));
+        }
+        if value > maximum {
+            return Err(ConfigError::InvalidValue(format!(
+                "{key} must be a positive integer no greater than {maximum}"
+            )));
+        }
+        Ok(value)
+    };
+    let maximum_seconds = u64::MAX / 1_000;
+    let hot_retention_enabled = match env.get("TASKCAST_HOT_RETENTION_ENABLED") {
+        Some(value) if value == "true" => true,
+        Some(value) if value == "false" => false,
+        Some(_) => {
+            return Err(ConfigError::InvalidValue(
+                "TASKCAST_HOT_RETENTION_ENABLED must be true or false".to_string(),
+            ))
+        }
+        None => file
+            .and_then(|value| value.hot_retention_enabled)
+            .unwrap_or(false),
+    };
+
+    Ok(ResolvedStorageLifecycleConfig {
+        hot_retention_enabled,
+        hot_retention_terminal_seconds: parse_positive(
+            "TASKCAST_HOT_RETENTION_TERMINAL_SECONDS",
+            file.and_then(|value| value.hot_retention_terminal_seconds),
+            86_400,
+            maximum_seconds,
+        )?,
+        hot_retention_idle_seconds: parse_positive(
+            "TASKCAST_HOT_RETENTION_IDLE_SECONDS",
+            file.and_then(|value| value.hot_retention_idle_seconds),
+            3_600,
+            maximum_seconds,
+        )?,
+        rehydrate_replay_events: parse_positive(
+            "TASKCAST_REHYDRATE_REPLAY_EVENTS",
+            file.and_then(|value| value.rehydrate_replay_events),
+            1_000,
+            u64::MAX,
+        )?,
+        storage_lock_ttl_seconds: parse_positive(
+            "TASKCAST_STORAGE_LOCK_TTL_SECONDS",
+            file.and_then(|value| value.storage_lock_ttl_seconds),
+            30,
+            maximum_seconds,
+        )?,
+        ttl_sweep_interval_seconds: parse_positive(
+            "TASKCAST_TTL_SWEEP_INTERVAL_SECONDS",
+            file.and_then(|value| value.ttl_sweep_interval_seconds),
+            5,
+            maximum_seconds,
+        )?,
+        ttl_sweep_batch_size: parse_positive(
+            "TASKCAST_TTL_SWEEP_BATCH_SIZE",
+            file.and_then(|value| value.ttl_sweep_batch_size),
+            100,
+            u64::MAX,
+        )?,
+    })
 }
 
 // ─── Environment Variable Interpolation ──────────────────────────────────────
@@ -392,6 +507,7 @@ fn load_config_file_from_dir(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::env;
     use std::io::Write;
 
@@ -972,5 +1088,95 @@ trustedServices:
         let json = r#"{"port": 3000}"#;
         let config = parse_config(json, ConfigFormat::Json).unwrap();
         assert!(config.admin_api.is_none());
+    }
+
+    #[test]
+    fn storage_lifecycle_uses_conservative_defaults() {
+        let resolved =
+            resolve_storage_lifecycle_config(&TaskcastConfig::default(), &HashMap::new()).unwrap();
+        assert_eq!(
+            resolved,
+            ResolvedStorageLifecycleConfig {
+                hot_retention_enabled: false,
+                hot_retention_terminal_seconds: 86_400,
+                hot_retention_idle_seconds: 3_600,
+                rehydrate_replay_events: 1_000,
+                storage_lock_ttl_seconds: 30,
+                ttl_sweep_interval_seconds: 5,
+                ttl_sweep_batch_size: 100,
+            }
+        );
+    }
+
+    #[test]
+    fn storage_lifecycle_env_overrides_config_file() {
+        let config = parse_config(
+            r#"
+storageLifecycle:
+  hotRetentionEnabled: true
+  hotRetentionTerminalSeconds: 7200
+  hotRetentionIdleSeconds: 1800
+  rehydrateReplayEvents: 250
+  storageLockTtlSeconds: 45
+  ttlSweepIntervalSeconds: 10
+  ttlSweepBatchSize: 25
+"#,
+            ConfigFormat::Yaml,
+        )
+        .unwrap();
+        let env = HashMap::from([
+            (
+                "TASKCAST_HOT_RETENTION_ENABLED".to_string(),
+                "false".to_string(),
+            ),
+            (
+                "TASKCAST_REHYDRATE_REPLAY_EVENTS".to_string(),
+                "500".to_string(),
+            ),
+            (
+                "TASKCAST_TTL_SWEEP_BATCH_SIZE".to_string(),
+                "50".to_string(),
+            ),
+        ]);
+
+        assert_eq!(
+            resolve_storage_lifecycle_config(&config, &env).unwrap(),
+            ResolvedStorageLifecycleConfig {
+                hot_retention_enabled: false,
+                hot_retention_terminal_seconds: 7_200,
+                hot_retention_idle_seconds: 1_800,
+                rehydrate_replay_events: 500,
+                storage_lock_ttl_seconds: 45,
+                ttl_sweep_interval_seconds: 10,
+                ttl_sweep_batch_size: 50,
+            }
+        );
+    }
+
+    #[test]
+    fn storage_lifecycle_rejects_invalid_values() {
+        for (key, value) in [
+            ("TASKCAST_HOT_RETENTION_ENABLED", "yes"),
+            ("TASKCAST_HOT_RETENTION_TERMINAL_SECONDS", "0"),
+            ("TASKCAST_HOT_RETENTION_IDLE_SECONDS", "-1"),
+            ("TASKCAST_REHYDRATE_REPLAY_EVENTS", "NaN"),
+            ("TASKCAST_STORAGE_LOCK_TTL_SECONDS", "1.5"),
+            ("TASKCAST_TTL_SWEEP_INTERVAL_SECONDS", "0"),
+            ("TASKCAST_TTL_SWEEP_BATCH_SIZE", ""),
+        ] {
+            let env = HashMap::from([(key.to_string(), value.to_string())]);
+            let error =
+                resolve_storage_lifecycle_config(&TaskcastConfig::default(), &env).unwrap_err();
+            assert!(error.to_string().contains(key));
+        }
+
+        let env = HashMap::from([(
+            "TASKCAST_STORAGE_LOCK_TTL_SECONDS".to_string(),
+            u64::MAX.to_string(),
+        )]);
+        let error = resolve_storage_lifecycle_config(&TaskcastConfig::default(), &env).unwrap_err();
+        assert!(error.to_string().starts_with(
+            "TASKCAST_STORAGE_LOCK_TTL_SECONDS must be a positive integer no greater than"
+        ));
     }
 }

@@ -51,10 +51,6 @@ impl RedisCommandConnection {
         }
     }
 
-    pub(crate) fn is_managed(&self) -> bool {
-        matches!(self, Self::Managed { .. })
-    }
-
     fn observe(&self, state: DependencyObservationState, error_kind: Option<DependencyErrorKind>) {
         let Self::Managed {
             observer: Some(observer),

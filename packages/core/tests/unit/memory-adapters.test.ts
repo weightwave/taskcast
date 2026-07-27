@@ -1,6 +1,13 @@
 import { describe, it, expect } from 'vitest'
 import { MemoryBroadcastProvider, MemoryShortTermStore } from '../../src/memory-adapters.js'
-import type { Task, TaskEvent, Worker, WorkerAssignment } from '../../src/types.js'
+import {
+  StorageFenceConflictError,
+  type RehydrateSnapshot,
+  type Task,
+  type TaskEvent,
+  type Worker,
+  type WorkerAssignment,
+} from '../../src/types.js'
 
 const makeEvent = (index = 0): TaskEvent => ({
   id: `evt-${index}`,
@@ -501,5 +508,127 @@ describe('MemoryShortTermStore.assignments', () => {
     await store.addAssignment(makeAssignment({ taskId: 't1', workerId: 'w2' }))
     const retrieved = await store.getTaskAssignment('t1')
     expect(retrieved!.workerId).toBe('w2')
+  })
+})
+
+describe('MemoryShortTermStore storage lifecycle', () => {
+  it('serializes storage leases and rejects a different lock owner', async () => {
+    const store = new MemoryShortTermStore()
+    await store.saveTask(makeTask())
+
+    const lease = await store.acquireStorageLock('task-1', 'lock-1', 'generation-1', 60_000)
+    expect(lease).toMatchObject({
+      taskId: 'task-1',
+      lockToken: 'lock-1',
+      generation: 'generation-1',
+      storageEpoch: 1,
+    })
+    await expect(
+      store.acquireStorageLock('task-1', 'lock-2', 'generation-2', 60_000),
+    ).resolves.toBeNull()
+    await expect(
+      store.releaseStorageLock({ ...lease!, lockToken: 'lock-2' }),
+    ).resolves.toBe(false)
+    await expect(store.renewStorageLock(lease!, 60_000)).resolves.toBe(true)
+    await expect(store.releaseStorageLock(lease!)).resolves.toBe(true)
+  })
+
+  it('fences a racing event without consuming its global index', async () => {
+    const store = new MemoryShortTermStore()
+    await store.saveTask(makeTask())
+    const lease = await store.acquireStorageLock('task-1', 'lock-1', 'generation-1', 60_000)
+    const oldToken = { taskId: 'task-1', storageEpoch: 1 }
+    const closed = await store.closeWriteFence(lease!, 1)
+
+    expect(closed.highWatermark).toBe(-1)
+    await expect(
+      store.commitEventFenced(
+        'task-1',
+        { ...makeEvent(999), id: 'fenced-event', taskId: 'task-1' },
+        oldToken,
+      ),
+    ).rejects.toBeInstanceOf(StorageFenceConflictError)
+
+    const newToken = await store.reopenWriteFence(lease!, 1)
+    const committed = await store.commitEventFenced(
+      'task-1',
+      { ...makeEvent(999), id: 'accepted-event', taskId: 'task-1' },
+      newToken,
+    )
+    expect(committed.event.index).toBe(0)
+    expect((await store.getEvents('task-1')).map((entry) => entry.id)).toEqual(['accepted-event'])
+  })
+
+  it('pages a sparse fenced archive source by opaque cursor', async () => {
+    const store = new MemoryShortTermStore()
+    await store.saveTask(makeTask())
+    await store.appendEvent('task-1', makeEvent(2))
+    await store.appendEvent('task-1', makeEvent(7))
+    await store.appendEvent('task-1', makeEvent(11))
+
+    const first = await store.readArchiveSourcePage('task-1', 11, null, 2)
+    const second = await store.readArchiveSourcePage('task-1', 11, first.nextCursor, 2)
+
+    expect(first.events.map((entry) => entry.index)).toEqual([2, 7])
+    expect(first.done).toBe(false)
+    expect(second.events.map((entry) => entry.index)).toEqual([11])
+    expect(second.done).toBe(true)
+  })
+
+  it('deletes every task-specific hot key only for the current closed fence', async () => {
+    const store = new MemoryShortTermStore()
+    await store.saveTask(makeTask())
+    await store.appendEvent('task-1', makeEvent(0))
+    await store.setSeriesLatest('task-1', 'series-1', makeEvent(0))
+    await store.nextIndex('task-1')
+    const lease = await store.acquireStorageLock('task-1', 'lock-1', 'generation-1', 60_000)
+    await store.closeWriteFence(lease!, 1)
+
+    await store.deleteTaskStorageFenced(lease!, 1)
+
+    expect(await store.getTaskStoragePresence('task-1')).toEqual({
+      task: false,
+      eventCount: 0,
+      nextIndex: false,
+      seriesStateCount: 0,
+      writeFence: false,
+    })
+  })
+
+  it('atomically restores a bounded hot snapshot with the durable next index', async () => {
+    const store = new MemoryShortTermStore()
+    await store.saveTask(makeTask())
+    const lease = await store.acquireStorageLock('task-1', 'lock-1', 'generation-1', 60_000)
+    await store.closeWriteFence(lease!, 1)
+    await store.deleteTaskStorageFenced(lease!, 1)
+
+    const latest = { ...makeEvent(7), seriesId: 'series-1', seriesMode: 'latest' as const }
+    const snapshot: RehydrateSnapshot = {
+      task: makeTask(),
+      archiveWatermark: 7,
+      maxEventIndex: 7,
+      replayEvents: [latest],
+      seriesLatest: [
+        {
+          taskId: 'task-1',
+          seriesId: 'series-1',
+          mode: 'latest',
+          event: latest,
+          throughIndex: 7,
+        },
+      ],
+      storageEpoch: 1,
+    }
+
+    const token = await store.restoreHotTaskFenced(snapshot, lease!, 2)
+    const committed = await store.commitEventFenced(
+      'task-1',
+      { ...makeEvent(999), id: 'event-8', taskId: 'task-1' },
+      token,
+    )
+
+    expect(token.storageEpoch).toBe(2)
+    expect(committed.event.index).toBe(8)
+    expect(await store.getSeriesLatest('task-1', 'series-1')).toEqual(latest)
   })
 })

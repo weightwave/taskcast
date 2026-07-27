@@ -276,6 +276,254 @@ export interface SeriesResult {
   stored?: boolean
 }
 
+// ─── Storage Lifecycle ─────────────────────────────────────────────────────
+
+export type StorageState = 'hot' | 'releasing' | 'cold'
+
+export interface TaskStorageMetadata {
+  taskId: string
+  storageState: StorageState
+  storageEpoch: number
+  activeReleaseGeneration: string | null
+  archiveWatermark: number
+  lastEventAt: number | null
+  coldAt: number | null
+  executionDeadlineAt: number | null
+  taskVersion: number
+}
+
+export interface HotWriteToken {
+  taskId: string
+  storageEpoch: number
+}
+
+/**
+ * A task plus an opaque compare-and-set token for its exact hot-store record.
+ * Redis adapters use the raw serialized task so writes from older instances
+ * that do not maintain a separate revision key are still detected.
+ */
+export interface TaskMutationSnapshot {
+  task: Task
+  revision: string
+}
+
+export interface StorageLease {
+  taskId: string
+  lockToken: string
+  generation: string
+  storageEpoch: number
+}
+
+export interface TaskWriteFence {
+  taskId: string
+  acceptingWrites: boolean
+  storageEpoch: number
+  activeReleaseGeneration: string | null
+}
+
+export interface ClosedWriteFence extends TaskWriteFence {
+  acceptingWrites: false
+  highWatermark: number
+}
+
+export interface ReleasePreconditions {
+  expectedLastEventIndex: number
+  inactiveSince: number
+}
+
+export interface ReleaseResult {
+  taskId: string
+  storageState: StorageState
+  archiveWatermark: number
+  released: boolean
+}
+
+export interface ArchiveSourceManifest {
+  priorWatermark: number
+  targetWatermark: number
+  sourceEntryCount: number
+  sourceDigest: string
+  seriesStateDigest: string
+  expectedBatchOrdinals: number[]
+}
+
+export type ArchiveGenerationStatus = 'open' | 'finalized' | 'aborted'
+
+export interface ArchiveGeneration {
+  taskId: string
+  generation: string
+  storageEpoch: number
+  targetWatermark: number
+  manifest: ArchiveSourceManifest
+  status: ArchiveGenerationStatus
+  createdAt: number
+  updatedAt: number
+}
+
+export interface ArchiveBatchReceipt {
+  taskId: string
+  generation: string
+  ordinal: number
+  previousBatchDigest: string | null
+  batchDigest: string
+  entryCount: number
+  firstIndex: number | null
+  lastIndex: number | null
+}
+
+export interface ArchiveSourcePage {
+  taskId: string
+  watermark: number
+  cursor: string | null
+  nextCursor: string | null
+  events: TaskEvent[]
+  done: boolean
+}
+
+export interface DurableSeriesState {
+  taskId: string
+  seriesId: string
+  mode: 'latest' | 'accumulate'
+  event: TaskEvent
+  throughIndex: number
+}
+
+export interface RehydrateSnapshot {
+  task: Task
+  archiveWatermark: number
+  maxEventIndex: number
+  replayEvents: TaskEvent[]
+  seriesLatest: DurableSeriesState[]
+  storageEpoch: number
+}
+
+export interface CanonicalHistoryEntry {
+  event: TaskEvent
+  seriesThroughIndex?: number
+}
+
+export interface TtlClaim {
+  taskId: string
+  claimToken: string
+  claimUntil: number
+  taskVersion: number
+  executionDeadlineAt: number
+}
+
+export interface TerminalProjection {
+  projectionId: string
+  task: Task
+  event: TaskEvent
+  assignment: WorkerAssignment | null
+  claimToken: string | null
+  claimUntil: number | null
+}
+
+export interface TerminalProjectionResult {
+  token: HotWriteToken
+  projected: boolean
+}
+
+export interface TaskStoragePresence {
+  task: boolean
+  eventCount: number
+  nextIndex: boolean
+  seriesStateCount: number
+  writeFence: boolean
+}
+
+export interface StorageWriterRegistration {
+  instanceId: string
+  storageProtocolVersion: number
+  build: string
+  expiresAt: number
+}
+
+export interface StorageReleaseRequest {
+  taskId: string
+  requestedAt: number
+  expectedLastEventIndex: number
+  inactiveSince: number
+}
+
+export interface TaskStorageMetadataCas {
+  taskId: string
+  expectedStorageState: StorageState
+  expectedStorageEpoch: number
+  expectedReleaseGeneration: string | null
+  next: TaskStorageMetadata
+}
+
+export interface ArchiveBatch {
+  receipt: ArchiveBatchReceipt
+  events: TaskEvent[]
+  seriesLatest: DurableSeriesState[]
+}
+
+export abstract class TaskStorageError extends Error {
+  abstract readonly code: string
+  abstract readonly retryable: boolean
+
+  protected constructor(message: string) {
+    super(message)
+    this.name = new.target.name
+  }
+}
+
+export class StorageFenceConflictError extends TaskStorageError {
+  readonly code = 'storage_fence_conflict'
+  readonly retryable = true
+
+  constructor(message = 'Task storage write fence changed') {
+    super(message)
+  }
+}
+
+export class StorageBusyError extends TaskStorageError {
+  readonly code = 'storage_busy'
+  readonly retryable = true
+
+  constructor(message = 'Task storage lifecycle operation is busy') {
+    super(message)
+  }
+}
+
+export class StoragePreconditionError extends TaskStorageError {
+  readonly code = 'storage_precondition_failed'
+  readonly retryable = false
+
+  constructor(message = 'Task storage release precondition failed') {
+    super(message)
+  }
+}
+
+export class StorageIntegrityError extends TaskStorageError {
+  readonly code = 'storage_integrity_error'
+  readonly retryable = false
+
+  constructor(message = 'Task storage integrity check failed') {
+    super(message)
+  }
+}
+
+export class StorageUnavailableError extends TaskStorageError {
+  readonly code = 'storage_unavailable'
+  readonly retryable = true
+
+  constructor(message = 'Task storage lifecycle service is unavailable') {
+    super(message)
+  }
+}
+
+export class StorageReleaseUnsupportedError extends TaskStorageError {
+  readonly code = 'storage_release_unsupported'
+  readonly retryable = false
+
+  constructor(message = 'Task storage release is not supported by this adapter') {
+    super(message)
+  }
+}
+
 // ─── Storage Interfaces ──────────────────────────────────────────────────────
 
 export interface BroadcastProvider {
@@ -284,6 +532,8 @@ export interface BroadcastProvider {
 }
 
 export interface ShortTermStore {
+  /** True only when every lifecycle operation below is implemented atomically. */
+  readonly supportsHotColdRelease?: boolean
   saveTask(task: Task): Promise<void>
   getTask(taskId: string): Promise<Task | null>
   /** Atomically allocates the next event index for a task. */
@@ -306,6 +556,57 @@ export interface ShortTermStore {
     data: TaskArchiveRestoreData,
     options?: TaskArchiveImportOptions,
   ): Promise<{ overwritten: boolean }>
+
+  // Fenced hot/cold lifecycle. Optional only for adapters that explicitly
+  // report supportsHotColdRelease !== true.
+  acquireStorageLock?(
+    taskId: string,
+    lockToken: string,
+    generation: string,
+    ttlMs: number,
+  ): Promise<StorageLease | null>
+  renewStorageLock?(lease: StorageLease, ttlMs: number): Promise<boolean>
+  releaseStorageLock?(lease: StorageLease): Promise<boolean>
+  getWriteFence?(taskId: string): Promise<TaskWriteFence | null>
+  closeWriteFence?(lease: StorageLease, expectedEpoch: number): Promise<ClosedWriteFence>
+  reopenWriteFence?(lease: StorageLease, expectedEpoch: number): Promise<HotWriteToken>
+  commitEventFenced?(
+    taskId: string,
+    event: Omit<TaskEvent, 'index'>,
+    token: HotWriteToken,
+  ): Promise<SeriesResult>
+  /** Atomically reads a task and the opaque token for its current mutation. */
+  getTaskMutationSnapshot?(taskId: string): Promise<TaskMutationSnapshot | null>
+  /** Atomically stores a task mutation and its derived non-series events. */
+  commitTaskEventsFenced?(
+    task: Task,
+    expectedRevision: string,
+    events: Omit<TaskEvent, 'index'>[],
+    token: HotWriteToken,
+  ): Promise<TaskEvent[] | null>
+  saveTaskFenced?(task: Task, token: HotWriteToken): Promise<void>
+  readArchiveSourcePage?(
+    taskId: string,
+    watermark: number,
+    cursor: string | null,
+    limit: number,
+  ): Promise<ArchiveSourcePage>
+  deleteTaskStorageFenced?(lease: StorageLease, expectedEpoch: number): Promise<void>
+  restoreHotTaskFenced?(
+    snapshot: RehydrateSnapshot,
+    lease: StorageLease,
+    nextEpoch: number,
+  ): Promise<HotWriteToken>
+  /** Atomically projects a durable terminal task/event and settles its assignment. */
+  projectTerminalFenced?(
+    projection: TerminalProjection,
+    lease: StorageLease,
+    expectedEpoch: number,
+    nextEpoch: number,
+  ): Promise<TerminalProjectionResult>
+  getTaskStoragePresence?(taskId: string): Promise<TaskStoragePresence>
+  registerStorageWriter?(registration: StorageWriterRegistration, ttlMs: number): Promise<void>
+  listStorageWriters?(): Promise<StorageWriterRegistration[]>
 
   // Task query
   listTasks(filter: TaskFilter): Promise<Task[]>
@@ -333,7 +634,19 @@ export interface ShortTermStore {
 }
 
 export interface LongTermStore {
+  /** True only for split-tier stores with a verifiable archive barrier. */
+  readonly supportsHotColdRelease?: boolean
+  /** True only when deadline claims and terminal projection are durable. */
+  readonly supportsDurableTtl?: boolean
   saveTask(task: Task): Promise<void>
+  /** Atomically claims a durable task identity. Returns false when it already exists. */
+  createTaskIfAbsent?(task: Task): Promise<boolean>
+  /** Claims an explicit task identity until its hot copy is created. */
+  claimTaskCreation?(task: Task, creationToken: string, claimTtlMs: number): Promise<boolean>
+  /** Marks a claimed identity as fully created. */
+  completeTaskCreation?(taskId: string, creationToken: string): Promise<boolean>
+  /** Removes only the pristine identity owned by this creation token. */
+  abortTaskCreation?(taskId: string, creationToken: string): Promise<boolean>
   getTask(taskId: string): Promise<Task | null>
   saveEvent(event: TaskEvent): Promise<void>
   /** Optional series-aware durable write for latest-mode series. */
@@ -357,6 +670,43 @@ export interface LongTermStore {
     data: TaskArchiveRestoreData,
     options?: TaskArchiveImportOptions,
   ): Promise<{ overwritten: boolean }>
+
+  // Durable lifecycle metadata and archive barrier.
+  persistStorageReleaseRequest?(request: StorageReleaseRequest): Promise<boolean>
+  clearStorageReleaseRequest?(request: StorageReleaseRequest): Promise<boolean>
+  listStorageReleaseRequests?(limit: number): Promise<StorageReleaseRequest[]>
+  getTaskStorageMetadata?(taskId: string): Promise<TaskStorageMetadata | null>
+  compareAndSetTaskStorageMetadata?(update: TaskStorageMetadataCas): Promise<boolean>
+  beginArchive?(generation: ArchiveGeneration): Promise<ArchiveGeneration>
+  archiveBatch?(taskId: string, generation: string, batch: ArchiveBatch): Promise<ArchiveBatchReceipt>
+  finalizeArchive?(
+    taskId: string,
+    generation: string,
+    task: Task,
+    seriesLatest: DurableSeriesState[],
+  ): Promise<number>
+  getArchiveWatermark?(taskId: string): Promise<number>
+  getLastEventIndex?(taskId: string): Promise<number>
+  getRecentEvents?(taskId: string, limit: number): Promise<TaskEvent[]>
+  getDurableSeriesState?(taskId: string): Promise<DurableSeriesState[]>
+
+  // Durable execution TTL and terminal projection.
+  claimOverdueTasks?(limit: number, claimTtlMs: number): Promise<TtlClaim[]>
+  terminalizeTtlClaim?(
+    claim: TtlClaim,
+    task: Task,
+    event: TaskEvent,
+    assignment: WorkerAssignment | null,
+  ): Promise<TerminalProjection | null>
+  claimTerminalProjections?(
+    limit: number,
+    claimToken: string,
+    claimTtlMs: number,
+  ): Promise<TerminalProjection[]>
+  completeTerminalProjection?(projection: TerminalProjection): Promise<void>
+  saveDurableAssignment?(assignment: WorkerAssignment): Promise<void>
+  deleteDurableAssignment?(taskId: string, assignmentId?: string): Promise<void>
+
   saveWorkerEvent(event: WorkerAuditEvent): Promise<void>
   getWorkerEvents(workerId: string, opts?: EventQueryOptions): Promise<WorkerAuditEvent[]>
 }

@@ -66,6 +66,124 @@ export interface TaskcastConfig {
       disconnectGraceMs?: number
     }
   }
+  storageLifecycle?: StorageLifecycleConfig
+}
+
+export interface StorageLifecycleConfig {
+  hotRetentionEnabled?: boolean
+  hotRetentionTerminalSeconds?: number
+  hotRetentionIdleSeconds?: number
+  rehydrateReplayEvents?: number
+  storageLockTtlSeconds?: number
+  ttlSweepIntervalSeconds?: number
+  ttlSweepBatchSize?: number
+}
+
+export interface ResolvedStorageLifecycleConfig {
+  hotRetentionEnabled: boolean
+  hotRetentionTerminalSeconds: number
+  hotRetentionIdleSeconds: number
+  rehydrateReplayEvents: number
+  storageLockTtlSeconds: number
+  ttlSweepIntervalSeconds: number
+  ttlSweepBatchSize: number
+}
+
+const STORAGE_LIFECYCLE_DEFAULTS: ResolvedStorageLifecycleConfig = {
+  hotRetentionEnabled: false,
+  hotRetentionTerminalSeconds: 86_400,
+  hotRetentionIdleSeconds: 3_600,
+  rehydrateReplayEvents: 1_000,
+  storageLockTtlSeconds: 30,
+  ttlSweepIntervalSeconds: 5,
+  ttlSweepBatchSize: 100,
+}
+const MAX_STORAGE_LIFECYCLE_SECONDS = Math.floor(Number.MAX_SAFE_INTEGER / 1_000)
+
+export function resolveStorageLifecycleConfig(
+  config: TaskcastConfig,
+  env: Record<string, string | undefined> = process.env,
+): ResolvedStorageLifecycleConfig {
+  const file = config.storageLifecycle ?? {}
+  const positiveInteger = (
+    key: string,
+    envValue: string | undefined,
+    fileValue: number | undefined,
+    fallback: number,
+    maximum = Number.MAX_SAFE_INTEGER,
+  ): number => {
+    const value: unknown = envValue !== undefined ? envValue : fileValue ?? fallback
+    const parsed = typeof value === 'number' ? value : Number(value)
+    if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+      throw new Error(`${key} must be a positive integer`)
+    }
+    if (parsed > maximum) {
+      throw new Error(
+        `${key} must be a positive integer no greater than ${maximum}`,
+      )
+    }
+    return parsed
+  }
+  const retentionEnv = env['TASKCAST_HOT_RETENTION_ENABLED']
+  const fileRetentionEnabled: unknown = file.hotRetentionEnabled
+  if (
+    fileRetentionEnabled !== undefined
+    && typeof fileRetentionEnabled !== 'boolean'
+  ) {
+    throw new Error('storageLifecycle.hotRetentionEnabled must be true or false')
+  }
+  let hotRetentionEnabled = fileRetentionEnabled
+    ?? STORAGE_LIFECYCLE_DEFAULTS.hotRetentionEnabled
+  if (retentionEnv !== undefined) {
+    if (retentionEnv !== 'true' && retentionEnv !== 'false') {
+      throw new Error('TASKCAST_HOT_RETENTION_ENABLED must be true or false')
+    }
+    hotRetentionEnabled = retentionEnv === 'true'
+  }
+
+  return {
+    hotRetentionEnabled,
+    hotRetentionTerminalSeconds: positiveInteger(
+      'TASKCAST_HOT_RETENTION_TERMINAL_SECONDS',
+      env['TASKCAST_HOT_RETENTION_TERMINAL_SECONDS'],
+      file.hotRetentionTerminalSeconds,
+      STORAGE_LIFECYCLE_DEFAULTS.hotRetentionTerminalSeconds,
+      MAX_STORAGE_LIFECYCLE_SECONDS,
+    ),
+    hotRetentionIdleSeconds: positiveInteger(
+      'TASKCAST_HOT_RETENTION_IDLE_SECONDS',
+      env['TASKCAST_HOT_RETENTION_IDLE_SECONDS'],
+      file.hotRetentionIdleSeconds,
+      STORAGE_LIFECYCLE_DEFAULTS.hotRetentionIdleSeconds,
+      MAX_STORAGE_LIFECYCLE_SECONDS,
+    ),
+    rehydrateReplayEvents: positiveInteger(
+      'TASKCAST_REHYDRATE_REPLAY_EVENTS',
+      env['TASKCAST_REHYDRATE_REPLAY_EVENTS'],
+      file.rehydrateReplayEvents,
+      STORAGE_LIFECYCLE_DEFAULTS.rehydrateReplayEvents,
+    ),
+    storageLockTtlSeconds: positiveInteger(
+      'TASKCAST_STORAGE_LOCK_TTL_SECONDS',
+      env['TASKCAST_STORAGE_LOCK_TTL_SECONDS'],
+      file.storageLockTtlSeconds,
+      STORAGE_LIFECYCLE_DEFAULTS.storageLockTtlSeconds,
+      MAX_STORAGE_LIFECYCLE_SECONDS,
+    ),
+    ttlSweepIntervalSeconds: positiveInteger(
+      'TASKCAST_TTL_SWEEP_INTERVAL_SECONDS',
+      env['TASKCAST_TTL_SWEEP_INTERVAL_SECONDS'],
+      file.ttlSweepIntervalSeconds,
+      STORAGE_LIFECYCLE_DEFAULTS.ttlSweepIntervalSeconds,
+      MAX_STORAGE_LIFECYCLE_SECONDS,
+    ),
+    ttlSweepBatchSize: positiveInteger(
+      'TASKCAST_TTL_SWEEP_BATCH_SIZE',
+      env['TASKCAST_TTL_SWEEP_BATCH_SIZE'],
+      file.ttlSweepBatchSize,
+      STORAGE_LIFECYCLE_DEFAULTS.ttlSweepBatchSize,
+    ),
+  }
 }
 
 export function interpolateEnvVars(value: string): string {

@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest'
-import { TaskEngine, MemoryBroadcastProvider, MemoryShortTermStore } from '@taskcast/core'
+import {
+  TaskEngine,
+  MemoryBroadcastProvider,
+  MemoryLongTermStore,
+  MemoryShortTermStore,
+} from '@taskcast/core'
 import { createTaskcastApp, DependencyHealthRegistry } from '../src/index.js'
 
 describe('GET /health/detail', () => {
@@ -77,6 +82,36 @@ describe('GET /health/detail', () => {
     expect(body).toHaveProperty('uptime')
     expect(body).toHaveProperty('auth')
     expect(body).toHaveProperty('adapters')
+    expect(body).toHaveProperty('storage')
+  })
+
+  it('reports writer protocol readiness and incompatible writer IDs', async () => {
+    const shortTermStore = new MemoryShortTermStore()
+    const engine = new TaskEngine({
+      broadcast: new MemoryBroadcastProvider(),
+      shortTermStore,
+      longTermStore: new MemoryLongTermStore(),
+    })
+    await shortTermStore.registerStorageWriter({
+      instanceId: 'legacy-writer',
+      storageProtocolVersion: 1,
+      build: 'old',
+      expiresAt: 0,
+    }, 30_000)
+    const { app, stop } = createTaskcastApp({
+      engine,
+      shortTermStore,
+      auth: { mode: 'none' },
+    })
+
+    const body = await (await app.request('/health/detail')).json()
+    expect(body.storage).toEqual({
+      releaseReady: false,
+      requiredStorageProtocolVersion: 2,
+      activeWriterCount: 2,
+      incompatibleWriterIds: ['legacy-writer'],
+    })
+    stop()
   })
 
   it('uptime is a non-negative number', async () => {

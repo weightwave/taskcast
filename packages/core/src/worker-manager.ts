@@ -249,7 +249,16 @@ export class WorkerManager {
       assignedAt: Date.now(),
       status: 'assigned',
     }
-    await this.shortTermStore.addAssignment(assignment)
+    await this.longTermStore?.saveDurableAssignment?.(assignment)
+    try {
+      await this.shortTermStore.addAssignment(assignment)
+    } catch (error) {
+      await this.longTermStore?.deleteDurableAssignment?.(
+        taskId,
+        durableAssignmentId(assignment),
+      ).catch(() => {})
+      throw error
+    }
 
     // Update worker status (usedSlots already updated by claimTask)
     const worker = await this.shortTermStore.getWorker(workerId)
@@ -270,6 +279,10 @@ export class WorkerManager {
     if (!assignment || assignment.workerId !== workerId) return
 
     // Remove assignment
+    await this.longTermStore?.deleteDurableAssignment?.(
+      taskId,
+      durableAssignmentId(assignment),
+    )
     await this.shortTermStore.removeAssignment(taskId)
 
     // Restore worker capacity
@@ -320,9 +333,16 @@ export class WorkerManager {
 
   async releaseTask(taskId: string): Promise<void> {
     const assignment = await this.shortTermStore.getTaskAssignment(taskId)
-    if (!assignment) return
+    if (!assignment) {
+      await this.longTermStore?.deleteDurableAssignment?.(taskId)
+      return
+    }
 
     // Remove the assignment record
+    await this.longTermStore?.deleteDurableAssignment?.(
+      taskId,
+      durableAssignmentId(assignment),
+    )
     await this.shortTermStore.removeAssignment(taskId)
 
     // Restore worker capacity (but don't change status if offline/draining)
@@ -440,4 +460,8 @@ export class WorkerManager {
     }
     await this.opts.broadcast.publish('taskcast:worker:new-task', event)
   }
+}
+
+function durableAssignmentId(assignment: WorkerAssignment): string {
+  return `${assignment.taskId}:${assignment.workerId}:${assignment.assignedAt}`
 }

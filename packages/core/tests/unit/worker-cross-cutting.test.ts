@@ -249,7 +249,7 @@ describe('TTL + Worker', () => {
     expect(timedOut.completedAt).toBeDefined()
   })
 
-  it('assigned → timeout is NOT a valid transition (state machine rejects it)', async () => {
+  it('assigned → timeout is a valid durable TTL transition', async () => {
     const { engine, manager } = makeSetup()
 
     await registerDefaultWorker(manager, { id: 'W-ttl-assigned' })
@@ -265,12 +265,9 @@ describe('TTL + Worker', () => {
     const assigned = await engine.getTask(task.id)
     expect(assigned?.status).toBe('assigned')
 
-    // The state machine does NOT allow assigned → timeout.
-    // This means if a TTL fires while the task is assigned, the external TTL
-    // handler must either: (a) skip firing, or (b) transition to cancelled instead.
-    await expect(engine.transitionTask(task.id, 'timeout')).rejects.toThrow(
-      /Invalid transition: assigned → timeout/,
-    )
+    const timedOut = await engine.transitionTask(task.id, 'timeout')
+    expect(timedOut.status).toBe('timeout')
+    expect(timedOut.completedAt).toBeDefined()
   })
 
   it('assigned → cancelled is allowed as an alternative to timeout for TTL expiry while assigned', async () => {

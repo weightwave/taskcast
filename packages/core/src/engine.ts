@@ -1,6 +1,16 @@
 import { ulid } from 'ulidx'
 import { canTransition, isTerminal, isSuspended } from './state-machine.js'
 import { processSeries } from './series.js'
+import { StorageCoordinator } from './storage-coordinator.js'
+import {
+  TtlCoordinator,
+  type DurableTtlSweepResult,
+} from './ttl-coordinator.js'
+import {
+  applyCanonicalHistoryQuery,
+  mergeCanonicalHistory,
+  resolveCanonicalSeriesLatest,
+} from './canonical-history.js'
 import { InvalidTaskArchiveError, buildTaskArchiveRestoreData, normalizeTaskArchive } from './archive.js'
 import type {
   Task,
@@ -17,6 +27,18 @@ import type {
   TaskcastHooks,
   EventQueryOptions,
   TaskArchiveEvent,
+  ReleasePreconditions,
+  ReleaseResult,
+  StorageReleaseRequest,
+  StorageWriterRegistration,
+  HotWriteToken,
+  DurableSeriesState,
+} from './types.js'
+import {
+  StorageFenceConflictError,
+  StorageIntegrityError,
+  StoragePreconditionError,
+  StorageReleaseUnsupportedError,
 } from './types.js'
 
 // ─── Error Classes ──────────────────────────────────────────────────────────
@@ -25,6 +47,24 @@ export class TaskConflictError extends Error {
   constructor(taskId: string) {
     super(`Task already exists: ${taskId}`)
     this.name = 'TaskConflictError'
+  }
+}
+
+function canonicalDurableQuery(
+  opts: EventQueryOptions | undefined,
+  hotEvents: readonly TaskEvent[],
+  durableSeries: readonly DurableSeriesState[],
+): EventQueryOptions | undefined {
+  if (!opts) return undefined
+  let since = opts.since
+  if (since?.id) {
+    const anchor = hotEvents.find((event) => event.id === since!.id)
+      ?? durableSeries.find((state) => state.event.id === since!.id)?.event
+    if (anchor) since = { index: anchor.index }
+  }
+  return {
+    ...(since && { since }),
+    ...(opts.limit !== undefined && { limit: opts.limit }),
   }
 }
 
@@ -43,6 +83,8 @@ export class InvalidTransitionError extends Error {
 interface TaskEngineOptionsBase {
   broadcast: BroadcastProvider
   hooks?: TaskcastHooks
+  storageLockTtlMs?: number
+  rehydrateReplayEvents?: number
 }
 
 interface TaskEngineOptionsCanonical extends TaskEngineOptionsBase {
@@ -84,14 +126,31 @@ export interface CreateTaskInput {
 
 export type TransitionListener = (task: Task, from: TaskStatus, to: TaskStatus) => void
 export type CreationListener = (task: Task) => void
+export type StorageLifecycleObservation = Readonly<Record<string, unknown>>
+export type StorageLifecycleListener = (
+  observation: StorageLifecycleObservation,
+) => void
+
+export interface StorageReleaseSweepResult {
+  claimed: number
+  released: number
+  recovered: number
+  stale: number
+  deferred: number
+  failed: number
+}
 
 export class TaskEngine {
+  private static readonly CREATION_CLAIM_TTL_MS = 30_000
   private shortTermStore: ShortTermStore
   private longTermStore: LongTermStore | undefined
   private broadcast: BroadcastProvider
   private hooks: TaskcastHooks | undefined
+  private storageCoordinator: StorageCoordinator | undefined
+  private ttlCoordinator: TtlCoordinator | undefined
   private transitionListeners: TransitionListener[] = []
   private creationListeners: CreationListener[] = []
+  private storageLifecycleListeners = new Set<StorageLifecycleListener>()
   /** Per-task promise chain to serialize `_emit` calls, preventing race
    *  conditions where concurrent publishes store events out of index order. */
   private _emitChains = new Map<string, Promise<void>>()
@@ -111,6 +170,56 @@ export class TaskEngine {
         : undefined
     this.broadcast = opts.broadcast
     if (opts.hooks !== undefined) this.hooks = opts.hooks
+    if (
+      this.longTermStore?.supportsHotColdRelease === true &&
+      this.shortTermStore.supportsHotColdRelease === true
+    ) {
+      this.storageCoordinator = new StorageCoordinator({
+        shortTermStore: this.shortTermStore,
+        longTermStore: this.longTermStore,
+        observe: (observation) => {
+          this.emitStorageLifecycleObservation(observation)
+        },
+        ...(opts.storageLockTtlMs !== undefined && {
+          storageLockTtlMs: opts.storageLockTtlMs,
+        }),
+        ...(opts.rehydrateReplayEvents !== undefined && {
+          rehydrateReplayEvents: opts.rehydrateReplayEvents,
+        }),
+      })
+    }
+    if (
+      this.storageCoordinator &&
+      this.longTermStore?.supportsDurableTtl === true &&
+      typeof this.shortTermStore.projectTerminalFenced === 'function'
+    ) {
+      this.ttlCoordinator = new TtlCoordinator({
+        shortTermStore: this.shortTermStore,
+        longTermStore: this.longTermStore,
+        broadcast: this.broadcast,
+        storageCoordinator: this.storageCoordinator,
+        ...(opts.storageLockTtlMs !== undefined && {
+          storageLockTtlMs: opts.storageLockTtlMs,
+        }),
+        onTimeoutProjected: (task, from) => {
+          this._emitChains.delete(task.id)
+          this.hooks?.onTaskTimeout?.(task)
+          this.hooks?.onTaskTransitioned?.(task, from, 'timeout')
+          for (const listener of this.transitionListeners) {
+            try { listener(task, from, 'timeout') } catch { /* best-effort */ }
+          }
+        },
+      })
+    }
+  }
+
+  addStorageLifecycleListener(
+    listener: StorageLifecycleListener,
+  ): () => void {
+    this.storageLifecycleListeners.add(listener)
+    return () => {
+      this.storageLifecycleListeners.delete(listener)
+    }
   }
 
   async createTask(input: CreateTaskInput): Promise<Task> {
@@ -123,10 +232,17 @@ export class TaskEngine {
 
     const now = Date.now()
     const id = input.id ?? ulid()
+    const durable = this.longTermStore
+    const canFenceCreation =
+      durable?.claimTaskCreation !== undefined &&
+      durable.completeTaskCreation !== undefined &&
+      durable.abortTaskCreation !== undefined
 
-    // Check for duplicate user-supplied IDs
-    if (input.id !== undefined) {
-      const existing = await this.shortTermStore.getTask(id)
+    // Explicit IDs are durable identities, including while their hot state is cold.
+    // A leased creation store must inspect the claim itself so an expired
+    // pristine row left by a crashed creator can be taken over.
+    if (input.id !== undefined && !canFenceCreation) {
+      const existing = await this.getTask(id)
       if (existing) throw new TaskConflictError(id)
     }
 
@@ -147,9 +263,65 @@ export class TaskEngine {
       ...(input.cost !== undefined && { cost: input.cost }),
       ...(input.disconnectPolicy !== undefined && { disconnectPolicy: input.disconnectPolicy }),
     }
-    await this.shortTermStore.saveTask(task)
-    if (this.longTermStore) await this.longTermStore.saveTask(task)
-    if (task.ttl) await this.shortTermStore.setTTL(task.id, task.ttl)
+    let durableIdentityClaimed = false
+    let creationToken: string | null = null
+    if (input.id !== undefined && durable) {
+      if (canFenceCreation) {
+        creationToken = ulid()
+        durableIdentityClaimed = await durable.claimTaskCreation!(
+          task,
+          creationToken,
+          TaskEngine.CREATION_CLAIM_TTL_MS,
+        )
+      } else if (durable.supportsHotColdRelease === true) {
+        throw new StorageReleaseUnsupportedError(
+          'Hot/cold long-term stores must support token-fenced task creation',
+        )
+      } else if (durable.createTaskIfAbsent) {
+        durableIdentityClaimed = await durable.createTaskIfAbsent(task)
+      }
+      if (
+        (canFenceCreation || durable.createTaskIfAbsent !== undefined) &&
+        !durableIdentityClaimed
+      ) {
+        throw new TaskConflictError(id)
+      }
+    }
+    try {
+      await this.shortTermStore.saveTask(task)
+    } catch (error) {
+      if (creationToken !== null) {
+        await durable!.abortTaskCreation!(id, creationToken)
+      }
+      throw error
+    }
+    if (creationToken !== null) {
+      let completed = false
+      let completionError: unknown
+      for (let attempt = 0; attempt < 3 && !completed; attempt++) {
+        try {
+          completed = await durable!.completeTaskCreation!(id, creationToken)
+          completionError = undefined
+        } catch (error) {
+          completionError = error
+        }
+      }
+      if (completionError !== undefined) throw completionError
+      if (!completed) {
+        throw new StorageReleaseUnsupportedError(
+          `Durable creation claim was lost for task ${id}`,
+        )
+      }
+    } else if (durable && !durableIdentityClaimed) {
+      await durable.saveTask(task)
+    }
+    if (task.ttl) {
+      if (this.ttlCoordinator) {
+        await this.shortTermStore.clearTTL(task.id)
+      } else {
+        await this.shortTermStore.setTTL(task.id, task.ttl)
+      }
+    }
     this.hooks?.onTaskCreated?.(task)
     for (const listener of this.creationListeners) {
       try { listener(task) } catch { /* best-effort */ }
@@ -188,7 +360,19 @@ export class TaskEngine {
       ttl?: number
     },
   ): Promise<Task> {
-    const task = await this.getTask(taskId)
+    let expectedRevision: string | null = null
+    let initialWriteToken: HotWriteToken | null = null
+    let task: Task | null
+    if (this.storageCoordinator) {
+      const getSnapshot = this.shortTermStore.getTaskMutationSnapshot
+      if (!getSnapshot) throw new StorageReleaseUnsupportedError()
+      initialWriteToken = await this.storageCoordinator.ensureTaskHotForWrite(taskId)
+      const snapshot = await getSnapshot.call(this.shortTermStore, taskId)
+      task = snapshot?.task ?? null
+      expectedRevision = snapshot?.revision ?? null
+    } else {
+      task = await this.getTask(taskId)
+    }
     if (!task) throw new Error(`Task not found: ${taskId}`)
     if (!canTransition(task.status, to)) {
       throw new InvalidTransitionError(task.status, to)
@@ -227,44 +411,45 @@ export class TaskEngine {
       }
     }
 
-    // ─── TTL manipulation for suspended states ───────────────────────────
-    // → paused: stop TTL clock
-    if (to === 'paused') {
-      await this.shortTermStore.clearTTL(taskId)
-    }
-    // → blocked from paused: restart TTL (clock resumes)
-    if (from === 'paused' && to === 'blocked' && updated.ttl) {
-      await this.shortTermStore.setTTL(taskId, updated.ttl)
-    }
-    // paused → running: reset full TTL
-    if (from === 'paused' && to === 'running' && updated.ttl) {
-      await this.shortTermStore.setTTL(taskId, updated.ttl)
-    }
-    // blocked → paused: stop TTL clock
-    if (from === 'blocked' && to === 'paused') {
-      await this.shortTermStore.clearTTL(taskId)
-    }
-
     // TTL override from payload
     if (payload?.ttl !== undefined) {
       updated.ttl = payload.ttl
-      if (to !== 'paused') {
+    }
+
+    // PostgreSQL owns durable execution deadlines. Redis expiration remains
+    // available only for stores without durable TTL support.
+    if (this.ttlCoordinator) {
+      if (updated.ttl !== undefined) {
+        await this.shortTermStore.clearTTL(taskId)
+      }
+    } else {
+      // → paused: stop TTL clock
+      if (to === 'paused') {
+        await this.shortTermStore.clearTTL(taskId)
+      }
+      // → blocked/running from paused: restart the full TTL
+      if (
+        from === 'paused' &&
+        (to === 'blocked' || to === 'running') &&
+        updated.ttl
+      ) {
+        await this.shortTermStore.setTTL(taskId, updated.ttl)
+      }
+      // TTL override restarts the clock outside paused state
+      if (payload?.ttl !== undefined && to !== 'paused') {
         await this.shortTermStore.setTTL(taskId, payload.ttl)
       }
     }
 
-    await this.shortTermStore.saveTask(updated)
-    if (this.longTermStore) await this.longTermStore.saveTask(updated)
-
-    await this._emit(taskId, {
+    const derivedEvents: PublishEventInput[] = [{
       type: 'taskcast:status',
       level: 'info',
       data: { status: to, result: updated.result, error: updated.error },
-    })
+    }]
 
     // Emit taskcast:blocked when entering blocked with a blockedRequest
     if (to === 'blocked' && updated.blockedRequest) {
-      await this._emit(taskId, {
+      derivedEvents.push({
         type: 'taskcast:blocked',
         level: 'info',
         data: { reason: updated.reason, request: updated.blockedRequest },
@@ -273,11 +458,31 @@ export class TaskEngine {
 
     // Emit taskcast:resolved when leaving blocked to running (if had a blockedRequest)
     if (from === 'blocked' && to === 'running' && task.blockedRequest) {
-      await this._emit(taskId, {
+      derivedEvents.push({
         type: 'taskcast:resolved',
         level: 'info',
         data: { resolution: payload?.result },
       })
+    }
+
+    if (this.storageCoordinator) {
+      const committed = await this.commitTaskEventsForMutation(
+        updated,
+        expectedRevision!,
+        from,
+        derivedEvents,
+        initialWriteToken!,
+      )
+      if (this.longTermStore) await this.longTermStore.saveTask(updated)
+      for (const event of committed) {
+        await this.finishCommittedEvent(event)
+      }
+    } else {
+      await this.shortTermStore.saveTask(updated)
+      if (this.longTermStore) await this.longTermStore.saveTask(updated)
+      for (const event of derivedEvents) {
+        await this._emit(taskId, event, true)
+      }
     }
 
     // Clean up per-task emit chain — no more events can be published
@@ -311,6 +516,189 @@ export class TaskEngine {
     }
 
     return this._emit(taskId, input)
+  }
+
+  async releaseTaskStorage(
+    taskId: string,
+    preconditions: ReleasePreconditions,
+  ): Promise<ReleaseResult> {
+    if (!this.storageCoordinator) throw new StorageReleaseUnsupportedError()
+    if (
+      !Number.isSafeInteger(preconditions.expectedLastEventIndex) ||
+      preconditions.expectedLastEventIndex < -1 ||
+      !Number.isSafeInteger(preconditions.inactiveSince) ||
+      preconditions.inactiveSince < 0
+    ) {
+      throw new StoragePreconditionError('Storage release preconditions are invalid')
+    }
+    const durable = this.longTermStore
+    if (!durable?.persistStorageReleaseRequest || !durable.clearStorageReleaseRequest) {
+      throw new StorageReleaseUnsupportedError(
+        'Long-term store cannot persist storage release requests',
+      )
+    }
+    const request: StorageReleaseRequest = {
+      taskId,
+      requestedAt: Date.now(),
+      expectedLastEventIndex: preconditions.expectedLastEventIndex,
+      inactiveSince: preconditions.inactiveSince,
+    }
+    const persisted = await durable.persistStorageReleaseRequest(request)
+    if (!persisted) throw new Error(`Task not found: ${taskId}`)
+    try {
+      const result = await this.storageCoordinator.releaseTaskStorage(taskId, preconditions)
+      await durable.clearStorageReleaseRequest(request)
+      return result
+    } catch (error) {
+      if (error instanceof StoragePreconditionError) {
+        await durable.clearStorageReleaseRequest(request)
+      }
+      throw error
+    }
+  }
+
+  async releaseTaskStorageAtCurrentDurableIndex(
+    taskId: string,
+    inactiveSince: number,
+  ): Promise<ReleaseResult> {
+    const durable = this.longTermStore
+    if (!durable?.getLastEventIndex) {
+      throw new StorageReleaseUnsupportedError(
+        'Long-term store cannot read the durable event watermark',
+      )
+    }
+    const expectedLastEventIndex = await durable.getLastEventIndex(taskId)
+    return this.releaseTaskStorage(taskId, {
+      expectedLastEventIndex,
+      inactiveSince,
+    })
+  }
+
+  async retryStorageReleaseRequests(
+    limit: number,
+    inactiveBefore = Number.MAX_SAFE_INTEGER,
+  ): Promise<StorageReleaseSweepResult> {
+    if (
+      !Number.isSafeInteger(limit) ||
+      limit <= 0 ||
+      !Number.isSafeInteger(inactiveBefore) ||
+      inactiveBefore < 0
+    ) {
+      throw new StoragePreconditionError('Storage release sweep bounds are invalid')
+    }
+    const coordinator = this.storageCoordinator
+    const durable = this.longTermStore
+    if (!coordinator || !durable?.listStorageReleaseRequests) {
+      throw new StorageReleaseUnsupportedError(
+        'Long-term store cannot list storage release requests',
+      )
+    }
+    if (!durable.clearStorageReleaseRequest) {
+      throw new StorageReleaseUnsupportedError(
+        'Long-term store cannot clear storage release requests',
+      )
+    }
+    const requests = await durable.listStorageReleaseRequests(limit)
+    const result: StorageReleaseSweepResult = {
+      claimed: requests.length,
+      released: 0,
+      recovered: 0,
+      stale: 0,
+      deferred: 0,
+      failed: 0,
+    }
+    for (const request of requests) {
+      if (request.inactiveSince > inactiveBefore) {
+        result.deferred += 1
+        continue
+      }
+      try {
+        const recovery = await coordinator.recoverTaskStorage(request.taskId)
+        if (recovery.storageState === 'cold') {
+          await durable.clearStorageReleaseRequest(request)
+          result.recovered += 1
+          continue
+        }
+        await coordinator.releaseTaskStorage(request.taskId, {
+          expectedLastEventIndex: request.expectedLastEventIndex,
+          inactiveSince: request.inactiveSince,
+        })
+        await durable.clearStorageReleaseRequest(request)
+        result.released += 1
+      } catch (error) {
+        if (error instanceof StoragePreconditionError) {
+          await durable.clearStorageReleaseRequest(request)
+          result.stale += 1
+        } else {
+          result.failed += 1
+        }
+      }
+    }
+    return result
+  }
+
+  async registerStorageWriter(
+    registration: StorageWriterRegistration,
+    ttlMs: number,
+  ): Promise<void> {
+    if (
+      this.shortTermStore.supportsHotColdRelease !== true ||
+      !this.shortTermStore.registerStorageWriter
+    ) {
+      throw new StorageReleaseUnsupportedError(
+        'Short-term store cannot register storage writers',
+      )
+    }
+    await this.shortTermStore.registerStorageWriter(registration, ttlMs)
+  }
+
+  async listStorageWriters(): Promise<StorageWriterRegistration[]> {
+    if (
+      this.shortTermStore.supportsHotColdRelease !== true ||
+      !this.shortTermStore.listStorageWriters
+    ) {
+      throw new StorageReleaseUnsupportedError(
+        'Short-term store cannot list storage writers',
+      )
+    }
+    return this.shortTermStore.listStorageWriters()
+  }
+
+  supportsStorageRelease(): boolean {
+    return this.storageCoordinator !== undefined
+  }
+
+  supportsDurableTtl(): boolean {
+    return this.ttlCoordinator !== undefined
+  }
+
+  async sweepDurableTtl(
+    limit: number,
+    claimTtlMs?: number,
+  ): Promise<DurableTtlSweepResult> {
+    if (!this.ttlCoordinator) {
+      throw new StorageReleaseUnsupportedError(
+        'Durable execution TTL is not supported by the configured stores',
+      )
+    }
+    return this.ttlCoordinator.sweepOverdue(limit, claimTtlMs)
+  }
+
+  async sweepTerminalProjections(
+    limit: number,
+    claimTtlMs?: number,
+  ): Promise<DurableTtlSweepResult> {
+    if (!this.ttlCoordinator) {
+      throw new StorageReleaseUnsupportedError(
+        'Durable terminal projection is not supported by the configured stores',
+      )
+    }
+    return this.ttlCoordinator.sweepTerminalProjections(limit, claimTtlMs)
+  }
+
+  async recoverTaskStorage(taskId: string): Promise<ReleaseResult> {
+    if (!this.storageCoordinator) throw new StorageReleaseUnsupportedError()
+    return this.storageCoordinator.recoverTaskStorage(taskId)
   }
 
   async exportTaskArchive(taskId: string): Promise<TaskArchive> {
@@ -523,12 +911,75 @@ export class TaskEngine {
   }
 
   async getEvents(taskId: string, opts?: EventQueryOptions): Promise<TaskEvent[]> {
-    const fromShort = await this.shortTermStore.getEvents(taskId, opts)
-    if (fromShort.length > 0) return fromShort
-    if (this.longTermStore) {
-      return this.longTermStore.getEvents(taskId, opts)
+    if (!this.longTermStore) {
+      return this.shortTermStore.getEvents(taskId, opts)
     }
-    return []
+    const startedAt = Date.now()
+    const succeed = (
+      events: TaskEvent[],
+      source: 'hot' | 'durable' | 'durable+hot',
+      hotEventCount: number,
+      durableEventCount: number,
+    ): TaskEvent[] => {
+      this.emitStorageLifecycleObservation({
+        event: 'storage_history_read',
+        taskId,
+        outcome: 'success',
+        source,
+        durationMs: Math.max(0, Date.now() - startedAt),
+        eventCount: events.length,
+        hotEventCount,
+        durableEventCount,
+      })
+      return events
+    }
+    try {
+      if (this.longTermStore.supportsHotColdRelease !== true) {
+        const fromShort = await this.shortTermStore.getEvents(taskId, opts)
+        if (fromShort.length > 0) {
+          return succeed(fromShort, 'hot', fromShort.length, 0)
+        }
+        const fromDurable = await this.longTermStore.getEvents(taskId, opts)
+        return succeed(fromDurable, 'durable', 0, fromDurable.length)
+      }
+
+      const overlayHot = await this.shouldOverlayHotHistory(taskId)
+      const hotEvents = overlayHot
+        ? await this.shortTermStore.getEvents(taskId)
+        : []
+      const getDurableSeriesState = this.longTermStore.getDurableSeriesState
+      if (!getDurableSeriesState) throw new StorageReleaseUnsupportedError()
+      const durableSeries = await getDurableSeriesState.call(
+        this.longTermStore,
+        taskId,
+      )
+      const durableEvents = await this.loadCanonicalDurableEvents(
+        taskId,
+        opts,
+        hotEvents,
+        durableSeries,
+      )
+      const events = applyCanonicalHistoryQuery(
+        mergeCanonicalHistory(durableEvents, hotEvents, durableSeries),
+        opts,
+      )
+      return succeed(
+        events,
+        overlayHot ? 'durable+hot' : 'durable',
+        hotEvents.length,
+        durableEvents.length,
+      )
+    } catch (error) {
+      this.emitStorageLifecycleObservation({
+        event: 'storage_history_read',
+        taskId,
+        outcome: 'failed',
+        durationMs: Math.max(0, Date.now() - startedAt),
+        errorCode: this.storageErrorCode(error),
+        error: error instanceof Error ? error.message : String(error),
+      })
+      throw error
+    }
   }
 
   subscribe(taskId: string, handler: (event: TaskEvent) => void): () => void {
@@ -536,10 +987,86 @@ export class TaskEngine {
   }
 
   async getSeriesLatest(taskId: string, seriesId: string): Promise<TaskEvent | null> {
-    return this.shortTermStore.getSeriesLatest(taskId, seriesId)
+    if (
+      !this.longTermStore ||
+      this.longTermStore.supportsHotColdRelease !== true
+    ) {
+      return this.shortTermStore.getSeriesLatest(taskId, seriesId)
+    }
+    const getDurableSeriesState = this.longTermStore.getDurableSeriesState
+    if (!getDurableSeriesState) throw new StorageReleaseUnsupportedError()
+    const durable = (await getDurableSeriesState.call(this.longTermStore, taskId))
+      .find((state) => state.seriesId === seriesId)
+    if (!durable) return this.shortTermStore.getSeriesLatest(taskId, seriesId)
+    if (!(await this.shouldOverlayHotHistory(taskId))) return durable.event
+    const hotEvents = await this.shortTermStore.getEvents(taskId)
+    return resolveCanonicalSeriesLatest(durable, hotEvents)
   }
 
-  private async _emit(taskId: string, input: PublishEventInput): Promise<TaskEvent> {
+  private async shouldOverlayHotHistory(taskId: string): Promise<boolean> {
+    if (this.longTermStore?.supportsHotColdRelease !== true) return true
+    const getMetadata = this.longTermStore.getTaskStorageMetadata
+    if (!getMetadata) throw new StorageReleaseUnsupportedError()
+    const metadata = await getMetadata.call(this.longTermStore, taskId)
+    if (metadata?.storageState === 'cold') return false
+    return true
+  }
+
+  private async loadCanonicalDurableEvents(
+    taskId: string,
+    opts: EventQueryOptions | undefined,
+    hotEvents: readonly TaskEvent[],
+    durableSeries: readonly DurableSeriesState[],
+  ): Promise<TaskEvent[]> {
+    if (!this.longTermStore) return []
+    const requestedLimit = opts?.limit
+    if (requestedLimit === undefined) {
+      return this.longTermStore.getEvents(
+        taskId,
+        canonicalDurableQuery(opts, hotEvents, durableSeries),
+      )
+    }
+    if (requestedLimit <= 0) return []
+
+    const pageSize = Math.min(requestedLimit, 1_000)
+    const loaded: TaskEvent[] = []
+    let query = canonicalDurableQuery(
+      { ...opts, limit: pageSize },
+      hotEvents,
+      durableSeries,
+    )
+    let previousBoundary = -1
+    for (;;) {
+      const page = await this.longTermStore.getEvents(taskId, query)
+      loaded.push(...page)
+      const assembled = applyCanonicalHistoryQuery(
+        mergeCanonicalHistory(loaded, hotEvents, durableSeries),
+        opts,
+      )
+      if (page.length < pageSize) return loaded
+
+      const boundary = page.at(-1)!.index
+      if (boundary <= previousBoundary) {
+        throw new StorageIntegrityError(
+          'Durable history pagination did not advance',
+        )
+      }
+      if (
+        assembled.length >= requestedLimit &&
+        assembled[requestedLimit - 1]!.index <= boundary
+      ) {
+        return loaded
+      }
+      previousBoundary = boundary
+      query = { since: { index: boundary }, limit: pageSize }
+    }
+  }
+
+  private async _emit(
+    taskId: string,
+    input: PublishEventInput,
+    allowTerminal = false,
+  ): Promise<TaskEvent> {
     // Serialize emit calls per task to prevent race conditions where
     // concurrent publishes store events in a different order than
     // their atomically-assigned indices.
@@ -550,13 +1077,90 @@ export class TaskEngine {
 
     await prev
     try {
+      if (!allowTerminal) {
+        const current = await this.getTask(taskId)
+        if (!current) throw new Error(`Task not found: ${taskId}`)
+        if (isTerminal(current.status)) {
+          throw new Error(
+            `Cannot publish to task in terminal status: ${current.status}`,
+          )
+        }
+      }
       return await this._emitInner(taskId, input)
     } finally {
       release()
     }
   }
 
+  private emitStorageLifecycleObservation(
+    observation: StorageLifecycleObservation,
+  ): void {
+    for (const listener of this.storageLifecycleListeners) {
+      try {
+        listener(observation)
+      } catch {
+        // Observability must never affect task correctness.
+      }
+    }
+  }
+
+  private storageErrorCode(error: unknown): string {
+    if (
+      error &&
+      typeof error === 'object' &&
+      'code' in error &&
+      typeof error.code === 'string'
+    ) {
+      return error.code
+    }
+    return 'storage_unavailable'
+  }
+
   private async _emitInner(taskId: string, input: PublishEventInput): Promise<TaskEvent> {
+    if (this.storageCoordinator) {
+      const raw: Omit<TaskEvent, 'index'> = {
+        id: ulid(),
+        taskId,
+        timestamp: Date.now(),
+        type: input.type,
+        level: input.level,
+        data: input.data,
+        ...(input.seriesId !== undefined && { seriesId: input.seriesId }),
+        ...(input.seriesMode !== undefined && { seriesMode: input.seriesMode }),
+        ...(input.seriesAccField !== undefined && {
+          seriesAccField: input.seriesAccField,
+        }),
+      }
+      let initialStorageEpoch: number | null = null
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const token = await this.storageCoordinator.ensureTaskHotForWrite(
+          taskId,
+          attempt === 0,
+        )
+        if (initialStorageEpoch === null) {
+          initialStorageEpoch = token.storageEpoch
+        } else if (token.storageEpoch !== initialStorageEpoch) {
+          throw new StorageFenceConflictError(
+            'Task storage epoch changed after the write mutation started',
+          )
+        }
+        try {
+          const result = await this.shortTermStore.commitEventFenced!(
+            taskId,
+            raw,
+            token,
+          )
+          await this.finishCommittedEvent(result.event, result.accumulatedEvent)
+          return result.event
+        } catch (error) {
+          if (!(error instanceof StorageFenceConflictError) || attempt === 2) {
+            throw error
+          }
+        }
+      }
+      throw new StorageFenceConflictError()
+    }
+
     const index = await this.shortTermStore.nextIndex(taskId)
     const raw: TaskEvent = {
       id: ulid(),
@@ -576,11 +1180,79 @@ export class TaskEngine {
       await this.shortTermStore.appendEvent(taskId, event)
     }
 
-    // Attach accumulated data to broadcast for SSE accumulated subscribers
+    await this.finishCommittedEvent(event, accumulatedEvent)
+
+    return event
+  }
+
+  private async commitTaskEventsForMutation(
+    task: Task,
+    expectedRevision: string,
+    expectedStatus: TaskStatus,
+    inputs: PublishEventInput[],
+    initialToken: HotWriteToken,
+  ): Promise<TaskEvent[]> {
+    const coordinator = this.storageCoordinator
+    const commit = this.shortTermStore.commitTaskEventsFenced
+    if (!coordinator || !commit) throw new StorageReleaseUnsupportedError()
+
+    const previous = this._emitChains.get(task.id) ?? Promise.resolve()
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    this._emitChains.set(task.id, gate)
+    await previous
+    try {
+      const events = inputs.map((input): Omit<TaskEvent, 'index'> => ({
+        id: ulid(),
+        taskId: task.id,
+        timestamp: Date.now(),
+        type: input.type,
+        level: input.level,
+        data: input.data,
+      }))
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const token = attempt === 0
+          ? initialToken
+          : await coordinator.ensureTaskHotForWrite(task.id, false)
+        if (token.storageEpoch !== initialToken.storageEpoch) {
+          throw new StorageFenceConflictError(
+            'Task storage epoch changed after the write mutation started',
+          )
+        }
+        try {
+          const committed = await commit.call(
+            this.shortTermStore,
+            task,
+            expectedRevision,
+            events,
+            token,
+          )
+          if (committed !== null) return committed
+          const current = await this.getTask(task.id)
+          throw new InvalidTransitionError(
+            current?.status ?? expectedStatus,
+            task.status,
+          )
+        } catch (error) {
+          if (!(error instanceof StorageFenceConflictError) || attempt === 2) {
+            throw error
+          }
+        }
+      }
+      throw new StorageFenceConflictError()
+    } finally {
+      release()
+    }
+  }
+
+  private async finishCommittedEvent(
+    event: TaskEvent,
+    accumulatedEvent?: TaskEvent,
+  ): Promise<void> {
     const broadcastEvent = accumulatedEvent
       ? { ...event, _accumulatedData: accumulatedEvent.data }
       : event
-    await this.broadcast.publish(taskId, broadcastEvent)
+    await this.broadcast.publish(event.taskId, broadcastEvent)
 
     if (this.longTermStore) {
       const storeEvent = accumulatedEvent ?? event
@@ -588,8 +1260,6 @@ export class TaskEngine {
         this.hooks?.onEventDropped?.(storeEvent, String(err))
       })
     }
-
-    return event
   }
 
   private async persistLongTermEvent(event: TaskEvent, accumulatedEvent?: TaskEvent): Promise<void> {

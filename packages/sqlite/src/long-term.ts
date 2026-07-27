@@ -13,6 +13,8 @@ import { rowToTask, rowToEvent, rowToWorkerEvent } from './row-mappers.js'
 // ─── SqliteLongTermStore ──────────────────────────────────────────────────
 
 export class SqliteLongTermStore implements LongTermStore {
+  readonly supportsHotColdRelease = false
+
   constructor(
     private db: Database.Database,
     public readonly sharesTaskArchiveRestoreStorage = false,

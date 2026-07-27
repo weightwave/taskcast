@@ -8,15 +8,23 @@ use crate::archive::{
     build_task_archive_restore_data, sanitize_task_archive_event, validate_task_archive,
     ArchiveError, TASK_ARCHIVE_SCHEMA, TASK_ARCHIVE_VERSION,
 };
+use crate::canonical_history::{
+    apply_canonical_history_query, merge_canonical_history, resolve_canonical_series_latest,
+};
 use crate::series::process_series;
+use crate::storage_coordinator::{StorageCoordinator, StorageLifecycleObserver};
+use crate::ttl_coordinator::{DurableTtlSweepResult, TtlCoordinator};
 use serde::{Deserialize, Serialize};
 
 use crate::state_machine::{can_transition, is_suspended, is_terminal};
 use crate::types::{
     AssignMode, BlockedRequest, BroadcastProvider, CleanupConfig, DisconnectPolicy,
-    EventQueryOptions, Level, LongTermStore, SeriesMode, ShortTermStore, Task, TaskArchive,
-    TaskArchiveImportOptions, TaskArchiveImportResult, TaskAuthConfig, TaskError, TaskEvent,
-    TaskFilter, TaskStatus, TaskcastHooks, WebhookConfig,
+    DurableSeriesState, EventQueryOptions, HotWriteToken, Level, LongTermStore,
+    ReleasePreconditions, ReleaseResult, SeriesMode, ShortTermStore, SinceCursor, StorageBusyError,
+    StorageFenceConflictError, StorageIntegrityError, StoragePreconditionError,
+    StorageReleaseRequest, StorageReleaseUnsupportedError, StorageWriterRegistration, Task,
+    TaskArchive, TaskArchiveImportOptions, TaskArchiveImportResult, TaskAuthConfig, TaskError,
+    TaskEvent, TaskFilter, TaskStatus, TaskcastHooks, WebhookConfig,
 };
 
 // ─── Error ───────────────────────────────────────────────────────────────────
@@ -101,29 +109,131 @@ pub type TransitionListener = Box<dyn Fn(&Task, &TaskStatus, &TaskStatus) + Send
 /// Callback signature for creation listeners.
 /// Receives the newly created task.
 pub type CreationListener = Arc<dyn Fn(&Task) + Send + Sync>;
+pub type StorageLifecycleListener = StorageLifecycleObserver;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct StorageReleaseSweepResult {
+    pub claimed: u64,
+    pub released: u64,
+    pub recovered: u64,
+    pub stale: u64,
+    pub deferred: u64,
+    pub failed: u64,
+}
+
+struct ObservedHistory {
+    events: Vec<TaskEvent>,
+    source: &'static str,
+    hot_event_count: usize,
+    durable_event_count: usize,
+}
 
 pub struct TaskEngine {
     short_term_store: Arc<dyn ShortTermStore>,
     broadcast: Arc<dyn BroadcastProvider>,
     long_term_store: Option<Arc<dyn LongTermStore>>,
+    storage_coordinator: Option<StorageCoordinator>,
+    ttl_coordinator: Option<TtlCoordinator>,
     hooks: Option<Arc<dyn TaskcastHooks>>,
-    transition_listeners: Mutex<Vec<TransitionListener>>,
+    transition_listeners: Arc<Mutex<Vec<TransitionListener>>>,
     creation_listeners: Mutex<Vec<CreationListener>>,
+    storage_lifecycle_listeners: Arc<Mutex<Vec<StorageLifecycleListener>>>,
     /// Per-task mutex to serialize `emit` calls, ensuring events are stored
     /// in the same order as their atomically-assigned indices.
-    emit_locks: Mutex<HashMap<String, Arc<TokioMutex<()>>>>,
+    emit_locks: Arc<Mutex<HashMap<String, Arc<TokioMutex<()>>>>>,
 }
 
 impl TaskEngine {
+    const CREATION_CLAIM_TTL_MS: u64 = 30_000;
+
     pub fn new(opts: TaskEngineOptions) -> Self {
+        Self::new_with_storage_lifecycle(opts, 30_000, 1_000)
+    }
+
+    pub fn new_with_storage_lifecycle(
+        opts: TaskEngineOptions,
+        storage_lock_ttl_ms: u64,
+        rehydrate_replay_events: u64,
+    ) -> Self {
+        assert!(storage_lock_ttl_ms > 0, "storage lock TTL must be positive");
+        assert!(
+            rehydrate_replay_events > 0,
+            "rehydrate replay event count must be positive"
+        );
+        let transition_listeners: Arc<Mutex<Vec<TransitionListener>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let emit_locks: Arc<Mutex<HashMap<String, Arc<TokioMutex<()>>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let storage_lifecycle_listeners: Arc<Mutex<Vec<StorageLifecycleListener>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let coordinator_listeners = Arc::clone(&storage_lifecycle_listeners);
+        let storage_coordinator = opts.long_term_store.as_ref().and_then(|long_term_store| {
+            if opts.short_term_store.supports_hot_cold_release()
+                && long_term_store.supports_hot_cold_release()
+            {
+                Some(
+                    StorageCoordinator::new(
+                        Arc::clone(&opts.short_term_store),
+                        Arc::clone(long_term_store),
+                    )
+                    .with_storage_lock_ttl_ms(storage_lock_ttl_ms)
+                    .with_rehydrate_replay_events(rehydrate_replay_events)
+                    .with_observer(Arc::new(move |observation| {
+                        let listeners = coordinator_listeners.lock().unwrap();
+                        for listener in listeners.iter() {
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                listener(observation)
+                            }));
+                        }
+                    })),
+                )
+            } else {
+                None
+            }
+        });
+        let ttl_coordinator = opts.long_term_store.as_ref().and_then(|long_term_store| {
+            if opts.short_term_store.supports_hot_cold_release()
+                && long_term_store.supports_durable_ttl()
+            {
+                let hooks = opts.hooks.clone();
+                let ttl_transition_listeners = Arc::clone(&transition_listeners);
+                let ttl_emit_locks = Arc::clone(&emit_locks);
+                TtlCoordinator::new(
+                    Arc::clone(&opts.short_term_store),
+                    Arc::clone(long_term_store),
+                    Arc::clone(&opts.broadcast),
+                )
+                .map(|coordinator| {
+                    coordinator
+                        .with_storage_lock_ttl_ms(storage_lock_ttl_ms)
+                        .with_on_timeout_projected(Arc::new(move |task, from| {
+                            ttl_emit_locks.lock().unwrap().remove(&task.id);
+                            if let Some(hooks) = &hooks {
+                                hooks.on_task_timeout(task);
+                                hooks.on_task_transitioned(task, from, &task.status);
+                            }
+                            let listeners = ttl_transition_listeners.lock().unwrap();
+                            for listener in listeners.iter() {
+                                listener(task, from, &task.status);
+                            }
+                        }))
+                })
+                .ok()
+            } else {
+                None
+            }
+        });
         Self {
             short_term_store: opts.short_term_store,
             broadcast: opts.broadcast,
             long_term_store: opts.long_term_store,
+            storage_coordinator,
+            ttl_coordinator,
             hooks: opts.hooks,
-            transition_listeners: Mutex::new(Vec::new()),
+            transition_listeners,
             creation_listeners: Mutex::new(Vec::new()),
-            emit_locks: Mutex::new(HashMap::new()),
+            storage_lifecycle_listeners,
+            emit_locks,
         }
     }
 
@@ -137,6 +247,13 @@ impl TaskEngine {
     /// Returns the listener Arc so it can be passed to `remove_creation_listener`.
     pub fn add_creation_listener(&self, listener: CreationListener) {
         self.creation_listeners.lock().unwrap().push(listener);
+    }
+
+    pub fn add_storage_lifecycle_listener(&self, listener: StorageLifecycleListener) {
+        self.storage_lifecycle_listeners
+            .lock()
+            .unwrap()
+            .push(listener);
     }
 
     /// Remove a previously registered creation listener by Arc identity.
@@ -158,26 +275,17 @@ impl TaskEngine {
             .id
             .clone()
             .unwrap_or_else(|| ulid::Ulid::new().to_string());
+        let can_fence_creation = self
+            .long_term_store
+            .as_ref()
+            .is_some_and(|store| store.supports_task_creation_claims());
 
-        // Check for duplicate user-supplied IDs
-        if input.id.is_some() {
-            let existing = self.short_term_store.get_task(&id).await?;
-            if existing.is_some() {
-                return Err(EngineError::TaskConflict(id));
-            }
-        }
-
-        let now = now_millis();
-        let id = input
-            .id
-            .clone()
-            .unwrap_or_else(|| ulid::Ulid::new().to_string());
-
-        // Check for duplicate explicit ID
-        if input.id.is_some() && self.short_term_store.get_task(&id).await?.is_some() {
+        // Explicit IDs are durable identities, including while hot state is cold.
+        if input.id.is_some() && !can_fence_creation && self.get_task(&id).await?.is_some() {
             return Err(EngineError::TaskConflict(id));
         }
 
+        let now = now_millis();
         let task = Task {
             id,
             status: TaskStatus::Pending,
@@ -203,14 +311,83 @@ impl TaskEngine {
             blocked_request: None,
         };
 
-        self.short_term_store.save_task(task.clone()).await?;
+        let mut durable_identity_claimed = false;
+        let mut creation_token = None;
+        if input.id.is_some() {
+            if let Some(ref long_term_store) = self.long_term_store {
+                if long_term_store.supports_task_creation_claims() {
+                    let token = ulid::Ulid::new().to_string();
+                    durable_identity_claimed = long_term_store
+                        .claim_task_creation(task.clone(), &token, Self::CREATION_CLAIM_TTL_MS)
+                        .await?;
+                    creation_token = Some(token);
+                } else if long_term_store.supports_hot_cold_release() {
+                    return Err(EngineError::Store(Box::new(
+                        StorageReleaseUnsupportedError::new(
+                            "Hot/cold long-term stores must support token-fenced task creation",
+                        ),
+                    )));
+                } else {
+                    durable_identity_claimed =
+                        long_term_store.create_task_if_absent(task.clone()).await?;
+                }
+                if !durable_identity_claimed {
+                    return Err(EngineError::TaskConflict(task.id.clone()));
+                }
+            }
+        }
+        if let Err(error) = self.short_term_store.save_task(task.clone()).await {
+            if let (Some(long_term_store), Some(token)) =
+                (self.long_term_store.as_ref(), creation_token.as_ref())
+            {
+                long_term_store.abort_task_creation(&task.id, token).await?;
+            }
+            return Err(EngineError::Store(error));
+        }
 
-        if let Some(ref long_term_store) = self.long_term_store {
-            long_term_store.save_task(task.clone()).await?;
+        if let (Some(long_term_store), Some(token)) =
+            (self.long_term_store.as_ref(), creation_token.as_ref())
+        {
+            let mut completed = false;
+            let mut completion_error = None;
+            for _ in 0..3 {
+                match long_term_store
+                    .complete_task_creation(&task.id, token)
+                    .await
+                {
+                    Ok(value) => {
+                        completed = value;
+                        completion_error = None;
+                        if completed {
+                            break;
+                        }
+                    }
+                    Err(error) => completion_error = Some(error),
+                }
+            }
+            if let Some(error) = completion_error {
+                return Err(EngineError::Store(error));
+            }
+            if !completed {
+                return Err(EngineError::Store(Box::new(
+                    StorageReleaseUnsupportedError::new(format!(
+                        "Durable creation claim was lost for task {}",
+                        task.id
+                    )),
+                )));
+            }
+        } else if !durable_identity_claimed {
+            if let Some(ref long_term_store) = self.long_term_store {
+                long_term_store.save_task(task.clone()).await?;
+            }
         }
 
         if let Some(ttl) = task.ttl {
-            self.short_term_store.set_ttl(&task.id, ttl).await?;
+            if self.ttl_coordinator.is_some() {
+                self.short_term_store.clear_ttl(&task.id).await?;
+            } else {
+                self.short_term_store.set_ttl(&task.id, ttl).await?;
+            }
         }
 
         if let Some(ref hooks) = self.hooks {
@@ -255,10 +432,24 @@ impl TaskEngine {
         to: TaskStatus,
         payload: Option<TransitionPayload>,
     ) -> Result<Task, EngineError> {
-        let task = self
-            .get_task(task_id)
-            .await?
-            .ok_or_else(|| EngineError::TaskNotFound(task_id.to_string()))?;
+        let (task, expected_revision, initial_write_token) =
+            if let Some(coordinator) = &self.storage_coordinator {
+                let token = coordinator.ensure_task_hot_for_write(task_id).await?;
+                let snapshot = self
+                    .short_term_store
+                    .get_task_mutation_snapshot(task_id)
+                    .await?
+                    .ok_or_else(|| EngineError::TaskNotFound(task_id.to_string()))?;
+                (snapshot.task, Some(snapshot.revision), Some(token))
+            } else {
+                (
+                    self.get_task(task_id)
+                        .await?
+                        .ok_or_else(|| EngineError::TaskNotFound(task_id.to_string()))?,
+                    None,
+                    None,
+                )
+            };
 
         let from = task.status.clone();
 
@@ -317,60 +508,56 @@ impl TaskEngine {
             }
         }
 
-        // ─── TTL manipulation for suspended states ───────────────────────────
-        // → paused: stop TTL clock
-        if to == TaskStatus::Paused {
-            self.short_term_store.clear_ttl(task_id).await?;
-        }
-        // paused → blocked: restart TTL
-        if from == TaskStatus::Paused && to == TaskStatus::Blocked {
-            if let Some(ttl) = updated.ttl {
-                self.short_term_store.set_ttl(task_id, ttl).await?;
-            }
-        }
-        // paused → running: reset full TTL
-        if from == TaskStatus::Paused && to == TaskStatus::Running {
-            if let Some(ttl) = updated.ttl {
-                self.short_term_store.set_ttl(task_id, ttl).await?;
-            }
-        }
-        // blocked → paused: stop TTL clock
-        if from == TaskStatus::Blocked && to == TaskStatus::Paused {
-            self.short_term_store.clear_ttl(task_id).await?;
-        }
-
         // TTL override from payload
         if let Some(ref payload) = payload {
             if let Some(ttl) = payload.ttl {
                 updated.ttl = Some(ttl);
+            }
+        }
+
+        // PostgreSQL owns durable execution deadlines. Redis expiration remains
+        // available only for stores without durable TTL support.
+        if self.ttl_coordinator.is_some() {
+            if updated.ttl.is_some() {
+                self.short_term_store.clear_ttl(task_id).await?;
+            }
+        } else {
+            // → paused: stop TTL clock
+            if to == TaskStatus::Paused {
+                self.short_term_store.clear_ttl(task_id).await?;
+            }
+            // → blocked/running from paused: restart the full TTL
+            if from == TaskStatus::Paused
+                && (to == TaskStatus::Blocked || to == TaskStatus::Running)
+            {
+                if let Some(ttl) = updated.ttl {
+                    self.short_term_store.set_ttl(task_id, ttl).await?;
+                }
+            }
+            // TTL override restarts the clock outside paused state
+            if let Some(ttl) = payload.as_ref().and_then(|payload| payload.ttl) {
                 if to != TaskStatus::Paused {
                     self.short_term_store.set_ttl(task_id, ttl).await?;
                 }
             }
         }
 
-        self.short_term_store.save_task(updated.clone()).await?;
-
-        if let Some(ref long_term_store) = self.long_term_store {
-            long_term_store.save_task(updated.clone()).await?;
+        let mut status_data = serde_json::Map::new();
+        status_data.insert("status".to_string(), serde_json::json!(to));
+        if let Some(ref result) = updated.result {
+            status_data.insert("result".to_string(), serde_json::json!(result));
         }
-
-        self.emit(
-            task_id,
-            PublishEventInput {
-                r#type: "taskcast:status".to_string(),
-                level: Level::Info,
-                data: serde_json::json!({
-                    "status": to,
-                    "result": updated.result,
-                    "error": updated.error,
-                }),
-                series_id: None,
-                series_mode: None,
-                series_acc_field: None,
-            },
-        )
-        .await?;
+        if let Some(ref error) = updated.error {
+            status_data.insert("error".to_string(), serde_json::json!(error));
+        }
+        let mut derived_events = vec![PublishEventInput {
+            r#type: "taskcast:status".to_string(),
+            level: Level::Info,
+            data: serde_json::Value::Object(status_data),
+            series_id: None,
+            series_mode: None,
+            series_acc_field: None,
+        }];
 
         // Emit taskcast:blocked event when entering blocked with blockedRequest
         if to == TaskStatus::Blocked {
@@ -386,18 +573,14 @@ impl TaskEngine {
                     "request".to_string(),
                     serde_json::to_value(blocked_request).unwrap(),
                 );
-                self.emit(
-                    task_id,
-                    PublishEventInput {
-                        r#type: "taskcast:blocked".to_string(),
-                        level: Level::Info,
-                        data: serde_json::Value::Object(data),
-                        series_id: None,
-                        series_mode: None,
-                        series_acc_field: None,
-                    },
-                )
-                .await?;
+                derived_events.push(PublishEventInput {
+                    r#type: "taskcast:blocked".to_string(),
+                    level: Level::Info,
+                    data: serde_json::Value::Object(data),
+                    series_id: None,
+                    series_mode: None,
+                    series_acc_field: None,
+                });
             }
         }
 
@@ -407,18 +590,40 @@ impl TaskEngine {
             && task.blocked_request.is_some()
         {
             let resolution = payload.as_ref().and_then(|p| p.result.clone());
-            self.emit(
-                task_id,
-                PublishEventInput {
-                    r#type: "taskcast:resolved".to_string(),
-                    level: Level::Info,
-                    data: serde_json::json!({ "resolution": resolution }),
-                    series_id: None,
-                    series_mode: None,
-                    series_acc_field: None,
-                },
-            )
-            .await?;
+            derived_events.push(PublishEventInput {
+                r#type: "taskcast:resolved".to_string(),
+                level: Level::Info,
+                data: serde_json::json!({ "resolution": resolution }),
+                series_id: None,
+                series_mode: None,
+                series_acc_field: None,
+            });
+        }
+
+        if self.storage_coordinator.is_some() {
+            let committed = self
+                .commit_task_events_for_mutation(
+                    updated.clone(),
+                    expected_revision.as_deref().unwrap_or_default(),
+                    &from,
+                    derived_events,
+                    initial_write_token.expect("storage coordinator write token"),
+                )
+                .await?;
+            if let Some(ref long_term_store) = self.long_term_store {
+                long_term_store.save_task(updated.clone()).await?;
+            }
+            for event in committed {
+                self.finish_committed_event(event, None).await?;
+            }
+        } else {
+            self.short_term_store.save_task(updated.clone()).await?;
+            if let Some(ref long_term_store) = self.long_term_store {
+                long_term_store.save_task(updated.clone()).await?;
+            }
+            for event in derived_events {
+                self.emit(task_id, event, true).await?;
+            }
         }
 
         // Clean up per-task emit lock — no more events can be published
@@ -458,7 +663,216 @@ impl TaskEngine {
             return Err(EngineError::TaskTerminal(task.status));
         }
 
-        self.emit(task_id, input).await
+        self.emit(task_id, input, false).await
+    }
+
+    pub async fn release_task_storage(
+        &self,
+        task_id: &str,
+        preconditions: ReleasePreconditions,
+    ) -> Result<ReleaseResult, EngineError> {
+        let coordinator = self.storage_coordinator.as_ref().ok_or_else(|| {
+            EngineError::Store(Box::new(StorageReleaseUnsupportedError::default()))
+        })?;
+        if preconditions.expected_last_event_index < -1
+            || !preconditions.inactive_since.is_finite()
+            || preconditions.inactive_since < 0.0
+            || preconditions.inactive_since.fract() != 0.0
+            || preconditions.inactive_since > i64::MAX as f64
+        {
+            return Err(EngineError::Store(Box::new(StoragePreconditionError::new(
+                "Storage release preconditions are invalid",
+            ))));
+        }
+        let durable = self.long_term_store.as_ref().ok_or_else(|| {
+            EngineError::Store(Box::new(StorageReleaseUnsupportedError::default()))
+        })?;
+        let request = StorageReleaseRequest {
+            task_id: task_id.to_string(),
+            requested_at: now_millis(),
+            expected_last_event_index: preconditions.expected_last_event_index,
+            inactive_since: preconditions.inactive_since,
+        };
+        if !durable
+            .persist_storage_release_request(request.clone())
+            .await?
+        {
+            return Err(EngineError::TaskNotFound(task_id.to_string()));
+        }
+        match coordinator
+            .release_task_storage(task_id, preconditions)
+            .await
+        {
+            Ok(result) => {
+                durable.clear_storage_release_request(&request).await?;
+                Ok(result)
+            }
+            Err(error) => {
+                if error.downcast_ref::<StoragePreconditionError>().is_some() {
+                    durable.clear_storage_release_request(&request).await?;
+                }
+                Err(EngineError::Store(error))
+            }
+        }
+    }
+
+    pub async fn release_task_storage_at_current_durable_index(
+        &self,
+        task_id: &str,
+        inactive_since: f64,
+    ) -> Result<ReleaseResult, EngineError> {
+        let durable = self.long_term_store.as_ref().ok_or_else(|| {
+            EngineError::Store(Box::new(StorageReleaseUnsupportedError::new(
+                "Long-term store cannot read the durable event watermark",
+            )))
+        })?;
+        let expected_last_event_index = durable.get_last_event_index(task_id).await?;
+        self.release_task_storage(
+            task_id,
+            ReleasePreconditions {
+                expected_last_event_index,
+                inactive_since,
+            },
+        )
+        .await
+    }
+
+    pub async fn retry_storage_release_requests(
+        &self,
+        limit: u64,
+        inactive_before: f64,
+    ) -> Result<StorageReleaseSweepResult, EngineError> {
+        if limit == 0
+            || !inactive_before.is_finite()
+            || inactive_before < 0.0
+            || inactive_before.fract() != 0.0
+        {
+            return Err(EngineError::Store(Box::new(StoragePreconditionError::new(
+                "Storage release sweep bounds are invalid",
+            ))));
+        }
+        let coordinator = self.storage_coordinator.as_ref().ok_or_else(|| {
+            EngineError::Store(Box::new(StorageReleaseUnsupportedError::new(
+                "Storage release is not supported by the configured stores",
+            )))
+        })?;
+        let durable = self.long_term_store.as_ref().ok_or_else(|| {
+            EngineError::Store(Box::new(StorageReleaseUnsupportedError::new(
+                "Long-term store cannot list storage release requests",
+            )))
+        })?;
+        let requests = durable.list_storage_release_requests(limit).await?;
+        let mut result = StorageReleaseSweepResult {
+            claimed: requests.len() as u64,
+            ..Default::default()
+        };
+        for request in requests {
+            if request.inactive_since > inactive_before {
+                result.deferred += 1;
+                continue;
+            }
+            let outcome = async {
+                let recovery = coordinator.recover_task_storage(&request.task_id).await?;
+                if recovery.storage_state == crate::types::StorageState::Cold {
+                    durable.clear_storage_release_request(&request).await?;
+                    return Ok::<_, Box<dyn std::error::Error + Send + Sync>>("recovered");
+                }
+                coordinator
+                    .release_task_storage(
+                        &request.task_id,
+                        ReleasePreconditions {
+                            expected_last_event_index: request.expected_last_event_index,
+                            inactive_since: request.inactive_since,
+                        },
+                    )
+                    .await?;
+                durable.clear_storage_release_request(&request).await?;
+                Ok("released")
+            }
+            .await;
+            match outcome {
+                Ok("recovered") => result.recovered += 1,
+                Ok(_) => result.released += 1,
+                Err(error) if error.downcast_ref::<StoragePreconditionError>().is_some() => {
+                    durable.clear_storage_release_request(&request).await?;
+                    result.stale += 1;
+                }
+                Err(_) => result.failed += 1,
+            }
+        }
+        Ok(result)
+    }
+
+    pub async fn register_storage_writer(
+        &self,
+        registration: StorageWriterRegistration,
+        ttl_ms: u64,
+    ) -> Result<(), EngineError> {
+        if !self.short_term_store.supports_hot_cold_release() {
+            return Err(EngineError::Store(Box::new(
+                StorageReleaseUnsupportedError::new(
+                    "Short-term store cannot register storage writers",
+                ),
+            )));
+        }
+        self.short_term_store
+            .register_storage_writer(registration, ttl_ms)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_storage_writers(
+        &self,
+    ) -> Result<Vec<StorageWriterRegistration>, EngineError> {
+        if !self.short_term_store.supports_hot_cold_release() {
+            return Err(EngineError::Store(Box::new(
+                StorageReleaseUnsupportedError::new("Short-term store cannot list storage writers"),
+            )));
+        }
+        Ok(self.short_term_store.list_storage_writers().await?)
+    }
+
+    pub fn supports_storage_release(&self) -> bool {
+        self.storage_coordinator.is_some()
+    }
+
+    pub fn supports_durable_ttl(&self) -> bool {
+        self.ttl_coordinator.is_some()
+    }
+
+    pub async fn sweep_durable_ttl(
+        &self,
+        limit: u64,
+        claim_ttl_ms: Option<u64>,
+    ) -> Result<DurableTtlSweepResult, EngineError> {
+        let coordinator = self.ttl_coordinator.as_ref().ok_or_else(|| {
+            EngineError::Store(Box::new(StorageReleaseUnsupportedError::new(
+                "Durable execution TTL is not supported by the configured stores",
+            )))
+        })?;
+        Ok(coordinator.sweep_overdue(limit, claim_ttl_ms).await?)
+    }
+
+    pub async fn sweep_terminal_projections(
+        &self,
+        limit: u64,
+        claim_ttl_ms: Option<u64>,
+    ) -> Result<DurableTtlSweepResult, EngineError> {
+        let coordinator = self.ttl_coordinator.as_ref().ok_or_else(|| {
+            EngineError::Store(Box::new(StorageReleaseUnsupportedError::new(
+                "Durable terminal projection is not supported by the configured stores",
+            )))
+        })?;
+        Ok(coordinator
+            .sweep_terminal_projections(limit, claim_ttl_ms)
+            .await?)
+    }
+
+    pub async fn recover_task_storage(&self, task_id: &str) -> Result<ReleaseResult, EngineError> {
+        let coordinator = self.storage_coordinator.as_ref().ok_or_else(|| {
+            EngineError::Store(Box::new(StorageReleaseUnsupportedError::default()))
+        })?;
+        Ok(coordinator.recover_task_storage(task_id).await?)
     }
 
     pub async fn export_task_archive(&self, task_id: &str) -> Result<TaskArchive, EngineError> {
@@ -544,17 +958,103 @@ impl TaskEngine {
         task_id: &str,
         opts: Option<EventQueryOptions>,
     ) -> Result<Vec<TaskEvent>, EngineError> {
-        let from_short = self
-            .short_term_store
-            .get_events(task_id, opts.clone())
+        if self.long_term_store.is_none() {
+            return Ok(self.short_term_store.get_events(task_id, opts).await?);
+        }
+        let started_at = now_millis();
+        match self.get_events_observed(task_id, opts).await {
+            Ok(read) => {
+                self.observe_storage_lifecycle(serde_json::json!({
+                    "event": "storage_history_read",
+                    "taskId": task_id,
+                    "outcome": "success",
+                    "source": read.source,
+                    "durationMs": (now_millis() - started_at).max(0.0),
+                    "eventCount": read.events.len(),
+                    "hotEventCount": read.hot_event_count,
+                    "durableEventCount": read.durable_event_count,
+                }));
+                Ok(read.events)
+            }
+            Err(error) => {
+                self.observe_storage_lifecycle(serde_json::json!({
+                    "event": "storage_history_read",
+                    "taskId": task_id,
+                    "outcome": "failed",
+                    "durationMs": (now_millis() - started_at).max(0.0),
+                    "errorCode": Self::storage_error_code(&error),
+                    "error": error.to_string(),
+                }));
+                Err(error)
+            }
+        }
+    }
+
+    async fn get_events_observed(
+        &self,
+        task_id: &str,
+        opts: Option<EventQueryOptions>,
+    ) -> Result<ObservedHistory, EngineError> {
+        let Some(ref long_term_store) = self.long_term_store else {
+            let events = self.short_term_store.get_events(task_id, opts).await?;
+            let event_count = events.len();
+            return Ok(ObservedHistory {
+                events,
+                source: "hot",
+                hot_event_count: event_count,
+                durable_event_count: 0,
+            });
+        };
+        if !long_term_store.supports_hot_cold_release() {
+            let from_short = self
+                .short_term_store
+                .get_events(task_id, opts.clone())
+                .await?;
+            if !from_short.is_empty() {
+                let event_count = from_short.len();
+                return Ok(ObservedHistory {
+                    events: from_short,
+                    source: "hot",
+                    hot_event_count: event_count,
+                    durable_event_count: 0,
+                });
+            }
+            let from_durable = long_term_store.get_events(task_id, opts).await?;
+            let event_count = from_durable.len();
+            return Ok(ObservedHistory {
+                events: from_durable,
+                source: "durable",
+                hot_event_count: 0,
+                durable_event_count: event_count,
+            });
+        }
+        let overlay_hot = self.should_overlay_hot_history(task_id).await?;
+        let hot_events = if overlay_hot {
+            self.short_term_store.get_events(task_id, None).await?
+        } else {
+            Vec::new()
+        };
+        let durable_series = if long_term_store.supports_hot_cold_release() {
+            long_term_store.get_durable_series_state(task_id).await?
+        } else {
+            Vec::new()
+        };
+        let durable_events = self
+            .load_canonical_durable_events(task_id, opts.as_ref(), &hot_events, &durable_series)
             .await?;
-        if !from_short.is_empty() {
-            return Ok(from_short);
-        }
-        if let Some(ref long_term_store) = self.long_term_store {
-            return Ok(long_term_store.get_events(task_id, opts).await?);
-        }
-        Ok(vec![])
+        let merged = merge_canonical_history(&durable_events, &hot_events, &durable_series)
+            .map_err(|error| EngineError::Store(Box::new(error)))?;
+        let events = apply_canonical_history_query(&merged, opts);
+        Ok(ObservedHistory {
+            events,
+            source: if overlay_hot {
+                "durable+hot"
+            } else {
+                "durable"
+            },
+            hot_event_count: hot_events.len(),
+            durable_event_count: durable_events.len(),
+        })
     }
 
     pub async fn list_tasks(&self, filter: TaskFilter) -> Result<Vec<Task>, EngineError> {
@@ -587,13 +1087,151 @@ impl TaskEngine {
         task_id: &str,
         series_id: &str,
     ) -> Result<Option<TaskEvent>, EngineError> {
-        Ok(self
-            .short_term_store
-            .get_series_latest(task_id, series_id)
-            .await?)
+        let Some(ref long_term_store) = self.long_term_store else {
+            return Ok(self
+                .short_term_store
+                .get_series_latest(task_id, series_id)
+                .await?);
+        };
+        if !long_term_store.supports_hot_cold_release() {
+            return Ok(self
+                .short_term_store
+                .get_series_latest(task_id, series_id)
+                .await?);
+        }
+        let durable = long_term_store
+            .get_durable_series_state(task_id)
+            .await?
+            .into_iter()
+            .find(|state| state.series_id == series_id);
+        let Some(durable) = durable else {
+            return Ok(self
+                .short_term_store
+                .get_series_latest(task_id, series_id)
+                .await?);
+        };
+        if !self.should_overlay_hot_history(task_id).await? {
+            return Ok(Some(durable.event));
+        }
+        let hot_events = self.short_term_store.get_events(task_id, None).await?;
+        Ok(Some(
+            resolve_canonical_series_latest(&durable, &hot_events)
+                .map_err(|error| EngineError::Store(Box::new(error)))?,
+        ))
     }
 
     // ─── Private ─────────────────────────────────────────────────────────
+
+    async fn should_overlay_hot_history(&self, task_id: &str) -> Result<bool, EngineError> {
+        let Some(ref long_term_store) = self.long_term_store else {
+            return Ok(true);
+        };
+        if long_term_store.supports_hot_cold_release() {
+            let metadata = long_term_store.get_task_storage_metadata(task_id).await?;
+            if metadata
+                .is_some_and(|metadata| metadata.storage_state == crate::types::StorageState::Cold)
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn observe_storage_lifecycle(&self, observation: serde_json::Value) {
+        let listeners = self.storage_lifecycle_listeners.lock().unwrap();
+        for listener in listeners.iter() {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                listener(&observation);
+            }));
+        }
+    }
+
+    fn storage_error_code(error: &EngineError) -> &'static str {
+        let EngineError::Store(source) = error else {
+            return "storage_unavailable";
+        };
+        if source.downcast_ref::<StoragePreconditionError>().is_some() {
+            "storage_precondition_failed"
+        } else if source.downcast_ref::<StorageFenceConflictError>().is_some() {
+            "storage_fence_conflict"
+        } else if source.downcast_ref::<StorageBusyError>().is_some() {
+            "storage_busy"
+        } else if source.downcast_ref::<StorageIntegrityError>().is_some() {
+            "storage_integrity_error"
+        } else if source
+            .downcast_ref::<StorageReleaseUnsupportedError>()
+            .is_some()
+        {
+            "storage_release_unsupported"
+        } else {
+            "storage_unavailable"
+        }
+    }
+
+    async fn load_canonical_durable_events(
+        &self,
+        task_id: &str,
+        opts: Option<&EventQueryOptions>,
+        hot_events: &[TaskEvent],
+        durable_series: &[DurableSeriesState],
+    ) -> Result<Vec<TaskEvent>, EngineError> {
+        let long_term_store = self
+            .long_term_store
+            .as_ref()
+            .expect("canonical history requires long-term storage");
+        let Some(requested_limit) = opts.and_then(|opts| opts.limit) else {
+            return Ok(long_term_store
+                .get_events(
+                    task_id,
+                    canonical_durable_query(opts, hot_events, durable_series),
+                )
+                .await?);
+        };
+        if requested_limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let page_size = requested_limit.min(1_000);
+        let mut paged_opts = opts.cloned().unwrap_or(EventQueryOptions {
+            since: None,
+            limit: None,
+        });
+        paged_opts.limit = Some(page_size);
+        let mut query = canonical_durable_query(Some(&paged_opts), hot_events, durable_series);
+        let mut loaded = Vec::new();
+        let mut previous_boundary = None;
+        loop {
+            let page = long_term_store.get_events(task_id, query).await?;
+            loaded.extend(page.iter().cloned());
+            let merged = merge_canonical_history(&loaded, hot_events, durable_series)
+                .map_err(|error| EngineError::Store(Box::new(error)))?;
+            let assembled = apply_canonical_history_query(&merged, opts.cloned());
+            if page.len() < page_size as usize {
+                return Ok(loaded);
+            }
+
+            let boundary = page.last().expect("full durable history page").index;
+            if previous_boundary.is_some_and(|previous| boundary <= previous) {
+                return Err(EngineError::Store(Box::new(StorageIntegrityError::new(
+                    "Durable history pagination did not advance",
+                ))));
+            }
+            if assembled.len() >= requested_limit as usize
+                && assembled[requested_limit as usize - 1].index <= boundary
+            {
+                return Ok(loaded);
+            }
+            previous_boundary = Some(boundary);
+            query = Some(EventQueryOptions {
+                since: Some(SinceCursor {
+                    id: None,
+                    index: Some(boundary),
+                    timestamp: None,
+                }),
+                limit: Some(page_size),
+            });
+        }
+    }
 
     async fn build_export_archive(&self, task: &Task) -> Result<TaskArchive, EngineError> {
         let short_term_events = self.short_term_store.get_events(&task.id, None).await?;
@@ -758,6 +1396,7 @@ impl TaskEngine {
         &self,
         task_id: &str,
         input: PublishEventInput,
+        allow_terminal: bool,
     ) -> Result<TaskEvent, EngineError> {
         // Acquire per-task lock to serialize event storage + broadcast,
         // preventing race conditions where concurrent publishes could
@@ -770,6 +1409,75 @@ impl TaskEngine {
                 .clone()
         };
         let _guard = emit_lock.lock().await;
+        if !allow_terminal {
+            let current = self
+                .get_task(task_id)
+                .await?
+                .ok_or_else(|| EngineError::TaskNotFound(task_id.to_string()))?;
+            if is_terminal(&current.status) {
+                return Err(EngineError::TaskTerminal(current.status));
+            }
+        }
+
+        if let Some(coordinator) = &self.storage_coordinator {
+            let raw = TaskEvent {
+                id: ulid::Ulid::new().to_string(),
+                task_id: task_id.to_string(),
+                index: 0,
+                timestamp: now_millis(),
+                r#type: input.r#type,
+                level: input.level,
+                data: input.data,
+                series_id: input.series_id,
+                series_mode: input.series_mode,
+                series_acc_field: input.series_acc_field,
+                series_snapshot: None,
+                _accumulated_data: None,
+            };
+            let mut initial_storage_epoch = None;
+            for attempt in 0..3 {
+                let token = if attempt == 0 {
+                    coordinator.ensure_task_hot_for_write(task_id).await?
+                } else {
+                    coordinator
+                        .ensure_task_hot_for_write_without_rehydrate(task_id)
+                        .await?
+                };
+                match initial_storage_epoch {
+                    Some(epoch) if token.storage_epoch != epoch => {
+                        return Err(EngineError::Store(Box::new(
+                            StorageFenceConflictError::new(
+                                "Task storage epoch changed after the write mutation started",
+                            ),
+                        )));
+                    }
+                    None => initial_storage_epoch = Some(token.storage_epoch),
+                    Some(_) => {}
+                }
+                match self
+                    .short_term_store
+                    .commit_event_fenced(task_id, raw.clone(), &token)
+                    .await
+                {
+                    Ok(series_result) => {
+                        let event = series_result.event;
+                        self.finish_committed_event(event.clone(), series_result.accumulated_event)
+                            .await?;
+                        return Ok(event);
+                    }
+                    Err(error)
+                        if error.downcast_ref::<StorageFenceConflictError>().is_some()
+                            && attempt < 2 =>
+                    {
+                        continue;
+                    }
+                    Err(error) => return Err(EngineError::Store(error)),
+                }
+            }
+            return Err(EngineError::Store(Box::new(
+                StorageFenceConflictError::default(),
+            )));
+        }
 
         let index = self.short_term_store.next_index(task_id).await?;
         let raw = TaskEvent {
@@ -797,8 +1505,98 @@ impl TaskEngine {
                 .await?;
         }
 
-        // Attach accumulated data to broadcast event for SSE accumulated subscribers
-        let broadcast_event = if let Some(ref accumulated) = series_result.accumulated_event {
+        self.finish_committed_event(event.clone(), series_result.accumulated_event)
+            .await?;
+
+        Ok(event)
+    }
+
+    async fn commit_task_events_for_mutation(
+        &self,
+        task: Task,
+        expected_revision: &str,
+        expected_status: &TaskStatus,
+        inputs: Vec<PublishEventInput>,
+        initial_token: HotWriteToken,
+    ) -> Result<Vec<TaskEvent>, EngineError> {
+        let coordinator = self.storage_coordinator.as_ref().ok_or_else(|| {
+            EngineError::Store(Box::new(StorageReleaseUnsupportedError::default()))
+        })?;
+        let emit_lock = {
+            let mut locks = self.emit_locks.lock().unwrap();
+            locks
+                .entry(task.id.clone())
+                .or_insert_with(|| Arc::new(TokioMutex::new(())))
+                .clone()
+        };
+        let _guard = emit_lock.lock().await;
+        let events = inputs
+            .into_iter()
+            .map(|input| TaskEvent {
+                id: ulid::Ulid::new().to_string(),
+                task_id: task.id.clone(),
+                index: 0,
+                timestamp: now_millis(),
+                r#type: input.r#type,
+                level: input.level,
+                data: input.data,
+                series_id: None,
+                series_mode: None,
+                series_acc_field: None,
+                series_snapshot: None,
+                _accumulated_data: None,
+            })
+            .collect::<Vec<_>>();
+        for attempt in 0..3 {
+            let token = if attempt == 0 {
+                initial_token.clone()
+            } else {
+                coordinator
+                    .ensure_task_hot_for_write_without_rehydrate(&task.id)
+                    .await?
+            };
+            if token.storage_epoch != initial_token.storage_epoch {
+                return Err(EngineError::Store(Box::new(
+                    StorageFenceConflictError::new(
+                        "Task storage epoch changed after the write mutation started",
+                    ),
+                )));
+            }
+            match self
+                .short_term_store
+                .commit_task_events_fenced(task.clone(), expected_revision, events.clone(), &token)
+                .await
+            {
+                Ok(Some(committed)) => return Ok(committed),
+                Ok(None) => {
+                    let current = self.get_task(&task.id).await?;
+                    return Err(EngineError::InvalidTransition {
+                        from: current
+                            .map(|current| current.status)
+                            .unwrap_or_else(|| expected_status.clone()),
+                        to: task.status.clone(),
+                    });
+                }
+                Err(error)
+                    if error.downcast_ref::<StorageFenceConflictError>().is_some()
+                        && attempt < 2 =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(EngineError::Store(error)),
+            }
+        }
+        Err(EngineError::Store(Box::new(
+            StorageFenceConflictError::default(),
+        )))
+    }
+
+    async fn finish_committed_event(
+        &self,
+        event: TaskEvent,
+        accumulated_event: Option<TaskEvent>,
+    ) -> Result<(), EngineError> {
+        let broadcast_event = if let Some(ref accumulated) = accumulated_event {
             TaskEvent {
                 _accumulated_data: Some(accumulated.data.clone()),
                 ..event.clone()
@@ -806,12 +1604,13 @@ impl TaskEngine {
         } else {
             event.clone()
         };
-        self.broadcast.publish(task_id, broadcast_event).await?;
+        self.broadcast
+            .publish(&event.task_id, broadcast_event)
+            .await?;
 
         if let Some(ref long_term_store) = self.long_term_store {
             let long_term_store = Arc::clone(long_term_store);
             let raw_event = event.clone();
-            let accumulated_event = series_result.accumulated_event.clone();
             let store_event = accumulated_event
                 .clone()
                 .unwrap_or_else(|| raw_event.clone());
@@ -826,8 +1625,7 @@ impl TaskEngine {
                 }
             });
         }
-
-        Ok(event)
+        Ok(())
     }
 }
 
@@ -892,6 +1690,35 @@ fn contiguous_prefix_len(events: &[TaskEvent]) -> u64 {
     expected
 }
 
+fn canonical_durable_query(
+    opts: Option<&EventQueryOptions>,
+    hot_events: &[TaskEvent],
+    durable_series: &[DurableSeriesState],
+) -> Option<EventQueryOptions> {
+    let mut query = opts.cloned()?;
+    if let Some(id) = query
+        .since
+        .as_ref()
+        .and_then(|since| since.id.as_ref())
+        .cloned()
+    {
+        let anchor = hot_events.iter().find(|event| event.id == id).or_else(|| {
+            durable_series
+                .iter()
+                .find(|state| state.event.id == id)
+                .map(|state| &state.event)
+        });
+        if let Some(anchor) = anchor {
+            query.since = Some(SinceCursor {
+                id: None,
+                index: Some(anchor.index),
+                timestamp: None,
+            });
+        }
+    }
+    Some(query)
+}
+
 fn unsupported_archive_restore(message: &'static str) -> EngineError {
     EngineError::Store(Box::new(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
@@ -904,8 +1731,10 @@ fn unsupported_archive_restore(message: &'static str) -> EngineError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory_adapters::{MemoryBroadcastProvider, MemoryShortTermStore};
-    use crate::types::{LongTermStore, SeriesMode, WorkerAuditEvent};
+    use crate::memory_adapters::{
+        MemoryBroadcastProvider, MemoryLongTermStore, MemoryShortTermStore,
+    };
+    use crate::types::{LongTermStore, SeriesMode, StorageBusyError, WorkerAuditEvent};
     use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::sync::RwLock as TokioRwLock;
 
@@ -1119,6 +1948,62 @@ mod tests {
             long_term_store: None,
             hooks: None,
         })
+    }
+
+    #[tokio::test]
+    async fn stale_write_retry_does_not_rehydrate_a_released_task() {
+        let hot = Arc::new(MemoryShortTermStore::new());
+        let durable = Arc::new(MemoryLongTermStore::new());
+        let engine = TaskEngine::new(TaskEngineOptions {
+            short_term_store: hot.clone(),
+            long_term_store: Some(durable),
+            broadcast: Arc::new(MemoryBroadcastProvider::new()),
+            hooks: None,
+        });
+        engine
+            .create_task(CreateTaskInput {
+                id: Some("task-stale-write".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        engine
+            .transition_task("task-stale-write", TaskStatus::Running, None)
+            .await
+            .unwrap();
+        let event = hot
+            .get_events("task-stale-write", None)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let coordinator = engine.storage_coordinator.as_ref().unwrap();
+        let initial = coordinator
+            .ensure_task_hot_for_write("task-stale-write")
+            .await
+            .unwrap();
+
+        engine
+            .release_task_storage(
+                "task-stale-write",
+                ReleasePreconditions {
+                    expected_last_event_index: event.index as i64,
+                    inactive_since: event.timestamp,
+                },
+            )
+            .await
+            .unwrap();
+
+        let stale_retry = coordinator
+            .ensure_task_hot_for_write_without_rehydrate("task-stale-write")
+            .await
+            .unwrap_err();
+        assert!(stale_retry.downcast_ref::<StorageBusyError>().is_some());
+        let fresh = coordinator
+            .ensure_task_hot_for_write("task-stale-write")
+            .await
+            .unwrap();
+        assert_eq!(fresh.storage_epoch, initial.storage_epoch + 1);
     }
 
     // ─── create_task ─────────────────────────────────────────────────────
@@ -1472,9 +2357,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].r#type, "taskcast:status");
         assert_eq!(events[0].level, Level::Info);
-
-        let data = &events[0].data;
-        assert_eq!(data["status"], "running");
+        assert_eq!(events[0].data, serde_json::json!({"status": "running"}));
     }
 
     // ─── publish_event ───────────────────────────────────────────────────
