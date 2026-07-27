@@ -32,6 +32,9 @@ describe('canTransition', () => {
   it('allows running → timeout', () => {
     expect(canTransition('running', 'timeout')).toBe(true)
   })
+  it.each(['pending', 'assigned', 'paused', 'blocked'] as const)('allows %s → timeout', (status) => {
+    expect(canTransition(status, 'timeout')).toBe(true)
+  })
   it('allows pending → cancelled', () => {
     expect(canTransition('pending', 'cancelled')).toBe(true)
   })

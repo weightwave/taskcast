@@ -7,15 +7,24 @@ pub const TERMINAL_STATUSES: &[TaskStatus] = &[
     TaskStatus::Cancelled,
 ];
 
-pub const SUSPENDED_STATUSES: &[TaskStatus] = &[
-    TaskStatus::Paused,
-    TaskStatus::Blocked,
-];
+pub const SUSPENDED_STATUSES: &[TaskStatus] = &[TaskStatus::Paused, TaskStatus::Blocked];
 
 pub fn allowed_transitions(from: &TaskStatus) -> &'static [TaskStatus] {
     match from {
-        TaskStatus::Pending => &[TaskStatus::Assigned, TaskStatus::Running, TaskStatus::Paused, TaskStatus::Cancelled],
-        TaskStatus::Assigned => &[TaskStatus::Running, TaskStatus::Pending, TaskStatus::Paused, TaskStatus::Cancelled],
+        TaskStatus::Pending => &[
+            TaskStatus::Assigned,
+            TaskStatus::Running,
+            TaskStatus::Paused,
+            TaskStatus::Timeout,
+            TaskStatus::Cancelled,
+        ],
+        TaskStatus::Assigned => &[
+            TaskStatus::Running,
+            TaskStatus::Pending,
+            TaskStatus::Paused,
+            TaskStatus::Timeout,
+            TaskStatus::Cancelled,
+        ],
         TaskStatus::Running => &[
             TaskStatus::Paused,
             TaskStatus::Blocked,
@@ -24,8 +33,21 @@ pub fn allowed_transitions(from: &TaskStatus) -> &'static [TaskStatus] {
             TaskStatus::Timeout,
             TaskStatus::Cancelled,
         ],
-        TaskStatus::Paused => &[TaskStatus::Running, TaskStatus::Assigned, TaskStatus::Blocked, TaskStatus::Cancelled],
-        TaskStatus::Blocked => &[TaskStatus::Running, TaskStatus::Assigned, TaskStatus::Paused, TaskStatus::Cancelled, TaskStatus::Failed],
+        TaskStatus::Paused => &[
+            TaskStatus::Running,
+            TaskStatus::Assigned,
+            TaskStatus::Blocked,
+            TaskStatus::Timeout,
+            TaskStatus::Cancelled,
+        ],
+        TaskStatus::Blocked => &[
+            TaskStatus::Running,
+            TaskStatus::Assigned,
+            TaskStatus::Paused,
+            TaskStatus::Cancelled,
+            TaskStatus::Failed,
+            TaskStatus::Timeout,
+        ],
         TaskStatus::Completed
         | TaskStatus::Failed
         | TaskStatus::Timeout
@@ -80,7 +102,10 @@ mod tests {
 
     #[test]
     fn pending_to_completed_is_invalid() {
-        assert!(!can_transition(&TaskStatus::Pending, &TaskStatus::Completed));
+        assert!(!can_transition(
+            &TaskStatus::Pending,
+            &TaskStatus::Completed
+        ));
     }
 
     #[test]
@@ -89,8 +114,8 @@ mod tests {
     }
 
     #[test]
-    fn pending_to_timeout_is_invalid() {
-        assert!(!can_transition(&TaskStatus::Pending, &TaskStatus::Timeout));
+    fn pending_to_timeout_is_valid() {
+        assert!(can_transition(&TaskStatus::Pending, &TaskStatus::Timeout));
     }
 
     #[test]
@@ -146,8 +171,8 @@ mod tests {
     }
 
     #[test]
-    fn assigned_to_timeout_is_invalid() {
-        assert!(!can_transition(&TaskStatus::Assigned, &TaskStatus::Timeout));
+    fn assigned_to_timeout_is_valid() {
+        assert!(can_transition(&TaskStatus::Assigned, &TaskStatus::Timeout));
     }
 
     #[test]
@@ -241,8 +266,8 @@ mod tests {
     }
 
     #[test]
-    fn paused_to_timeout_is_invalid() {
-        assert!(!can_transition(&TaskStatus::Paused, &TaskStatus::Timeout));
+    fn paused_to_timeout_is_valid() {
+        assert!(can_transition(&TaskStatus::Paused, &TaskStatus::Timeout));
     }
 
     // ─── can_transition: valid transitions from Blocked ─────────────────
@@ -276,7 +301,10 @@ mod tests {
 
     #[test]
     fn blocked_to_completed_is_invalid() {
-        assert!(!can_transition(&TaskStatus::Blocked, &TaskStatus::Completed));
+        assert!(!can_transition(
+            &TaskStatus::Blocked,
+            &TaskStatus::Completed
+        ));
     }
 
     #[test]
@@ -285,18 +313,27 @@ mod tests {
     }
 
     #[test]
-    fn blocked_to_timeout_is_invalid() {
-        assert!(!can_transition(&TaskStatus::Blocked, &TaskStatus::Timeout));
+    fn blocked_to_timeout_is_valid() {
+        assert!(can_transition(&TaskStatus::Blocked, &TaskStatus::Timeout));
     }
 
     // ─── can_transition: terminal states cannot transition ────────────────
 
     #[test]
     fn completed_to_any_is_invalid() {
-        assert!(!can_transition(&TaskStatus::Completed, &TaskStatus::Pending));
-        assert!(!can_transition(&TaskStatus::Completed, &TaskStatus::Running));
+        assert!(!can_transition(
+            &TaskStatus::Completed,
+            &TaskStatus::Pending
+        ));
+        assert!(!can_transition(
+            &TaskStatus::Completed,
+            &TaskStatus::Running
+        ));
         assert!(!can_transition(&TaskStatus::Completed, &TaskStatus::Failed));
-        assert!(!can_transition(&TaskStatus::Completed, &TaskStatus::Timeout));
+        assert!(!can_transition(
+            &TaskStatus::Completed,
+            &TaskStatus::Timeout
+        ));
         assert!(!can_transition(
             &TaskStatus::Completed,
             &TaskStatus::Cancelled
@@ -316,7 +353,10 @@ mod tests {
     fn timeout_to_any_is_invalid() {
         assert!(!can_transition(&TaskStatus::Timeout, &TaskStatus::Pending));
         assert!(!can_transition(&TaskStatus::Timeout, &TaskStatus::Running));
-        assert!(!can_transition(&TaskStatus::Timeout, &TaskStatus::Completed));
+        assert!(!can_transition(
+            &TaskStatus::Timeout,
+            &TaskStatus::Completed
+        ));
         assert!(!can_transition(&TaskStatus::Timeout, &TaskStatus::Failed));
         assert!(!can_transition(
             &TaskStatus::Timeout,
@@ -326,7 +366,10 @@ mod tests {
 
     #[test]
     fn cancelled_to_any_is_invalid() {
-        assert!(!can_transition(&TaskStatus::Cancelled, &TaskStatus::Pending));
+        assert!(!can_transition(
+            &TaskStatus::Cancelled,
+            &TaskStatus::Pending
+        ));
         assert!(!can_transition(
             &TaskStatus::Cancelled,
             &TaskStatus::Running
@@ -582,20 +625,22 @@ mod tests {
     #[test]
     fn allowed_transitions_from_pending() {
         let transitions = allowed_transitions(&TaskStatus::Pending);
-        assert_eq!(transitions.len(), 4);
+        assert_eq!(transitions.len(), 5);
         assert!(transitions.contains(&TaskStatus::Assigned));
         assert!(transitions.contains(&TaskStatus::Running));
         assert!(transitions.contains(&TaskStatus::Paused));
+        assert!(transitions.contains(&TaskStatus::Timeout));
         assert!(transitions.contains(&TaskStatus::Cancelled));
     }
 
     #[test]
     fn allowed_transitions_from_assigned() {
         let transitions = allowed_transitions(&TaskStatus::Assigned);
-        assert_eq!(transitions.len(), 4);
+        assert_eq!(transitions.len(), 5);
         assert!(transitions.contains(&TaskStatus::Running));
         assert!(transitions.contains(&TaskStatus::Pending));
         assert!(transitions.contains(&TaskStatus::Paused));
+        assert!(transitions.contains(&TaskStatus::Timeout));
         assert!(transitions.contains(&TaskStatus::Cancelled));
     }
 
@@ -614,22 +659,24 @@ mod tests {
     #[test]
     fn allowed_transitions_from_paused() {
         let transitions = allowed_transitions(&TaskStatus::Paused);
-        assert_eq!(transitions.len(), 4);
+        assert_eq!(transitions.len(), 5);
         assert!(transitions.contains(&TaskStatus::Running));
         assert!(transitions.contains(&TaskStatus::Assigned));
         assert!(transitions.contains(&TaskStatus::Blocked));
+        assert!(transitions.contains(&TaskStatus::Timeout));
         assert!(transitions.contains(&TaskStatus::Cancelled));
     }
 
     #[test]
     fn allowed_transitions_from_blocked() {
         let transitions = allowed_transitions(&TaskStatus::Blocked);
-        assert_eq!(transitions.len(), 5);
+        assert_eq!(transitions.len(), 6);
         assert!(transitions.contains(&TaskStatus::Running));
         assert!(transitions.contains(&TaskStatus::Assigned));
         assert!(transitions.contains(&TaskStatus::Paused));
         assert!(transitions.contains(&TaskStatus::Cancelled));
         assert!(transitions.contains(&TaskStatus::Failed));
+        assert!(transitions.contains(&TaskStatus::Timeout));
     }
 
     #[test]

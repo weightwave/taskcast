@@ -593,6 +593,281 @@ pub struct TaskArchiveRestoreData {
     pub series_latest: Vec<SeriesLatestEntry>,
 }
 
+// ─── Storage Lifecycle ─────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum StorageState {
+    Hot,
+    Releasing,
+    Cold,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskStorageMetadata {
+    pub task_id: String,
+    pub storage_state: StorageState,
+    pub storage_epoch: u64,
+    pub active_release_generation: Option<String>,
+    pub archive_watermark: i64,
+    pub last_event_at: Option<f64>,
+    pub cold_at: Option<f64>,
+    pub execution_deadline_at: Option<f64>,
+    pub task_version: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct HotWriteToken {
+    pub task_id: String,
+    pub storage_epoch: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageLease {
+    pub task_id: String,
+    pub lock_token: String,
+    pub generation: String,
+    pub storage_epoch: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskWriteFence {
+    pub task_id: String,
+    pub accepting_writes: bool,
+    pub storage_epoch: u64,
+    pub active_release_generation: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ClosedWriteFence {
+    pub task_id: String,
+    pub accepting_writes: bool,
+    pub storage_epoch: u64,
+    pub active_release_generation: Option<String>,
+    pub high_watermark: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ReleasePreconditions {
+    pub expected_last_event_index: i64,
+    pub inactive_since: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ReleaseResult {
+    pub task_id: String,
+    pub storage_state: StorageState,
+    pub archive_watermark: i64,
+    pub released: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveSourceManifest {
+    pub prior_watermark: i64,
+    pub target_watermark: i64,
+    pub source_entry_count: u64,
+    pub source_digest: String,
+    pub series_state_digest: String,
+    pub expected_batch_ordinals: Vec<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum ArchiveGenerationStatus {
+    Open,
+    Finalized,
+    Aborted,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveGeneration {
+    pub task_id: String,
+    pub generation: String,
+    pub storage_epoch: u64,
+    pub target_watermark: i64,
+    pub manifest: ArchiveSourceManifest,
+    pub status: ArchiveGenerationStatus,
+    pub created_at: f64,
+    pub updated_at: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveBatchReceipt {
+    pub task_id: String,
+    pub generation: String,
+    pub ordinal: u64,
+    pub previous_batch_digest: Option<String>,
+    pub batch_digest: String,
+    pub entry_count: u64,
+    pub first_index: Option<u64>,
+    pub last_index: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveSourcePage {
+    pub task_id: String,
+    pub watermark: i64,
+    pub cursor: Option<String>,
+    pub next_cursor: Option<String>,
+    pub events: Vec<TaskEvent>,
+    pub done: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DurableSeriesState {
+    pub task_id: String,
+    pub series_id: String,
+    pub mode: SeriesMode,
+    pub event: TaskEvent,
+    pub through_index: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RehydrateSnapshot {
+    pub task: Task,
+    pub archive_watermark: i64,
+    pub max_event_index: i64,
+    pub replay_events: Vec<TaskEvent>,
+    pub series_latest: Vec<DurableSeriesState>,
+    pub storage_epoch: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CanonicalHistoryEntry {
+    pub event: TaskEvent,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub series_through_index: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TtlClaim {
+    pub task_id: String,
+    pub claim_token: String,
+    pub claim_until: f64,
+    pub task_version: u64,
+    pub execution_deadline_at: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalProjection {
+    pub projection_id: String,
+    pub task: Task,
+    pub event: TaskEvent,
+    pub assignment: Option<WorkerAssignment>,
+    pub claim_token: Option<String>,
+    pub claim_until: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskStoragePresence {
+    pub task: bool,
+    pub event_count: u64,
+    pub next_index: bool,
+    pub series_state_count: u64,
+    pub write_fence: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageWriterRegistration {
+    pub instance_id: String,
+    pub storage_protocol_version: u64,
+    pub build: String,
+    pub expires_at: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskStorageMetadataCas {
+    pub task_id: String,
+    pub expected_storage_state: StorageState,
+    pub expected_storage_epoch: u64,
+    pub expected_release_generation: Option<String>,
+    pub next: TaskStorageMetadata,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveBatch {
+    pub receipt: ArchiveBatchReceipt,
+    pub events: Vec<TaskEvent>,
+    pub series_latest: Vec<DurableSeriesState>,
+}
+
+macro_rules! storage_error {
+    ($name:ident, $default_message:literal, $code:literal, $retryable:literal) => {
+        #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+        #[error("{message}")]
+        pub struct $name {
+            message: String,
+        }
+
+        impl $name {
+            pub fn new(message: impl Into<String>) -> Self {
+                Self {
+                    message: message.into(),
+                }
+            }
+
+            pub fn code(&self) -> &'static str {
+                $code
+            }
+
+            pub fn retryable(&self) -> bool {
+                $retryable
+            }
+        }
+
+        impl Default for $name {
+            fn default() -> Self {
+                Self::new($default_message)
+            }
+        }
+    };
+}
+
+storage_error!(
+    StorageFenceConflictError,
+    "Task storage write fence changed",
+    "storage_fence_conflict",
+    true
+);
+storage_error!(
+    StorageBusyError,
+    "Task storage lifecycle operation is busy",
+    "storage_busy",
+    true
+);
+storage_error!(
+    StorageIntegrityError,
+    "Task storage integrity check failed",
+    "storage_integrity_error",
+    false
+);
+storage_error!(
+    StorageReleaseUnsupportedError,
+    "Task storage release is not supported by this adapter",
+    "storage_release_unsupported",
+    false
+);
+
 // ─── Storage Interfaces ──────────────────────────────────────────────────────
 
 #[async_trait]
@@ -628,6 +903,11 @@ pub trait BroadcastProvider: Send + Sync {
 
 #[async_trait]
 pub trait ShortTermStore: Send + Sync {
+    /// True only when every lifecycle method below is implemented atomically.
+    fn supports_hot_cold_release(&self) -> bool {
+        false
+    }
+
     async fn save_task(&self, task: Task) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
     async fn get_task(
         &self,
@@ -703,6 +983,119 @@ pub trait ShortTermStore: Send + Sync {
         )))
     }
 
+    async fn acquire_storage_lock(
+        &self,
+        _task_id: &str,
+        _lock_token: &str,
+        _generation: &str,
+        _ttl_ms: u64,
+    ) -> Result<Option<StorageLease>, Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(StorageReleaseUnsupportedError::default()))
+    }
+
+    async fn renew_storage_lock(
+        &self,
+        _lease: &StorageLease,
+        _ttl_ms: u64,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(StorageReleaseUnsupportedError::default()))
+    }
+
+    async fn release_storage_lock(
+        &self,
+        _lease: &StorageLease,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(StorageReleaseUnsupportedError::default()))
+    }
+
+    async fn get_write_fence(
+        &self,
+        _task_id: &str,
+    ) -> Result<Option<TaskWriteFence>, Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(StorageReleaseUnsupportedError::default()))
+    }
+
+    async fn close_write_fence(
+        &self,
+        _lease: &StorageLease,
+        _expected_epoch: u64,
+    ) -> Result<ClosedWriteFence, Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(StorageReleaseUnsupportedError::default()))
+    }
+
+    async fn reopen_write_fence(
+        &self,
+        _lease: &StorageLease,
+        _expected_epoch: u64,
+    ) -> Result<HotWriteToken, Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(StorageReleaseUnsupportedError::default()))
+    }
+
+    async fn commit_event_fenced(
+        &self,
+        _task_id: &str,
+        _event: TaskEvent,
+        _token: &HotWriteToken,
+    ) -> Result<SeriesResult, Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(StorageReleaseUnsupportedError::default()))
+    }
+
+    async fn save_task_fenced(
+        &self,
+        _task: Task,
+        _token: &HotWriteToken,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(StorageReleaseUnsupportedError::default()))
+    }
+
+    async fn read_archive_source_page(
+        &self,
+        _task_id: &str,
+        _watermark: i64,
+        _cursor: Option<&str>,
+        _limit: u64,
+    ) -> Result<ArchiveSourcePage, Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(StorageReleaseUnsupportedError::default()))
+    }
+
+    async fn delete_task_storage_fenced(
+        &self,
+        _lease: &StorageLease,
+        _expected_epoch: u64,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(StorageReleaseUnsupportedError::default()))
+    }
+
+    async fn restore_hot_task_fenced(
+        &self,
+        _snapshot: RehydrateSnapshot,
+        _lease: &StorageLease,
+        _next_epoch: u64,
+    ) -> Result<HotWriteToken, Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(StorageReleaseUnsupportedError::default()))
+    }
+
+    async fn get_task_storage_presence(
+        &self,
+        _task_id: &str,
+    ) -> Result<TaskStoragePresence, Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(StorageReleaseUnsupportedError::default()))
+    }
+
+    async fn register_storage_writer(
+        &self,
+        _registration: StorageWriterRegistration,
+        _ttl_ms: u64,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(StorageReleaseUnsupportedError::default()))
+    }
+
+    async fn list_storage_writers(
+        &self,
+    ) -> Result<Vec<StorageWriterRegistration>, Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(StorageReleaseUnsupportedError::default()))
+    }
+
     // Task query
     async fn list_tasks(
         &self,
@@ -772,6 +1165,16 @@ pub trait ShortTermStore: Send + Sync {
 
 #[async_trait]
 pub trait LongTermStore: Send + Sync {
+    /// True only for split-tier stores with a verifiable archive barrier.
+    fn supports_hot_cold_release(&self) -> bool {
+        false
+    }
+
+    /// True only when deadline claims and terminal projection are durable.
+    fn supports_durable_ttl(&self) -> bool {
+        false
+    }
+
     async fn save_task(&self, task: Task) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
     async fn get_task(
         &self,
@@ -837,6 +1240,124 @@ pub trait LongTermStore: Send + Sync {
             std::io::ErrorKind::Unsupported,
             "restore_task_archive is not supported by this long-term store",
         )))
+    }
+
+    async fn get_task_storage_metadata(
+        &self,
+        _task_id: &str,
+    ) -> Result<Option<TaskStorageMetadata>, Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(StorageReleaseUnsupportedError::default()))
+    }
+
+    async fn compare_and_set_task_storage_metadata(
+        &self,
+        _update: TaskStorageMetadataCas,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(StorageReleaseUnsupportedError::default()))
+    }
+
+    async fn begin_archive(
+        &self,
+        _generation: ArchiveGeneration,
+    ) -> Result<ArchiveGeneration, Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(StorageReleaseUnsupportedError::default()))
+    }
+
+    async fn archive_batch(
+        &self,
+        _task_id: &str,
+        _generation: &str,
+        _batch: ArchiveBatch,
+    ) -> Result<ArchiveBatchReceipt, Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(StorageReleaseUnsupportedError::default()))
+    }
+
+    async fn finalize_archive(
+        &self,
+        _task_id: &str,
+        _generation: &str,
+        _task: Task,
+        _series_latest: Vec<DurableSeriesState>,
+    ) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(StorageReleaseUnsupportedError::default()))
+    }
+
+    async fn get_archive_watermark(
+        &self,
+        _task_id: &str,
+    ) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(StorageReleaseUnsupportedError::default()))
+    }
+
+    async fn get_last_event_index(
+        &self,
+        _task_id: &str,
+    ) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(StorageReleaseUnsupportedError::default()))
+    }
+
+    async fn get_recent_events(
+        &self,
+        _task_id: &str,
+        _limit: u64,
+    ) -> Result<Vec<TaskEvent>, Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(StorageReleaseUnsupportedError::default()))
+    }
+
+    async fn get_durable_series_state(
+        &self,
+        _task_id: &str,
+    ) -> Result<Vec<DurableSeriesState>, Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(StorageReleaseUnsupportedError::default()))
+    }
+
+    async fn claim_overdue_tasks(
+        &self,
+        _limit: u64,
+        _claim_ttl_ms: u64,
+    ) -> Result<Vec<TtlClaim>, Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(StorageReleaseUnsupportedError::default()))
+    }
+
+    async fn terminalize_ttl_claim(
+        &self,
+        _claim: TtlClaim,
+        _task: Task,
+        _event: TaskEvent,
+        _assignment: Option<WorkerAssignment>,
+    ) -> Result<Option<TerminalProjection>, Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(StorageReleaseUnsupportedError::default()))
+    }
+
+    async fn claim_terminal_projections(
+        &self,
+        _limit: u64,
+        _claim_token: &str,
+        _claim_ttl_ms: u64,
+    ) -> Result<Vec<TerminalProjection>, Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(StorageReleaseUnsupportedError::default()))
+    }
+
+    async fn complete_terminal_projection(
+        &self,
+        _projection: &TerminalProjection,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(StorageReleaseUnsupportedError::default()))
+    }
+
+    async fn save_durable_assignment(
+        &self,
+        _assignment: WorkerAssignment,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(StorageReleaseUnsupportedError::default()))
+    }
+
+    async fn delete_durable_assignment(
+        &self,
+        _task_id: &str,
+        _assignment_id: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(StorageReleaseUnsupportedError::default()))
     }
 
     // Worker audit
