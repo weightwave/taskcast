@@ -15,10 +15,10 @@ use serde::{Deserialize, Serialize};
 use crate::state_machine::{can_transition, is_suspended, is_terminal};
 use crate::types::{
     AssignMode, BlockedRequest, BroadcastProvider, CleanupConfig, DisconnectPolicy,
-    EventQueryOptions, Level, LongTermStore, ReleasePreconditions, ReleaseResult, SeriesMode,
-    ShortTermStore, StorageFenceConflictError, StorageReleaseUnsupportedError, Task, TaskArchive,
-    TaskArchiveImportOptions, TaskArchiveImportResult, TaskAuthConfig, TaskError, TaskEvent,
-    TaskFilter, TaskStatus, TaskcastHooks, WebhookConfig,
+    EventQueryOptions, HotWriteToken, Level, LongTermStore, ReleasePreconditions, ReleaseResult,
+    SeriesMode, ShortTermStore, StorageFenceConflictError, StorageReleaseUnsupportedError, Task,
+    TaskArchive, TaskArchiveImportOptions, TaskArchiveImportResult, TaskAuthConfig, TaskError,
+    TaskEvent, TaskFilter, TaskStatus, TaskcastHooks, WebhookConfig,
 };
 
 // ─── Error ───────────────────────────────────────────────────────────────────
@@ -329,22 +329,24 @@ impl TaskEngine {
         to: TaskStatus,
         payload: Option<TransitionPayload>,
     ) -> Result<Task, EngineError> {
-        let (task, expected_revision) = if let Some(coordinator) = &self.storage_coordinator {
-            coordinator.ensure_task_hot_for_write(task_id).await?;
-            let snapshot = self
-                .short_term_store
-                .get_task_mutation_snapshot(task_id)
-                .await?
-                .ok_or_else(|| EngineError::TaskNotFound(task_id.to_string()))?;
-            (snapshot.task, Some(snapshot.revision))
-        } else {
-            (
-                self.get_task(task_id)
+        let (task, expected_revision, initial_write_token) =
+            if let Some(coordinator) = &self.storage_coordinator {
+                let token = coordinator.ensure_task_hot_for_write(task_id).await?;
+                let snapshot = self
+                    .short_term_store
+                    .get_task_mutation_snapshot(task_id)
                     .await?
-                    .ok_or_else(|| EngineError::TaskNotFound(task_id.to_string()))?,
-                None,
-            )
-        };
+                    .ok_or_else(|| EngineError::TaskNotFound(task_id.to_string()))?;
+                (snapshot.task, Some(snapshot.revision), Some(token))
+            } else {
+                (
+                    self.get_task(task_id)
+                        .await?
+                        .ok_or_else(|| EngineError::TaskNotFound(task_id.to_string()))?,
+                    None,
+                    None,
+                )
+            };
 
         let from = task.status.clone();
 
@@ -496,6 +498,7 @@ impl TaskEngine {
                     expected_revision.as_deref().unwrap_or_default(),
                     &from,
                     derived_events,
+                    initial_write_token.expect("storage coordinator write token"),
                 )
                 .await?;
             if let Some(ref long_term_store) = self.long_term_store {
@@ -909,8 +912,26 @@ impl TaskEngine {
                 series_snapshot: None,
                 _accumulated_data: None,
             };
+            let mut initial_storage_epoch = None;
             for attempt in 0..3 {
-                let token = coordinator.ensure_task_hot_for_write(task_id).await?;
+                let token = if attempt == 0 {
+                    coordinator.ensure_task_hot_for_write(task_id).await?
+                } else {
+                    coordinator
+                        .ensure_task_hot_for_write_without_rehydrate(task_id)
+                        .await?
+                };
+                match initial_storage_epoch {
+                    Some(epoch) if token.storage_epoch != epoch => {
+                        return Err(EngineError::Store(Box::new(
+                            StorageFenceConflictError::new(
+                                "Task storage epoch changed after the write mutation started",
+                            ),
+                        )));
+                    }
+                    None => initial_storage_epoch = Some(token.storage_epoch),
+                    Some(_) => {}
+                }
                 match self
                     .short_term_store
                     .commit_event_fenced(task_id, raw.clone(), &token)
@@ -974,6 +995,7 @@ impl TaskEngine {
         expected_revision: &str,
         expected_status: &TaskStatus,
         inputs: Vec<PublishEventInput>,
+        initial_token: HotWriteToken,
     ) -> Result<Vec<TaskEvent>, EngineError> {
         let coordinator = self.storage_coordinator.as_ref().ok_or_else(|| {
             EngineError::Store(Box::new(StorageReleaseUnsupportedError::default()))
@@ -1004,7 +1026,20 @@ impl TaskEngine {
             })
             .collect::<Vec<_>>();
         for attempt in 0..3 {
-            let token = coordinator.ensure_task_hot_for_write(&task.id).await?;
+            let token = if attempt == 0 {
+                initial_token.clone()
+            } else {
+                coordinator
+                    .ensure_task_hot_for_write_without_rehydrate(&task.id)
+                    .await?
+            };
+            if token.storage_epoch != initial_token.storage_epoch {
+                return Err(EngineError::Store(Box::new(
+                    StorageFenceConflictError::new(
+                        "Task storage epoch changed after the write mutation started",
+                    ),
+                )));
+            }
             match self
                 .short_term_store
                 .commit_task_events_fenced(task.clone(), expected_revision, events.clone(), &token)
@@ -1145,8 +1180,10 @@ fn unsupported_archive_restore(message: &'static str) -> EngineError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory_adapters::{MemoryBroadcastProvider, MemoryShortTermStore};
-    use crate::types::{LongTermStore, SeriesMode, WorkerAuditEvent};
+    use crate::memory_adapters::{
+        MemoryBroadcastProvider, MemoryLongTermStore, MemoryShortTermStore,
+    };
+    use crate::types::{LongTermStore, SeriesMode, StorageBusyError, WorkerAuditEvent};
     use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::sync::RwLock as TokioRwLock;
 
@@ -1360,6 +1397,62 @@ mod tests {
             long_term_store: None,
             hooks: None,
         })
+    }
+
+    #[tokio::test]
+    async fn stale_write_retry_does_not_rehydrate_a_released_task() {
+        let hot = Arc::new(MemoryShortTermStore::new());
+        let durable = Arc::new(MemoryLongTermStore::new());
+        let engine = TaskEngine::new(TaskEngineOptions {
+            short_term_store: hot.clone(),
+            long_term_store: Some(durable),
+            broadcast: Arc::new(MemoryBroadcastProvider::new()),
+            hooks: None,
+        });
+        engine
+            .create_task(CreateTaskInput {
+                id: Some("task-stale-write".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        engine
+            .transition_task("task-stale-write", TaskStatus::Running, None)
+            .await
+            .unwrap();
+        let event = hot
+            .get_events("task-stale-write", None)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let coordinator = engine.storage_coordinator.as_ref().unwrap();
+        let initial = coordinator
+            .ensure_task_hot_for_write("task-stale-write")
+            .await
+            .unwrap();
+
+        engine
+            .release_task_storage(
+                "task-stale-write",
+                ReleasePreconditions {
+                    expected_last_event_index: event.index as i64,
+                    inactive_since: event.timestamp,
+                },
+            )
+            .await
+            .unwrap();
+
+        let stale_retry = coordinator
+            .ensure_task_hot_for_write_without_rehydrate("task-stale-write")
+            .await
+            .unwrap_err();
+        assert!(stale_retry.downcast_ref::<StorageBusyError>().is_some());
+        let fresh = coordinator
+            .ensure_task_hot_for_write("task-stale-write")
+            .await
+            .unwrap();
+        assert_eq!(fresh.storage_epoch, initial.storage_epoch + 1);
     }
 
     // ─── create_task ─────────────────────────────────────────────────────

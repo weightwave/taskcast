@@ -30,6 +30,7 @@ export interface StorageCoordinatorOptions {
   longTermStore: LongTermStore
   archiveBatchSize?: number
   storageLockTtlMs?: number
+  rehydrateReplayEvents?: number
   requiredStorageProtocolVersion?: number
   generateId?: () => string
   now?: () => number
@@ -42,6 +43,7 @@ interface LifecycleMethods {
   getWriteFence: NonNullable<ShortTermStore['getWriteFence']>
   closeWriteFence: NonNullable<ShortTermStore['closeWriteFence']>
   reopenWriteFence: NonNullable<ShortTermStore['reopenWriteFence']>
+  restoreHotTaskFenced: NonNullable<ShortTermStore['restoreHotTaskFenced']>
   readArchiveSourcePage: NonNullable<ShortTermStore['readArchiveSourcePage']>
   deleteTaskStorageFenced: NonNullable<ShortTermStore['deleteTaskStorageFenced']>
   getTaskStoragePresence: NonNullable<ShortTermStore['getTaskStoragePresence']>
@@ -58,6 +60,8 @@ interface DurableMethods {
   finalizeArchive: NonNullable<LongTermStore['finalizeArchive']>
   getArchiveWatermark: NonNullable<LongTermStore['getArchiveWatermark']>
   getLastEventIndex: NonNullable<LongTermStore['getLastEventIndex']>
+  getRecentEvents: NonNullable<LongTermStore['getRecentEvents']>
+  getDurableSeriesState: NonNullable<LongTermStore['getDurableSeriesState']>
 }
 
 interface SourceDescription {
@@ -71,6 +75,7 @@ export class StorageCoordinator {
   private readonly longTermStore: LongTermStore
   private readonly archiveBatchSize: number
   private readonly storageLockTtlMs: number
+  private readonly rehydrateReplayEvents: number
   private readonly requiredStorageProtocolVersion: number
   private readonly generateId: () => string
   private readonly now: () => number
@@ -80,6 +85,7 @@ export class StorageCoordinator {
     this.longTermStore = options.longTermStore
     this.archiveBatchSize = options.archiveBatchSize ?? 1_000
     this.storageLockTtlMs = options.storageLockTtlMs ?? 30_000
+    this.rehydrateReplayEvents = options.rehydrateReplayEvents ?? 1_000
     this.requiredStorageProtocolVersion =
       options.requiredStorageProtocolVersion ?? 2
     this.generateId = options.generateId ?? ulid
@@ -90,6 +96,14 @@ export class StorageCoordinator {
     }
     if (!Number.isSafeInteger(this.storageLockTtlMs) || this.storageLockTtlMs <= 0) {
       throw new StorageIntegrityError('Storage lock TTL must be a positive integer')
+    }
+    if (
+      !Number.isSafeInteger(this.rehydrateReplayEvents) ||
+      this.rehydrateReplayEvents < 0
+    ) {
+      throw new StorageIntegrityError(
+        'Rehydrate replay event count must be a non-negative integer',
+      )
     }
   }
 
@@ -354,7 +368,10 @@ export class StorageCoordinator {
     }
   }
 
-  async ensureTaskHotForWrite(taskId: string): Promise<HotWriteToken> {
+  async ensureTaskHotForWrite(
+    taskId: string,
+    rehydrateCold = true,
+  ): Promise<HotWriteToken> {
     const hot = this.requireHotLifecycle()
     const durable = this.requireDurableLifecycle()
     for (let attempt = 0; attempt < 3; attempt++) {
@@ -371,7 +388,12 @@ export class StorageCoordinator {
         throw new StorageBusyError('Task storage lifecycle operation is in progress')
       }
       if (metadata.storageState === 'cold') {
-        throw new StorageBusyError('Cold task must be rehydrated before mutation')
+        if (!rehydrateCold) {
+          throw new StorageBusyError(
+            'Task became cold after the write mutation started',
+          )
+        }
+        return this.rehydrateColdTask(taskId, metadata, hot, durable)
       }
       const fence = await hot.getWriteFence.call(this.shortTermStore, taskId)
       if (
@@ -407,6 +429,212 @@ export class StorageCoordinator {
     throw new StorageFenceConflictError(
       'Hot task write fence repair lost its metadata race',
     )
+  }
+
+  private async rehydrateColdTask(
+    taskId: string,
+    initial: TaskStorageMetadata,
+    hot: LifecycleMethods,
+    durable: DurableMethods,
+  ): Promise<HotWriteToken> {
+    const generation = this.generateId()
+    const lease = await hot.acquireStorageLock.call(
+      this.shortTermStore,
+      taskId,
+      this.generateId(),
+      generation,
+      this.storageLockTtlMs,
+    )
+    if (!lease) throw new StorageBusyError('Task storage rehydration is already in progress')
+
+    let leaseLost = false
+    const renew = async (): Promise<void> => {
+      let owned = false
+      try {
+        owned = await hot.renewStorageLock.call(
+          this.shortTermStore,
+          lease,
+          this.storageLockTtlMs,
+        )
+      } catch {
+        leaseLost = true
+        throw new StorageFenceConflictError('Storage rehydration lease renewal failed')
+      }
+      if (!owned) {
+        leaseLost = true
+        throw new StorageFenceConflictError('Storage rehydration lease was lost')
+      }
+    }
+
+    try {
+      await renew()
+      const metadata = await durable.getTaskStorageMetadata.call(
+        this.longTermStore,
+        taskId,
+      )
+      if (!metadata) {
+        throw new StorageIntegrityError(
+          `Task storage metadata does not exist: ${taskId}`,
+        )
+      }
+      if (metadata.storageState === 'releasing') {
+        throw new StorageBusyError('Task storage lifecycle operation is in progress')
+      }
+      if (metadata.storageState === 'hot') {
+        const fence = await hot.getWriteFence.call(this.shortTermStore, taskId)
+        if (
+          fence?.acceptingWrites &&
+          fence.activeReleaseGeneration === null &&
+          fence.storageEpoch === metadata.storageEpoch
+        ) {
+          return { taskId, storageEpoch: fence.storageEpoch }
+        }
+        throw new StorageFenceConflictError(
+          'Hot task write fence does not match durable metadata',
+        )
+      }
+      if (
+        metadata.storageEpoch !== initial.storageEpoch ||
+        metadata.activeReleaseGeneration !== null
+      ) {
+        throw new StorageFenceConflictError(
+          'Cold task metadata changed before rehydration',
+        )
+      }
+
+      const [presence, existingFence] = await Promise.all([
+        hot.getTaskStoragePresence.call(this.shortTermStore, taskId),
+        hot.getWriteFence.call(this.shortTermStore, taskId),
+      ])
+      if (
+        presence.task &&
+        existingFence?.acceptingWrites &&
+        existingFence.activeReleaseGeneration === null &&
+        existingFence.storageEpoch > metadata.storageEpoch
+      ) {
+        const adopted = await durable.compareAndSetTaskStorageMetadata.call(
+          this.longTermStore,
+          {
+            taskId,
+            expectedStorageState: 'cold',
+            expectedStorageEpoch: metadata.storageEpoch,
+            expectedReleaseGeneration: null,
+            next: {
+              ...metadata,
+              storageState: 'hot',
+              storageEpoch: existingFence.storageEpoch,
+              coldAt: null,
+            },
+          },
+        )
+        if (!adopted) {
+          throw new StorageFenceConflictError(
+            'Restored hot epoch lost its metadata recovery race',
+          )
+        }
+        return { taskId, storageEpoch: existingFence.storageEpoch }
+      }
+      if (
+        presence.task ||
+        presence.eventCount !== 0 ||
+        presence.nextIndex ||
+        presence.seriesStateCount !== 0 ||
+        presence.writeFence
+      ) {
+        throw new StorageIntegrityError(
+          'Cold task has partial or stale hot storage',
+        )
+      }
+
+      await renew()
+      const [task, maxEventIndex, replayEvents, seriesLatest] = await Promise.all([
+        this.longTermStore.getTask(taskId),
+        durable.getLastEventIndex.call(this.longTermStore, taskId),
+        durable.getRecentEvents.call(
+          this.longTermStore,
+          taskId,
+          this.rehydrateReplayEvents,
+        ),
+        durable.getDurableSeriesState.call(this.longTermStore, taskId),
+      ])
+      if (!task) {
+        throw new StorageIntegrityError(`Durable task does not exist: ${taskId}`)
+      }
+      if (
+        !Number.isSafeInteger(maxEventIndex) ||
+        maxEventIndex < metadata.archiveWatermark ||
+        replayEvents.some(
+          (event) =>
+            event.taskId !== taskId ||
+            !Number.isSafeInteger(event.index) ||
+            event.index > maxEventIndex,
+        )
+      ) {
+        throw new StorageIntegrityError('Durable rehydrate snapshot is inconsistent')
+      }
+      const nextEpoch = metadata.storageEpoch + 1
+      if (!Number.isSafeInteger(nextEpoch)) {
+        throw new StorageIntegrityError('Task storage epoch exceeds safe bounds')
+      }
+      await renew()
+      const token = await hot.restoreHotTaskFenced.call(
+        this.shortTermStore,
+        {
+          task,
+          archiveWatermark: metadata.archiveWatermark,
+          maxEventIndex,
+          replayEvents,
+          seriesLatest,
+          storageEpoch: metadata.storageEpoch,
+        },
+        lease,
+        nextEpoch,
+      )
+      await renew()
+      const installed = await durable.compareAndSetTaskStorageMetadata.call(
+        this.longTermStore,
+        {
+          taskId,
+          expectedStorageState: 'cold',
+          expectedStorageEpoch: metadata.storageEpoch,
+          expectedReleaseGeneration: null,
+          next: {
+            ...metadata,
+            storageState: 'hot',
+            storageEpoch: nextEpoch,
+            activeReleaseGeneration: null,
+            coldAt: null,
+          },
+        },
+      )
+      if (installed) return token
+
+      const current = await durable.getTaskStorageMetadata.call(
+        this.longTermStore,
+        taskId,
+      )
+      if (
+        current?.storageState === 'hot' &&
+        current.storageEpoch === nextEpoch &&
+        current.activeReleaseGeneration === null
+      ) {
+        return token
+      }
+      await renew()
+      await hot.closeWriteFence.call(this.shortTermStore, lease, nextEpoch)
+      await hot.deleteTaskStorageFenced.call(
+        this.shortTermStore,
+        lease,
+        nextEpoch,
+      )
+      throw new StorageFenceConflictError(
+        'Restored hot epoch lost its durable metadata race',
+      )
+    } finally {
+      if (!leaseLost) {
+        await hot.releaseStorageLock.call(this.shortTermStore, lease).catch(() => false)
+      }
+    }
   }
 
   async recoverTaskStorage(taskId: string): Promise<ReleaseResult> {
@@ -865,6 +1093,7 @@ export class StorageCoordinator {
       getWriteFence: this.shortTermStore.getWriteFence,
       closeWriteFence: this.shortTermStore.closeWriteFence,
       reopenWriteFence: this.shortTermStore.reopenWriteFence,
+      restoreHotTaskFenced: this.shortTermStore.restoreHotTaskFenced,
       readArchiveSourcePage: this.shortTermStore.readArchiveSourcePage,
       deleteTaskStorageFenced: this.shortTermStore.deleteTaskStorageFenced,
       getTaskStoragePresence: this.shortTermStore.getTaskStoragePresence,
@@ -889,6 +1118,8 @@ export class StorageCoordinator {
       finalizeArchive: this.longTermStore.finalizeArchive,
       getArchiveWatermark: this.longTermStore.getArchiveWatermark,
       getLastEventIndex: this.longTermStore.getLastEventIndex,
+      getRecentEvents: this.longTermStore.getRecentEvents,
+      getDurableSeriesState: this.longTermStore.getDurableSeriesState,
     }
     if (Object.values(methods).some((method) => typeof method !== 'function')) {
       throw new StorageReleaseUnsupportedError()

@@ -9,10 +9,10 @@ use crate::archive::{
 };
 use crate::types::{
     ArchiveBatch, ArchiveBatchReceipt, ArchiveGeneration, ArchiveGenerationStatus,
-    ArchiveSourceManifest, DurableSeriesState, HotWriteToken, LongTermStore, ReleasePreconditions,
-    ReleaseResult, SeriesMode, ShortTermStore, StorageBusyError, StorageFenceConflictError,
-    StorageIntegrityError, StorageLease, StorageReleaseUnsupportedError, StorageState, TaskEvent,
-    TaskStorageMetadata, TaskStorageMetadataCas,
+    ArchiveSourceManifest, DurableSeriesState, HotWriteToken, LongTermStore, RehydrateSnapshot,
+    ReleasePreconditions, ReleaseResult, SeriesMode, ShortTermStore, StorageBusyError,
+    StorageFenceConflictError, StorageIntegrityError, StorageLease, StorageReleaseUnsupportedError,
+    StorageState, TaskEvent, TaskStorageMetadata, TaskStorageMetadataCas,
 };
 
 type StorageResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -22,6 +22,7 @@ pub struct StorageCoordinator {
     long_term_store: Arc<dyn LongTermStore>,
     archive_batch_size: u64,
     storage_lock_ttl_ms: u64,
+    rehydrate_replay_events: u64,
     required_storage_protocol_version: u64,
     id_generator: Arc<dyn Fn() -> String + Send + Sync>,
 }
@@ -42,6 +43,7 @@ impl StorageCoordinator {
             long_term_store,
             archive_batch_size: 1_000,
             storage_lock_ttl_ms: 30_000,
+            rehydrate_replay_events: 1_000,
             required_storage_protocol_version: 2,
             id_generator: Arc::new(|| ulid::Ulid::new().to_string()),
         }
@@ -62,6 +64,11 @@ impl StorageCoordinator {
         self
     }
 
+    pub fn with_rehydrate_replay_events(mut self, rehydrate_replay_events: u64) -> Self {
+        self.rehydrate_replay_events = rehydrate_replay_events;
+        self
+    }
+
     pub fn with_required_storage_protocol_version(
         mut self,
         required_storage_protocol_version: u64,
@@ -79,6 +86,21 @@ impl StorageCoordinator {
     }
 
     pub async fn ensure_task_hot_for_write(&self, task_id: &str) -> StorageResult<HotWriteToken> {
+        self.ensure_task_hot_for_write_mode(task_id, true).await
+    }
+
+    pub(crate) async fn ensure_task_hot_for_write_without_rehydrate(
+        &self,
+        task_id: &str,
+    ) -> StorageResult<HotWriteToken> {
+        self.ensure_task_hot_for_write_mode(task_id, false).await
+    }
+
+    async fn ensure_task_hot_for_write_mode(
+        &self,
+        task_id: &str,
+        rehydrate_cold: bool,
+    ) -> StorageResult<HotWriteToken> {
         self.require_capabilities()?;
         for _attempt in 0..3 {
             let metadata = self
@@ -97,9 +119,12 @@ impl StorageCoordinator {
                     )))
                 }
                 StorageState::Cold => {
-                    return Err(boxed(StorageBusyError::new(
-                        "Cold task must be rehydrated before mutation",
-                    )))
+                    if !rehydrate_cold {
+                        return Err(boxed(StorageBusyError::new(
+                            "Task became cold after the write mutation started",
+                        )));
+                    }
+                    return self.rehydrate_cold_task(task_id, metadata).await;
                 }
                 StorageState::Hot => {}
             }
@@ -149,6 +174,221 @@ impl StorageCoordinator {
         }
         Err(boxed(StorageFenceConflictError::new(
             "Hot task write fence repair lost its metadata race",
+        )))
+    }
+
+    async fn rehydrate_cold_task(
+        &self,
+        task_id: &str,
+        initial: TaskStorageMetadata,
+    ) -> StorageResult<HotWriteToken> {
+        let lease = self
+            .short_term_store
+            .acquire_storage_lock(
+                task_id,
+                &(self.id_generator)(),
+                &(self.id_generator)(),
+                self.storage_lock_ttl_ms,
+            )
+            .await?
+            .ok_or_else(|| {
+                boxed(StorageBusyError::new(
+                    "Task storage rehydration is already in progress",
+                ))
+            })?;
+        let lease_lost = AtomicBool::new(false);
+        let result = self
+            .rehydrate_cold_task_owned(task_id, initial, &lease, &lease_lost)
+            .await;
+        if !lease_lost.load(Ordering::SeqCst) {
+            let _ = self.short_term_store.release_storage_lock(&lease).await;
+        }
+        result
+    }
+
+    async fn rehydrate_cold_task_owned(
+        &self,
+        task_id: &str,
+        initial: TaskStorageMetadata,
+        lease: &StorageLease,
+        lease_lost: &AtomicBool,
+    ) -> StorageResult<HotWriteToken> {
+        self.renew(lease, lease_lost).await?;
+        let metadata = self
+            .long_term_store
+            .get_task_storage_metadata(task_id)
+            .await?
+            .ok_or_else(|| {
+                boxed(StorageIntegrityError::new(format!(
+                    "Task storage metadata does not exist: {task_id}"
+                )))
+            })?;
+        match metadata.storage_state {
+            StorageState::Releasing => {
+                return Err(boxed(StorageBusyError::new(
+                    "Task storage lifecycle operation is in progress",
+                )))
+            }
+            StorageState::Hot => {
+                let fence = self.short_term_store.get_write_fence(task_id).await?;
+                if fence.as_ref().is_some_and(|fence| {
+                    fence.accepting_writes
+                        && fence.active_release_generation.is_none()
+                        && fence.storage_epoch == metadata.storage_epoch
+                }) {
+                    return Ok(HotWriteToken {
+                        task_id: task_id.to_string(),
+                        storage_epoch: metadata.storage_epoch,
+                    });
+                }
+                return Err(boxed(StorageFenceConflictError::new(
+                    "Hot task write fence does not match durable metadata",
+                )));
+            }
+            StorageState::Cold => {}
+        }
+        if metadata.storage_epoch != initial.storage_epoch
+            || metadata.active_release_generation.is_some()
+        {
+            return Err(boxed(StorageFenceConflictError::new(
+                "Cold task metadata changed before rehydration",
+            )));
+        }
+
+        let (presence, existing_fence) = tokio::try_join!(
+            self.short_term_store.get_task_storage_presence(task_id),
+            self.short_term_store.get_write_fence(task_id),
+        )?;
+        if presence.task
+            && existing_fence.as_ref().is_some_and(|fence| {
+                fence.accepting_writes
+                    && fence.active_release_generation.is_none()
+                    && fence.storage_epoch > metadata.storage_epoch
+            })
+        {
+            let storage_epoch = existing_fence.unwrap().storage_epoch;
+            let adopted = self
+                .long_term_store
+                .compare_and_set_task_storage_metadata(TaskStorageMetadataCas {
+                    task_id: task_id.to_string(),
+                    expected_storage_state: StorageState::Cold,
+                    expected_storage_epoch: metadata.storage_epoch,
+                    expected_release_generation: None,
+                    next: TaskStorageMetadata {
+                        storage_state: StorageState::Hot,
+                        storage_epoch,
+                        cold_at: None,
+                        ..metadata
+                    },
+                })
+                .await?;
+            if !adopted {
+                return Err(boxed(StorageFenceConflictError::new(
+                    "Restored hot epoch lost its metadata recovery race",
+                )));
+            }
+            return Ok(HotWriteToken {
+                task_id: task_id.to_string(),
+                storage_epoch,
+            });
+        }
+        if presence.task
+            || presence.event_count != 0
+            || presence.next_index
+            || presence.series_state_count != 0
+            || presence.write_fence
+        {
+            return Err(boxed(StorageIntegrityError::new(
+                "Cold task has partial or stale hot storage",
+            )));
+        }
+
+        self.renew(lease, lease_lost).await?;
+        let (task, max_event_index, replay_events, series_latest) = tokio::try_join!(
+            self.long_term_store.get_task(task_id),
+            self.long_term_store.get_last_event_index(task_id),
+            self.long_term_store
+                .get_recent_events(task_id, self.rehydrate_replay_events),
+            self.long_term_store.get_durable_series_state(task_id),
+        )?;
+        let task = task.ok_or_else(|| {
+            boxed(StorageIntegrityError::new(format!(
+                "Durable task does not exist: {task_id}"
+            )))
+        })?;
+        if max_event_index < metadata.archive_watermark
+            || replay_events.iter().any(|event| {
+                event.task_id != task_id
+                    || i64::try_from(event.index)
+                        .map(|index| index > max_event_index)
+                        .unwrap_or(true)
+            })
+        {
+            return Err(boxed(StorageIntegrityError::new(
+                "Durable rehydrate snapshot is inconsistent",
+            )));
+        }
+        let next_epoch = metadata.storage_epoch.checked_add(1).ok_or_else(|| {
+            boxed(StorageIntegrityError::new(
+                "Task storage epoch exceeds safe bounds",
+            ))
+        })?;
+        self.renew(lease, lease_lost).await?;
+        let token = self
+            .short_term_store
+            .restore_hot_task_fenced(
+                RehydrateSnapshot {
+                    task,
+                    archive_watermark: metadata.archive_watermark,
+                    max_event_index,
+                    replay_events,
+                    series_latest,
+                    storage_epoch: metadata.storage_epoch,
+                },
+                lease,
+                next_epoch,
+            )
+            .await?;
+        self.renew(lease, lease_lost).await?;
+        let installed = self
+            .long_term_store
+            .compare_and_set_task_storage_metadata(TaskStorageMetadataCas {
+                task_id: task_id.to_string(),
+                expected_storage_state: StorageState::Cold,
+                expected_storage_epoch: metadata.storage_epoch,
+                expected_release_generation: None,
+                next: TaskStorageMetadata {
+                    storage_state: StorageState::Hot,
+                    storage_epoch: next_epoch,
+                    active_release_generation: None,
+                    cold_at: None,
+                    ..metadata.clone()
+                },
+            })
+            .await?;
+        if installed {
+            return Ok(token);
+        }
+        let current = self
+            .long_term_store
+            .get_task_storage_metadata(task_id)
+            .await?;
+        if current.as_ref().is_some_and(|current| {
+            current.storage_state == StorageState::Hot
+                && current.storage_epoch == next_epoch
+                && current.active_release_generation.is_none()
+        }) {
+            return Ok(token);
+        }
+        self.renew(lease, lease_lost).await?;
+        self.short_term_store
+            .close_write_fence(lease, next_epoch)
+            .await?;
+        self.short_term_store
+            .delete_task_storage_fenced(lease, next_epoch)
+            .await?;
+        Err(boxed(StorageFenceConflictError::new(
+            "Restored hot epoch lost its durable metadata race",
         )))
     }
 

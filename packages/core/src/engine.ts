@@ -20,6 +20,7 @@ import type {
   TaskArchiveEvent,
   ReleasePreconditions,
   ReleaseResult,
+  HotWriteToken,
 } from './types.js'
 import {
   StorageFenceConflictError,
@@ -264,11 +265,12 @@ export class TaskEngine {
     },
   ): Promise<Task> {
     let expectedRevision: string | null = null
+    let initialWriteToken: HotWriteToken | null = null
     let task: Task | null
     if (this.storageCoordinator) {
       const getSnapshot = this.shortTermStore.getTaskMutationSnapshot
       if (!getSnapshot) throw new StorageReleaseUnsupportedError()
-      await this.storageCoordinator.ensureTaskHotForWrite(taskId)
+      initialWriteToken = await this.storageCoordinator.ensureTaskHotForWrite(taskId)
       const snapshot = await getSnapshot.call(this.shortTermStore, taskId)
       task = snapshot?.task ?? null
       expectedRevision = snapshot?.revision ?? null
@@ -369,6 +371,7 @@ export class TaskEngine {
         expectedRevision!,
         from,
         derivedEvents,
+        initialWriteToken!,
       )
       if (this.longTermStore) await this.longTermStore.saveTask(updated)
       for (const event of committed) {
@@ -699,8 +702,19 @@ export class TaskEngine {
           seriesAccField: input.seriesAccField,
         }),
       }
+      let initialStorageEpoch: number | null = null
       for (let attempt = 0; attempt < 3; attempt++) {
-        const token = await this.storageCoordinator.ensureTaskHotForWrite(taskId)
+        const token = await this.storageCoordinator.ensureTaskHotForWrite(
+          taskId,
+          attempt === 0,
+        )
+        if (initialStorageEpoch === null) {
+          initialStorageEpoch = token.storageEpoch
+        } else if (token.storageEpoch !== initialStorageEpoch) {
+          throw new StorageFenceConflictError(
+            'Task storage epoch changed after the write mutation started',
+          )
+        }
         try {
           const result = await this.shortTermStore.commitEventFenced!(
             taskId,
@@ -747,6 +761,7 @@ export class TaskEngine {
     expectedRevision: string,
     expectedStatus: TaskStatus,
     inputs: PublishEventInput[],
+    initialToken: HotWriteToken,
   ): Promise<TaskEvent[]> {
     const coordinator = this.storageCoordinator
     const commit = this.shortTermStore.commitTaskEventsFenced
@@ -767,7 +782,14 @@ export class TaskEngine {
         data: input.data,
       }))
       for (let attempt = 0; attempt < 3; attempt++) {
-        const token = await coordinator.ensureTaskHotForWrite(task.id)
+        const token = attempt === 0
+          ? initialToken
+          : await coordinator.ensureTaskHotForWrite(task.id, false)
+        if (token.storageEpoch !== initialToken.storageEpoch) {
+          throw new StorageFenceConflictError(
+            'Task storage epoch changed after the write mutation started',
+          )
+        }
         try {
           const committed = await commit.call(
             this.shortTermStore,
