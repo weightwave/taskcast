@@ -180,7 +180,9 @@ impl DependencyHealthRegistry {
                 .collect()
         };
         let outcomes = Arc::new(std::sync::Mutex::new(HashMap::new()));
-        let futures = checks.iter().cloned().map(|(name, check, generation)| {
+        let futures = checks.iter().map(|(name, check, generation)| {
+            let name = *name;
+            let generation = *generation;
             let registry = self.clone();
             let outcomes = Arc::clone(&outcomes);
             async move {

@@ -145,7 +145,7 @@ pub fn canonical_json(value: &serde_json::Value) -> Result<String, ArchiveError>
         }
         serde_json::Value::Object(values) => {
             let mut entries = values.iter().collect::<Vec<_>>();
-            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            entries.sort_by_key(|(left, _)| *left);
             let encoded = entries
                 .into_iter()
                 .map(|(key, value)| {
