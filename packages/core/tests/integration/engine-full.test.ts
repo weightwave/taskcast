@@ -100,7 +100,8 @@ describe('Full stack: task lifecycle', () => {
     // Verify Redis short-term store
     const redisEvents = await engine.getEvents(task.id)
     const userEvents = redisEvents.filter((e) => e.type !== 'taskcast:status')
-    expect(userEvents).toHaveLength(2)
+    expect(userEvents).toHaveLength(1)
+    expect(userEvents[0]?.data).toEqual({ delta: 'Hello World' })
 
     // Verify Postgres long-term store
     const pgTask = await sql`SELECT * FROM taskcast_tasks WHERE id = ${task.id}`

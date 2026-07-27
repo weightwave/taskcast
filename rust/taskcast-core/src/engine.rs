@@ -8,6 +8,9 @@ use crate::archive::{
     build_task_archive_restore_data, sanitize_task_archive_event, validate_task_archive,
     ArchiveError, TASK_ARCHIVE_SCHEMA, TASK_ARCHIVE_VERSION,
 };
+use crate::canonical_history::{
+    apply_canonical_history_query, merge_canonical_history, resolve_canonical_series_latest,
+};
 use crate::series::process_series;
 use crate::storage_coordinator::StorageCoordinator;
 use serde::{Deserialize, Serialize};
@@ -15,8 +18,9 @@ use serde::{Deserialize, Serialize};
 use crate::state_machine::{can_transition, is_suspended, is_terminal};
 use crate::types::{
     AssignMode, BlockedRequest, BroadcastProvider, CleanupConfig, DisconnectPolicy,
-    EventQueryOptions, HotWriteToken, Level, LongTermStore, ReleasePreconditions, ReleaseResult,
-    SeriesMode, ShortTermStore, StorageFenceConflictError, StorageReleaseUnsupportedError, Task,
+    DurableSeriesState, EventQueryOptions, HotWriteToken, Level, LongTermStore,
+    ReleasePreconditions, ReleaseResult, SeriesMode, ShortTermStore, SinceCursor,
+    StorageFenceConflictError, StorageIntegrityError, StorageReleaseUnsupportedError, Task,
     TaskArchive, TaskArchiveImportOptions, TaskArchiveImportResult, TaskAuthConfig, TaskError,
     TaskEvent, TaskFilter, TaskStatus, TaskcastHooks, WebhookConfig,
 };
@@ -660,17 +664,37 @@ impl TaskEngine {
         task_id: &str,
         opts: Option<EventQueryOptions>,
     ) -> Result<Vec<TaskEvent>, EngineError> {
-        let from_short = self
-            .short_term_store
-            .get_events(task_id, opts.clone())
+        let Some(ref long_term_store) = self.long_term_store else {
+            return Ok(self.short_term_store.get_events(task_id, opts).await?);
+        };
+        if !long_term_store.supports_hot_cold_release() {
+            let from_short = self
+                .short_term_store
+                .get_events(task_id, opts.clone())
+                .await?;
+            return if from_short.is_empty() {
+                Ok(long_term_store.get_events(task_id, opts).await?)
+            } else {
+                Ok(from_short)
+            };
+        }
+        let overlay_hot = self.should_overlay_hot_history(task_id).await?;
+        let hot_events = if overlay_hot {
+            self.short_term_store.get_events(task_id, None).await?
+        } else {
+            Vec::new()
+        };
+        let durable_series = if long_term_store.supports_hot_cold_release() {
+            long_term_store.get_durable_series_state(task_id).await?
+        } else {
+            Vec::new()
+        };
+        let durable_events = self
+            .load_canonical_durable_events(task_id, opts.as_ref(), &hot_events, &durable_series)
             .await?;
-        if !from_short.is_empty() {
-            return Ok(from_short);
-        }
-        if let Some(ref long_term_store) = self.long_term_store {
-            return Ok(long_term_store.get_events(task_id, opts).await?);
-        }
-        Ok(vec![])
+        let merged = merge_canonical_history(&durable_events, &hot_events, &durable_series)
+            .map_err(|error| EngineError::Store(Box::new(error)))?;
+        Ok(apply_canonical_history_query(&merged, opts))
     }
 
     pub async fn list_tasks(&self, filter: TaskFilter) -> Result<Vec<Task>, EngineError> {
@@ -703,13 +727,120 @@ impl TaskEngine {
         task_id: &str,
         series_id: &str,
     ) -> Result<Option<TaskEvent>, EngineError> {
-        Ok(self
-            .short_term_store
-            .get_series_latest(task_id, series_id)
-            .await?)
+        let Some(ref long_term_store) = self.long_term_store else {
+            return Ok(self
+                .short_term_store
+                .get_series_latest(task_id, series_id)
+                .await?);
+        };
+        if !long_term_store.supports_hot_cold_release() {
+            return Ok(self
+                .short_term_store
+                .get_series_latest(task_id, series_id)
+                .await?);
+        }
+        let durable = long_term_store
+            .get_durable_series_state(task_id)
+            .await?
+            .into_iter()
+            .find(|state| state.series_id == series_id);
+        let Some(durable) = durable else {
+            return Ok(self
+                .short_term_store
+                .get_series_latest(task_id, series_id)
+                .await?);
+        };
+        if !self.should_overlay_hot_history(task_id).await? {
+            return Ok(Some(durable.event));
+        }
+        let hot_events = self.short_term_store.get_events(task_id, None).await?;
+        Ok(Some(
+            resolve_canonical_series_latest(&durable, &hot_events)
+                .map_err(|error| EngineError::Store(Box::new(error)))?,
+        ))
     }
 
     // ─── Private ─────────────────────────────────────────────────────────
+
+    async fn should_overlay_hot_history(&self, task_id: &str) -> Result<bool, EngineError> {
+        let Some(ref long_term_store) = self.long_term_store else {
+            return Ok(true);
+        };
+        if long_term_store.supports_hot_cold_release() {
+            let metadata = long_term_store.get_task_storage_metadata(task_id).await?;
+            if metadata
+                .is_some_and(|metadata| metadata.storage_state == crate::types::StorageState::Cold)
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    async fn load_canonical_durable_events(
+        &self,
+        task_id: &str,
+        opts: Option<&EventQueryOptions>,
+        hot_events: &[TaskEvent],
+        durable_series: &[DurableSeriesState],
+    ) -> Result<Vec<TaskEvent>, EngineError> {
+        let long_term_store = self
+            .long_term_store
+            .as_ref()
+            .expect("canonical history requires long-term storage");
+        let Some(requested_limit) = opts.and_then(|opts| opts.limit) else {
+            return Ok(long_term_store
+                .get_events(
+                    task_id,
+                    canonical_durable_query(opts, hot_events, durable_series),
+                )
+                .await?);
+        };
+        if requested_limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let page_size = requested_limit.min(1_000);
+        let mut paged_opts = opts.cloned().unwrap_or(EventQueryOptions {
+            since: None,
+            limit: None,
+        });
+        paged_opts.limit = Some(page_size);
+        let mut query = canonical_durable_query(Some(&paged_opts), hot_events, durable_series);
+        let mut loaded = Vec::new();
+        let mut previous_boundary = None;
+        loop {
+            let page = long_term_store.get_events(task_id, query).await?;
+            loaded.extend(page.iter().cloned());
+            let merged = merge_canonical_history(&loaded, hot_events, durable_series)
+                .map_err(|error| EngineError::Store(Box::new(error)))?;
+            let assembled = apply_canonical_history_query(&merged, opts.cloned());
+            if page.len() < page_size as usize {
+                return Ok(loaded);
+            }
+
+            let boundary = page.last().expect("full durable history page").index;
+            if previous_boundary.is_some_and(|previous| boundary <= previous) {
+                return Err(EngineError::Store(Box::new(StorageIntegrityError::new(
+                    "Durable history pagination did not advance",
+                ))));
+            }
+            if assembled.len() >= requested_limit as usize
+                && assembled[requested_limit as usize - 1].index <= boundary
+            {
+                return Ok(loaded);
+            }
+            previous_boundary = Some(boundary);
+            query = Some(EventQueryOptions {
+                since: Some(SinceCursor {
+                    id: None,
+                    index: Some(boundary),
+                    timestamp: None,
+                }),
+                limit: Some(page_size),
+            });
+        }
+    }
 
     async fn build_export_archive(&self, task: &Task) -> Result<TaskArchive, EngineError> {
         let short_term_events = self.short_term_store.get_events(&task.id, None).await?;
@@ -1166,6 +1297,35 @@ fn contiguous_prefix_len(events: &[TaskEvent]) -> u64 {
         expected += 1;
     }
     expected
+}
+
+fn canonical_durable_query(
+    opts: Option<&EventQueryOptions>,
+    hot_events: &[TaskEvent],
+    durable_series: &[DurableSeriesState],
+) -> Option<EventQueryOptions> {
+    let mut query = opts.cloned()?;
+    if let Some(id) = query
+        .since
+        .as_ref()
+        .and_then(|since| since.id.as_ref())
+        .cloned()
+    {
+        let anchor = hot_events.iter().find(|event| event.id == id).or_else(|| {
+            durable_series
+                .iter()
+                .find(|state| state.event.id == id)
+                .map(|state| &state.event)
+        });
+        if let Some(anchor) = anchor {
+            query.since = Some(SinceCursor {
+                id: None,
+                index: Some(anchor.index),
+                timestamp: None,
+            });
+        }
+    }
+    Some(query)
 }
 
 fn unsupported_archive_restore(message: &'static str) -> EngineError {

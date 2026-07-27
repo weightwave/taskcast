@@ -2,6 +2,11 @@ import { ulid } from 'ulidx'
 import { canTransition, isTerminal, isSuspended } from './state-machine.js'
 import { processSeries } from './series.js'
 import { StorageCoordinator } from './storage-coordinator.js'
+import {
+  applyCanonicalHistoryQuery,
+  mergeCanonicalHistory,
+  resolveCanonicalSeriesLatest,
+} from './canonical-history.js'
 import { InvalidTaskArchiveError, buildTaskArchiveRestoreData, normalizeTaskArchive } from './archive.js'
 import type {
   Task,
@@ -21,9 +26,11 @@ import type {
   ReleasePreconditions,
   ReleaseResult,
   HotWriteToken,
+  DurableSeriesState,
 } from './types.js'
 import {
   StorageFenceConflictError,
+  StorageIntegrityError,
   StorageReleaseUnsupportedError,
 } from './types.js'
 
@@ -33,6 +40,24 @@ export class TaskConflictError extends Error {
   constructor(taskId: string) {
     super(`Task already exists: ${taskId}`)
     this.name = 'TaskConflictError'
+  }
+}
+
+function canonicalDurableQuery(
+  opts: EventQueryOptions | undefined,
+  hotEvents: readonly TaskEvent[],
+  durableSeries: readonly DurableSeriesState[],
+): EventQueryOptions | undefined {
+  if (!opts) return undefined
+  let since = opts.since
+  if (since?.id) {
+    const anchor = hotEvents.find((event) => event.id === since!.id)
+      ?? durableSeries.find((state) => state.event.id === since!.id)?.event
+    if (anchor) since = { index: anchor.index }
+  }
+  return {
+    ...(since && { since }),
+    ...(opts.limit !== undefined && { limit: opts.limit }),
   }
 }
 
@@ -641,12 +666,36 @@ export class TaskEngine {
   }
 
   async getEvents(taskId: string, opts?: EventQueryOptions): Promise<TaskEvent[]> {
-    const fromShort = await this.shortTermStore.getEvents(taskId, opts)
-    if (fromShort.length > 0) return fromShort
-    if (this.longTermStore) {
-      return this.longTermStore.getEvents(taskId, opts)
+    if (!this.longTermStore) {
+      return this.shortTermStore.getEvents(taskId, opts)
     }
-    return []
+    if (this.longTermStore.supportsHotColdRelease !== true) {
+      const fromShort = await this.shortTermStore.getEvents(taskId, opts)
+      return fromShort.length > 0
+        ? fromShort
+        : this.longTermStore.getEvents(taskId, opts)
+    }
+
+    const overlayHot = await this.shouldOverlayHotHistory(taskId)
+    const hotEvents = overlayHot
+      ? await this.shortTermStore.getEvents(taskId)
+      : []
+    const getDurableSeriesState = this.longTermStore.getDurableSeriesState
+    if (!getDurableSeriesState) throw new StorageReleaseUnsupportedError()
+    const durableSeries = await getDurableSeriesState.call(
+      this.longTermStore,
+      taskId,
+    )
+    const durableEvents = await this.loadCanonicalDurableEvents(
+      taskId,
+      opts,
+      hotEvents,
+      durableSeries,
+    )
+    return applyCanonicalHistoryQuery(
+      mergeCanonicalHistory(durableEvents, hotEvents, durableSeries),
+      opts,
+    )
   }
 
   subscribe(taskId: string, handler: (event: TaskEvent) => void): () => void {
@@ -654,7 +703,79 @@ export class TaskEngine {
   }
 
   async getSeriesLatest(taskId: string, seriesId: string): Promise<TaskEvent | null> {
-    return this.shortTermStore.getSeriesLatest(taskId, seriesId)
+    if (
+      !this.longTermStore ||
+      this.longTermStore.supportsHotColdRelease !== true
+    ) {
+      return this.shortTermStore.getSeriesLatest(taskId, seriesId)
+    }
+    const getDurableSeriesState = this.longTermStore.getDurableSeriesState
+    if (!getDurableSeriesState) throw new StorageReleaseUnsupportedError()
+    const durable = (await getDurableSeriesState.call(this.longTermStore, taskId))
+      .find((state) => state.seriesId === seriesId)
+    if (!durable) return this.shortTermStore.getSeriesLatest(taskId, seriesId)
+    if (!(await this.shouldOverlayHotHistory(taskId))) return durable.event
+    const hotEvents = await this.shortTermStore.getEvents(taskId)
+    return resolveCanonicalSeriesLatest(durable, hotEvents)
+  }
+
+  private async shouldOverlayHotHistory(taskId: string): Promise<boolean> {
+    if (this.longTermStore?.supportsHotColdRelease !== true) return true
+    const getMetadata = this.longTermStore.getTaskStorageMetadata
+    if (!getMetadata) throw new StorageReleaseUnsupportedError()
+    const metadata = await getMetadata.call(this.longTermStore, taskId)
+    if (metadata?.storageState === 'cold') return false
+    return true
+  }
+
+  private async loadCanonicalDurableEvents(
+    taskId: string,
+    opts: EventQueryOptions | undefined,
+    hotEvents: readonly TaskEvent[],
+    durableSeries: readonly DurableSeriesState[],
+  ): Promise<TaskEvent[]> {
+    if (!this.longTermStore) return []
+    const requestedLimit = opts?.limit
+    if (requestedLimit === undefined) {
+      return this.longTermStore.getEvents(
+        taskId,
+        canonicalDurableQuery(opts, hotEvents, durableSeries),
+      )
+    }
+    if (requestedLimit <= 0) return []
+
+    const pageSize = Math.min(requestedLimit, 1_000)
+    const loaded: TaskEvent[] = []
+    let query = canonicalDurableQuery(
+      { ...opts, limit: pageSize },
+      hotEvents,
+      durableSeries,
+    )
+    let previousBoundary = -1
+    for (;;) {
+      const page = await this.longTermStore.getEvents(taskId, query)
+      loaded.push(...page)
+      const assembled = applyCanonicalHistoryQuery(
+        mergeCanonicalHistory(loaded, hotEvents, durableSeries),
+        opts,
+      )
+      if (page.length < pageSize) return loaded
+
+      const boundary = page.at(-1)!.index
+      if (boundary <= previousBoundary) {
+        throw new StorageIntegrityError(
+          'Durable history pagination did not advance',
+        )
+      }
+      if (
+        assembled.length >= requestedLimit &&
+        assembled[requestedLimit - 1]!.index <= boundary
+      ) {
+        return loaded
+      }
+      previousBoundary = boundary
+      query = { since: { index: boundary }, limit: pageSize }
+    }
   }
 
   private async _emit(
