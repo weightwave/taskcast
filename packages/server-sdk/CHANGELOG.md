@@ -1,5 +1,12 @@
 # @taskcast/server-sdk
 
+## 1.6.0
+
+### Patch Changes
+
+- Updated dependencies [c058cd1]
+  - @taskcast/core@1.6.0
+
 ## 1.5.5
 
 ### Patch Changes

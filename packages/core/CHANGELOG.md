@@ -1,5 +1,14 @@
 # @taskcast/core
 
+## 1.6.0
+
+### Minor Changes
+
+- c058cd1: Add a fenced hot-to-cold storage lifecycle with a guarded release endpoint,
+  PostgreSQL-canonical history, bounded Redis rehydration, and durable task TTL
+  terminalization. Emit payload-free release, rehydration, history-source,
+  watermark, TTL, and unusually old/large hot-task observations.
+
 ## 1.5.5
 
 ### Patch Changes
