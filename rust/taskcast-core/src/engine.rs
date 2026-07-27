@@ -514,14 +514,18 @@ impl TaskEngine {
             }
         }
 
+        let mut status_data = serde_json::Map::new();
+        status_data.insert("status".to_string(), serde_json::json!(to));
+        if let Some(ref result) = updated.result {
+            status_data.insert("result".to_string(), serde_json::json!(result));
+        }
+        if let Some(ref error) = updated.error {
+            status_data.insert("error".to_string(), serde_json::json!(error));
+        }
         let mut derived_events = vec![PublishEventInput {
             r#type: "taskcast:status".to_string(),
             level: Level::Info,
-            data: serde_json::json!({
-                "status": to,
-                "result": updated.result,
-                "error": updated.error,
-            }),
+            data: serde_json::Value::Object(status_data),
             series_id: None,
             series_mode: None,
             series_acc_field: None,
@@ -2228,9 +2232,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].r#type, "taskcast:status");
         assert_eq!(events[0].level, Level::Info);
-
-        let data = &events[0].data;
-        assert_eq!(data["status"], "running");
+        assert_eq!(events[0].data, serde_json::json!({"status": "running"}));
     }
 
     // ─── publish_event ───────────────────────────────────────────────────
