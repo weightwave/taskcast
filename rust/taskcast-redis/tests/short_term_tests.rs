@@ -5,13 +5,18 @@
 //!
 //! Run with: `cargo test -p taskcast-redis --test short_term_tests`
 
+use std::sync::Arc;
 use taskcast_core::types::{
     AssignMode, ConnectionMode, DurableSeriesState, EventQueryOptions, HotWriteToken, Level,
     RehydrateSnapshot, SeriesMode, ShortTermStore, SinceCursor, StorageFenceConflictError,
     StorageIntegrityError, StorageWriterRegistration, Task, TaskError, TaskFilter, TaskStatus,
-    Worker, WorkerAssignment, WorkerAssignmentStatus, WorkerFilter, WorkerMatchRule, WorkerStatus,
+    TerminalProjection, Worker, WorkerAssignment, WorkerAssignmentStatus, WorkerFilter,
+    WorkerMatchRule, WorkerStatus,
 };
-use taskcast_core::TaskEvent;
+use taskcast_core::{
+    BroadcastProvider, CreateTaskInput, LongTermStore, MemoryBroadcastProvider,
+    MemoryLongTermStore, TaskEngine, TaskEngineOptions, TaskEvent,
+};
 use taskcast_redis::RedisShortTermStore;
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
@@ -2437,4 +2442,135 @@ async fn storage_writer_readiness_expires_without_a_heartbeat() {
     assert_eq!(writers[0].instance_id, "writer-a");
     tokio::time::sleep(std::time::Duration::from_millis(60)).await;
     assert!(store.list_storage_writers().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn terminal_projection_is_atomic_and_releases_worker_capacity_once() {
+    let (_container, redis_url) = start_redis().await;
+    flush_redis(&redis_url).await;
+    let store = make_store(&redis_url).await;
+    let mut task = make_task("ttl-projection");
+    task.status = TaskStatus::Assigned;
+    task.assigned_worker = Some("worker-1".to_string());
+    task.cost = Some(3);
+    store.save_task(task.clone()).await.unwrap();
+    let mut worker = make_worker("worker-1");
+    worker.status = WorkerStatus::Busy;
+    worker.used_slots = 3;
+    store.save_worker(worker).await.unwrap();
+    let mut assignment = make_assignment("ttl-projection", "worker-1");
+    assignment.cost = 3;
+    assignment.status = WorkerAssignmentStatus::Running;
+    store.add_assignment(assignment.clone()).await.unwrap();
+
+    let first_lease = store
+        .acquire_storage_lock("ttl-projection", "owner-1", "ttl-generation-1", 5_000)
+        .await
+        .unwrap()
+        .unwrap();
+    store.close_write_fence(&first_lease, 1).await.unwrap();
+    let mut timeout = task;
+    timeout.status = TaskStatus::Timeout;
+    timeout.updated_at = 3_000.0;
+    timeout.completed_at = Some(3_000.0);
+    timeout.assigned_worker = None;
+    let event = TaskEvent {
+        id: "ttl-timeout-event".to_string(),
+        task_id: "ttl-projection".to_string(),
+        index: 0,
+        timestamp: 3_000.0,
+        r#type: "taskcast:status".to_string(),
+        level: Level::Info,
+        data: serde_json::json!({"status": "timeout"}),
+        series_id: None,
+        series_mode: None,
+        series_acc_field: None,
+        series_snapshot: None,
+        _accumulated_data: None,
+    };
+    let projection = TerminalProjection {
+        projection_id: "ttl:ttl-timeout-event".to_string(),
+        task: timeout,
+        event: event.clone(),
+        assignment: Some(assignment),
+        claim_token: Some("claim-1".to_string()),
+        claim_until: Some(10_000.0),
+    };
+
+    let first = store
+        .project_terminal_fenced(&projection, &first_lease, 1, 2)
+        .await
+        .unwrap();
+    assert!(first.projected);
+    assert_eq!(first.token.storage_epoch, 2);
+    assert!(store.release_storage_lock(&first_lease).await.unwrap());
+
+    let retry_lease = store
+        .acquire_storage_lock("ttl-projection", "owner-2", "ttl-generation-2", 5_000)
+        .await
+        .unwrap()
+        .unwrap();
+    store.close_write_fence(&retry_lease, 2).await.unwrap();
+    let retry = store
+        .project_terminal_fenced(&projection, &retry_lease, 2, 3)
+        .await
+        .unwrap();
+    assert!(!retry.projected);
+    assert_eq!(retry.token.storage_epoch, 3);
+
+    assert_eq!(
+        store
+            .get_task("ttl-projection")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        TaskStatus::Timeout
+    );
+    assert_eq!(
+        store.get_events("ttl-projection", None).await.unwrap(),
+        vec![event]
+    );
+    assert!(store
+        .get_task_assignment("ttl-projection")
+        .await
+        .unwrap()
+        .is_none());
+    let settled_worker = store.get_worker("worker-1").await.unwrap().unwrap();
+    assert_eq!(settled_worker.used_slots, 0);
+    assert_eq!(settled_worker.status, WorkerStatus::Idle);
+}
+
+#[tokio::test]
+async fn durable_ttl_engine_does_not_expire_redis_hot_storage() {
+    let (_container, redis_url) = start_redis().await;
+    flush_redis(&redis_url).await;
+    let store = Arc::new(make_store(&redis_url).await);
+    let durable = Arc::new(MemoryLongTermStore::new());
+    let short: Arc<dyn ShortTermStore> = store;
+    let long: Arc<dyn LongTermStore> = durable;
+    let broadcast: Arc<dyn BroadcastProvider> = Arc::new(MemoryBroadcastProvider::new());
+    let engine = TaskEngine::new(TaskEngineOptions {
+        short_term_store: short,
+        long_term_store: Some(long),
+        broadcast,
+        hooks: None,
+    });
+    engine
+        .create_task(CreateTaskInput {
+            id: Some("durable-no-expiry".to_string()),
+            ttl: Some(60),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let client = redis::Client::open(redis_url).unwrap();
+    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+    let ttl: i64 = redis::cmd("TTL")
+        .arg("test:task:durable-no-expiry")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(ttl, -1);
 }

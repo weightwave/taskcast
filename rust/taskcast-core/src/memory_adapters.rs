@@ -12,7 +12,8 @@ use crate::types::{
     StorageState, StorageWriterRegistration, Task, TaskArchiveImportOptions,
     TaskArchiveRestoreData, TaskEvent, TaskFilter, TaskMutationSnapshot, TaskStatus,
     TaskStorageMetadata, TaskStorageMetadataCas, TaskStoragePresence, TaskWriteFence, Worker,
-    WorkerAssignment, WorkerAuditEvent, WorkerFilter,
+    WorkerAssignment, WorkerAuditEvent, WorkerFilter, WorkerStatus, TerminalProjection,
+    TerminalProjectionResult, TtlClaim,
 };
 use crate::{
     compute_archive_batch_digest, compute_archive_source_digest,
@@ -129,6 +130,12 @@ struct MemoryCreationClaim {
     completed_at: Option<u128>,
 }
 
+#[derive(Clone)]
+struct MemoryTerminalProjection {
+    projection: TerminalProjection,
+    projected_at: Option<u128>,
+}
+
 impl MemoryShortTermStore {
     pub fn new() -> Self {
         Self {
@@ -199,6 +206,9 @@ pub struct MemoryLongTermStore {
     worker_events: RwLock<HashMap<String, Vec<WorkerAuditEvent>>>,
     creation_claims: RwLock<HashMap<String, MemoryCreationClaim>>,
     release_requests: RwLock<HashMap<String, StorageReleaseRequest>>,
+    ttl_claims: RwLock<HashMap<String, TtlClaim>>,
+    durable_assignments: RwLock<HashMap<String, WorkerAssignment>>,
+    terminal_projections: RwLock<HashMap<String, MemoryTerminalProjection>>,
 }
 
 impl MemoryLongTermStore {
@@ -214,6 +224,9 @@ impl MemoryLongTermStore {
             worker_events: RwLock::new(HashMap::new()),
             creation_claims: RwLock::new(HashMap::new()),
             release_requests: RwLock::new(HashMap::new()),
+            ttl_claims: RwLock::new(HashMap::new()),
+            durable_assignments: RwLock::new(HashMap::new()),
+            terminal_projections: RwLock::new(HashMap::new()),
         }
     }
 
@@ -289,6 +302,10 @@ impl LongTermStore for MemoryLongTermStore {
         true
     }
 
+    fn supports_durable_ttl(&self) -> bool {
+        true
+    }
+
     fn supports_task_creation_claims(&self) -> bool {
         true
     }
@@ -296,13 +313,44 @@ impl LongTermStore for MemoryLongTermStore {
     async fn save_task(&self, task: Task) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let _lifecycle = self.lifecycle_guard.lock().unwrap();
         let task_id = task.id.clone();
-        let deadline = task.ttl.map(|ttl| task.created_at + ttl as f64 * 1_000.0);
-        self.tasks.write().unwrap().insert(task_id.clone(), task);
-        self.metadata
+        let now = MemoryShortTermStore::now_ms() as f64;
+        let deadline = if has_memory_execution_deadline(&task) {
+            Some(now + task.ttl.unwrap_or(0) as f64 * 1_000.0)
+        } else {
+            None
+        };
+        let existing = self.tasks.read().unwrap().get(&task_id).cloned();
+        if existing.as_ref().is_some_and(|existing| {
+            is_memory_terminal(&existing.status) && existing.status != task.status
+        }) {
+            return Err(Box::new(StorageFenceConflictError::new(format!(
+                "Durable terminal task cannot be overwritten: {task_id}"
+            ))));
+        }
+        self.tasks
             .write()
             .unwrap()
-            .entry(task_id.clone())
-            .or_insert(TaskStorageMetadata {
+            .insert(task_id.clone(), task.clone());
+        let mut metadata = self.metadata.write().unwrap();
+        if let Some(current) = metadata.get_mut(&task_id) {
+            current.execution_deadline_at = if has_memory_execution_deadline(&task) {
+                if current.execution_deadline_at.is_none()
+                    || existing
+                        .as_ref()
+                        .is_some_and(|existing| existing.status == TaskStatus::Paused)
+                    || existing.as_ref().and_then(|existing| existing.ttl) != task.ttl
+                {
+                    deadline
+                } else {
+                    current.execution_deadline_at
+                }
+            } else {
+                None
+            };
+            current.task_version += 1;
+            self.ttl_claims.write().unwrap().remove(&task_id);
+        } else {
+            metadata.insert(task_id.clone(), TaskStorageMetadata {
                 task_id,
                 storage_state: StorageState::Hot,
                 storage_epoch: 1,
@@ -313,6 +361,7 @@ impl LongTermStore for MemoryLongTermStore {
                 execution_deadline_at: deadline,
                 task_version: 0,
             });
+        }
         Ok(())
     }
 
@@ -322,7 +371,12 @@ impl LongTermStore for MemoryLongTermStore {
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
         let _lifecycle = self.lifecycle_guard.lock().unwrap();
         let task_id = task.id.clone();
-        let deadline = task.ttl.map(|ttl| task.created_at + ttl as f64 * 1_000.0);
+        let now = MemoryShortTermStore::now_ms() as f64;
+        let deadline = if has_memory_execution_deadline(&task) {
+            task.ttl.map(|ttl| now + ttl as f64 * 1_000.0)
+        } else {
+            None
+        };
         {
             let mut tasks = self.tasks.write().unwrap();
             if tasks.contains_key(&task_id) {
@@ -362,7 +416,11 @@ impl LongTermStore for MemoryLongTermStore {
         let _lifecycle = self.lifecycle_guard.lock().unwrap();
         let task_id = task.id.clone();
         let now = MemoryShortTermStore::now_ms();
-        let deadline = task.ttl.map(|ttl| task.created_at + ttl as f64 * 1_000.0);
+        let deadline = if has_memory_execution_deadline(&task) {
+            task.ttl.map(|ttl| now as f64 + ttl as f64 * 1_000.0)
+        } else {
+            None
+        };
         if self.tasks.read().unwrap().contains_key(&task_id) {
             let claims = self.creation_claims.read().unwrap();
             let can_take_over = claims.get(&task_id).is_some_and(|claim| {
@@ -938,14 +996,34 @@ impl LongTermStore for MemoryLongTermStore {
         &self,
         task_id: &str,
     ) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(self
+        let event_index = self
             .events
             .read()
             .unwrap()
             .get(task_id)
-            .and_then(|events| events.last())
+            .into_iter()
+            .flatten()
             .map(|event| event.index as i64)
-            .unwrap_or(-1))
+            .max()
+            .unwrap_or(-1);
+        let series_index = self
+            .series
+            .read()
+            .unwrap()
+            .get(task_id)
+            .into_iter()
+            .flatten()
+            .map(|state| state.through_index as i64)
+            .max()
+            .unwrap_or(-1);
+        let watermark = self
+            .metadata
+            .read()
+            .unwrap()
+            .get(task_id)
+            .map(|metadata| metadata.archive_watermark)
+            .unwrap_or(-1);
+        Ok(event_index.max(series_index).max(watermark))
     }
 
     async fn get_recent_events(
@@ -983,6 +1061,261 @@ impl LongTermStore for MemoryLongTermStore {
             .unwrap_or_default())
     }
 
+    async fn claim_overdue_tasks(
+        &self,
+        limit: u64,
+        claim_ttl_ms: u64,
+    ) -> Result<Vec<TtlClaim>, Box<dyn std::error::Error + Send + Sync>> {
+        if limit == 0 || claim_ttl_ms == 0 {
+            return Err(Box::new(StorageIntegrityError::new(
+                "TTL claim bounds are invalid",
+            )));
+        }
+        let _lifecycle = self.lifecycle_guard.lock().unwrap();
+        let now = MemoryShortTermStore::now_ms() as f64;
+        let tasks = self.tasks.read().unwrap();
+        let active_claims = self.ttl_claims.read().unwrap();
+        let mut due = self
+            .metadata
+            .read()
+            .unwrap()
+            .values()
+            .filter(|metadata| {
+                tasks
+                    .get(&metadata.task_id)
+                    .is_some_and(|task| !is_memory_terminal(&task.status))
+                    && metadata
+                        .execution_deadline_at
+                        .is_some_and(|deadline| deadline <= now)
+                    && active_claims
+                        .get(&metadata.task_id)
+                        .is_none_or(|claim| claim.claim_until <= now)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        drop(active_claims);
+        drop(tasks);
+        due.sort_by(|left, right| {
+            left.execution_deadline_at
+                .partial_cmp(&right.execution_deadline_at)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.task_id.cmp(&right.task_id))
+        });
+        due.truncate(limit as usize);
+        let mut claims = self.ttl_claims.write().unwrap();
+        Ok(due
+            .into_iter()
+            .map(|metadata| {
+                let claim = TtlClaim {
+                    task_id: metadata.task_id.clone(),
+                    claim_token: ulid::Ulid::new().to_string(),
+                    claim_until: now + claim_ttl_ms as f64,
+                    task_version: metadata.task_version,
+                    execution_deadline_at: metadata.execution_deadline_at.unwrap(),
+                };
+                claims.insert(metadata.task_id, claim.clone());
+                claim
+            })
+            .collect())
+    }
+
+    async fn terminalize_ttl_claim(
+        &self,
+        claim: TtlClaim,
+        task: Task,
+        event: TaskEvent,
+        assignment: Option<WorkerAssignment>,
+    ) -> Result<Option<TerminalProjection>, Box<dyn std::error::Error + Send + Sync>> {
+        let _lifecycle = self.lifecycle_guard.lock().unwrap();
+        let now = MemoryShortTermStore::now_ms() as f64;
+        let current_claim = self.ttl_claims.read().unwrap().get(&claim.task_id).cloned();
+        let current_task = self.tasks.read().unwrap().get(&claim.task_id).cloned();
+        let metadata = self.metadata.read().unwrap().get(&claim.task_id).cloned();
+        if current_claim.as_ref() != Some(&claim)
+            || claim.claim_until <= now
+            || current_task
+                .as_ref()
+                .is_none_or(|task| is_memory_terminal(&task.status))
+            || metadata.as_ref().is_none_or(|metadata| {
+                metadata.task_version != claim.task_version
+                    || metadata.execution_deadline_at != Some(claim.execution_deadline_at)
+            })
+        {
+            return Ok(None);
+        }
+        if task.id != claim.task_id
+            || task.status != TaskStatus::Timeout
+            || event.task_id != claim.task_id
+            || event.r#type != "taskcast:status"
+        {
+            return Err(Box::new(StorageIntegrityError::new(
+                "TTL terminalization input is invalid",
+            )));
+        }
+        let durable_assignment = self
+            .durable_assignments
+            .read()
+            .unwrap()
+            .get(&claim.task_id)
+            .cloned();
+        if durable_assignment != assignment {
+            return Err(Box::new(StorageIntegrityError::new(format!(
+                "Durable assignment changed before TTL terminalization: {}",
+                claim.task_id
+            ))));
+        }
+        let last_index = self
+            .events
+            .read()
+            .unwrap()
+            .get(&claim.task_id)
+            .into_iter()
+            .flatten()
+            .map(|event| event.index as i64)
+            .chain(
+                self.series
+                    .read()
+                    .unwrap()
+                    .get(&claim.task_id)
+                    .into_iter()
+                    .flatten()
+                    .map(|state| state.through_index as i64),
+            )
+            .chain(std::iter::once(metadata.unwrap().archive_watermark))
+            .max()
+            .unwrap_or(-1);
+        if event.index as i64 != last_index + 1 {
+            return Err(Box::new(StorageIntegrityError::new(format!(
+                "TTL timeout event index is not contiguous for {}",
+                claim.task_id
+            ))));
+        }
+
+        self.tasks
+            .write()
+            .unwrap()
+            .insert(claim.task_id.clone(), task.clone());
+        self.upsert_event(event.clone());
+        if let Some(metadata) = self.metadata.write().unwrap().get_mut(&claim.task_id) {
+            metadata.execution_deadline_at = None;
+            metadata.task_version += 1;
+            metadata.last_event_at = Some(event.timestamp);
+        }
+        self.ttl_claims.write().unwrap().remove(&claim.task_id);
+        self.durable_assignments
+            .write()
+            .unwrap()
+            .remove(&claim.task_id);
+        let projection = TerminalProjection {
+            projection_id: format!("ttl:{}", event.id),
+            task,
+            event,
+            assignment: durable_assignment,
+            claim_token: Some(claim.claim_token),
+            claim_until: Some(claim.claim_until),
+        };
+        self.terminal_projections.write().unwrap().insert(
+            projection.projection_id.clone(),
+            MemoryTerminalProjection {
+                projection: projection.clone(),
+                projected_at: None,
+            },
+        );
+        Ok(Some(projection))
+    }
+
+    async fn claim_terminal_projections(
+        &self,
+        limit: u64,
+        claim_token: &str,
+        claim_ttl_ms: u64,
+    ) -> Result<Vec<TerminalProjection>, Box<dyn std::error::Error + Send + Sync>> {
+        if limit == 0 || claim_token.is_empty() || claim_ttl_ms == 0 {
+            return Err(Box::new(StorageIntegrityError::new(
+                "Terminal projection claim bounds are invalid",
+            )));
+        }
+        let now = MemoryShortTermStore::now_ms() as f64;
+        let mut rows = self.terminal_projections.write().unwrap();
+        let mut claimed = Vec::new();
+        for row in rows.values_mut() {
+            if row.projected_at.is_some()
+                || row
+                    .projection
+                    .claim_until
+                    .is_some_and(|claim_until| claim_until > now)
+            {
+                continue;
+            }
+            row.projection.claim_token = Some(claim_token.to_string());
+            row.projection.claim_until = Some(now + claim_ttl_ms as f64);
+            claimed.push(row.projection.clone());
+            if claimed.len() == limit as usize {
+                break;
+            }
+        }
+        Ok(claimed)
+    }
+
+    async fn complete_terminal_projection(
+        &self,
+        projection: &TerminalProjection,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut rows = self.terminal_projections.write().unwrap();
+        let Some(row) = rows.get_mut(&projection.projection_id) else {
+            return Err(Box::new(StorageFenceConflictError::new(
+                "Terminal projection claim was lost",
+            )));
+        };
+        if row.projected_at.is_some() {
+            return Ok(());
+        }
+        if projection.claim_token.is_none()
+            || projection.claim_until.is_none()
+            || projection
+                .claim_until
+                .is_some_and(|claim_until| claim_until <= MemoryShortTermStore::now_ms() as f64)
+            || row.projection.claim_token != projection.claim_token
+            || row.projection.claim_until != projection.claim_until
+        {
+            return Err(Box::new(StorageFenceConflictError::new(
+                "Terminal projection claim was lost",
+            )));
+        }
+        row.projected_at = Some(MemoryShortTermStore::now_ms());
+        row.projection.claim_token = None;
+        row.projection.claim_until = None;
+        Ok(())
+    }
+
+    async fn save_durable_assignment(
+        &self,
+        assignment: WorkerAssignment,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.durable_assignments
+            .write()
+            .unwrap()
+            .insert(assignment.task_id.clone(), assignment);
+        Ok(())
+    }
+
+    async fn delete_durable_assignment(
+        &self,
+        task_id: &str,
+        assignment_id: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut assignments = self.durable_assignments.write().unwrap();
+        let should_delete = assignments.get(task_id).is_some_and(|assignment| {
+            assignment_id.is_none_or(|assignment_id| {
+                assignment_id == memory_assignment_id(assignment)
+            })
+        });
+        if should_delete {
+            assignments.remove(task_id);
+        }
+        Ok(())
+    }
+
     async fn save_worker_event(
         &self,
         event: WorkerAuditEvent,
@@ -1009,6 +1342,27 @@ impl LongTermStore for MemoryLongTermStore {
             .cloned()
             .unwrap_or_default())
     }
+}
+
+fn is_memory_terminal(status: &TaskStatus) -> bool {
+    matches!(
+        status,
+        TaskStatus::Completed
+            | TaskStatus::Failed
+            | TaskStatus::Timeout
+            | TaskStatus::Cancelled
+    )
+}
+
+fn has_memory_execution_deadline(task: &Task) -> bool {
+    task.ttl.is_some() && task.status != TaskStatus::Paused && !is_memory_terminal(&task.status)
+}
+
+fn memory_assignment_id(assignment: &WorkerAssignment) -> String {
+    format!(
+        "{}:{}:{}",
+        assignment.task_id, assignment.worker_id, assignment.assigned_at as i64
+    )
 }
 
 #[async_trait]
@@ -1746,6 +2100,120 @@ impl ShortTermStore for MemoryShortTermStore {
         Ok(HotWriteToken {
             task_id,
             storage_epoch: next_epoch,
+        })
+    }
+
+    async fn project_terminal_fenced(
+        &self,
+        projection: &TerminalProjection,
+        lease: &StorageLease,
+        expected_epoch: u64,
+        next_epoch: u64,
+    ) -> Result<TerminalProjectionResult, Box<dyn std::error::Error + Send + Sync>> {
+        let _mutation = self.task_event_guard.lock().unwrap();
+        self.assert_owned_storage_lock(lease)?;
+        let task_id = &projection.task.id;
+        let mut fences = self.write_fences.write().unwrap();
+        let Some(fence) = fences.get_mut(task_id) else {
+            return Err(Box::new(StorageFenceConflictError::default()));
+        };
+        if task_id != &lease.task_id
+            || projection.event.task_id != *task_id
+            || projection
+                .assignment
+                .as_ref()
+                .is_some_and(|assignment| assignment.task_id != *task_id)
+            || fence.accepting_writes
+            || fence.storage_epoch != expected_epoch
+            || fence.active_release_generation.as_deref() != Some(lease.generation.as_str())
+            || next_epoch != expected_epoch + 1
+        {
+            return Err(Box::new(StorageFenceConflictError::default()));
+        }
+
+        let mut events = self.events.write().unwrap();
+        let task_events = events.entry(task_id.clone()).or_default();
+        let existing = task_events
+            .iter()
+            .find(|event| event.index == projection.event.index);
+        let projected = if let Some(existing) = existing {
+            if existing != &projection.event {
+                return Err(Box::new(StorageIntegrityError::new(
+                    "Terminal projection conflicts with the hot event at its index",
+                )));
+            }
+            false
+        } else {
+            let next_index = self
+                .index_counters
+                .read()
+                .unwrap()
+                .get(task_id)
+                .map(|counter| counter.load(Ordering::SeqCst))
+                .unwrap_or(0);
+            if next_index != projection.event.index {
+                return Err(Box::new(StorageIntegrityError::new(
+                    "Terminal projection event index is not contiguous in hot storage",
+                )));
+            }
+            task_events.push(projection.event.clone());
+            self.index_counters.write().unwrap().insert(
+                task_id.clone(),
+                Arc::new(AtomicU64::new(projection.event.index + 1)),
+            );
+            true
+        };
+        drop(events);
+
+        self.tasks
+            .write()
+            .unwrap()
+            .insert(task_id.clone(), projection.task.clone());
+        let mut revisions = self.task_revisions.write().unwrap();
+        *revisions.entry(task_id.clone()).or_insert(0) += 1;
+        drop(revisions);
+
+        if let Some(assignment) = &projection.assignment {
+            let mut assignments = self.assignments.write().unwrap();
+            let current = assignments
+                .iter()
+                .find(|candidate| candidate.task_id == *task_id)
+                .cloned();
+            if current.as_ref().is_some_and(|current| current != assignment) {
+                return Err(Box::new(StorageIntegrityError::new(
+                    "Terminal projection conflicts with the hot assignment",
+                )));
+            }
+            if current.is_some() {
+                assignments.retain(|candidate| candidate.task_id != *task_id);
+                drop(assignments);
+                if let Some(worker) = self
+                    .workers
+                    .write()
+                    .unwrap()
+                    .get_mut(&assignment.worker_id)
+                {
+                    worker.used_slots = worker.used_slots.saturating_sub(assignment.cost);
+                    if !matches!(worker.status, WorkerStatus::Offline | WorkerStatus::Draining) {
+                        worker.status = if worker.used_slots >= worker.capacity {
+                            WorkerStatus::Busy
+                        } else {
+                            WorkerStatus::Idle
+                        };
+                    }
+                }
+            }
+        }
+
+        fence.accepting_writes = true;
+        fence.storage_epoch = next_epoch;
+        fence.active_release_generation = None;
+        Ok(TerminalProjectionResult {
+            token: HotWriteToken {
+                task_id: task_id.clone(),
+                storage_epoch: next_epoch,
+            },
+            projected,
         })
     }
 

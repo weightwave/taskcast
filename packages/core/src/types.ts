@@ -419,6 +419,11 @@ export interface TerminalProjection {
   claimUntil: number | null
 }
 
+export interface TerminalProjectionResult {
+  token: HotWriteToken
+  projected: boolean
+}
+
 export interface TaskStoragePresence {
   task: boolean
   eventCount: number
@@ -592,6 +597,13 @@ export interface ShortTermStore {
     lease: StorageLease,
     nextEpoch: number,
   ): Promise<HotWriteToken>
+  /** Atomically projects a durable terminal task/event and settles its assignment. */
+  projectTerminalFenced?(
+    projection: TerminalProjection,
+    lease: StorageLease,
+    expectedEpoch: number,
+    nextEpoch: number,
+  ): Promise<TerminalProjectionResult>
   getTaskStoragePresence?(taskId: string): Promise<TaskStoragePresence>
   registerStorageWriter?(registration: StorageWriterRegistration, ttlMs: number): Promise<void>
   listStorageWriters?(): Promise<StorageWriterRegistration[]>

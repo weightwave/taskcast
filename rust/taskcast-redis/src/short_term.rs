@@ -7,7 +7,8 @@ use taskcast_core::types::{
     ArchiveSourcePage, ClosedWriteFence, EventQueryOptions, HotWriteToken, RehydrateSnapshot,
     SeriesMode, SeriesResult, ShortTermStore, StorageFenceConflictError, StorageIntegrityError,
     StorageLease, StorageWriterRegistration, Task, TaskEvent, TaskFilter, TaskMutationSnapshot,
-    TaskStoragePresence, TaskWriteFence, Worker, WorkerAssignment, WorkerFilter,
+    TaskStoragePresence, TaskWriteFence, TerminalProjection, TerminalProjectionResult, Worker,
+    WorkerAssignment, WorkerFilter,
 };
 use taskcast_core::DependencyObserver;
 
@@ -116,6 +117,10 @@ impl Keys {
     /// `{prefix}:workerAssignments:{workerId}` -- SET of task IDs for a worker's assignments.
     fn worker_assignments(&self, worker_id: &str) -> String {
         format!("{}:workerAssignments:{}", self.prefix, worker_id)
+    }
+
+    fn terminal_projection(&self, projection_id: &str) -> String {
+        format!("{}:terminalProjection:{}", self.prefix, projection_id)
     }
 }
 
@@ -984,6 +989,116 @@ const RESTORE_HOT_TASK_LUA: &str = r#"
     return 1
 "#;
 
+const PROJECT_TERMINAL_FENCED_LUA: &str = r#"
+    local function validType(key, expected)
+      local actual = redis.call('TYPE', key).ok
+      return actual == 'none' or actual == expected
+    end
+    if not validType(KEYS[1], 'string')
+       or not validType(KEYS[2], 'string')
+       or not validType(KEYS[3], 'string')
+       or not validType(KEYS[4], 'string')
+       or not validType(KEYS[5], 'list')
+       or not validType(KEYS[6], 'string')
+       or not validType(KEYS[7], 'string')
+       or not validType(KEYS[8], 'string')
+       or not validType(KEYS[9], 'set')
+       or not validType(KEYS[10], 'string')
+       or not validType(KEYS[11], 'string') then
+      return redis.error_reply('STORAGE_INTEGRITY_ERROR')
+    end
+
+    local leaseJson = redis.call('GET', KEYS[1])
+    local fenceJson = redis.call('GET', KEYS[2])
+    if not leaseJson or not fenceJson then
+      return redis.error_reply('STORAGE_FENCE_CONFLICT')
+    end
+    local lease = cjson.decode(leaseJson)
+    local fence = cjson.decode(fenceJson)
+    if lease.taskId ~= ARGV[1]
+       or lease.lockToken ~= ARGV[2]
+       or lease.generation ~= ARGV[3]
+       or lease.storageEpoch ~= tonumber(ARGV[4])
+       or fence.taskId ~= ARGV[1]
+       or fence.acceptingWrites ~= false
+       or fence.storageEpoch ~= tonumber(ARGV[5])
+       or fence.activeReleaseGeneration ~= ARGV[3]
+       or tonumber(ARGV[6]) ~= tonumber(ARGV[5]) + 1 then
+      return redis.error_reply('STORAGE_FENCE_CONFLICT')
+    end
+
+    local eventIndex = tonumber(ARGV[9])
+    local nextIndex = tonumber(redis.call('GET', KEYS[6]) or '0')
+    if not eventIndex or eventIndex < 0 or not nextIndex then
+      return redis.error_reply('STORAGE_INTEGRITY_ERROR')
+    end
+    local projected = 0
+    if nextIndex == eventIndex then
+      redis.call('RPUSH', KEYS[5], ARGV[8])
+      redis.call('SET', KEYS[6], tostring(eventIndex + 1))
+      projected = 1
+    elseif nextIndex > eventIndex then
+      local found = false
+      for _, candidateJson in ipairs(redis.call('LRANGE', KEYS[5], 0, -1)) do
+        local candidate = cjson.decode(candidateJson)
+        if candidate.index == eventIndex then
+          if candidateJson ~= ARGV[8] then
+            return redis.error_reply('STORAGE_INTEGRITY_ERROR')
+          end
+          found = true
+          break
+        end
+      end
+      if not found then
+        return redis.error_reply('STORAGE_INTEGRITY_ERROR')
+      end
+    else
+      return redis.error_reply('STORAGE_INTEGRITY_ERROR')
+    end
+
+    redis.call('SET', KEYS[3], ARGV[7])
+    redis.call('SET', KEYS[4], 'timeout')
+    local windowJson = redis.call('GET', KEYS[7])
+    local firstIndex = eventIndex
+    if windowJson then
+      local window = cjson.decode(windowJson)
+      if window.firstIndex ~= cjson.null then firstIndex = window.firstIndex end
+    end
+    redis.call(
+      'SET',
+      KEYS[7],
+      cjson.encode({ firstIndex = firstIndex, lastIndex = eventIndex })
+    )
+
+    if ARGV[10] ~= '' and redis.call('EXISTS', KEYS[11]) == 0 then
+      local assignmentJson = redis.call('GET', KEYS[8])
+      if assignmentJson and assignmentJson ~= ARGV[10] then
+        return redis.error_reply('STORAGE_INTEGRITY_ERROR')
+      end
+      if assignmentJson then
+        redis.call('DEL', KEYS[8])
+        redis.call('SREM', KEYS[9], ARGV[1])
+        local workerJson = redis.call('GET', KEYS[10])
+        if workerJson then
+          local worker = cjson.decode(workerJson)
+          worker.usedSlots = math.max(0, worker.usedSlots - tonumber(ARGV[12]))
+          if worker.status ~= 'offline' and worker.status ~= 'draining' then
+            if worker.usedSlots >= worker.capacity then
+              worker.status = 'busy'
+            else
+              worker.status = 'idle'
+            end
+          end
+          redis.call('SET', KEYS[10], cjson.encode(worker))
+        end
+      end
+      redis.call('SET', KEYS[11], '1', 'PX', tonumber(ARGV[14]))
+    end
+
+    redis.call('SET', KEYS[2], ARGV[13])
+    return { tostring(projected), ARGV[6] }
+"#;
+
 const REGISTER_STORAGE_WRITER_LUA: &str = r#"
     redis.call('SET', KEYS[1], ARGV[2], 'PX', tonumber(ARGV[3]))
     redis.call('SADD', KEYS[2], ARGV[1])
@@ -1643,6 +1758,84 @@ impl ShortTermStore for RedisShortTermStore {
         Ok(HotWriteToken {
             task_id,
             storage_epoch: next_epoch,
+        })
+    }
+
+    async fn project_terminal_fenced(
+        &self,
+        projection: &TerminalProjection,
+        lease: &StorageLease,
+        expected_epoch: u64,
+        next_epoch: u64,
+    ) -> Result<TerminalProjectionResult, Box<dyn std::error::Error + Send + Sync>> {
+        let task_id = &projection.task.id;
+        if task_id != &lease.task_id
+            || projection.task.status != taskcast_core::types::TaskStatus::Timeout
+            || projection.event.task_id != *task_id
+            || projection
+                .assignment
+                .as_ref()
+                .is_some_and(|assignment| assignment.task_id != *task_id)
+            || next_epoch != expected_epoch + 1
+        {
+            return Err(Box::new(StorageFenceConflictError::default()));
+        }
+        let assignment = projection.assignment.as_ref();
+        let assignment_json = assignment
+            .map(serde_json::to_string)
+            .transpose()?
+            .unwrap_or_default();
+        let worker_id = assignment
+            .map(|assignment| assignment.worker_id.as_str())
+            .unwrap_or("");
+        let cost = assignment.map(|assignment| assignment.cost).unwrap_or(0);
+        let fence = TaskWriteFence {
+            task_id: task_id.clone(),
+            accepting_writes: true,
+            storage_epoch: next_epoch,
+            active_release_generation: None,
+        };
+        let mut conn = self.conn.clone();
+        let result: (u64, u64) = redis::Script::new(PROJECT_TERMINAL_FENCED_LUA)
+            .key(self.keys.storage_lock(task_id))
+            .key(self.keys.write_fence(task_id))
+            .key(self.keys.task(task_id))
+            .key(self.keys.task_status(task_id))
+            .key(self.keys.events(task_id))
+            .key(self.keys.idx(task_id))
+            .key(self.keys.hot_window(task_id))
+            .key(self.keys.assignment(task_id))
+            .key(self.keys.worker_assignments(worker_id))
+            .key(self.keys.worker(worker_id))
+            .key(self.keys.terminal_projection(&projection.projection_id))
+            .arg(task_id)
+            .arg(&lease.lock_token)
+            .arg(&lease.generation)
+            .arg(lease.storage_epoch)
+            .arg(expected_epoch)
+            .arg(next_epoch)
+            .arg(serde_json::to_string(&projection.task)?)
+            .arg(serde_json::to_string(&projection.event)?)
+            .arg(projection.event.index)
+            .arg(assignment_json)
+            .arg(worker_id)
+            .arg(cost)
+            .arg(serde_json::to_string(&fence)?)
+            .arg(7_u64 * 24 * 60 * 60 * 1_000)
+            .invoke_async(&mut conn)
+            .await
+            .map_err(Self::map_fence_error)?;
+        if result.0 > 1 || result.1 != next_epoch {
+            return Err(Box::new(StorageIntegrityError::new(
+                "Redis returned an invalid terminal projection result",
+            )));
+        }
+        Ok(TerminalProjectionResult {
+            token: HotWriteToken {
+                task_id: task_id.clone(),
+                storage_epoch: next_epoch,
+            },
+            projected: result.0 == 1,
         })
     }
 

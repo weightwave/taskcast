@@ -30,6 +30,9 @@ import type {
   TaskStorageMetadata,
   TaskStorageMetadataCas,
   WorkerAuditEvent,
+  TerminalProjection,
+  TerminalProjectionResult,
+  TtlClaim,
 } from './types.js'
 import { StorageFenceConflictError, StorageIntegrityError } from './types.js'
 import { TaskConflictError } from './engine.js'
@@ -411,6 +414,85 @@ export class MemoryShortTermStore implements ShortTermStore {
     return { taskId, storageEpoch: nextEpoch }
   }
 
+  async projectTerminalFenced(
+    projection: TerminalProjection,
+    lease: StorageLease,
+    expectedEpoch: number,
+    nextEpoch: number,
+  ): Promise<TerminalProjectionResult> {
+    this.assertOwnedStorageLock(lease)
+    const taskId = projection.task.id
+    const fence = this.writeFences.get(taskId)
+    if (
+      taskId !== lease.taskId ||
+      projection.event.taskId !== taskId ||
+      (projection.assignment !== null &&
+        projection.assignment.taskId !== taskId) ||
+      !fence ||
+      fence.acceptingWrites ||
+      fence.storageEpoch !== expectedEpoch ||
+      fence.activeReleaseGeneration !== lease.generation ||
+      nextEpoch !== expectedEpoch + 1
+    ) {
+      throw new StorageFenceConflictError()
+    }
+
+    const taskEvents = this.events.get(taskId) ?? []
+    const existing = taskEvents.find(
+      (event) => event.index === projection.event.index,
+    )
+    let projected = false
+    if (existing) {
+      if (canonicalJson(existing) !== canonicalJson(projection.event)) {
+        throw new StorageIntegrityError(
+          'Terminal projection conflicts with the hot event at its index',
+        )
+      }
+    } else {
+      const nextIndex = (this.indexCounters.get(taskId) ?? -1) + 1
+      if (nextIndex !== projection.event.index) {
+        throw new StorageIntegrityError(
+          'Terminal projection event index is not contiguous in hot storage',
+        )
+      }
+      this.indexCounters.set(taskId, projection.event.index)
+      this.appendEventSync(taskId, projection.event)
+      projected = true
+    }
+
+    this.tasks.set(taskId, structuredClone(projection.task))
+    this.bumpTaskRevision(taskId)
+    const assignment = projection.assignment
+    if (assignment) {
+      const current = this.assignments.get(taskId)
+      if (current && canonicalJson(current) !== canonicalJson(assignment)) {
+        throw new StorageIntegrityError(
+          'Terminal projection conflicts with the hot assignment',
+        )
+      }
+      if (current) {
+        this.assignments.delete(taskId)
+        const worker = this.workers.get(assignment.workerId)
+        if (worker) {
+          worker.usedSlots = Math.max(0, worker.usedSlots - assignment.cost)
+          if (worker.status !== 'offline' && worker.status !== 'draining') {
+            worker.status = worker.usedSlots >= worker.capacity ? 'busy' : 'idle'
+          }
+        }
+      }
+    }
+    this.writeFences.set(taskId, {
+      taskId,
+      acceptingWrites: true,
+      storageEpoch: nextEpoch,
+      activeReleaseGeneration: null,
+    })
+    return {
+      token: { taskId, storageEpoch: nextEpoch },
+      projected,
+    }
+  }
+
   async getTaskStoragePresence(taskId: string): Promise<TaskStoragePresence> {
     const prefix = `${taskId}:`
     let seriesStateCount = 0
@@ -672,6 +754,7 @@ export class MemoryShortTermStore implements ShortTermStore {
 
 export class MemoryLongTermStore implements LongTermStore {
   readonly supportsHotColdRelease = true
+  readonly supportsDurableTtl = true
   private tasks = new Map<string, Task>()
   private events = new Map<string, TaskEvent[]>()
   private metadata = new Map<string, TaskStorageMetadata>()
@@ -680,14 +763,31 @@ export class MemoryLongTermStore implements LongTermStore {
   private series = new Map<string, DurableSeriesState[]>()
   private workerEvents = new Map<string, WorkerAuditEvent[]>()
   private releaseRequests = new Map<string, StorageReleaseRequest>()
+  private ttlClaims = new Map<string, TtlClaim>()
+  private durableAssignments = new Map<string, WorkerAssignment>()
+  private terminalProjections = new Map<
+    string,
+    { projection: TerminalProjection; projectedAt: number | null }
+  >()
   private creationClaims = new Map<
     string,
     { token: string; claimedAt: number; expiresAt: number | null; completedAt: number | null }
   >()
 
   async saveTask(task: Task): Promise<void> {
+    const existing = this.tasks.get(task.id)
+    const metadata = this.metadata.get(task.id)
+    if (
+      existing &&
+      isMemoryTerminal(existing.status) &&
+      existing.status !== task.status
+    ) {
+      throw new StorageFenceConflictError(
+        `Durable terminal task cannot be overwritten: ${task.id}`,
+      )
+    }
     this.tasks.set(task.id, structuredClone(task))
-    if (!this.metadata.has(task.id)) {
+    if (!metadata) {
       this.metadata.set(task.id, {
         taskId: task.id,
         storageState: 'hot',
@@ -697,10 +797,24 @@ export class MemoryLongTermStore implements LongTermStore {
         lastEventAt: null,
         coldAt: null,
         executionDeadlineAt:
-          task.ttl === undefined ? null : task.createdAt + task.ttl * 1_000,
+          hasMemoryExecutionDeadline(task)
+            ? Date.now() + task.ttl! * 1_000
+            : null,
         taskVersion: 0,
       })
+      return
     }
+    metadata.executionDeadlineAt = hasMemoryExecutionDeadline(task)
+      ? (
+          metadata.executionDeadlineAt === null ||
+          existing?.status === 'paused' ||
+          existing?.ttl !== task.ttl
+            ? Date.now() + task.ttl! * 1_000
+            : metadata.executionDeadlineAt
+        )
+      : null
+    metadata.taskVersion += 1
+    this.ttlClaims.delete(task.id)
   }
 
   async createTaskIfAbsent(task: Task): Promise<boolean> {
@@ -737,7 +851,9 @@ export class MemoryLongTermStore implements LongTermStore {
       lastEventAt: null,
       coldAt: null,
       executionDeadlineAt:
-        task.ttl === undefined ? null : task.createdAt + task.ttl * 1_000,
+        hasMemoryExecutionDeadline(task)
+          ? now + task.ttl! * 1_000
+          : null,
       taskVersion: 0,
     })
     this.creationClaims.set(task.id, {
@@ -1170,6 +1286,185 @@ export class MemoryLongTermStore implements LongTermStore {
     return structuredClone(this.series.get(taskId) ?? [])
   }
 
+  async claimOverdueTasks(limit: number, claimTtlMs: number): Promise<TtlClaim[]> {
+    if (
+      !Number.isSafeInteger(limit) ||
+      limit <= 0 ||
+      !Number.isSafeInteger(claimTtlMs) ||
+      claimTtlMs <= 0
+    ) {
+      throw new StorageIntegrityError('TTL claim bounds are invalid')
+    }
+    const now = Date.now()
+    const due = Array.from(this.metadata.values())
+      .filter((metadata) => {
+        const task = this.tasks.get(metadata.taskId)
+        const active = this.ttlClaims.get(metadata.taskId)
+        return (
+          task !== undefined &&
+          !isMemoryTerminal(task.status) &&
+          metadata.executionDeadlineAt !== null &&
+          metadata.executionDeadlineAt <= now &&
+          (active === undefined || active.claimUntil <= now)
+        )
+      })
+      .sort((left, right) =>
+        (left.executionDeadlineAt! - right.executionDeadlineAt!) ||
+        left.taskId.localeCompare(right.taskId),
+      )
+      .slice(0, limit)
+
+    return due.map((metadata) => {
+      const claim: TtlClaim = {
+        taskId: metadata.taskId,
+        claimToken: `${metadata.taskId}:${now}:${Math.random()}`,
+        claimUntil: now + claimTtlMs,
+        taskVersion: metadata.taskVersion,
+        executionDeadlineAt: metadata.executionDeadlineAt!,
+      }
+      this.ttlClaims.set(metadata.taskId, claim)
+      return structuredClone(claim)
+    })
+  }
+
+  async terminalizeTtlClaim(
+    claim: TtlClaim,
+    task: Task,
+    event: TaskEvent,
+    assignment: WorkerAssignment | null,
+  ): Promise<TerminalProjection | null> {
+    const now = Date.now()
+    const currentClaim = this.ttlClaims.get(claim.taskId)
+    const currentTask = this.tasks.get(claim.taskId)
+    const metadata = this.metadata.get(claim.taskId)
+    if (
+      !currentClaim ||
+      canonicalJson(currentClaim) !== canonicalJson(claim) ||
+      claim.claimUntil <= now ||
+      !currentTask ||
+      isMemoryTerminal(currentTask.status) ||
+      !metadata ||
+      metadata.taskVersion !== claim.taskVersion ||
+      metadata.executionDeadlineAt !== claim.executionDeadlineAt
+    ) {
+      return null
+    }
+    if (
+      task.id !== claim.taskId ||
+      task.status !== 'timeout' ||
+      event.taskId !== claim.taskId ||
+      event.type !== 'taskcast:status'
+    ) {
+      throw new StorageIntegrityError('TTL terminalization input is invalid')
+    }
+    const durableAssignment = this.durableAssignments.get(claim.taskId) ?? null
+    if (canonicalJson(durableAssignment) !== canonicalJson(assignment)) {
+      throw new StorageIntegrityError(
+        `Durable assignment changed before TTL terminalization: ${claim.taskId}`,
+      )
+    }
+    const lastIndex = Math.max(
+      metadata.archiveWatermark,
+      ...(this.events.get(claim.taskId) ?? []).map((candidate) => candidate.index),
+      ...(this.series.get(claim.taskId) ?? []).map((state) => state.throughIndex),
+    )
+    if (event.index !== lastIndex + 1) {
+      throw new StorageIntegrityError(
+        `TTL timeout event index is not contiguous for ${claim.taskId}`,
+      )
+    }
+
+    this.tasks.set(claim.taskId, structuredClone(task))
+    this.upsertEvent(event)
+    metadata.executionDeadlineAt = null
+    metadata.taskVersion += 1
+    metadata.lastEventAt = event.timestamp
+    this.ttlClaims.delete(claim.taskId)
+    this.durableAssignments.delete(claim.taskId)
+    const projection: TerminalProjection = {
+      projectionId: `ttl:${event.id}`,
+      task: structuredClone(task),
+      event: structuredClone(event),
+      assignment: structuredClone(durableAssignment),
+      claimToken: claim.claimToken,
+      claimUntil: claim.claimUntil,
+    }
+    this.terminalProjections.set(projection.projectionId, {
+      projection: structuredClone(projection),
+      projectedAt: null,
+    })
+    return projection
+  }
+
+  async claimTerminalProjections(
+    limit: number,
+    claimToken: string,
+    claimTtlMs: number,
+  ): Promise<TerminalProjection[]> {
+    if (
+      !Number.isSafeInteger(limit) ||
+      limit <= 0 ||
+      claimToken.length === 0 ||
+      !Number.isSafeInteger(claimTtlMs) ||
+      claimTtlMs <= 0
+    ) {
+      throw new StorageIntegrityError('Terminal projection claim bounds are invalid')
+    }
+    const now = Date.now()
+    const claimed: TerminalProjection[] = []
+    for (const row of this.terminalProjections.values()) {
+      if (
+        row.projectedAt !== null ||
+        (row.projection.claimUntil !== null && row.projection.claimUntil > now)
+      ) {
+        continue
+      }
+      row.projection.claimToken = claimToken
+      row.projection.claimUntil = now + claimTtlMs
+      claimed.push(structuredClone(row.projection))
+      if (claimed.length === limit) break
+    }
+    return claimed
+  }
+
+  async completeTerminalProjection(projection: TerminalProjection): Promise<void> {
+    const row = this.terminalProjections.get(projection.projectionId)
+    if (row?.projectedAt !== null && row?.projectedAt !== undefined) return
+    if (
+      !row ||
+      projection.claimToken === null ||
+      projection.claimUntil === null ||
+      projection.claimUntil <= Date.now() ||
+      row.projection.claimToken !== projection.claimToken ||
+      row.projection.claimUntil !== projection.claimUntil
+    ) {
+      throw new StorageFenceConflictError('Terminal projection claim was lost')
+    }
+    row.projectedAt = Date.now()
+    row.projection.claimToken = null
+    row.projection.claimUntil = null
+  }
+
+  async saveDurableAssignment(assignment: WorkerAssignment): Promise<void> {
+    this.durableAssignments.set(assignment.taskId, structuredClone(assignment))
+  }
+
+  async deleteDurableAssignment(
+    taskId: string,
+    assignmentId?: string,
+  ): Promise<void> {
+    const assignment = this.durableAssignments.get(taskId)
+    if (
+      assignment &&
+      (
+        assignmentId === undefined ||
+        assignmentId === memoryAssignmentId(assignment)
+      )
+    ) {
+      this.durableAssignments.delete(taskId)
+    }
+  }
+
   async saveWorkerEvent(event: WorkerAuditEvent): Promise<void> {
     const events = this.workerEvents.get(event.workerId) ?? []
     events.push(structuredClone(event))
@@ -1218,4 +1513,25 @@ export class MemoryLongTermStore implements LongTermStore {
   private archiveKey(taskId: string, generation: string): string {
     return `${taskId}\u0000${generation}`
   }
+}
+
+function isMemoryTerminal(status: TaskStatus): boolean {
+  return (
+    status === 'completed' ||
+    status === 'failed' ||
+    status === 'timeout' ||
+    status === 'cancelled'
+  )
+}
+
+function hasMemoryExecutionDeadline(task: Task): boolean {
+  return (
+    task.ttl !== undefined &&
+    task.status !== 'paused' &&
+    !isMemoryTerminal(task.status)
+  )
+}
+
+function memoryAssignmentId(assignment: WorkerAssignment): string {
+  return `${assignment.taskId}:${assignment.workerId}:${assignment.assignedAt}`
 }

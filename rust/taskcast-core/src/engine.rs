@@ -13,6 +13,7 @@ use crate::canonical_history::{
 };
 use crate::series::process_series;
 use crate::storage_coordinator::StorageCoordinator;
+use crate::ttl_coordinator::{DurableTtlSweepResult, TtlCoordinator};
 use serde::{Deserialize, Serialize};
 
 use crate::state_machine::{can_transition, is_suspended, is_terminal};
@@ -114,18 +115,23 @@ pub struct TaskEngine {
     broadcast: Arc<dyn BroadcastProvider>,
     long_term_store: Option<Arc<dyn LongTermStore>>,
     storage_coordinator: Option<StorageCoordinator>,
+    ttl_coordinator: Option<TtlCoordinator>,
     hooks: Option<Arc<dyn TaskcastHooks>>,
-    transition_listeners: Mutex<Vec<TransitionListener>>,
+    transition_listeners: Arc<Mutex<Vec<TransitionListener>>>,
     creation_listeners: Mutex<Vec<CreationListener>>,
     /// Per-task mutex to serialize `emit` calls, ensuring events are stored
     /// in the same order as their atomically-assigned indices.
-    emit_locks: Mutex<HashMap<String, Arc<TokioMutex<()>>>>,
+    emit_locks: Arc<Mutex<HashMap<String, Arc<TokioMutex<()>>>>>,
 }
 
 impl TaskEngine {
     const CREATION_CLAIM_TTL_MS: u64 = 30_000;
 
     pub fn new(opts: TaskEngineOptions) -> Self {
+        let transition_listeners: Arc<Mutex<Vec<TransitionListener>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let emit_locks: Arc<Mutex<HashMap<String, Arc<TokioMutex<()>>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         let storage_coordinator = opts.long_term_store.as_ref().and_then(|long_term_store| {
             if opts.short_term_store.supports_hot_cold_release()
                 && long_term_store.supports_hot_cold_release()
@@ -138,15 +144,46 @@ impl TaskEngine {
                 None
             }
         });
+        let ttl_coordinator = opts.long_term_store.as_ref().and_then(|long_term_store| {
+            if opts.short_term_store.supports_hot_cold_release()
+                && long_term_store.supports_durable_ttl()
+            {
+                let hooks = opts.hooks.clone();
+                let ttl_transition_listeners = Arc::clone(&transition_listeners);
+                let ttl_emit_locks = Arc::clone(&emit_locks);
+                TtlCoordinator::new(
+                    Arc::clone(&opts.short_term_store),
+                    Arc::clone(long_term_store),
+                    Arc::clone(&opts.broadcast),
+                )
+                .map(|coordinator| {
+                    coordinator.with_on_timeout_projected(Arc::new(move |task, from| {
+                        ttl_emit_locks.lock().unwrap().remove(&task.id);
+                        if let Some(hooks) = &hooks {
+                            hooks.on_task_timeout(task);
+                            hooks.on_task_transitioned(task, from, &task.status);
+                        }
+                        let listeners = ttl_transition_listeners.lock().unwrap();
+                        for listener in listeners.iter() {
+                            listener(task, from, &task.status);
+                        }
+                    }))
+                })
+                .ok()
+            } else {
+                None
+            }
+        });
         Self {
             short_term_store: opts.short_term_store,
             broadcast: opts.broadcast,
             long_term_store: opts.long_term_store,
             storage_coordinator,
+            ttl_coordinator,
             hooks: opts.hooks,
-            transition_listeners: Mutex::new(Vec::new()),
+            transition_listeners,
             creation_listeners: Mutex::new(Vec::new()),
-            emit_locks: Mutex::new(HashMap::new()),
+            emit_locks,
         }
     }
 
@@ -289,7 +326,11 @@ impl TaskEngine {
         }
 
         if let Some(ttl) = task.ttl {
-            self.short_term_store.set_ttl(&task.id, ttl).await?;
+            if self.ttl_coordinator.is_some() {
+                self.short_term_store.clear_ttl(&task.id).await?;
+            } else {
+                self.short_term_store.set_ttl(&task.id, ttl).await?;
+            }
         }
 
         if let Some(ref hooks) = self.hooks {
@@ -410,32 +451,34 @@ impl TaskEngine {
             }
         }
 
-        // ─── TTL manipulation for suspended states ───────────────────────────
-        // → paused: stop TTL clock
-        if to == TaskStatus::Paused {
-            self.short_term_store.clear_ttl(task_id).await?;
-        }
-        // paused → blocked: restart TTL
-        if from == TaskStatus::Paused && to == TaskStatus::Blocked {
-            if let Some(ttl) = updated.ttl {
-                self.short_term_store.set_ttl(task_id, ttl).await?;
-            }
-        }
-        // paused → running: reset full TTL
-        if from == TaskStatus::Paused && to == TaskStatus::Running {
-            if let Some(ttl) = updated.ttl {
-                self.short_term_store.set_ttl(task_id, ttl).await?;
-            }
-        }
-        // blocked → paused: stop TTL clock
-        if from == TaskStatus::Blocked && to == TaskStatus::Paused {
-            self.short_term_store.clear_ttl(task_id).await?;
-        }
-
         // TTL override from payload
         if let Some(ref payload) = payload {
             if let Some(ttl) = payload.ttl {
                 updated.ttl = Some(ttl);
+            }
+        }
+
+        // PostgreSQL owns durable execution deadlines. Redis expiration remains
+        // available only for stores without durable TTL support.
+        if self.ttl_coordinator.is_some() {
+            if updated.ttl.is_some() {
+                self.short_term_store.clear_ttl(task_id).await?;
+            }
+        } else {
+            // → paused: stop TTL clock
+            if to == TaskStatus::Paused {
+                self.short_term_store.clear_ttl(task_id).await?;
+            }
+            // → blocked/running from paused: restart the full TTL
+            if from == TaskStatus::Paused
+                && (to == TaskStatus::Blocked || to == TaskStatus::Running)
+            {
+                if let Some(ttl) = updated.ttl {
+                    self.short_term_store.set_ttl(task_id, ttl).await?;
+                }
+            }
+            // TTL override restarts the clock outside paused state
+            if let Some(ttl) = payload.as_ref().and_then(|payload| payload.ttl) {
                 if to != TaskStatus::Paused {
                     self.short_term_store.set_ttl(task_id, ttl).await?;
                 }
@@ -643,6 +686,38 @@ impl TaskEngine {
 
     pub fn supports_storage_release(&self) -> bool {
         self.storage_coordinator.is_some()
+    }
+
+    pub fn supports_durable_ttl(&self) -> bool {
+        self.ttl_coordinator.is_some()
+    }
+
+    pub async fn sweep_durable_ttl(
+        &self,
+        limit: u64,
+        claim_ttl_ms: Option<u64>,
+    ) -> Result<DurableTtlSweepResult, EngineError> {
+        let coordinator = self.ttl_coordinator.as_ref().ok_or_else(|| {
+            EngineError::Store(Box::new(StorageReleaseUnsupportedError::new(
+                "Durable execution TTL is not supported by the configured stores",
+            )))
+        })?;
+        Ok(coordinator.sweep_overdue(limit, claim_ttl_ms).await?)
+    }
+
+    pub async fn sweep_terminal_projections(
+        &self,
+        limit: u64,
+        claim_ttl_ms: Option<u64>,
+    ) -> Result<DurableTtlSweepResult, EngineError> {
+        let coordinator = self.ttl_coordinator.as_ref().ok_or_else(|| {
+            EngineError::Store(Box::new(StorageReleaseUnsupportedError::new(
+                "Durable terminal projection is not supported by the configured stores",
+            )))
+        })?;
+        Ok(coordinator
+            .sweep_terminal_projections(limit, claim_ttl_ms)
+            .await?)
     }
 
     pub async fn recover_task_storage(&self, task_id: &str) -> Result<ReleaseResult, EngineError> {

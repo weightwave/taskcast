@@ -10,7 +10,8 @@ use taskcast_core::types::{
     ArchiveBatch, ArchiveBatchReceipt, ArchiveGeneration, ArchiveGenerationStatus,
     ArchiveSourceManifest, DurableSeriesState, EventQueryOptions, Level, LongTermStore, SeriesMode,
     SinceCursor, StorageReleaseRequest, StorageState, Task, TaskEvent, TaskStatus,
-    TaskStorageMetadataCas, WorkerAuditAction, WorkerAuditEvent,
+    TaskStorageMetadataCas, WorkerAssignment, WorkerAssignmentStatus, WorkerAuditAction,
+    WorkerAuditEvent,
 };
 use taskcast_postgres::PostgresLongTermStore;
 
@@ -148,6 +149,284 @@ fn make_event(task_id: &str, index: u64) -> TaskEvent {
         series_snapshot: None,
         _accumulated_data: None,
     }
+}
+
+fn make_ttl_task(id: &str) -> Task {
+    let mut task = make_task(id);
+    task.status = TaskStatus::Running;
+    task.ttl = Some(60);
+    task
+}
+
+fn make_assignment(task_id: &str) -> WorkerAssignment {
+    WorkerAssignment {
+        task_id: task_id.to_string(),
+        worker_id: "worker-1".to_string(),
+        cost: 3,
+        assigned_at: 2_000.0,
+        status: WorkerAssignmentStatus::Running,
+    }
+}
+
+fn make_timeout_event(task_id: &str, index: u64) -> TaskEvent {
+    TaskEvent {
+        id: format!("timeout-{task_id}"),
+        task_id: task_id.to_string(),
+        index,
+        timestamp: 3_000.0,
+        r#type: "taskcast:status".to_string(),
+        level: Level::Info,
+        data: serde_json::json!({"status": "timeout"}),
+        series_id: None,
+        series_mode: None,
+        series_acc_field: None,
+        series_snapshot: None,
+        _accumulated_data: None,
+    }
+}
+
+async fn make_overdue(
+    store: &PostgresLongTermStore,
+    task: Task,
+    claim_ttl_ms: u64,
+) -> taskcast_core::types::TtlClaim {
+    let task_id = task.id.clone();
+    store.save_task(task).await.unwrap();
+    let metadata = store
+        .get_task_storage_metadata(&task_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut overdue = metadata.clone();
+    overdue.execution_deadline_at = Some(0.0);
+    assert!(store
+        .compare_and_set_task_storage_metadata(TaskStorageMetadataCas {
+            task_id,
+            expected_storage_state: metadata.storage_state,
+            expected_storage_epoch: metadata.storage_epoch,
+            expected_release_generation: metadata.active_release_generation,
+            next: overdue,
+        })
+        .await
+        .unwrap());
+    store
+        .claim_overdue_tasks(1, claim_ttl_ms)
+        .await
+        .unwrap()
+        .remove(0)
+}
+
+#[tokio::test]
+async fn ttl_deadline_uses_database_time_and_paused_tasks_are_suspended() {
+    let (store, _container) = setup().await;
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as f64;
+    store
+        .save_task(make_ttl_task("ttl-deadline"))
+        .await
+        .unwrap();
+    let created = store
+        .get_task_storage_metadata("ttl-deadline")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(created.execution_deadline_at.unwrap() >= before + 59_000.0);
+    assert_eq!(created.task_version, 0);
+
+    let mut paused = make_ttl_task("ttl-deadline");
+    paused.status = TaskStatus::Paused;
+    paused.updated_at = 2_000.0;
+    store.save_task(paused).await.unwrap();
+    let suspended = store
+        .get_task_storage_metadata("ttl-deadline")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(suspended.execution_deadline_at, None);
+    assert_eq!(suspended.task_version, 1);
+
+    let mut resumed = make_ttl_task("ttl-deadline");
+    resumed.updated_at = 3_000.0;
+    store.save_task(resumed).await.unwrap();
+    let resumed = store
+        .get_task_storage_metadata("ttl-deadline")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(resumed.execution_deadline_at.unwrap() >= before + 59_000.0);
+    assert_eq!(resumed.task_version, 2);
+}
+
+#[tokio::test]
+async fn ttl_claim_is_exclusive_until_it_expires() {
+    let (store, _container) = setup().await;
+    let first = make_overdue(&store, make_ttl_task("ttl-claim"), 20).await;
+    assert!(store.claim_overdue_tasks(1, 20).await.unwrap().is_empty());
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    let second = store.claim_overdue_tasks(1, 20).await.unwrap().remove(0);
+    assert_eq!(second.task_id, first.task_id);
+    assert_eq!(second.task_version, first.task_version);
+    assert_ne!(second.claim_token, first.claim_token);
+}
+
+#[tokio::test]
+async fn ttl_terminalization_commits_task_event_assignment_and_outbox_atomically() {
+    let (store, _container) = setup().await;
+    let claim = make_overdue(&store, make_ttl_task("ttl-terminalize"), 20).await;
+    let assignment = make_assignment("ttl-terminalize");
+    store
+        .save_durable_assignment(assignment.clone())
+        .await
+        .unwrap();
+    let mut timeout = make_ttl_task("ttl-terminalize");
+    timeout.status = TaskStatus::Timeout;
+    timeout.updated_at = 3_000.0;
+    timeout.completed_at = Some(3_000.0);
+    let event = make_timeout_event("ttl-terminalize", 0);
+    let projection = store
+        .terminalize_ttl_claim(
+            claim.clone(),
+            timeout.clone(),
+            event.clone(),
+            Some(assignment),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        store
+            .get_task("ttl-terminalize")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        TaskStatus::Timeout
+    );
+    assert_eq!(
+        store.get_events("ttl-terminalize", None).await.unwrap(),
+        vec![event]
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    let claimed = store
+        .claim_terminal_projections(1, "projector", 30_000)
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].projection_id, projection.projection_id);
+    store
+        .complete_terminal_projection(&claimed[0])
+        .await
+        .unwrap();
+    assert!(store
+        .claim_terminal_projections(1, "next-projector", 30_000)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn ttl_terminalization_loses_to_version_and_terminal_races() {
+    let (store, _container) = setup().await;
+    let version_claim = make_overdue(&store, make_ttl_task("ttl-version-race"), 30_000).await;
+    let mut blocked = make_ttl_task("ttl-version-race");
+    blocked.status = TaskStatus::Blocked;
+    blocked.updated_at = 2_000.0;
+    store.save_task(blocked).await.unwrap();
+    let mut timeout = make_ttl_task("ttl-version-race");
+    timeout.status = TaskStatus::Timeout;
+    timeout.completed_at = Some(3_000.0);
+    timeout.updated_at = 3_000.0;
+    assert!(store
+        .terminalize_ttl_claim(
+            version_claim,
+            timeout,
+            make_timeout_event("ttl-version-race", 0),
+            None,
+        )
+        .await
+        .unwrap()
+        .is_none());
+
+    let terminal_claim = make_overdue(&store, make_ttl_task("ttl-terminal-race"), 30_000).await;
+    let mut completed = make_ttl_task("ttl-terminal-race");
+    completed.status = TaskStatus::Completed;
+    completed.completed_at = Some(2_000.0);
+    completed.updated_at = 2_000.0;
+    store.save_task(completed).await.unwrap();
+    let mut timeout = make_ttl_task("ttl-terminal-race");
+    timeout.status = TaskStatus::Timeout;
+    timeout.completed_at = Some(3_000.0);
+    timeout.updated_at = 3_000.0;
+    assert!(store
+        .terminalize_ttl_claim(
+            terminal_claim,
+            timeout,
+            make_timeout_event("ttl-terminal-race", 0),
+            None,
+        )
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        store
+            .get_task("ttl-terminal-race")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        TaskStatus::Completed
+    );
+}
+
+#[tokio::test]
+async fn durable_assignment_delete_compares_the_assignment_identity() {
+    let (store, _container) = setup().await;
+    let claim = make_overdue(&store, make_ttl_task("ttl-assignment"), 30_000).await;
+    let assignment = make_assignment("ttl-assignment");
+    store
+        .save_durable_assignment(assignment.clone())
+        .await
+        .unwrap();
+    store
+        .delete_durable_assignment("ttl-assignment", Some("wrong-assignment"))
+        .await
+        .unwrap();
+    let mut timeout = make_ttl_task("ttl-assignment");
+    timeout.status = TaskStatus::Timeout;
+    timeout.completed_at = Some(3_000.0);
+    timeout.updated_at = 3_000.0;
+    assert!(store
+        .terminalize_ttl_claim(
+            claim,
+            timeout,
+            make_timeout_event("ttl-assignment", 0),
+            Some(assignment),
+        )
+        .await
+        .unwrap()
+        .is_some());
+}
+
+#[tokio::test]
+async fn ttl_claim_methods_reject_invalid_bounds() {
+    let (store, _container) = setup().await;
+    assert!(store.claim_overdue_tasks(0, 30_000).await.is_err());
+    assert!(store.claim_overdue_tasks(1, 0).await.is_err());
+    assert!(store
+        .claim_terminal_projections(0, "projector", 30_000)
+        .await
+        .is_err());
+    assert!(store
+        .claim_terminal_projections(1, "", 30_000)
+        .await
+        .is_err());
+    assert!(store
+        .claim_terminal_projections(1, "projector", 0)
+        .await
+        .is_err());
 }
 
 async fn start_archive_release(store: &PostgresLongTermStore, generation: &str) {

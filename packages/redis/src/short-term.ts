@@ -21,6 +21,8 @@ import type {
   Worker,
   WorkerFilter,
   WorkerAssignment,
+  TerminalProjection,
+  TerminalProjectionResult,
 } from '@taskcast/core'
 import { StorageFenceConflictError, StorageIntegrityError } from '@taskcast/core'
 import {
@@ -51,6 +53,8 @@ function makeKeys(prefix: string) {
     workerSet: `${prefix}:workers`,
     assignment: (taskId: string) => `${prefix}:assignment:${taskId}`,
     workerAssignments: (workerId: string) => `${prefix}:workerAssignments:${workerId}`,
+    terminalProjection: (projectionId: string) =>
+      `${prefix}:terminalProjection:${projectionId}`,
   }
 }
 
@@ -541,6 +545,67 @@ export class RedisShortTermStore implements ShortTermStore {
       snapshot.task.status,
     )
     return { taskId, storageEpoch: nextEpoch }
+  }
+
+  async projectTerminalFenced(
+    projection: TerminalProjection,
+    lease: StorageLease,
+    expectedEpoch: number,
+    nextEpoch: number,
+  ): Promise<TerminalProjectionResult> {
+    const taskId = projection.task.id
+    if (
+      taskId !== lease.taskId ||
+      projection.task.status !== 'timeout' ||
+      projection.event.taskId !== taskId ||
+      (projection.assignment !== null &&
+        projection.assignment.taskId !== taskId) ||
+      nextEpoch !== expectedEpoch + 1
+    ) {
+      throw new StorageFenceConflictError()
+    }
+    const assignment = projection.assignment
+    const raw = await this.evalFenced<[string, string]>(
+      RedisShortTermStore.PROJECT_TERMINAL_FENCED_LUA,
+      11,
+      this.KEY.storageLock(taskId),
+      this.KEY.fence(taskId),
+      this.KEY.task(taskId),
+      this.KEY.taskStatus(taskId),
+      this.KEY.events(taskId),
+      this.KEY.idx(taskId),
+      this.KEY.hotWindow(taskId),
+      this.KEY.assignment(taskId),
+      this.KEY.workerAssignments(assignment?.workerId ?? ''),
+      this.KEY.worker(assignment?.workerId ?? ''),
+      this.KEY.terminalProjection(projection.projectionId),
+      taskId,
+      lease.lockToken,
+      lease.generation,
+      String(lease.storageEpoch),
+      String(expectedEpoch),
+      String(nextEpoch),
+      JSON.stringify(projection.task),
+      JSON.stringify(projection.event),
+      String(projection.event.index),
+      assignment ? JSON.stringify(assignment) : '',
+      assignment?.workerId ?? '',
+      String(assignment?.cost ?? 0),
+      JSON.stringify({
+        taskId,
+        acceptingWrites: true,
+        storageEpoch: nextEpoch,
+        activeReleaseGeneration: null,
+      } satisfies TaskWriteFence),
+      String(7 * 24 * 60 * 60 * 1_000),
+    )
+    if ((raw[0] !== '0' && raw[0] !== '1') || Number(raw[1]) !== nextEpoch) {
+      throw new StorageIntegrityError('Redis returned an invalid terminal projection result')
+    }
+    return {
+      token: { taskId, storageEpoch: nextEpoch },
+      projected: raw[0] === '1',
+    }
   }
 
   async getTaskStoragePresence(taskId: string): Promise<TaskStoragePresence> {
@@ -1801,6 +1866,116 @@ export class RedisShortTermStore implements ShortTermStore {
     redis.call('SET', KEYS[2], ARGV[12])
     redis.call('SET', KEYS[10], ARGV[13])
     return 1
+  `
+
+  private static PROJECT_TERMINAL_FENCED_LUA = `
+    local function validType(key, expected)
+      local actual = redis.call('TYPE', key).ok
+      return actual == 'none' or actual == expected
+    end
+    if not validType(KEYS[1], 'string')
+       or not validType(KEYS[2], 'string')
+       or not validType(KEYS[3], 'string')
+       or not validType(KEYS[4], 'string')
+       or not validType(KEYS[5], 'list')
+       or not validType(KEYS[6], 'string')
+       or not validType(KEYS[7], 'string')
+       or not validType(KEYS[8], 'string')
+       or not validType(KEYS[9], 'set')
+       or not validType(KEYS[10], 'string')
+       or not validType(KEYS[11], 'string') then
+      return redis.error_reply('STORAGE_INTEGRITY_ERROR')
+    end
+
+    local leaseJson = redis.call('GET', KEYS[1])
+    local fenceJson = redis.call('GET', KEYS[2])
+    if not leaseJson or not fenceJson then
+      return redis.error_reply('STORAGE_FENCE_CONFLICT')
+    end
+    local lease = cjson.decode(leaseJson)
+    local fence = cjson.decode(fenceJson)
+    if lease.taskId ~= ARGV[1]
+       or lease.lockToken ~= ARGV[2]
+       or lease.generation ~= ARGV[3]
+       or lease.storageEpoch ~= tonumber(ARGV[4])
+       or fence.taskId ~= ARGV[1]
+       or fence.acceptingWrites ~= false
+       or fence.storageEpoch ~= tonumber(ARGV[5])
+       or fence.activeReleaseGeneration ~= ARGV[3]
+       or tonumber(ARGV[6]) ~= tonumber(ARGV[5]) + 1 then
+      return redis.error_reply('STORAGE_FENCE_CONFLICT')
+    end
+
+    local eventIndex = tonumber(ARGV[9])
+    local nextIndex = tonumber(redis.call('GET', KEYS[6]) or '0')
+    if not eventIndex or eventIndex < 0 or not nextIndex then
+      return redis.error_reply('STORAGE_INTEGRITY_ERROR')
+    end
+    local projected = 0
+    if nextIndex == eventIndex then
+      redis.call('RPUSH', KEYS[5], ARGV[8])
+      redis.call('SET', KEYS[6], tostring(eventIndex + 1))
+      projected = 1
+    elseif nextIndex > eventIndex then
+      local found = false
+      for _, candidateJson in ipairs(redis.call('LRANGE', KEYS[5], 0, -1)) do
+        local candidate = cjson.decode(candidateJson)
+        if candidate.index == eventIndex then
+          if candidateJson ~= ARGV[8] then
+            return redis.error_reply('STORAGE_INTEGRITY_ERROR')
+          end
+          found = true
+          break
+        end
+      end
+      if not found then
+        return redis.error_reply('STORAGE_INTEGRITY_ERROR')
+      end
+    else
+      return redis.error_reply('STORAGE_INTEGRITY_ERROR')
+    end
+
+    redis.call('SET', KEYS[3], ARGV[7])
+    redis.call('SET', KEYS[4], 'timeout')
+    local windowJson = redis.call('GET', KEYS[7])
+    local firstIndex = eventIndex
+    if windowJson then
+      local window = cjson.decode(windowJson)
+      if window.firstIndex ~= cjson.null then firstIndex = window.firstIndex end
+    end
+    redis.call(
+      'SET',
+      KEYS[7],
+      cjson.encode({ firstIndex = firstIndex, lastIndex = eventIndex })
+    )
+
+    if ARGV[10] ~= '' and redis.call('EXISTS', KEYS[11]) == 0 then
+      local assignmentJson = redis.call('GET', KEYS[8])
+      if assignmentJson and assignmentJson ~= ARGV[10] then
+        return redis.error_reply('STORAGE_INTEGRITY_ERROR')
+      end
+      if assignmentJson then
+        redis.call('DEL', KEYS[8])
+        redis.call('SREM', KEYS[9], ARGV[1])
+        local workerJson = redis.call('GET', KEYS[10])
+        if workerJson then
+          local worker = cjson.decode(workerJson)
+          worker.usedSlots = math.max(0, worker.usedSlots - tonumber(ARGV[12]))
+          if worker.status ~= 'offline' and worker.status ~= 'draining' then
+            if worker.usedSlots >= worker.capacity then
+              worker.status = 'busy'
+            else
+              worker.status = 'idle'
+            end
+          end
+          redis.call('SET', KEYS[10], cjson.encode(worker))
+        end
+      end
+      redis.call('SET', KEYS[11], '1', 'PX', tonumber(ARGV[14]))
+    end
+
+    redis.call('SET', KEYS[2], ARGV[13])
+    return { tostring(projected), ARGV[6] }
   `
 
   private static REGISTER_STORAGE_WRITER_LUA = `

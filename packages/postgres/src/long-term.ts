@@ -1,6 +1,7 @@
 import type postgres from 'postgres'
 import {
   DependencyUnavailableError,
+  StorageFenceConflictError,
   StorageIntegrityError,
   archiveEventRecord,
   canonicalJson,
@@ -30,7 +31,10 @@ import {
   type TaskStorageMetadata,
   type TaskStorageMetadataCas,
   type StorageReleaseRequest,
+  type TerminalProjection,
+  type TtlClaim,
   type WebhookConfig,
+  type WorkerAssignment,
   type WorkerAuditEvent,
 } from '@taskcast/core'
 import { classifyPostgresConnectivity } from './health.js'
@@ -41,6 +45,8 @@ const WORKER_EVENTS = 'taskcast_worker_events'
 const ARCHIVE_GENERATIONS = 'taskcast_archive_generations'
 const ARCHIVE_BATCHES = 'taskcast_archive_batches'
 const SERIES_STATE = 'taskcast_series_state'
+const DURABLE_ASSIGNMENTS = 'taskcast_durable_assignments'
+const TERMINAL_OUTBOX = 'taskcast_terminal_outbox'
 const POSTGRES_INTEGER_MAX = 2_147_483_647
 
 type PostgresClient = ReturnType<typeof postgres>
@@ -53,6 +59,7 @@ interface ArchiveSeriesCoverage {
 
 export class PostgresLongTermStore implements LongTermStore {
   readonly supportsHotColdRelease = true
+  readonly supportsDurableTtl = true
 
   constructor(
     private sql: ReturnType<typeof postgres>,
@@ -102,7 +109,7 @@ export class PostgresLongTermStore implements LongTermStore {
         auth_config, webhooks, cleanup, created_at, updated_at, completed_at, ttl,
         tags, assign_mode, cost, assigned_worker, disconnect_policy,
         creation_token, creation_claimed_at, creation_claim_expires_at,
-        creation_completed_at
+        creation_completed_at, execution_deadline_at, task_version
       ) VALUES (
         ${task.id}, ${task.type ?? null}, ${task.status},
         ${task.params ? this.sql.json(task.params as never) : null},
@@ -122,7 +129,14 @@ export class PostgresLongTermStore implements LongTermStore {
         ${creationToken},
         FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT,
         FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT + ${claimTtlMs},
-        NULL
+        NULL,
+        CASE
+          WHEN ${hasExecutionDeadline(task)}
+          THEN FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT
+            + ${task.ttl ?? 0} * 1000
+          ELSE NULL
+        END,
+        0
       )
       ON CONFLICT (id) DO UPDATE SET
         type = EXCLUDED.type,
@@ -146,7 +160,11 @@ export class PostgresLongTermStore implements LongTermStore {
         creation_token = EXCLUDED.creation_token,
         creation_claimed_at = EXCLUDED.creation_claimed_at,
         creation_claim_expires_at = EXCLUDED.creation_claim_expires_at,
-        creation_completed_at = NULL
+        creation_completed_at = NULL,
+        execution_deadline_at = EXCLUDED.execution_deadline_at,
+        task_version = 0,
+        ttl_claim_token = NULL,
+        ttl_claim_until = NULL
       WHERE ${this.sql(t)}.creation_token IS NOT NULL
         AND ${this.sql(t)}.creation_completed_at IS NULL
         AND (
@@ -228,7 +246,8 @@ export class PostgresLongTermStore implements LongTermStore {
       INSERT INTO ${this.sql(t)} (
         id, type, status, params, result, error, metadata,
         auth_config, webhooks, cleanup, created_at, updated_at, completed_at, ttl,
-        tags, assign_mode, cost, assigned_worker, disconnect_policy, creation_token
+        tags, assign_mode, cost, assigned_worker, disconnect_policy, creation_token,
+        execution_deadline_at, task_version
       ) VALUES (
         ${task.id}, ${task.type ?? null}, ${task.status},
         ${task.params ? this.sql.json(task.params as never) : null},
@@ -245,7 +264,14 @@ export class PostgresLongTermStore implements LongTermStore {
         ${task.cost ?? null},
         ${task.assignedWorker ?? null},
         ${task.disconnectPolicy ?? null},
-        ${creationToken}
+        ${creationToken},
+        CASE
+          WHEN ${hasExecutionDeadline(task)}
+          THEN FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT
+            + ${task.ttl ?? 0} * 1000
+          ELSE NULL
+        END,
+        0
       )
       ON CONFLICT (id) DO NOTHING
       RETURNING id
@@ -255,11 +281,12 @@ export class PostgresLongTermStore implements LongTermStore {
 
   private async saveTaskWithClient(sql: PostgresClient, task: Task): Promise<void> {
     const t = TASKS
-    await sql`
+    const rows = await sql`
       INSERT INTO ${sql(t)} (
         id, type, status, params, result, error, metadata,
         auth_config, webhooks, cleanup, created_at, updated_at, completed_at, ttl,
-        tags, assign_mode, cost, assigned_worker, disconnect_policy
+        tags, assign_mode, cost, assigned_worker, disconnect_policy,
+        execution_deadline_at, task_version
       ) VALUES (
         ${task.id}, ${task.type ?? null}, ${task.status},
         ${task.params ? sql.json(task.params as never) : null},
@@ -275,7 +302,14 @@ export class PostgresLongTermStore implements LongTermStore {
         ${task.assignMode ?? null},
         ${task.cost ?? null},
         ${task.assignedWorker ?? null},
-        ${task.disconnectPolicy ?? null}
+        ${task.disconnectPolicy ?? null},
+        CASE
+          WHEN ${hasExecutionDeadline(task)}
+          THEN FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT
+            + ${task.ttl ?? 0} * 1000
+          ELSE NULL
+        END,
+        0
       )
       ON CONFLICT (id) DO UPDATE SET
         status = EXCLUDED.status,
@@ -284,12 +318,32 @@ export class PostgresLongTermStore implements LongTermStore {
         metadata = EXCLUDED.metadata,
         updated_at = EXCLUDED.updated_at,
         completed_at = EXCLUDED.completed_at,
+        ttl = EXCLUDED.ttl,
         tags = EXCLUDED.tags,
         assign_mode = EXCLUDED.assign_mode,
         cost = EXCLUDED.cost,
         assigned_worker = EXCLUDED.assigned_worker,
-        disconnect_policy = EXCLUDED.disconnect_policy
+        disconnect_policy = EXCLUDED.disconnect_policy,
+        execution_deadline_at = CASE
+          WHEN EXCLUDED.execution_deadline_at IS NULL THEN NULL
+          WHEN ${sql(t)}.execution_deadline_at IS NULL
+            OR ${sql(t)}.status = 'paused'
+            OR ${sql(t)}.ttl IS DISTINCT FROM EXCLUDED.ttl
+          THEN EXCLUDED.execution_deadline_at
+          ELSE ${sql(t)}.execution_deadline_at
+        END,
+        task_version = ${sql(t)}.task_version + 1,
+        ttl_claim_token = NULL,
+        ttl_claim_until = NULL
+      WHERE ${sql(t)}.status NOT IN ('completed', 'failed', 'timeout', 'cancelled')
+        OR ${sql(t)}.status = EXCLUDED.status
+      RETURNING id
     `
+    if (rows.length !== 1) {
+      throw new StorageFenceConflictError(
+        `Durable terminal task cannot be overwritten: ${task.id}`,
+      )
+    }
   }
 
   async getTask(taskId: string): Promise<Task | null> {
@@ -610,6 +664,253 @@ export class PostgresLongTermStore implements LongTermStore {
       WHERE id = ${taskId}
     `
     return rows[0] ? rowToStorageMetadata(rows[0]) : null
+  }
+
+  async claimOverdueTasks(limit: number, claimTtlMs: number): Promise<TtlClaim[]> {
+    validatePositiveInteger(limit, 'TTL claim limit')
+    validatePositiveInteger(claimTtlMs, 'TTL claim duration')
+    const rows = await this.sql`
+      WITH overdue AS (
+        SELECT id
+        FROM ${this.sql(TASKS)}
+        WHERE execution_deadline_at IS NOT NULL
+          AND execution_deadline_at <=
+            FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT
+          AND status NOT IN ('completed', 'failed', 'timeout', 'cancelled')
+          AND (
+            ttl_claim_until IS NULL
+            OR ttl_claim_until <=
+              FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT
+          )
+        ORDER BY execution_deadline_at, id
+        LIMIT ${limit}
+        FOR UPDATE SKIP LOCKED
+      )
+      UPDATE ${this.sql(TASKS)} AS task
+      SET ttl_claim_token = MD5(
+            task.id || ':' || clock_timestamp()::TEXT || ':'
+            || random()::TEXT || ':' || txid_current()::TEXT
+          ),
+          ttl_claim_until =
+            FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT
+            + ${claimTtlMs}
+      FROM overdue
+      WHERE task.id = overdue.id
+      RETURNING task.id, task.ttl_claim_token, task.ttl_claim_until,
+                task.task_version, task.execution_deadline_at
+    `
+    return rows.map((row) => ({
+      taskId: row['id'] as string,
+      claimToken: row['ttl_claim_token'] as string,
+      claimUntil: Number(row['ttl_claim_until']),
+      taskVersion: Number(row['task_version']),
+      executionDeadlineAt: Number(row['execution_deadline_at']),
+    }))
+  }
+
+  async terminalizeTtlClaim(
+    claim: TtlClaim,
+    task: Task,
+    event: TaskEvent,
+    assignment: WorkerAssignment | null,
+  ): Promise<TerminalProjection | null> {
+    validateTtlTerminalization(claim, task, event)
+    return this.sql.begin(async (sql) => {
+      const tx = sql as unknown as PostgresClient
+      const nowRows = await tx`
+        SELECT FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT AS now_ms
+      `
+      const now = Number(nowRows[0]!['now_ms'])
+      const taskRows = await tx`
+        SELECT *
+        FROM ${tx(TASKS)}
+        WHERE id = ${claim.taskId}
+        FOR UPDATE
+      `
+      const current = taskRows[0]
+      if (
+        !current ||
+        current['ttl_claim_token'] !== claim.claimToken ||
+        Number(current['ttl_claim_until']) !== claim.claimUntil ||
+        Number(current['ttl_claim_until']) <= now ||
+        Number(current['task_version']) !== claim.taskVersion ||
+        Number(current['execution_deadline_at']) !== claim.executionDeadlineAt ||
+        isTerminalStatus(current['status'] as string)
+      ) {
+        return null
+      }
+
+      const assignmentRows = await tx`
+        SELECT *
+        FROM ${tx(DURABLE_ASSIGNMENTS)}
+        WHERE task_id = ${claim.taskId}
+        FOR UPDATE
+      `
+      const durableAssignment = assignmentRows[0]
+        ? rowToWorkerAssignment(assignmentRows[0])
+        : null
+      if (
+        (durableAssignment === null) !== (assignment === null) ||
+        (durableAssignment !== null &&
+          canonicalJson(durableAssignment) !== canonicalJson(assignment))
+      ) {
+        throw new StorageIntegrityError(
+          `Durable assignment changed before TTL terminalization: ${claim.taskId}`,
+        )
+      }
+
+      const indexRows = await tx`
+        SELECT COALESCE(MAX(idx), -1) AS last_index
+        FROM ${tx(EVENTS)}
+        WHERE task_id = ${claim.taskId}
+      `
+      const lastIndex = Number(indexRows[0]!['last_index'])
+      if (event.index !== lastIndex + 1) {
+        throw new StorageIntegrityError(
+          `TTL timeout event index is not contiguous for ${claim.taskId}`,
+        )
+      }
+
+      await this.saveTaskWithClient(tx, task)
+      await this.saveEventWithClient(tx, event, 'strict')
+      await tx`
+        DELETE FROM ${tx(DURABLE_ASSIGNMENTS)}
+        WHERE task_id = ${claim.taskId}
+      `
+
+      const projection: TerminalProjection = {
+        projectionId: `ttl:${event.id}`,
+        task: structuredClone(task),
+        event: structuredClone(event),
+        assignment: durableAssignment,
+        claimToken: claim.claimToken,
+        claimUntil: claim.claimUntil,
+      }
+      await tx`
+        INSERT INTO ${tx(TERMINAL_OUTBOX)} (
+          projection_id, task_id, event_id, assignment_id, payload,
+          claim_token, claim_until, projected_at, created_at
+        ) VALUES (
+          ${projection.projectionId}, ${claim.taskId}, ${event.id},
+          ${durableAssignment ? durableAssignmentId(durableAssignment) : null},
+          ${tx.json({
+            task: projection.task,
+            event: projection.event,
+            assignment: projection.assignment,
+          } as never)},
+          ${claim.claimToken}, ${claim.claimUntil}, NULL, ${now}
+        )
+      `
+      return projection
+    })
+  }
+
+  async claimTerminalProjections(
+    limit: number,
+    claimToken: string,
+    claimTtlMs: number,
+  ): Promise<TerminalProjection[]> {
+    validatePositiveInteger(limit, 'Terminal projection limit')
+    validatePositiveInteger(claimTtlMs, 'Terminal projection claim duration')
+    if (claimToken.length === 0) {
+      throw new StorageIntegrityError('Terminal projection claim token is required')
+    }
+    const rows = await this.sql`
+      WITH pending AS (
+        SELECT projection_id
+        FROM ${this.sql(TERMINAL_OUTBOX)}
+        WHERE projected_at IS NULL
+          AND (
+            claim_until IS NULL
+            OR claim_until <=
+              FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT
+          )
+        ORDER BY created_at, projection_id
+        LIMIT ${limit}
+        FOR UPDATE SKIP LOCKED
+      )
+      UPDATE ${this.sql(TERMINAL_OUTBOX)} AS outbox
+      SET claim_token = ${claimToken},
+          claim_until =
+            FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT
+            + ${claimTtlMs}
+      FROM pending
+      WHERE outbox.projection_id = pending.projection_id
+      RETURNING outbox.projection_id, outbox.payload,
+                outbox.claim_token, outbox.claim_until
+    `
+    return rows.map(rowToTerminalProjection)
+  }
+
+  async completeTerminalProjection(projection: TerminalProjection): Promise<void> {
+    if (
+      projection.claimToken === null ||
+      projection.claimToken.length === 0 ||
+      projection.claimUntil === null
+    ) {
+      throw new StorageIntegrityError(
+        'Terminal projection completion requires an active claim',
+      )
+    }
+    const rows = await this.sql`
+      UPDATE ${this.sql(TERMINAL_OUTBOX)}
+      SET projected_at =
+            FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT,
+          claim_token = NULL,
+          claim_until = NULL
+      WHERE projection_id = ${projection.projectionId}
+        AND projected_at IS NULL
+        AND claim_token = ${projection.claimToken}
+        AND claim_until = ${projection.claimUntil}
+        AND claim_until >
+          FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT
+      RETURNING projection_id
+    `
+    if (rows.length === 1) return
+
+    const existing = await this.sql`
+      SELECT projected_at
+      FROM ${this.sql(TERMINAL_OUTBOX)}
+      WHERE projection_id = ${projection.projectionId}
+    `
+    if (existing[0]?.['projected_at'] != null) return
+    throw new StorageFenceConflictError(
+      `Terminal projection claim was lost: ${projection.projectionId}`,
+    )
+  }
+
+  async saveDurableAssignment(assignment: WorkerAssignment): Promise<void> {
+    validateWorkerAssignment(assignment)
+    await this.sql`
+      INSERT INTO ${this.sql(DURABLE_ASSIGNMENTS)} (
+        task_id, assignment_id, worker_id, cost, assigned_at, status, updated_at
+      ) VALUES (
+        ${assignment.taskId}, ${durableAssignmentId(assignment)},
+        ${assignment.workerId}, ${assignment.cost}, ${assignment.assignedAt},
+        ${assignment.status},
+        FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT
+      )
+      ON CONFLICT (task_id) DO UPDATE SET
+        assignment_id = EXCLUDED.assignment_id,
+        worker_id = EXCLUDED.worker_id,
+        cost = EXCLUDED.cost,
+        assigned_at = EXCLUDED.assigned_at,
+        status = EXCLUDED.status,
+        updated_at = EXCLUDED.updated_at
+    `
+  }
+
+  async deleteDurableAssignment(
+    taskId: string,
+    assignmentId?: string,
+  ): Promise<void> {
+    await this.sql`
+      DELETE FROM ${this.sql(DURABLE_ASSIGNMENTS)}
+      WHERE task_id = ${taskId}
+        ${assignmentId === undefined
+          ? this.sql``
+          : this.sql`AND assignment_id = ${assignmentId}`}
+    `
   }
 
   async persistStorageReleaseRequest(request: StorageReleaseRequest): Promise<boolean> {
@@ -1563,6 +1864,110 @@ function validateStorageReleaseRequest(request: StorageReleaseRequest): void {
     request.inactiveSince < 0
   ) {
     throw new StorageIntegrityError('Storage release request is invalid')
+  }
+}
+
+function hasExecutionDeadline(task: Task): boolean {
+  return (
+    task.ttl !== undefined &&
+    task.status !== 'paused' &&
+    !isTerminalStatus(task.status)
+  )
+}
+
+function isTerminalStatus(status: string): boolean {
+  return (
+    status === 'completed' ||
+    status === 'failed' ||
+    status === 'timeout' ||
+    status === 'cancelled'
+  )
+}
+
+function validatePositiveInteger(value: number, label: string): void {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new StorageIntegrityError(`${label} must be a positive integer`)
+  }
+}
+
+function validateTtlTerminalization(
+  claim: TtlClaim,
+  task: Task,
+  event: TaskEvent,
+): void {
+  if (
+    claim.taskId.length === 0 ||
+    claim.claimToken.length === 0 ||
+    !Number.isSafeInteger(claim.claimUntil) ||
+    !Number.isSafeInteger(claim.taskVersion) ||
+    claim.taskVersion < 0 ||
+    !Number.isSafeInteger(claim.executionDeadlineAt) ||
+    task.id !== claim.taskId ||
+    task.status !== 'timeout' ||
+    task.completedAt === undefined ||
+    event.taskId !== claim.taskId ||
+    event.id.length === 0 ||
+    event.type !== 'taskcast:status' ||
+    !Number.isSafeInteger(event.index) ||
+    event.index < 0 ||
+    event.index > POSTGRES_INTEGER_MAX ||
+    !Number.isSafeInteger(event.timestamp)
+  ) {
+    throw new StorageIntegrityError('TTL terminalization input is invalid')
+  }
+}
+
+function validateWorkerAssignment(assignment: WorkerAssignment): void {
+  if (
+    assignment.taskId.length === 0 ||
+    assignment.workerId.length === 0 ||
+    !Number.isSafeInteger(assignment.cost) ||
+    assignment.cost < 0 ||
+    !Number.isSafeInteger(assignment.assignedAt) ||
+    assignment.assignedAt < 0 ||
+    !['offered', 'assigned', 'running'].includes(assignment.status)
+  ) {
+    throw new StorageIntegrityError('Durable worker assignment is invalid')
+  }
+}
+
+function durableAssignmentId(assignment: WorkerAssignment): string {
+  validateWorkerAssignment(assignment)
+  return `${assignment.taskId}:${assignment.workerId}:${assignment.assignedAt}`
+}
+
+function rowToWorkerAssignment(row: postgres.Row): WorkerAssignment {
+  return {
+    taskId: row['task_id'] as string,
+    workerId: row['worker_id'] as string,
+    cost: Number(row['cost']),
+    assignedAt: Number(row['assigned_at']),
+    status: row['status'] as WorkerAssignment['status'],
+  }
+}
+
+function rowToTerminalProjection(row: postgres.Row): TerminalProjection {
+  const payload = row['payload'] as {
+    task: Task
+    event: TaskEvent
+    assignment: WorkerAssignment | null
+  }
+  if (
+    !payload ||
+    payload.task?.id !== payload.event?.taskId ||
+    (payload.assignment !== null &&
+      payload.assignment.taskId !== payload.task.id)
+  ) {
+    throw new StorageIntegrityError('Terminal projection payload is invalid')
+  }
+  return {
+    projectionId: row['projection_id'] as string,
+    task: payload.task,
+    event: payload.event,
+    assignment: payload.assignment,
+    claimToken: (row['claim_token'] as string | null) ?? null,
+    claimUntil:
+      row['claim_until'] == null ? null : Number(row['claim_until']),
   }
 }
 

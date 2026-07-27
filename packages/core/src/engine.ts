@@ -3,6 +3,10 @@ import { canTransition, isTerminal, isSuspended } from './state-machine.js'
 import { processSeries } from './series.js'
 import { StorageCoordinator } from './storage-coordinator.js'
 import {
+  TtlCoordinator,
+  type DurableTtlSweepResult,
+} from './ttl-coordinator.js'
+import {
   applyCanonicalHistoryQuery,
   mergeCanonicalHistory,
   resolveCanonicalSeriesLatest,
@@ -128,6 +132,7 @@ export class TaskEngine {
   private broadcast: BroadcastProvider
   private hooks: TaskcastHooks | undefined
   private storageCoordinator: StorageCoordinator | undefined
+  private ttlCoordinator: TtlCoordinator | undefined
   private transitionListeners: TransitionListener[] = []
   private creationListeners: CreationListener[] = []
   /** Per-task promise chain to serialize `_emit` calls, preventing race
@@ -156,6 +161,26 @@ export class TaskEngine {
       this.storageCoordinator = new StorageCoordinator({
         shortTermStore: this.shortTermStore,
         longTermStore: this.longTermStore,
+      })
+    }
+    if (
+      this.storageCoordinator &&
+      this.longTermStore?.supportsDurableTtl === true &&
+      typeof this.shortTermStore.projectTerminalFenced === 'function'
+    ) {
+      this.ttlCoordinator = new TtlCoordinator({
+        shortTermStore: this.shortTermStore,
+        longTermStore: this.longTermStore,
+        broadcast: this.broadcast,
+        storageCoordinator: this.storageCoordinator,
+        onTimeoutProjected: (task, from) => {
+          this._emitChains.delete(task.id)
+          this.hooks?.onTaskTimeout?.(task)
+          this.hooks?.onTaskTransitioned?.(task, from, 'timeout')
+          for (const listener of this.transitionListeners) {
+            try { listener(task, from, 'timeout') } catch { /* best-effort */ }
+          }
+        },
       })
     }
   }
@@ -253,7 +278,13 @@ export class TaskEngine {
     } else if (durable && !durableIdentityClaimed) {
       await durable.saveTask(task)
     }
-    if (task.ttl) await this.shortTermStore.setTTL(task.id, task.ttl)
+    if (task.ttl) {
+      if (this.ttlCoordinator) {
+        await this.shortTermStore.clearTTL(task.id)
+      } else {
+        await this.shortTermStore.setTTL(task.id, task.ttl)
+      }
+    }
     this.hooks?.onTaskCreated?.(task)
     for (const listener of this.creationListeners) {
       try { listener(task) } catch { /* best-effort */ }
@@ -343,28 +374,32 @@ export class TaskEngine {
       }
     }
 
-    // ─── TTL manipulation for suspended states ───────────────────────────
-    // → paused: stop TTL clock
-    if (to === 'paused') {
-      await this.shortTermStore.clearTTL(taskId)
-    }
-    // → blocked from paused: restart TTL (clock resumes)
-    if (from === 'paused' && to === 'blocked' && updated.ttl) {
-      await this.shortTermStore.setTTL(taskId, updated.ttl)
-    }
-    // paused → running: reset full TTL
-    if (from === 'paused' && to === 'running' && updated.ttl) {
-      await this.shortTermStore.setTTL(taskId, updated.ttl)
-    }
-    // blocked → paused: stop TTL clock
-    if (from === 'blocked' && to === 'paused') {
-      await this.shortTermStore.clearTTL(taskId)
-    }
-
     // TTL override from payload
     if (payload?.ttl !== undefined) {
       updated.ttl = payload.ttl
-      if (to !== 'paused') {
+    }
+
+    // PostgreSQL owns durable execution deadlines. Redis expiration remains
+    // available only for stores without durable TTL support.
+    if (this.ttlCoordinator) {
+      if (updated.ttl !== undefined) {
+        await this.shortTermStore.clearTTL(taskId)
+      }
+    } else {
+      // → paused: stop TTL clock
+      if (to === 'paused') {
+        await this.shortTermStore.clearTTL(taskId)
+      }
+      // → blocked/running from paused: restart the full TTL
+      if (
+        from === 'paused' &&
+        (to === 'blocked' || to === 'running') &&
+        updated.ttl
+      ) {
+        await this.shortTermStore.setTTL(taskId, updated.ttl)
+      }
+      // TTL override restarts the clock outside paused state
+      if (payload?.ttl !== undefined && to !== 'paused') {
         await this.shortTermStore.setTTL(taskId, payload.ttl)
       }
     }
@@ -514,6 +549,34 @@ export class TaskEngine {
 
   supportsStorageRelease(): boolean {
     return this.storageCoordinator !== undefined
+  }
+
+  supportsDurableTtl(): boolean {
+    return this.ttlCoordinator !== undefined
+  }
+
+  async sweepDurableTtl(
+    limit: number,
+    claimTtlMs?: number,
+  ): Promise<DurableTtlSweepResult> {
+    if (!this.ttlCoordinator) {
+      throw new StorageReleaseUnsupportedError(
+        'Durable execution TTL is not supported by the configured stores',
+      )
+    }
+    return this.ttlCoordinator.sweepOverdue(limit, claimTtlMs)
+  }
+
+  async sweepTerminalProjections(
+    limit: number,
+    claimTtlMs?: number,
+  ): Promise<DurableTtlSweepResult> {
+    if (!this.ttlCoordinator) {
+      throw new StorageReleaseUnsupportedError(
+        'Durable terminal projection is not supported by the configured stores',
+      )
+    }
+    return this.ttlCoordinator.sweepTerminalProjections(limit, claimTtlMs)
   }
 
   async recoverTaskStorage(taskId: string): Promise<ReleaseResult> {

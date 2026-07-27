@@ -8,6 +8,7 @@ import type {
   StorageLease,
   Task,
   TaskEvent,
+  TerminalProjection,
   Worker,
 } from '@taskcast/core'
 import { RedisShortTermStore } from '../src/short-term.js'
@@ -895,6 +896,80 @@ describe('RedisShortTermStore storage lifecycle', () => {
       token,
     )
     await expect(store.getEvents('task-1')).resolves.toHaveLength(3)
+  })
+
+  it('atomically projects a durable terminal event and settles worker capacity once', async () => {
+    await openTask()
+    const worker: Worker = {
+      id: 'worker-1',
+      status: 'busy',
+      matchRule: {},
+      capacity: 3,
+      usedSlots: 3,
+      weight: 50,
+      connectionMode: 'pull',
+      connectedAt: 1_000,
+      lastHeartbeatAt: 1_000,
+    }
+    const assignment = {
+      taskId: 'task-1',
+      workerId: worker.id,
+      cost: 3,
+      assignedAt: 2_000,
+      status: 'running' as const,
+    }
+    await store.saveWorker(worker)
+    await store.addAssignment(assignment)
+    const lease = await acquire()
+    await lifecycle.closeWriteFence!(lease, 1)
+    const projection: TerminalProjection = {
+      projectionId: 'projection-1',
+      task: makeTask({
+        status: 'timeout',
+        updatedAt: 3_000,
+        completedAt: 3_000,
+      }),
+      event: {
+        ...makeEvent('timeout-event', {
+          type: 'taskcast:status',
+          data: { status: 'timeout' },
+        }),
+        index: 0,
+      },
+      assignment,
+      claimToken: 'claim-1',
+      claimUntil: Date.now() + 30_000,
+    }
+
+    await expect(
+      lifecycle.projectTerminalFenced!(projection, lease, 1, 2),
+    ).resolves.toEqual({
+      token: { taskId: 'task-1', storageEpoch: 2 },
+      projected: true,
+    })
+    await expect(store.getTask('task-1')).resolves.toMatchObject({
+      status: 'timeout',
+    })
+    await expect(store.getEvents('task-1')).resolves.toEqual([projection.event])
+    await expect(store.getTaskAssignment('task-1')).resolves.toBeNull()
+    await expect(store.getWorker('worker-1')).resolves.toMatchObject({
+      usedSlots: 0,
+      status: 'idle',
+    })
+
+    await lifecycle.releaseStorageLock!(lease)
+    const retryLease = await acquire('retry-lock', 'retry-generation')
+    await lifecycle.closeWriteFence!(retryLease, 2)
+    await expect(
+      lifecycle.projectTerminalFenced!(projection, retryLease, 2, 3),
+    ).resolves.toEqual({
+      token: { taskId: 'task-1', storageEpoch: 3 },
+      projected: false,
+    })
+    await expect(store.getEvents('task-1')).resolves.toHaveLength(1)
+    await expect(store.getWorker('worker-1')).resolves.toMatchObject({
+      usedSlots: 0,
+    })
   })
 
   it('expires writer readiness registrations unless they are heartbeated', async () => {

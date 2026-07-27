@@ -782,6 +782,13 @@ pub struct TerminalProjection {
     pub claim_until: Option<f64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalProjectionResult {
+    pub token: HotWriteToken,
+    pub projected: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskStoragePresence {
@@ -1119,6 +1126,16 @@ pub trait ShortTermStore: Send + Sync {
         _lease: &StorageLease,
         _next_epoch: u64,
     ) -> Result<HotWriteToken, Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(StorageReleaseUnsupportedError::default()))
+    }
+
+    async fn project_terminal_fenced(
+        &self,
+        _projection: &TerminalProjection,
+        _lease: &StorageLease,
+        _expected_epoch: u64,
+        _next_epoch: u64,
+    ) -> Result<TerminalProjectionResult, Box<dyn std::error::Error + Send + Sync>> {
         Err(Box::new(StorageReleaseUnsupportedError::default()))
     }
 

@@ -16,10 +16,10 @@ use taskcast_core::archive::{
 use taskcast_core::types::{
     ArchiveBatch, ArchiveBatchReceipt, ArchiveGeneration, ArchiveGenerationStatus,
     ArchiveSourceManifest, AssignMode, CleanupConfig, DisconnectPolicy, DurableSeriesState,
-    EventQueryOptions, Level, LongTermStore, SeriesMode, StorageIntegrityError,
-    StorageReleaseRequest, StorageState, Task, TaskAuthConfig, TaskError, TaskEvent, TaskStatus,
-    TaskStorageMetadata, TaskStorageMetadataCas, WebhookConfig, WorkerAuditAction,
-    WorkerAuditEvent,
+    EventQueryOptions, Level, LongTermStore, SeriesMode, StorageFenceConflictError,
+    StorageIntegrityError, StorageReleaseRequest, StorageState, Task, TaskAuthConfig, TaskError,
+    TaskEvent, TaskStatus, TaskStorageMetadata, TaskStorageMetadataCas, TerminalProjection,
+    TtlClaim, WebhookConfig, WorkerAssignment, WorkerAuditAction, WorkerAuditEvent,
 };
 use taskcast_core::{
     BoxError, DependencyName, DependencyObservation, DependencyObservationState,
@@ -32,6 +32,8 @@ const WORKER_EVENTS: &str = "taskcast_worker_events";
 const ARCHIVE_GENERATIONS: &str = "taskcast_archive_generations";
 const ARCHIVE_BATCHES: &str = "taskcast_archive_batches";
 const SERIES_STATE: &str = "taskcast_series_state";
+const DURABLE_ASSIGNMENTS: &str = "taskcast_durable_assignments";
+const TERMINAL_OUTBOX: &str = "taskcast_terminal_outbox";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -39,6 +41,14 @@ struct ArchiveSeriesCoverage {
     series_id: String,
     mode: SeriesMode,
     through_index: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalProjectionPayload {
+    task: Task,
+    event: TaskEvent,
+    assignment: Option<WorkerAssignment>,
 }
 
 /// PostgreSQL-backed long-term store for tasks and events.
@@ -263,6 +273,10 @@ impl LongTermStore for PostgresLongTermStore {
         true
     }
 
+    fn supports_durable_ttl(&self) -> bool {
+        true
+    }
+
     fn supports_task_creation_claims(&self) -> bool {
         true
     }
@@ -326,10 +340,18 @@ impl LongTermStore for PostgresLongTermStore {
             INSERT INTO {TASKS} (
                 id, type, status, params, result, error, metadata,
                 auth_config, webhooks, cleanup, created_at, updated_at, completed_at, ttl,
-                tags, assign_mode, cost, assigned_worker, disconnect_policy
+                tags, assign_mode, cost, assigned_worker, disconnect_policy,
+                execution_deadline_at, task_version
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                $15, $16, $17, $18, $19
+                $15, $16, $17, $18, $19,
+                CASE
+                    WHEN $20
+                    THEN FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT
+                        + $21 * 1000
+                    ELSE NULL
+                END,
+                0
             )
             ON CONFLICT (id) DO UPDATE SET
                 status = EXCLUDED.status,
@@ -338,18 +360,33 @@ impl LongTermStore for PostgresLongTermStore {
                 metadata = EXCLUDED.metadata,
                 updated_at = EXCLUDED.updated_at,
                 completed_at = EXCLUDED.completed_at,
+                ttl = EXCLUDED.ttl,
                 tags = EXCLUDED.tags,
                 assign_mode = EXCLUDED.assign_mode,
                 cost = EXCLUDED.cost,
                 assigned_worker = EXCLUDED.assigned_worker,
-                disconnect_policy = EXCLUDED.disconnect_policy
+                disconnect_policy = EXCLUDED.disconnect_policy,
+                execution_deadline_at = CASE
+                    WHEN EXCLUDED.execution_deadline_at IS NULL THEN NULL
+                    WHEN {TASKS}.execution_deadline_at IS NULL
+                        OR {TASKS}.status = 'paused'
+                        OR {TASKS}.ttl IS DISTINCT FROM EXCLUDED.ttl
+                    THEN EXCLUDED.execution_deadline_at
+                    ELSE {TASKS}.execution_deadline_at
+                END,
+                task_version = {TASKS}.task_version + 1,
+                ttl_claim_token = NULL,
+                ttl_claim_until = NULL
+            WHERE {TASKS}.status NOT IN ('completed', 'failed', 'timeout', 'cancelled')
+               OR {TASKS}.status = EXCLUDED.status
+            RETURNING id
             "#
             );
 
             let status_str = serde_json::to_value(&task.status)
                 .map(|v| v.as_str().unwrap_or("pending").to_string())?;
 
-            sqlx::query(&sql)
+            let saved = sqlx::query(&sql)
                 .bind(&task.id)
                 .bind(&task.r#type)
                 .bind(&status_str)
@@ -369,8 +406,16 @@ impl LongTermStore for PostgresLongTermStore {
                 .bind(cost_i32)
                 .bind(&task.assigned_worker)
                 .bind(&disconnect_policy_str)
-                .execute(&self.pool)
+                .bind(has_execution_deadline(&task))
+                .bind(task.ttl.unwrap_or(0) as i64)
+                .fetch_optional(&self.pool)
                 .await?;
+            if saved.is_none() {
+                return Err(Box::new(StorageFenceConflictError::new(format!(
+                    "Durable terminal task cannot be overwritten: {}",
+                    task.id
+                ))));
+            }
 
             Ok(())
         })
@@ -426,10 +471,18 @@ impl LongTermStore for PostgresLongTermStore {
             INSERT INTO {TASKS} (
                 id, type, status, params, result, error, metadata,
                 auth_config, webhooks, cleanup, created_at, updated_at, completed_at, ttl,
-                tags, assign_mode, cost, assigned_worker, disconnect_policy
+                tags, assign_mode, cost, assigned_worker, disconnect_policy,
+                execution_deadline_at, task_version
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                $15, $16, $17, $18, $19
+                $15, $16, $17, $18, $19,
+                CASE
+                    WHEN $20
+                    THEN FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT
+                        + $21 * 1000
+                    ELSE NULL
+                END,
+                0
             )
             ON CONFLICT (id) DO NOTHING
             "#
@@ -454,6 +507,8 @@ impl LongTermStore for PostgresLongTermStore {
             .bind(task.cost.map(|value| value as i32))
             .bind(&task.assigned_worker)
             .bind(disconnect_policy)
+            .bind(has_execution_deadline(&task))
+            .bind(task.ttl.unwrap_or(0) as i64)
             .execute(&self.pool)
             .await?;
         Ok(result.rows_affected() == 1)
@@ -515,13 +570,20 @@ impl LongTermStore for PostgresLongTermStore {
                 auth_config, webhooks, cleanup, created_at, updated_at, completed_at, ttl,
                 tags, assign_mode, cost, assigned_worker, disconnect_policy,
                 creation_token, creation_claimed_at, creation_claim_expires_at,
-                creation_completed_at
+                creation_completed_at, execution_deadline_at, task_version
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
                 $15, $16, $17, $18, $19, $20,
                 FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT,
                 FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT + $21,
-                NULL
+                NULL,
+                CASE
+                    WHEN $22
+                    THEN FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT
+                        + $23 * 1000
+                    ELSE NULL
+                END,
+                0
             )
             ON CONFLICT (id) DO UPDATE SET
                 type = EXCLUDED.type,
@@ -545,7 +607,11 @@ impl LongTermStore for PostgresLongTermStore {
                 creation_token = EXCLUDED.creation_token,
                 creation_claimed_at = EXCLUDED.creation_claimed_at,
                 creation_claim_expires_at = EXCLUDED.creation_claim_expires_at,
-                creation_completed_at = NULL
+                creation_completed_at = NULL,
+                execution_deadline_at = EXCLUDED.execution_deadline_at,
+                task_version = 0,
+                ttl_claim_token = NULL,
+                ttl_claim_until = NULL
             WHERE {TASKS}.creation_token IS NOT NULL
               AND {TASKS}.creation_completed_at IS NULL
               AND (
@@ -592,6 +658,8 @@ impl LongTermStore for PostgresLongTermStore {
             .bind(disconnect_policy)
             .bind(creation_token)
             .bind(claim_ttl_ms as i64)
+            .bind(has_execution_deadline(&task))
+            .bind(task.ttl.unwrap_or(0) as i64)
             .execute(&self.pool)
             .await?;
         Ok(result.rows_affected() == 1)
@@ -912,6 +980,347 @@ impl LongTermStore for PostgresLongTermStore {
             .fetch_optional(&self.pool)
             .await?;
         row.as_ref().map(row_to_storage_metadata).transpose()
+    }
+
+    async fn claim_overdue_tasks(
+        &self,
+        limit: u64,
+        claim_ttl_ms: u64,
+    ) -> Result<Vec<TtlClaim>, Box<dyn std::error::Error + Send + Sync>> {
+        validate_positive_i64(limit, "TTL claim limit")?;
+        validate_positive_i64(claim_ttl_ms, "TTL claim duration")?;
+        let sql = format!(
+            r#"
+            WITH overdue AS (
+                SELECT id
+                FROM {TASKS}
+                WHERE execution_deadline_at IS NOT NULL
+                  AND execution_deadline_at <=
+                    FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT
+                  AND status NOT IN ('completed', 'failed', 'timeout', 'cancelled')
+                  AND (
+                    ttl_claim_until IS NULL
+                    OR ttl_claim_until <=
+                      FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT
+                  )
+                ORDER BY execution_deadline_at, id
+                LIMIT $1
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE {TASKS} AS task
+            SET ttl_claim_token = MD5(
+                    task.id || ':' || clock_timestamp()::TEXT || ':'
+                    || random()::TEXT || ':' || txid_current()::TEXT
+                ),
+                ttl_claim_until =
+                  FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT + $2
+            FROM overdue
+            WHERE task.id = overdue.id
+            RETURNING task.id, task.ttl_claim_token, task.ttl_claim_until,
+                      task.task_version, task.execution_deadline_at
+            "#
+        );
+        let rows = sqlx::query(&sql)
+            .bind(limit as i64)
+            .bind(claim_ttl_ms as i64)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|row| TtlClaim {
+                task_id: row.get("id"),
+                claim_token: row.get("ttl_claim_token"),
+                claim_until: row.get::<i64, _>("ttl_claim_until") as f64,
+                task_version: row.get::<i64, _>("task_version") as u64,
+                execution_deadline_at: row.get::<i64, _>("execution_deadline_at") as f64,
+            })
+            .collect())
+    }
+
+    async fn terminalize_ttl_claim(
+        &self,
+        claim: TtlClaim,
+        task: Task,
+        event: TaskEvent,
+        assignment: Option<WorkerAssignment>,
+    ) -> Result<Option<TerminalProjection>, Box<dyn std::error::Error + Send + Sync>> {
+        validate_ttl_terminalization(&claim, &task, &event)?;
+        let mut tx = self.pool.begin().await?;
+        let now: i64 = sqlx::query_scalar(
+            "SELECT FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        let task_sql = format!("SELECT * FROM {TASKS} WHERE id = $1 FOR UPDATE");
+        let current = sqlx::query(&task_sql)
+            .bind(&claim.task_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some(current) = current else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        let claim_token: Option<String> = current.get("ttl_claim_token");
+        let claim_until: Option<i64> = current.get("ttl_claim_until");
+        let deadline: Option<i64> = current.get("execution_deadline_at");
+        let version: i64 = current.get("task_version");
+        let status: String = current.get("status");
+        if claim_token.as_deref() != Some(claim.claim_token.as_str())
+            || claim_until != Some(claim.claim_until as i64)
+            || claim_until.is_none_or(|until| until <= now)
+            || version != claim.task_version as i64
+            || deadline != Some(claim.execution_deadline_at as i64)
+            || is_terminal_db_status(&status)
+        {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+
+        let assignment_sql =
+            format!("SELECT * FROM {DURABLE_ASSIGNMENTS} WHERE task_id = $1 FOR UPDATE");
+        let durable_assignment = sqlx::query(&assignment_sql)
+            .bind(&claim.task_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .as_ref()
+            .map(row_to_worker_assignment)
+            .transpose()?;
+        if durable_assignment != assignment {
+            return Err(integrity(&format!(
+                "Durable assignment changed before TTL terminalization: {}",
+                claim.task_id
+            )));
+        }
+
+        let index_sql = format!("SELECT COALESCE(MAX(idx), -1) FROM {EVENTS} WHERE task_id = $1");
+        let last_index: i32 = sqlx::query_scalar(&index_sql)
+            .bind(&claim.task_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let expected_index = (i64::from(last_index) + 1) as u64;
+        if event.index != expected_index {
+            return Err(integrity(&format!(
+                "TTL timeout event index is not contiguous for {}",
+                claim.task_id
+            )));
+        }
+
+        let update_sql = format!(
+            r#"
+            UPDATE {TASKS}
+            SET status = 'timeout', result = $1, error = $2, metadata = $3,
+                updated_at = $4, completed_at = $5, assigned_worker = NULL,
+                execution_deadline_at = NULL, task_version = task_version + 1,
+                ttl_claim_token = NULL, ttl_claim_until = NULL
+            WHERE id = $6
+            "#
+        );
+        sqlx::query(&update_sql)
+            .bind(task.result.as_ref().map(serde_json::to_value).transpose()?)
+            .bind(task.error.as_ref().map(serde_json::to_value).transpose()?)
+            .bind(
+                task.metadata
+                    .as_ref()
+                    .map(serde_json::to_value)
+                    .transpose()?,
+            )
+            .bind(task.updated_at as i64)
+            .bind(task.completed_at.map(|value| value as i64))
+            .bind(&claim.task_id)
+            .execute(&mut *tx)
+            .await?;
+        insert_event_pg_tx(&mut tx, &event).await?;
+        let delete_assignment_sql = format!("DELETE FROM {DURABLE_ASSIGNMENTS} WHERE task_id = $1");
+        sqlx::query(&delete_assignment_sql)
+            .bind(&claim.task_id)
+            .execute(&mut *tx)
+            .await?;
+
+        let projection = TerminalProjection {
+            projection_id: format!("ttl:{}", event.id),
+            task,
+            event,
+            assignment: durable_assignment,
+            claim_token: Some(claim.claim_token.clone()),
+            claim_until: Some(claim.claim_until),
+        };
+        let payload = TerminalProjectionPayload {
+            task: projection.task.clone(),
+            event: projection.event.clone(),
+            assignment: projection.assignment.clone(),
+        };
+        let outbox_sql = format!(
+            r#"
+            INSERT INTO {TERMINAL_OUTBOX} (
+                projection_id, task_id, event_id, assignment_id, payload,
+                claim_token, claim_until, projected_at, created_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, $8)
+            "#
+        );
+        sqlx::query(&outbox_sql)
+            .bind(&projection.projection_id)
+            .bind(&claim.task_id)
+            .bind(&projection.event.id)
+            .bind(projection.assignment.as_ref().map(durable_assignment_id))
+            .bind(serde_json::to_value(payload)?)
+            .bind(&claim.claim_token)
+            .bind(claim.claim_until as i64)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(Some(projection))
+    }
+
+    async fn claim_terminal_projections(
+        &self,
+        limit: u64,
+        claim_token: &str,
+        claim_ttl_ms: u64,
+    ) -> Result<Vec<TerminalProjection>, Box<dyn std::error::Error + Send + Sync>> {
+        validate_positive_i64(limit, "Terminal projection limit")?;
+        validate_positive_i64(claim_ttl_ms, "Terminal projection claim duration")?;
+        if claim_token.is_empty() {
+            return Err(integrity("Terminal projection claim token is required"));
+        }
+        let sql = format!(
+            r#"
+            WITH pending AS (
+                SELECT projection_id
+                FROM {TERMINAL_OUTBOX}
+                WHERE projected_at IS NULL
+                  AND (
+                    claim_until IS NULL
+                    OR claim_until <=
+                      FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT
+                  )
+                ORDER BY created_at, projection_id
+                LIMIT $1
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE {TERMINAL_OUTBOX} AS outbox
+            SET claim_token = $2,
+                claim_until =
+                  FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT + $3
+            FROM pending
+            WHERE outbox.projection_id = pending.projection_id
+            RETURNING outbox.projection_id, outbox.payload,
+                      outbox.claim_token, outbox.claim_until
+            "#
+        );
+        let rows = sqlx::query(&sql)
+            .bind(limit as i64)
+            .bind(claim_token)
+            .bind(claim_ttl_ms as i64)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(row_to_terminal_projection).collect()
+    }
+
+    async fn complete_terminal_projection(
+        &self,
+        projection: &TerminalProjection,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let (Some(claim_token), Some(claim_until)) =
+            (&projection.claim_token, projection.claim_until)
+        else {
+            return Err(integrity(
+                "Terminal projection completion requires an active claim",
+            ));
+        };
+        let sql = format!(
+            r#"
+            UPDATE {TERMINAL_OUTBOX}
+            SET projected_at =
+                  FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT,
+                claim_token = NULL, claim_until = NULL
+            WHERE projection_id = $1
+              AND projected_at IS NULL
+              AND claim_token = $2
+              AND claim_until = $3
+              AND claim_until >
+                FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT
+            "#
+        );
+        let result = sqlx::query(&sql)
+            .bind(&projection.projection_id)
+            .bind(claim_token)
+            .bind(claim_until as i64)
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() == 1 {
+            return Ok(());
+        }
+        let check_sql =
+            format!("SELECT projected_at FROM {TERMINAL_OUTBOX} WHERE projection_id = $1");
+        let projected_at: Option<i64> = sqlx::query_scalar(&check_sql)
+            .bind(&projection.projection_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .flatten();
+        if projected_at.is_some() {
+            return Ok(());
+        }
+        Err(Box::new(StorageFenceConflictError::new(format!(
+            "Terminal projection claim was lost: {}",
+            projection.projection_id
+        ))))
+    }
+
+    async fn save_durable_assignment(
+        &self,
+        assignment: WorkerAssignment,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        validate_worker_assignment(&assignment)?;
+        let status = serde_json::to_value(&assignment.status)?
+            .as_str()
+            .unwrap_or("assigned")
+            .to_string();
+        let sql = format!(
+            r#"
+            INSERT INTO {DURABLE_ASSIGNMENTS} (
+                task_id, assignment_id, worker_id, cost, assigned_at, status, updated_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6,
+                FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT
+            )
+            ON CONFLICT (task_id) DO UPDATE SET
+                assignment_id = EXCLUDED.assignment_id,
+                worker_id = EXCLUDED.worker_id,
+                cost = EXCLUDED.cost,
+                assigned_at = EXCLUDED.assigned_at,
+                status = EXCLUDED.status,
+                updated_at = EXCLUDED.updated_at
+            "#
+        );
+        sqlx::query(&sql)
+            .bind(&assignment.task_id)
+            .bind(durable_assignment_id(&assignment))
+            .bind(&assignment.worker_id)
+            .bind(assignment.cost as i32)
+            .bind(assignment.assigned_at as i64)
+            .bind(status)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_durable_assignment(
+        &self,
+        task_id: &str,
+        assignment_id: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let sql = if assignment_id.is_some() {
+            format!("DELETE FROM {DURABLE_ASSIGNMENTS} WHERE task_id = $1 AND assignment_id = $2")
+        } else {
+            format!("DELETE FROM {DURABLE_ASSIGNMENTS} WHERE task_id = $1")
+        };
+        let mut query = sqlx::query(&sql).bind(task_id);
+        if let Some(assignment_id) = assignment_id {
+            query = query.bind(assignment_id);
+        }
+        query.execute(&self.pool).await?;
+        Ok(())
     }
 
     async fn persist_storage_release_request(
@@ -1956,6 +2365,118 @@ fn validate_storage_release_request(
         return Err(integrity("Storage release request is invalid"));
     }
     Ok(())
+}
+
+fn has_execution_deadline(task: &Task) -> bool {
+    task.ttl.is_some()
+        && task.status != TaskStatus::Paused
+        && !matches!(
+            task.status,
+            TaskStatus::Completed
+                | TaskStatus::Failed
+                | TaskStatus::Timeout
+                | TaskStatus::Cancelled
+        )
+}
+
+fn is_terminal_db_status(status: &str) -> bool {
+    matches!(status, "completed" | "failed" | "timeout" | "cancelled")
+}
+
+fn validate_positive_i64(
+    value: u64,
+    label: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if value == 0 || value > i64::MAX as u64 {
+        return Err(integrity(&format!("{label} must be a positive integer")));
+    }
+    Ok(())
+}
+
+fn validate_ttl_terminalization(
+    claim: &TtlClaim,
+    task: &Task,
+    event: &TaskEvent,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if claim.task_id.is_empty()
+        || claim.claim_token.is_empty()
+        || !fits_postgres_bigint(claim.claim_until)
+        || claim.task_version > i64::MAX as u64
+        || !fits_postgres_bigint(claim.execution_deadline_at)
+        || task.id != claim.task_id
+        || task.status != TaskStatus::Timeout
+        || task.completed_at.is_none()
+        || event.task_id != claim.task_id
+        || event.id.is_empty()
+        || event.r#type != "taskcast:status"
+        || event.index > i32::MAX as u64
+        || !fits_postgres_bigint(event.timestamp)
+    {
+        return Err(integrity("TTL terminalization input is invalid"));
+    }
+    Ok(())
+}
+
+fn validate_worker_assignment(
+    assignment: &WorkerAssignment,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if assignment.task_id.is_empty()
+        || assignment.worker_id.is_empty()
+        || assignment.cost > i32::MAX as u32
+        || !fits_postgres_bigint(assignment.assigned_at)
+        || assignment.assigned_at < 0.0
+    {
+        return Err(integrity("Durable worker assignment is invalid"));
+    }
+    Ok(())
+}
+
+fn durable_assignment_id(assignment: &WorkerAssignment) -> String {
+    format!(
+        "{}:{}:{}",
+        assignment.task_id, assignment.worker_id, assignment.assigned_at as i64
+    )
+}
+
+fn row_to_worker_assignment(
+    row: &PgRow,
+) -> Result<WorkerAssignment, Box<dyn std::error::Error + Send + Sync>> {
+    let status: String = row.get("status");
+    let status = serde_json::from_value(JsonValue::String(status))
+        .map_err(|_| integrity("Durable worker assignment status is invalid"))?;
+    Ok(WorkerAssignment {
+        task_id: row.get("task_id"),
+        worker_id: row.get("worker_id"),
+        cost: row.get::<i32, _>("cost") as u32,
+        assigned_at: row.get::<i64, _>("assigned_at") as f64,
+        status,
+    })
+}
+
+fn row_to_terminal_projection(
+    row: &PgRow,
+) -> Result<TerminalProjection, Box<dyn std::error::Error + Send + Sync>> {
+    let payload: JsonValue = row.get("payload");
+    let payload: TerminalProjectionPayload = serde_json::from_value(payload)
+        .map_err(|_| integrity("Terminal projection payload is invalid"))?;
+    if payload.task.id != payload.event.task_id
+        || payload
+            .assignment
+            .as_ref()
+            .is_some_and(|assignment| assignment.task_id != payload.task.id)
+    {
+        return Err(integrity("Terminal projection payload is inconsistent"));
+    }
+    Ok(TerminalProjection {
+        projection_id: row.get("projection_id"),
+        task: payload.task,
+        event: payload.event,
+        assignment: payload.assignment,
+        claim_token: row.get("claim_token"),
+        claim_until: row
+            .get::<Option<i64>, _>("claim_until")
+            .map(|value| value as f64),
+    })
 }
 
 fn validate_batch_shape(

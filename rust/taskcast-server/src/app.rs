@@ -540,7 +540,6 @@ async fn health_detail(AxumState(state): AxumState<AppState>) -> impl IntoRespon
         }
     }
 
-    let mut response = serde_json::json!({
     let storage = state.storage_readiness.snapshot().await;
     let mut response = serde_json::json!({
         "ok": true,
