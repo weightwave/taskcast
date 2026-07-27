@@ -592,6 +592,7 @@ export function createTaskcastApp(opts: TaskcastServerOptions): TaskcastApp {
         uptime,
         auth: { mode: authMode },
         adapters,
+        storage: await storageReadiness.snapshot(),
       })
     }
 

@@ -414,7 +414,7 @@ impl LongTermStore for PostgresLongTermStore {
                 return Err(Box::new(StorageFenceConflictError::new(format!(
                     "Durable terminal task cannot be overwritten: {}",
                     task.id
-                ))));
+                ))) as BoxError);
             }
 
             Ok(())

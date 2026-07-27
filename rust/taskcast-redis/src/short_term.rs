@@ -10,7 +10,7 @@ use taskcast_core::types::{
     TaskStoragePresence, TaskWriteFence, TerminalProjection, TerminalProjectionResult, Worker,
     WorkerAssignment, WorkerFilter,
 };
-use taskcast_core::DependencyObserver;
+use taskcast_core::{BoxError, DependencyObserver};
 
 use crate::connection::RedisCommandConnection;
 
@@ -184,6 +184,19 @@ impl RedisShortTermStore {
             ))
         } else {
             Box::new(error)
+        }
+    }
+
+    fn observe_fence_result<T>(
+        connection: &RedisCommandConnection,
+        result: redis::RedisResult<T>,
+    ) -> Result<T, BoxError> {
+        match connection.observe_result(result) {
+            Ok(value) => Ok(value),
+            Err(error) => match error.downcast::<redis::RedisError>() {
+                Ok(error) => Err(Self::map_fence_error(*error)),
+                Err(error) => Err(error),
+            },
         }
     }
 
@@ -438,16 +451,18 @@ impl RedisShortTermStore {
         let mut cursor = 0_u64;
         let mut keys = std::collections::HashSet::new();
         loop {
-            let (next_cursor, page): (u64, Vec<String>) = redis::cmd("SCAN")
-                .arg(cursor)
-                .arg("MATCH")
-                .arg(&pattern)
-                .arg("COUNT")
-                .arg(1000)
-                .query_async(&mut conn)
-                .await?;
+            let (next_cursor, page): (u64, Vec<String>) = redis_call!(
+                conn,
+                redis::cmd("SCAN")
+                    .arg(cursor)
+                    .arg("MATCH")
+                    .arg(&pattern)
+                    .arg("COUNT")
+                    .arg(1000)
+                    .query_async(&mut conn)
+            );
             if !page.is_empty() {
-                let values: Vec<Option<String>> = conn.mget(&page).await?;
+                let values: Vec<Option<String>> = redis_call!(conn, conn.mget(&page));
                 for (key, raw) in page.into_iter().zip(values) {
                     let Some(raw) = raw else {
                         continue;
@@ -1192,7 +1207,7 @@ impl ShortTermStore for RedisShortTermStore {
     ) -> Result<Option<TaskMutationSnapshot>, Box<dyn std::error::Error + Send + Sync>> {
         let key = self.keys.task(task_id);
         let mut conn = self.conn.clone();
-        let result: Option<String> = conn.get(&key).await?;
+        let result: Option<String> = redis_call!(conn, conn.get(&key));
         match result {
             Some(json) => Ok(Some(TaskMutationSnapshot {
                 task: serde_json::from_str(&json)?,
@@ -1215,15 +1230,17 @@ impl ShortTermStore for RedisShortTermStore {
             )));
         }
         let mut conn = self.conn.clone();
-        let raw: Option<String> = redis::Script::new(ACQUIRE_STORAGE_LOCK_LUA)
-            .key(self.keys.storage_lock(task_id))
-            .key(self.keys.write_fence(task_id))
-            .arg(task_id)
-            .arg(lock_token)
-            .arg(generation)
-            .arg(ttl_ms)
-            .invoke_async(&mut conn)
-            .await?;
+        let raw: Option<String> = redis_call!(
+            conn,
+            redis::Script::new(ACQUIRE_STORAGE_LOCK_LUA)
+                .key(self.keys.storage_lock(task_id))
+                .key(self.keys.write_fence(task_id))
+                .arg(task_id)
+                .arg(lock_token)
+                .arg(generation)
+                .arg(ttl_ms)
+                .invoke_async(&mut conn)
+        );
         raw.map(|json| serde_json::from_str(&json))
             .transpose()
             .map_err(Into::into)
@@ -1238,15 +1255,17 @@ impl ShortTermStore for RedisShortTermStore {
             return Ok(false);
         }
         let mut conn = self.conn.clone();
-        let renewed: i32 = redis::Script::new(RENEW_STORAGE_LOCK_LUA)
-            .key(self.keys.storage_lock(&lease.task_id))
-            .arg(&lease.task_id)
-            .arg(&lease.lock_token)
-            .arg(&lease.generation)
-            .arg(lease.storage_epoch)
-            .arg(ttl_ms)
-            .invoke_async(&mut conn)
-            .await?;
+        let renewed: i32 = redis_call!(
+            conn,
+            redis::Script::new(RENEW_STORAGE_LOCK_LUA)
+                .key(self.keys.storage_lock(&lease.task_id))
+                .arg(&lease.task_id)
+                .arg(&lease.lock_token)
+                .arg(&lease.generation)
+                .arg(lease.storage_epoch)
+                .arg(ttl_ms)
+                .invoke_async(&mut conn)
+        );
         Ok(renewed == 1)
     }
 
@@ -1255,14 +1274,16 @@ impl ShortTermStore for RedisShortTermStore {
         lease: &StorageLease,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
         let mut conn = self.conn.clone();
-        let released: i32 = redis::Script::new(RELEASE_STORAGE_LOCK_LUA)
-            .key(self.keys.storage_lock(&lease.task_id))
-            .arg(&lease.task_id)
-            .arg(&lease.lock_token)
-            .arg(&lease.generation)
-            .arg(lease.storage_epoch)
-            .invoke_async(&mut conn)
-            .await?;
+        let released: i32 = redis_call!(
+            conn,
+            redis::Script::new(RELEASE_STORAGE_LOCK_LUA)
+                .key(self.keys.storage_lock(&lease.task_id))
+                .arg(&lease.task_id)
+                .arg(&lease.lock_token)
+                .arg(&lease.generation)
+                .arg(lease.storage_epoch)
+                .invoke_async(&mut conn)
+        );
         Ok(released == 1)
     }
 
@@ -1271,7 +1292,7 @@ impl ShortTermStore for RedisShortTermStore {
         task_id: &str,
     ) -> Result<Option<TaskWriteFence>, Box<dyn std::error::Error + Send + Sync>> {
         let mut conn = self.conn.clone();
-        let raw: Option<String> = conn.get(self.keys.write_fence(task_id)).await?;
+        let raw: Option<String> = redis_call!(conn, conn.get(self.keys.write_fence(task_id)));
         raw.map(|json| serde_json::from_str(&json))
             .transpose()
             .map_err(Into::into)
@@ -1283,19 +1304,19 @@ impl ShortTermStore for RedisShortTermStore {
         expected_epoch: u64,
     ) -> Result<ClosedWriteFence, Box<dyn std::error::Error + Send + Sync>> {
         let mut conn = self.conn.clone();
+        let result = redis::Script::new(CLOSE_WRITE_FENCE_LUA)
+            .key(self.keys.storage_lock(&lease.task_id))
+            .key(self.keys.write_fence(&lease.task_id))
+            .key(self.keys.idx(&lease.task_id))
+            .arg(&lease.task_id)
+            .arg(&lease.lock_token)
+            .arg(&lease.generation)
+            .arg(lease.storage_epoch)
+            .arg(expected_epoch)
+            .invoke_async(&mut conn)
+            .await;
         let (fence_json, high_watermark_json): (String, String) =
-            redis::Script::new(CLOSE_WRITE_FENCE_LUA)
-                .key(self.keys.storage_lock(&lease.task_id))
-                .key(self.keys.write_fence(&lease.task_id))
-                .key(self.keys.idx(&lease.task_id))
-                .arg(&lease.task_id)
-                .arg(&lease.lock_token)
-                .arg(&lease.generation)
-                .arg(lease.storage_epoch)
-                .arg(expected_epoch)
-                .invoke_async(&mut conn)
-                .await
-                .map_err(Self::map_fence_error)?;
+            Self::observe_fence_result(&conn, result)?;
         let fence: TaskWriteFence = serde_json::from_str(&fence_json)?;
         let high_watermark = high_watermark_json.parse::<i64>().map_err(|_| {
             Box::new(StorageIntegrityError::new(
@@ -1322,7 +1343,7 @@ impl ShortTermStore for RedisShortTermStore {
         expected_epoch: u64,
     ) -> Result<HotWriteToken, Box<dyn std::error::Error + Send + Sync>> {
         let mut conn = self.conn.clone();
-        let raw: String = redis::Script::new(REOPEN_WRITE_FENCE_LUA)
+        let result = redis::Script::new(REOPEN_WRITE_FENCE_LUA)
             .key(self.keys.storage_lock(&lease.task_id))
             .key(self.keys.write_fence(&lease.task_id))
             .arg(&lease.task_id)
@@ -1331,8 +1352,8 @@ impl ShortTermStore for RedisShortTermStore {
             .arg(lease.storage_epoch)
             .arg(expected_epoch)
             .invoke_async(&mut conn)
-            .await
-            .map_err(Self::map_fence_error)?;
+            .await;
+        let raw: String = Self::observe_fence_result(&conn, result)?;
         Ok(serde_json::from_str(&raw)?)
     }
 
@@ -1361,20 +1382,22 @@ impl ShortTermStore for RedisShortTermStore {
                 Option<String>,
                 Option<String>,
                 Option<String>,
-            ) = redis::pipe()
-                .cmd("HGET")
-                .arg(self.keys.series_state(task_id))
-                .arg(series_id)
-                .cmd("GET")
-                .arg(self.keys.legacy_series_latest(task_id, series_id))
-                .cmd("LINDEX")
-                .arg(self.keys.events(task_id))
-                .arg(0)
-                .cmd("LINDEX")
-                .arg(self.keys.events(task_id))
-                .arg(1)
-                .query_async(&mut conn)
-                .await?;
+            ) = redis_call!(
+                conn,
+                redis::pipe()
+                    .cmd("HGET")
+                    .arg(self.keys.series_state(task_id))
+                    .arg(series_id)
+                    .cmd("GET")
+                    .arg(self.keys.legacy_series_latest(task_id, series_id))
+                    .cmd("LINDEX")
+                    .arg(self.keys.events(task_id))
+                    .arg(0)
+                    .cmd("LINDEX")
+                    .arg(self.keys.events(task_id))
+                    .arg(1)
+                    .query_async(&mut conn)
+            );
 
             let hash_state_raw = hash_state_raw.unwrap_or_default();
             let legacy_candidate_raw = legacy_candidate_raw.unwrap_or_default();
@@ -1407,7 +1430,7 @@ impl ShortTermStore for RedisShortTermStore {
             };
             let (accumulated_prefix, accumulated_suffix) =
                 Self::make_indexed_event_template(&accumulated)?;
-            let (status, index_raw): (String, String) = redis::Script::new(COMMIT_EVENT_FENCED_LUA)
+            let result = redis::Script::new(COMMIT_EVENT_FENCED_LUA)
                 .key(self.keys.write_fence(task_id))
                 .key(self.keys.idx(task_id))
                 .key(self.keys.events(task_id))
@@ -1449,8 +1472,8 @@ impl ShortTermStore for RedisShortTermStore {
                 .arg(&legacy_candidate_raw)
                 .arg(self.legacy_series_writes as u8)
                 .invoke_async(&mut conn)
-                .await
-                .map_err(Self::map_fence_error)?;
+                .await;
+            let (status, index_raw): (String, String) = Self::observe_fence_result(&conn, result)?;
             if status == "RETRY" {
                 continue;
             }
@@ -1493,7 +1516,7 @@ impl ShortTermStore for RedisShortTermStore {
             return Err(Box::new(StorageFenceConflictError::default()));
         }
         let mut conn = self.conn.clone();
-        redis::Script::new(SAVE_TASK_FENCED_LUA)
+        let result = redis::Script::new(SAVE_TASK_FENCED_LUA)
             .key(self.keys.write_fence(&task.id))
             .key(self.keys.task(&task.id))
             .key(self.keys.task_status(&task.id))
@@ -1505,8 +1528,8 @@ impl ShortTermStore for RedisShortTermStore {
                     .unwrap_or("pending"),
             )
             .invoke_async::<()>(&mut conn)
-            .await
-            .map_err(Self::map_fence_error)?;
+            .await;
+        Self::observe_fence_result(&conn, result)?;
         Ok(())
     }
 
@@ -1551,10 +1574,8 @@ impl ShortTermStore for RedisShortTermStore {
             invocation.arg(prefix).arg(suffix);
         }
         let mut conn = self.conn.clone();
-        let raw = invocation
-            .invoke_async::<Vec<String>>(&mut conn)
-            .await
-            .map_err(Self::map_fence_error)?;
+        let result = invocation.invoke_async::<Vec<String>>(&mut conn).await;
+        let raw = Self::observe_fence_result(&conn, result)?;
         if raw.first().map(String::as_str) == Some("TASK_CONFLICT") {
             return Ok(None);
         }
@@ -1599,10 +1620,11 @@ impl ShortTermStore for RedisShortTermStore {
             )));
         }
         let mut conn = self.conn.clone();
-        let raw: Vec<String> = conn
-            .lrange(self.keys.events(task_id), offset as isize, end as isize)
-            .await?;
-        let length: usize = conn.llen(self.keys.events(task_id)).await?;
+        let raw: Vec<String> = redis_call!(
+            conn,
+            conn.lrange(self.keys.events(task_id), offset as isize, end as isize)
+        );
+        let length: usize = redis_call!(conn, conn.llen(self.keys.events(task_id)));
         let mut events = Vec::new();
         let mut beyond_watermark = false;
         for encoded in &raw {
@@ -1665,15 +1687,15 @@ impl ShortTermStore for RedisShortTermStore {
         for key in series_keys {
             invocation.key(key);
         }
-        invocation
+        let result = invocation
             .arg(&lease.task_id)
             .arg(&lease.lock_token)
             .arg(&lease.generation)
             .arg(lease.storage_epoch)
             .arg(expected_epoch)
             .invoke_async::<()>(&mut conn)
-            .await
-            .map_err(Self::map_fence_error)?;
+            .await;
+        Self::observe_fence_result(&conn, result)?;
         Ok(())
     }
 
@@ -1724,7 +1746,7 @@ impl ShortTermStore for RedisShortTermStore {
             })
             .collect::<Result<Vec<serde_json::Value>, serde_json::Error>>()?;
         let mut conn = self.conn.clone();
-        redis::Script::new(RESTORE_HOT_TASK_LUA)
+        let result = redis::Script::new(RESTORE_HOT_TASK_LUA)
             .key(self.keys.storage_lock(&task_id))
             .key(self.keys.write_fence(&task_id))
             .key(self.keys.task(&task_id))
@@ -1753,8 +1775,8 @@ impl ShortTermStore for RedisShortTermStore {
                     .unwrap_or("pending"),
             )
             .invoke_async::<()>(&mut conn)
-            .await
-            .map_err(Self::map_fence_error)?;
+            .await;
+        Self::observe_fence_result(&conn, result)?;
         Ok(HotWriteToken {
             task_id,
             storage_epoch: next_epoch,
@@ -1796,7 +1818,7 @@ impl ShortTermStore for RedisShortTermStore {
             active_release_generation: None,
         };
         let mut conn = self.conn.clone();
-        let result: (u64, u64) = redis::Script::new(PROJECT_TERMINAL_FENCED_LUA)
+        let result = redis::Script::new(PROJECT_TERMINAL_FENCED_LUA)
             .key(self.keys.storage_lock(task_id))
             .key(self.keys.write_fence(task_id))
             .key(self.keys.task(task_id))
@@ -1823,8 +1845,8 @@ impl ShortTermStore for RedisShortTermStore {
             .arg(serde_json::to_string(&fence)?)
             .arg(7_u64 * 24 * 60 * 60 * 1_000)
             .invoke_async(&mut conn)
-            .await
-            .map_err(Self::map_fence_error)?;
+            .await;
+        let result: (u64, u64) = Self::observe_fence_result(&conn, result)?;
         if result.0 > 1 || result.1 != next_epoch {
             return Err(Box::new(StorageIntegrityError::new(
                 "Redis returned an invalid terminal projection result",
@@ -1851,20 +1873,22 @@ impl ShortTermStore for RedisShortTermStore {
             u64,
             u64,
             u64,
-        ) = redis::pipe()
-            .cmd("EXISTS")
-            .arg(self.keys.task(task_id))
-            .arg(self.keys.task_status(task_id))
-            .cmd("LLEN")
-            .arg(self.keys.events(task_id))
-            .cmd("EXISTS")
-            .arg(self.keys.idx(task_id))
-            .cmd("HLEN")
-            .arg(self.keys.series_state(task_id))
-            .cmd("EXISTS")
-            .arg(self.keys.write_fence(task_id))
-            .query_async(&mut conn)
-            .await?;
+        ) = redis_call!(
+            conn,
+            redis::pipe()
+                .cmd("EXISTS")
+                .arg(self.keys.task(task_id))
+                .arg(self.keys.task_status(task_id))
+                .cmd("LLEN")
+                .arg(self.keys.events(task_id))
+                .cmd("EXISTS")
+                .arg(self.keys.idx(task_id))
+                .cmd("HLEN")
+                .arg(self.keys.series_state(task_id))
+                .cmd("EXISTS")
+                .arg(self.keys.write_fence(task_id))
+                .query_async(&mut conn)
+        );
         Ok(TaskStoragePresence {
             task: task > 0,
             event_count,
@@ -1886,14 +1910,16 @@ impl ShortTermStore for RedisShortTermStore {
         }
         registration.expires_at = Self::now_ms()? + ttl_ms as f64;
         let mut conn = self.conn.clone();
-        redis::Script::new(REGISTER_STORAGE_WRITER_LUA)
-            .key(self.keys.storage_writer(&registration.instance_id))
-            .key(self.keys.storage_writers())
-            .arg(&registration.instance_id)
-            .arg(serde_json::to_string(&registration)?)
-            .arg(ttl_ms)
-            .invoke_async::<()>(&mut conn)
-            .await?;
+        redis_call!(
+            conn,
+            redis::Script::new(REGISTER_STORAGE_WRITER_LUA)
+                .key(self.keys.storage_writer(&registration.instance_id))
+                .key(self.keys.storage_writers())
+                .arg(&registration.instance_id)
+                .arg(serde_json::to_string(&registration)?)
+                .arg(ttl_ms)
+                .invoke_async::<()>(&mut conn)
+        );
         Ok(())
     }
 
@@ -1901,7 +1927,8 @@ impl ShortTermStore for RedisShortTermStore {
         &self,
     ) -> Result<Vec<StorageWriterRegistration>, Box<dyn std::error::Error + Send + Sync>> {
         let mut conn = self.conn.clone();
-        let instance_ids: Vec<String> = conn.smembers(self.keys.storage_writers()).await?;
+        let instance_ids: Vec<String> =
+            redis_call!(conn, conn.smembers(self.keys.storage_writers()));
         if instance_ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -1909,7 +1936,7 @@ impl ShortTermStore for RedisShortTermStore {
             .iter()
             .map(|instance_id| self.keys.storage_writer(instance_id))
             .collect::<Vec<_>>();
-        let values: Vec<Option<String>> = conn.mget(writer_keys).await?;
+        let values: Vec<Option<String>> = redis_call!(conn, conn.mget(writer_keys));
         let mut stale = Vec::new();
         let mut registrations = Vec::new();
         for (instance_id, raw) in instance_ids.iter().zip(values) {
@@ -1920,8 +1947,10 @@ impl ShortTermStore for RedisShortTermStore {
             }
         }
         if !stale.is_empty() {
-            conn.srem::<_, _, ()>(self.keys.storage_writers(), stale)
-                .await?;
+            redis_call!(
+                conn,
+                conn.srem::<_, _, ()>(self.keys.storage_writers(), stale)
+            );
         }
         Ok(registrations)
     }
