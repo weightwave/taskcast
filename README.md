@@ -12,7 +12,7 @@
 [![Node.js](https://img.shields.io/badge/Node.js-%E2%89%A518-green?logo=node.js&logoColor=white)](https://nodejs.org/)
 [![Coverage](https://img.shields.io/badge/coverage-95%25-brightgreen?logo=vitest&logoColor=white)]()
 
-[Getting Started](./docs/guide/getting-started.md) | [Core Concepts](./docs/guide/concepts.md) | [REST API](./docs/api/rest.md) | [SSE](./docs/api/sse.md) | [Deployment](./docs/guide/deployment.md)
+[Getting Started](./docs/guide/getting-started.md) | [Core Concepts](./docs/guide/concepts.md) | [REST API](./docs/api/rest.md) | [SSE](./docs/api/sse.md) | [Deployment](./docs/guide/deployment.md) | [Hot/Cold Storage](./docs/guide/hot-cold-storage.md)
 
 [English](./README.md) | [中文](./README.zh.md)
 

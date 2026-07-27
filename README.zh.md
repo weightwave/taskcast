@@ -12,7 +12,7 @@
 [![Node.js](https://img.shields.io/badge/Node.js-%E2%89%A518-green?logo=node.js&logoColor=white)](https://nodejs.org/)
 [![Coverage](https://img.shields.io/badge/coverage-95%25-brightgreen?logo=vitest&logoColor=white)]()
 
-[快速上手](./docs/guide/getting-started.zh.md) | [核心概念](./docs/guide/concepts.zh.md) | [REST API](./docs/api/rest.zh.md) | [SSE](./docs/api/sse.zh.md) | [部署指南](./docs/guide/deployment.zh.md)
+[快速上手](./docs/guide/getting-started.zh.md) | [核心概念](./docs/guide/concepts.zh.md) | [REST API](./docs/api/rest.zh.md) | [SSE](./docs/api/sse.zh.md) | [部署指南](./docs/guide/deployment.zh.md) | [冷热存储](./docs/guide/hot-cold-storage.zh.md)
 
 [English](./README.md) | [中文](./README.zh.md)
 
