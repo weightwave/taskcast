@@ -343,6 +343,7 @@ async fn engine_recovers_an_interrupted_release_before_explicit_retry() {
 
     assert_eq!(released.storage_state, StorageState::Cold);
     assert!(released.released);
+    assert_eq!(released.archive_watermark, event.index as i64);
     assert!(durable
         .list_storage_release_requests(10)
         .await
