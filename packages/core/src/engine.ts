@@ -546,6 +546,11 @@ export class TaskEngine {
     const persisted = await durable.persistStorageReleaseRequest(request)
     if (!persisted) throw new Error(`Task not found: ${taskId}`)
     try {
+      const recovery = await this.storageCoordinator.recoverTaskStorage(taskId)
+      if (recovery.storageState === 'cold') {
+        await durable.clearStorageReleaseRequest(request)
+        return recovery
+      }
       const result = await this.storageCoordinator.releaseTaskStorage(taskId, preconditions)
       await durable.clearStorageReleaseRequest(request)
       return result
