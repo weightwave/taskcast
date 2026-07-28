@@ -1409,9 +1409,27 @@ where
 }
 
 fn now_millis() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+    millis_since_epoch(SystemTime::now())
+}
+
+fn millis_since_epoch(time: SystemTime) -> f64 {
+    time.duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs_f64()
-        * 1_000.0
+        .as_millis() as f64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn system_time_is_truncated_to_integer_milliseconds() {
+        let timestamp = UNIX_EPOCH + Duration::new(1, 123_456_789);
+
+        let millis = millis_since_epoch(timestamp);
+
+        assert_eq!(millis, 1_123.0);
+        assert_eq!(millis.fract(), 0.0);
+    }
 }
