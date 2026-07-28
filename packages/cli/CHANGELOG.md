@@ -1,5 +1,21 @@
 # @taskcast/cli
 
+## 1.6.1
+
+### Patch Changes
+
+- 5f8fae5: Recover interrupted explicit storage releases before retrying and ensure Rust
+  persists integer PostgreSQL lifecycle timestamps.
+- Updated dependencies [5f8fae5]
+  - @taskcast/core@1.6.1
+  - @taskcast/server@1.6.1
+  - @taskcast/postgres@1.6.1
+  - @taskcast/dashboard-web@0.3.15
+  - @taskcast/playground@0.3.15
+  - @taskcast/redis@1.6.1
+  - @taskcast/server-sdk@1.6.1
+  - @taskcast/sqlite@1.6.1
+
 ## 1.6.0
 
 ### Minor Changes

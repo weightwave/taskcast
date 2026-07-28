@@ -1,5 +1,14 @@
 # @taskcast/server
 
+## 1.6.1
+
+### Patch Changes
+
+- 5f8fae5: Recover interrupted explicit storage releases before retrying and ensure Rust
+  persists integer PostgreSQL lifecycle timestamps.
+- Updated dependencies [5f8fae5]
+  - @taskcast/core@1.6.1
+
 ## 1.6.0
 
 ### Minor Changes
