@@ -693,6 +693,54 @@ describe('StorageCoordinator', () => {
     })
   })
 
+  it('recovers an interrupted explicit release before starting it again', async () => {
+    const hot = new MemoryShortTermStore()
+    const durable = new CoordinatorLongTermStore()
+    const first = new TaskEngine({
+      shortTermStore: hot,
+      longTermStore: durable,
+      broadcast: new MemoryBroadcastProvider(),
+    })
+    await first.createTask({ id: 'task-1' })
+    await first.transitionTask('task-1', 'running')
+    const canary = await first.publishEvent('task-1', {
+      type: 'canary.event',
+      level: 'info',
+      data: {},
+    })
+    const preconditions = {
+      expectedLastEventIndex: canary.index,
+      inactiveSince: canary.timestamp,
+    }
+    await first.releaseTaskStorage('task-1', preconditions)
+    durable.metadata.set('task-1', {
+      ...durable.metadata.get('task-1')!,
+      storageState: 'releasing',
+      activeReleaseGeneration: 'interrupted-generation',
+      coldAt: null,
+    })
+    const second = new TaskEngine({
+      shortTermStore: hot,
+      longTermStore: durable,
+      broadcast: new MemoryBroadcastProvider(),
+    })
+
+    await expect(second.releaseTaskStorage('task-1', preconditions)).resolves.toEqual({
+      taskId: 'task-1',
+      storageState: 'cold',
+      archiveWatermark: canary.index,
+      released: true,
+    })
+    expect(durable.releaseRequests).toEqual(new Map())
+    await expect(hot.getTaskStoragePresence('task-1')).resolves.toEqual({
+      task: false,
+      eventCount: 0,
+      nextIndex: false,
+      seriesStateCount: 0,
+      writeFence: false,
+    })
+  })
+
   it('commits transition state and status events atomically against release', async () => {
     let unblockCommit!: () => void
     let reportBlocked!: () => void

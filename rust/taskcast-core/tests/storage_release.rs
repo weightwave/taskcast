@@ -271,6 +271,91 @@ async fn engine_routes_mutations_and_release_through_the_storage_coordinator() {
 }
 
 #[tokio::test]
+async fn engine_recovers_an_interrupted_release_before_explicit_retry() {
+    let hot = Arc::new(MemoryShortTermStore::new());
+    let durable = Arc::new(MemoryLongTermStore::new());
+    let engine = TaskEngine::new(TaskEngineOptions {
+        short_term_store: hot.clone(),
+        long_term_store: Some(durable.clone()),
+        broadcast: Arc::new(MemoryBroadcastProvider::new()),
+        hooks: None,
+    });
+    engine
+        .create_task(CreateTaskInput {
+            id: Some("task-1".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    engine
+        .transition_task("task-1", TaskStatus::Running, None)
+        .await
+        .unwrap();
+    let event = engine
+        .publish_event(
+            "task-1",
+            PublishEventInput {
+                r#type: "llm.delta".to_string(),
+                level: Level::Info,
+                data: serde_json::json!({ "delta": "canary" }),
+                series_id: None,
+                series_mode: None,
+                series_acc_field: None,
+            },
+        )
+        .await
+        .unwrap();
+    let preconditions = ReleasePreconditions {
+        expected_last_event_index: event.index as i64,
+        inactive_since: event.timestamp,
+    };
+
+    engine
+        .release_task_storage("task-1", preconditions.clone())
+        .await
+        .unwrap();
+    let metadata = durable
+        .get_task_storage_metadata("task-1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(metadata.storage_state, StorageState::Cold);
+    assert!(durable
+        .compare_and_set_task_storage_metadata(TaskStorageMetadataCas {
+            task_id: "task-1".to_string(),
+            expected_storage_state: StorageState::Cold,
+            expected_storage_epoch: metadata.storage_epoch,
+            expected_release_generation: None,
+            next: taskcast_core::TaskStorageMetadata {
+                storage_state: StorageState::Releasing,
+                active_release_generation: Some("interrupted-generation".to_string()),
+                cold_at: None,
+                ..metadata
+            },
+        })
+        .await
+        .unwrap());
+
+    let released = engine
+        .release_task_storage("task-1", preconditions)
+        .await
+        .unwrap();
+
+    assert_eq!(released.storage_state, StorageState::Cold);
+    assert!(released.released);
+    assert_eq!(released.archive_watermark, event.index as i64);
+    assert!(durable
+        .list_storage_release_requests(10)
+        .await
+        .unwrap()
+        .is_empty());
+    let presence = hot.get_task_storage_presence("task-1").await.unwrap();
+    assert!(!presence.task);
+    assert_eq!(presence.event_count, 0);
+    assert!(!presence.write_fence);
+}
+
+#[tokio::test]
 async fn engine_allows_only_one_concurrent_terminal_transition() {
     let hot = Arc::new(MemoryShortTermStore::new());
     let durable = Arc::new(MemoryLongTermStore::new());

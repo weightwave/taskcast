@@ -8,15 +8,17 @@ use taskcast_core::archive::{
 };
 use taskcast_core::types::{
     ArchiveBatch, ArchiveBatchReceipt, ArchiveGeneration, ArchiveGenerationStatus,
-    ArchiveSourceManifest, DurableSeriesState, EventQueryOptions, Level, LongTermStore, SeriesMode,
-    SinceCursor, StorageReleaseRequest, StorageState, Task, TaskEvent, TaskStatus,
-    TaskStorageMetadataCas, WorkerAssignment, WorkerAssignmentStatus, WorkerAuditAction,
-    WorkerAuditEvent,
+    ArchiveSourceManifest, DurableSeriesState, EventQueryOptions, HotWriteToken, Level,
+    LongTermStore, ReleasePreconditions, SeriesMode, ShortTermStore, SinceCursor,
+    StorageReleaseRequest, StorageState, Task, TaskEvent, TaskStatus, TaskStorageMetadataCas,
+    WorkerAssignment, WorkerAssignmentStatus, WorkerAuditAction, WorkerAuditEvent,
 };
+use taskcast_core::{MemoryShortTermStore, StorageCoordinator};
 use taskcast_postgres::PostgresLongTermStore;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 static TEST_SCHEMA_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -495,6 +497,71 @@ async fn storage_release_request_is_persisted_and_compare_cleared() {
         .await
         .unwrap());
     assert!(store.list_storage_release_requests(0).await.is_err());
+}
+
+#[tokio::test]
+async fn storage_coordinator_persists_integer_cold_timestamp_to_postgres() {
+    let (store, _container) = setup().await;
+    let durable = Arc::new(store);
+    let hot = Arc::new(MemoryShortTermStore::new());
+    let task_id = "integer-cold-timestamp";
+    let task = make_task(task_id);
+    hot.save_task(task.clone()).await.unwrap();
+    durable.save_task(task).await.unwrap();
+
+    let committed = hot
+        .commit_event_fenced(
+            task_id,
+            make_event(task_id, 0),
+            &HotWriteToken {
+                task_id: task_id.to_string(),
+                storage_epoch: 1,
+            },
+        )
+        .await
+        .unwrap();
+    let inactive_since = committed.event.timestamp;
+    durable.save_event(committed.event).await.unwrap();
+
+    let released = StorageCoordinator::new(hot.clone(), durable.clone())
+        .release_task_storage(
+            task_id,
+            ReleasePreconditions {
+                expected_last_event_index: 0,
+                inactive_since,
+            },
+        )
+        .await
+        .unwrap();
+
+    assert!(released.released);
+    assert_eq!(released.storage_state, StorageState::Cold);
+    assert_eq!(released.archive_watermark, 0);
+    let metadata = durable
+        .get_task_storage_metadata(task_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(metadata.storage_state, StorageState::Cold);
+    assert_eq!(metadata.archive_watermark, 0);
+    assert!(metadata.active_release_generation.is_none());
+    let cold_at = metadata.cold_at.unwrap();
+    assert_eq!(cold_at.fract(), 0.0);
+    assert_eq!(durable.get_archive_watermark(task_id).await.unwrap(), 0);
+    assert_eq!(
+        durable
+            .get_events(task_id, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|event| event.id)
+            .collect::<Vec<_>>(),
+        vec![format!("evt-{task_id}-0")]
+    );
+    let hot_presence = hot.get_task_storage_presence(task_id).await.unwrap();
+    assert!(!hot_presence.task);
+    assert_eq!(hot_presence.event_count, 0);
+    assert!(!hot_presence.write_fence);
 }
 
 fn build_archive(

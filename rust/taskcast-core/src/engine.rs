@@ -699,6 +699,14 @@ impl TaskEngine {
         {
             return Err(EngineError::TaskNotFound(task_id.to_string()));
         }
+        let recovery = coordinator
+            .recover_task_storage(task_id)
+            .await
+            .map_err(EngineError::Store)?;
+        if recovery.storage_state == crate::types::StorageState::Cold {
+            durable.clear_storage_release_request(&request).await?;
+            return Ok(recovery);
+        }
         match coordinator
             .release_task_storage(task_id, preconditions)
             .await
