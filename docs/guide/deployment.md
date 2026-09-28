@@ -417,3 +417,8 @@ const engine = new TaskEngine({
 - [REST API](../api/rest.md) — Complete API reference
 - [SSE Subscriptions](../api/sse.md) — SSE protocol in detail
 - [Authentication & Authorization](../api/authentication.md) — Authentication system in detail
+
+
+## Terminal history retention
+
+Permanent cleanup is disabled by default and separate from Redis hot retention. See [terminal history retention](./retention.md) for per-task policies, expired-history behavior and rollout steps.

@@ -45,8 +45,21 @@ jobs:
       - name: Type check
         run: pnpm lint
 
-      - name: Test
-        run: pnpm test
+      - name: Verify coverage runner
+        run: node --test scripts/tests/coverage-runner.test.mjs
+
+      - name: Test and enforce package coverage
+        run: pnpm test:coverage
+
+      - name: Upload TypeScript coverage
+        if: always()
+        uses: codecov/codecov-action@v4
+        with:
+          files: packages/*/coverage/lcov.info
+          flags: typescript
+          fail_ci_if_error: true
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
   migrations-staleness:
     runs-on: ubuntu-latest

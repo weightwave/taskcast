@@ -5,7 +5,7 @@
   "scripts": {
     "test": "vitest run --passWithNoTests --no-file-parallelism",
     "test:watch": "vitest",
-    "test:coverage": "vitest run --coverage",
+    "test:coverage": "node scripts/test-coverage.mjs",
     "build": "pnpm -r build",
     "lint": "tsc -b",
     "ci:publish": "pnpm build && pnpm publish -r --access public"

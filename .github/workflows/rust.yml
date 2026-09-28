@@ -5,6 +5,13 @@ on:
     branches: [main, feature/*]
     paths:
       - 'rust/**'
+      - 'packages/core/**'
+      - 'packages/server/**'
+      - 'packages/redis/**'
+      - 'packages/postgres/**'
+      - 'packages/cli/**'
+      - 'migrations/**'
+      - 'codecov.yml'
       - 'packages/playground/**'
       - '.github/workflows/rust.yml'
       - 'pnpm-lock.yaml'
@@ -14,6 +21,13 @@ on:
     branches: [main]
     paths:
       - 'rust/**'
+      - 'packages/core/**'
+      - 'packages/server/**'
+      - 'packages/redis/**'
+      - 'packages/postgres/**'
+      - 'packages/cli/**'
+      - 'migrations/**'
+      - 'codecov.yml'
       - 'packages/playground/**'
       - '.github/workflows/rust.yml'
       - 'pnpm-lock.yaml'
@@ -120,13 +134,13 @@ jobs:
           name: playground-dist
           path: packages/playground/dist
       - name: Generate coverage
-        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+        run: cargo llvm-cov --workspace --fail-under-lines 90 --lcov --output-path lcov.info
       - name: Upload to Codecov
         uses: codecov/codecov-action@v4
         with:
           files: rust/lcov.info
           flags: rust
-          fail_ci_if_error: false
+          fail_ci_if_error: true
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
@@ -179,4 +193,8 @@ jobs:
       - name: Make binary executable
         run: chmod +x rust/target/release/taskcast
       - name: Run integration tests
+        env:
+          TASKCAST_RUST_BINARY: ${{ github.workspace }}/rust/target/release/taskcast
+          NO_PROXY: 127.0.0.1,localhost
+          no_proxy: 127.0.0.1,localhost
         run: bash rust/tests/integration.sh
