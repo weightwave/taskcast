@@ -17,7 +17,7 @@ use taskcast_core::scheduler::{TaskScheduler, TaskSchedulerOptions};
 use taskcast_core::state_machine::is_terminal;
 use taskcast_core::worker_manager::{DispatchResult, WorkerManager};
 use taskcast_core::{
-    AssignMode, ConnectionMode, DisconnectPolicy, DurableTtlSweepResult, EngineError,
+    CleanupSweepResult, AssignMode, ConnectionMode, DisconnectPolicy, DurableTtlSweepResult, EngineError,
     ShortTermStore, StorageReleaseSweepResult, StorageUnavailableError, StorageWriterRegistration,
     Task, TaskEngine, TaskFilter, TaskStatus, WorkerStatus,
 };
@@ -43,7 +43,8 @@ pub struct AppState {
     pub storage_readiness: Arc<StorageWriterHeartbeat>,
 }
 
-const STORAGE_PROTOCOL_VERSION: u64 = 2;
+const STORAGE_PROTOCOL_VERSION: u64 = 3;
+const RELEASE_STORAGE_PROTOCOL_VERSION: u64 = 2;
 const STORAGE_WRITER_TTL_MS: u64 = 30_000;
 const STORAGE_WRITER_HEARTBEAT_MS: u64 = 10_000;
 static WRITER_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -114,7 +115,7 @@ impl StorageWriterHeartbeat {
             Err(_) => {
                 return StorageReadinessSnapshot {
                     release_ready: false,
-                    required_storage_protocol_version: STORAGE_PROTOCOL_VERSION,
+                    required_storage_protocol_version: RELEASE_STORAGE_PROTOCOL_VERSION,
                     active_writer_count: 0,
                     incompatible_writer_ids: Vec::new(),
                 }
@@ -122,7 +123,7 @@ impl StorageWriterHeartbeat {
         };
         let mut incompatible_writer_ids = writers
             .iter()
-            .filter(|writer| writer.storage_protocol_version < STORAGE_PROTOCOL_VERSION)
+            .filter(|writer| writer.storage_protocol_version < RELEASE_STORAGE_PROTOCOL_VERSION)
             .map(|writer| writer.instance_id.clone())
             .collect::<Vec<_>>();
         incompatible_writer_ids.sort();
@@ -133,7 +134,7 @@ impl StorageWriterHeartbeat {
                     .iter()
                     .any(|writer| writer.instance_id == self.registration.instance_id)
                 && incompatible_writer_ids.is_empty(),
-            required_storage_protocol_version: STORAGE_PROTOCOL_VERSION,
+            required_storage_protocol_version: RELEASE_STORAGE_PROTOCOL_VERSION,
             active_writer_count: writers.len(),
             incompatible_writer_ids,
         }
@@ -192,6 +193,7 @@ pub struct HotStorageSampleResult {
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StorageLifecycleTickResult {
+    pub cleanup: CleanupSweepResult,
     pub ttl: DurableTtlSweepResult,
     pub projection: DurableTtlSweepResult,
     pub release_requests: StorageReleaseSweepResult,
@@ -285,6 +287,13 @@ impl StorageLifecycleWorker {
                     result.projection.failed += 1;
                     Self::log_error("terminal_projection", &error.to_string(), None);
                 }
+            }
+        }
+
+        if self.engine.supports_cleanup() {
+            match self.engine.sweep_cleanup(limit, 1000, claim_ttl_ms).await {
+                Ok(cleanup) => result.cleanup = cleanup,
+                Err(error) => { result.cleanup.failed += 1; Self::log_error("terminal_cleanup", &error.to_string(), None); }
             }
         }
 
@@ -498,7 +507,7 @@ impl StorageLifecycleWorker {
                 !writers.is_empty()
                     && writers
                         .iter()
-                        .all(|writer| writer.storage_protocol_version >= STORAGE_PROTOCOL_VERSION)
+                        .all(|writer| writer.storage_protocol_version >= RELEASE_STORAGE_PROTOCOL_VERSION)
             })
     }
 }

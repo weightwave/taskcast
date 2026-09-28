@@ -1,8 +1,8 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import postgres from 'postgres'
 import { GenericContainer, Wait, type StartedTestContainer } from 'testcontainers'
 import { join } from 'node:path'
-import type { Task, TaskEvent } from '@taskcast/core'
+import { TaskEngine, MemoryShortTermStore, MemoryBroadcastProvider, type Task, type TaskEvent } from '@taskcast/core'
 import { PostgresLongTermStore } from '../../src/long-term.js'
 import { runMigrations } from '../../src/migration-runner.js'
 
@@ -34,6 +34,22 @@ async function enrolled(id: string, target: 'events' | 'all' = 'events', count =
 }
 
 describe('durable terminal cleanup', () => {
+  it('coordinates a real archive release before marking and deleting durable history', async () => {
+    const hot = new MemoryShortTermStore()
+    const engine = new TaskEngine({ shortTermStore: hot, longTermStore: store, broadcast: new MemoryBroadcastProvider(), cleanup: { enabled: true, rules: [{ target: 'events', trigger: {} }] } })
+    const task = await engine.createTask({})
+    await engine.transitionTask(task.id, 'running')
+    await engine.publishEvent(task.id, { type: 'test', level: 'info', data: 'keep result' })
+    await engine.transitionTask(task.id, 'completed', { result: { kept: true } })
+    await vi.waitFor(async () => expect(await store.getEvents(task.id)).toHaveLength(3))
+    expect(await engine.sweepCleanup()).toMatchObject({ completed: 1, deletedEvents: 3, failed: 0 })
+    expect(await hot.getTask(task.id)).toBeNull()
+    expect((await store.getTask(task.id))?.result).toEqual({ kept: true })
+    expect((await store.getTask(task.id))?.historyExpiredAt).toBeGreaterThan(0)
+    expect(await store.getLastEventIndex(task.id)).toBe(2)
+    expect(await sql`SELECT * FROM taskcast_archive_batches WHERE task_id = ${task.id}`).toHaveLength(0)
+  })
+
   it('does not enroll legacy cleanup JSON and does scan cold enrolled tasks', async () => {
     await store.saveTask({ id: 'legacy', status: 'completed', createdAt: 0, updatedAt: 0, completedAt: 1_000, cleanup: { rules: [{ target: 'all', trigger: {} }] } })
     await enrolled('new')
@@ -118,7 +134,9 @@ describe('durable terminal cleanup', () => {
     const [claim] = await store.claimCleanupTasks(1, 30_000)
     await store.saveDurableAssignment({ taskId: 'busy', workerId: 'worker', cost: 1, assignedAt: 100, status: 'running' })
     expect(await store.beginTaskCleanup(claim!, 1, 0)).toBe(false)
+    expect(await store.canCleanupTask(claim!)).toBe(false)
     await store.deleteDurableAssignment('busy')
+    expect(await store.canCleanupTask(claim!)).toBe(true)
     // Pending outbox fixture exercises the cleanup dependency guard, not normal terminalization.
     await sql`INSERT INTO taskcast_terminal_outbox(projection_id, task_id, event_id, payload, created_at) VALUES ('p', 'busy', 'e', '{}'::jsonb, 0)`
     expect(await store.beginTaskCleanup(claim!, 1, 0)).toBe(false)

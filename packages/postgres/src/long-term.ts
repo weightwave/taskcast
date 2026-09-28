@@ -66,6 +66,7 @@ export class PostgresLongTermStore implements LongTermStore {
   readonly supportsTerminalCleanup = true
 
   private cleanupStore() { return new PostgresCleanupStore(this.sql, row => this._rowToTask(row)) }
+  canCleanupTask(claim: CleanupClaim) { return this.observed(() => this.cleanupStore().ready(claim)) }
   claimCleanupTasks(limit: number, ttl: number) { return this.observed(() => this.cleanupStore().claim(limit, ttl)) }
   renewCleanupClaim(claim: CleanupClaim, ttl: number) { return this.observed(() => this.cleanupStore().renew(claim, ttl)) }
   deferCleanupClaim(claim: CleanupClaim, delay: number) { return this.observed(() => this.cleanupStore().defer(claim, delay)) }

@@ -22,6 +22,10 @@ describe('CLI — startup scenarios', () => {
     })).rejects.toThrow('TASKCAST_TTL_SWEEP_INTERVAL_SECONDS')
   })
 
+  it.each(['true', 'yes'])('rejects enabled unsupported or invalid cleanup before listening: %s', async (enabled) => {
+    await expect(runStart({ broadcast: new MemoryBroadcastProvider(), shortTermStore: new MemoryShortTermStore(), port: 0, config: {}, verbose: false, playground: false, env: { TASKCAST_CLEANUP_ENABLED: enabled } })).rejects.toThrow(/cleanup/i)
+  })
+
   it('memory mode: /health responds ok', async () => {
     const store = new MemoryShortTermStore()
     const broadcast = new MemoryBroadcastProvider()

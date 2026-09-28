@@ -1257,6 +1257,7 @@ pub struct CleanupBatchResult { pub deleted_events: u64, pub complete: bool }
 #[async_trait]
 pub trait LongTermStore: Send + Sync {
     fn supports_terminal_cleanup(&self) -> bool { false }
+    async fn can_cleanup_task(&self, _claim: &CleanupClaim) -> Result<bool, BoxError> { Err(Box::new(StorageReleaseUnsupportedError::default())) }
     async fn claim_cleanup_tasks(&self, _limit: u64, _claim_ttl_ms: u64) -> Result<Vec<CleanupClaim>, BoxError> { Err(Box::new(StorageReleaseUnsupportedError::default())) }
     async fn renew_cleanup_claim(&self, _claim: &CleanupClaim, _ttl: u64) -> Result<bool, BoxError> { Err(Box::new(StorageReleaseUnsupportedError::default())) }
     async fn defer_cleanup_claim(&self, _claim: &CleanupClaim, _delay: u64) -> Result<(), BoxError> { Err(Box::new(StorageReleaseUnsupportedError::default())) }

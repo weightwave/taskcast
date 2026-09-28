@@ -275,6 +275,7 @@ impl Error for BoxedSource {
 #[async_trait]
 impl LongTermStore for PostgresLongTermStore {
     fn supports_terminal_cleanup(&self) -> bool { true }
+    async fn can_cleanup_task(&self, claim: &CleanupClaim) -> Result<bool, BoxError> { self.observed(|| cleanup_store::ready(&self.pool, claim)).await }
     async fn claim_cleanup_tasks(&self, limit: u64, ttl: u64) -> Result<Vec<CleanupClaim>, BoxError> { self.observed(|| cleanup_store::claim(&self.pool, limit, ttl)).await }
     async fn renew_cleanup_claim(&self, claim: &CleanupClaim, ttl: u64) -> Result<bool, BoxError> { self.observed(|| cleanup_store::renew(&self.pool, claim, ttl)).await }
     async fn defer_cleanup_claim(&self, claim: &CleanupClaim, delay: u64) -> Result<(), BoxError> { self.observed(|| cleanup_store::defer(&self.pool, claim, delay)).await }

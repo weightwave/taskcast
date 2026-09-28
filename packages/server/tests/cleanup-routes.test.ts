@@ -1,11 +1,11 @@
 import { describe, expect, it } from 'vitest'
 import { Hono } from 'hono'
-import { TaskEngine, MemoryShortTermStore, MemoryBroadcastProvider } from '@taskcast/core'
+import { TaskEngine, MemoryShortTermStore, MemoryLongTermStore, MemoryBroadcastProvider } from '@taskcast/core'
 import { createTasksRouter } from '../src/routes/tasks.js'
 import { createSubscriberCounts } from '../src/routes/sse.js'
 
 function fixture() {
-  const engine = new TaskEngine({ shortTermStore: new MemoryShortTermStore(), broadcast: new MemoryBroadcastProvider(), cleanup: { enabled: true, rules: [] } })
+  const engine = new TaskEngine({ shortTermStore: new MemoryShortTermStore(), longTermStore: new MemoryLongTermStore(), broadcast: new MemoryBroadcastProvider(), cleanup: { enabled: true, rules: [] } })
   const app = new Hono()
   app.use('*', async (c, next) => { c.set('auth', { taskIds: '*', scope: ['*'] }); await next() })
   app.route('/tasks', createTasksRouter(engine, createSubscriberCounts()))

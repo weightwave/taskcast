@@ -1,3 +1,4 @@
+use crate::cleanup_coordinator::{CleanupCoordinator, CleanupSweepResult};
 use crate::types::DurableWriteContext;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -130,6 +131,7 @@ struct ObservedHistory {
 }
 
 pub struct TaskEngine {
+    cleanup_coordinator: Option<CleanupCoordinator>,
     cleanup: crate::cleanup_policy::ResolvedCleanupConfig,
     short_term_store: Arc<dyn ShortTermStore>,
     broadcast: Arc<dyn BroadcastProvider>,
@@ -227,6 +229,7 @@ impl TaskEngine {
         });
         Self {
             cleanup: crate::cleanup_policy::ResolvedCleanupConfig::default(),
+            cleanup_coordinator: None,
             short_term_store: opts.short_term_store,
             broadcast: opts.broadcast,
             long_term_store: opts.long_term_store,
@@ -246,7 +249,10 @@ impl TaskEngine {
     ) -> Result<Self, crate::config::ConfigError> {
         if cleanup.enabled {
             crate::cleanup_policy::validate_cleanup_rules(&cleanup.rules)?;
+            let durable = self.long_term_store.clone().filter(|_| self.storage_coordinator.is_some()).ok_or_else(|| crate::config::ConfigError::InvalidValue("Terminal cleanup requires fenced hot and durable stores".into()))?;
+            self.cleanup_coordinator = Some(CleanupCoordinator::new(self.short_term_store.clone(), durable).map_err(|e| crate::config::ConfigError::InvalidValue(e.to_string()))?);
         }
+        if !cleanup.enabled { self.cleanup_coordinator = None; }
         self.cleanup = cleanup;
         Ok(self)
     }
@@ -867,6 +873,15 @@ impl TaskEngine {
 
     pub fn supports_storage_release(&self) -> bool {
         self.storage_coordinator.is_some()
+    }
+
+    pub fn supports_cleanup(&self) -> bool { self.cleanup_coordinator.is_some() }
+
+    pub async fn sweep_cleanup(&self, limit: u64, event_batch_size: u64, claim_ttl_ms: u64) -> Result<CleanupSweepResult, EngineError> {
+        match &self.cleanup_coordinator {
+            Some(coordinator) => Ok(coordinator.sweep(self,limit,event_batch_size,claim_ttl_ms).await?),
+            None => Ok(CleanupSweepResult::default()),
+        }
     }
 
     pub fn supports_durable_ttl(&self) -> bool {

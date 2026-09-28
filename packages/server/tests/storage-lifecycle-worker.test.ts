@@ -51,6 +51,21 @@ async function makeFixture() {
 }
 
 describe('StorageLifecycleWorker', () => {
+  it('runs enabled history cleanup in the existing lifecycle tick', async () => {
+    const hot = new MemoryShortTermStore()
+    const durable = new MemoryLongTermStore()
+    const engine = new TaskEngine({ shortTermStore: hot, longTermStore: durable, broadcast: new MemoryBroadcastProvider(), cleanup: { enabled: true, rules: [{ target: 'events', trigger: {} }] } })
+    await engine.createTask({ id: 'cleanup' })
+    await engine.transitionTask('cleanup', 'running')
+    await engine.transitionTask('cleanup', 'completed', { result: { kept: true } })
+    const logger = vi.fn()
+    const worker = new StorageLifecycleWorker({ engine, shortTermStore: hot, config, logger })
+    expect((await worker.tick())?.cleanup).toMatchObject({ claimed: 1, completed: 1, deletedEvents: 2 })
+    expect(await hot.getTask('cleanup')).toBeNull()
+    expect((await durable.getTask('cleanup'))?.result).toEqual({ kept: true })
+    expect(logger).toHaveBeenCalledWith(expect.objectContaining({ event: 'storage_lifecycle_tick', cleanup: expect.objectContaining({ completed: 1 }) }))
+  })
+
   it('sweeps durable TTL and retries a persisted release request in one bounded tick', async () => {
     const { hot, durable, engine } = await makeFixture()
     const overdue = makeTask('overdue', 'running', { ttl: 60 })

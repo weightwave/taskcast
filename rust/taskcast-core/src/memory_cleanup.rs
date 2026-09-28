@@ -16,6 +16,10 @@ fn bound(value: u64, zero: bool) -> Result<(), BoxError> {
     Ok(())
 }
 impl MemoryLongTermStore {
+    pub(super) fn cleanup_ready(&self, claim: &CleanupClaim) -> Result<bool, BoxError> {
+        let _guard = self.lifecycle_guard.lock().unwrap();
+        Ok(self.cleanup_valid(claim) && self.cleanup_settled(&claim.task_id))
+    }
     pub(super) fn cleanup_claim(
         &self,
         limit: u64,

@@ -17,3 +17,5 @@ export * from './worker-manager.js'
 export * from './scheduler.js'
 export * from './heartbeat-monitor.js'
 export * from './dependency.js'
+
+export { CleanupCoordinator, emptyCleanupResult, type CleanupSweepResult } from './cleanup-coordinator.js'

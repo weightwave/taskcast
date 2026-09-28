@@ -192,6 +192,18 @@ async fn rejects_invalid_storage_lifecycle_env_before_listening() {
 }
 
 #[tokio::test]
+async fn rejects_enabled_unsupported_or_invalid_cleanup_before_listening() {
+    let directory = tempfile::tempdir().unwrap();
+    let config_path = directory.path().join("taskcast.yaml");
+    std::fs::write(&config_path, "{}\n").unwrap();
+    for enabled in ["true", "yes"] {
+        let _env = EnvGuard::with_removed(&[("TASKCAST_CLEANUP_ENABLED", enabled), ("TASKCAST_STORAGE", "memory")], &["TASKCAST_POSTGRES_URL", "TASKCAST_REDIS_URL", "TASKCAST_CONFIG"]);
+        let error = taskcast_cli::commands::start::run(StartArgs { config: Some(config_path.to_string_lossy().to_string()), port: find_available_port().await, storage: Some("memory".into()), ..Default::default() }).await.unwrap_err();
+        assert!(error.to_string().to_lowercase().contains("cleanup"));
+    }
+}
+
+#[tokio::test]
 async fn run_jwt_auth_rejects_unauthenticated_requests() {
     let _env = EnvGuard::new(&[
         ("TASKCAST_AUTH_MODE", "jwt"),

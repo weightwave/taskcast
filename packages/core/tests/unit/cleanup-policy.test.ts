@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import * as policy from '../../src/cleanup-policy.js'
 import { TaskEngine } from '../../src/engine.js'
-import { MemoryBroadcastProvider, MemoryShortTermStore } from '../../src/memory-adapters.js'
+import { MemoryBroadcastProvider, MemoryShortTermStore, MemoryLongTermStore } from '../../src/memory-adapters.js'
 import type { CleanupRule, Task } from '../../src/types.js'
 
 const success: CleanupRule = { match: { taskTypes: ['search.*'], status: ['completed', 'cancelled'] }, trigger: { afterMs: 86_400_000 }, target: 'events' }
@@ -77,10 +77,11 @@ describe('terminal cleanup policy', () => {
 
   it('enrolls new engine tasks only, without retaining mutable caller rules', async () => {
     const store = new MemoryShortTermStore()
-    const old = new TaskEngine({ shortTermStore: store, broadcast: new MemoryBroadcastProvider() })
+    const durable = new MemoryLongTermStore()
+    const old = new TaskEngine({ shortTermStore: store, longTermStore: durable, broadcast: new MemoryBroadcastProvider() })
     await old.createTask({ id: 'legacy', cleanup: { rules: [success] } })
     const defaults = config()
-    const engine = new TaskEngine({ shortTermStore: store, broadcast: new MemoryBroadcastProvider(), cleanup: defaults })
+    const engine = new TaskEngine({ shortTermStore: store, longTermStore: durable, broadcast: new MemoryBroadcastProvider(), cleanup: defaults })
     const created = await engine.createTask({ type: 'search.youtube' })
     defaults.rules[0]!.trigger.afterMs = 1
     expect(created.cleanupPolicyVersion).toBe(1)

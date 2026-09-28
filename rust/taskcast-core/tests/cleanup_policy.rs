@@ -146,10 +146,11 @@ fn enabled_rejects_unsupported_rules_but_disabled_keeps_legacy_config() {
 #[tokio::test]
 async fn enrolls_new_tasks_without_retroactively_adopting_existing_ones() {
     let store = Arc::new(MemoryShortTermStore::new());
+    let durable = Arc::new(MemoryLongTermStore::new());
     let legacy = TaskEngine::new(TaskEngineOptions {
         short_term_store: store.clone(),
         broadcast: Arc::new(MemoryBroadcastProvider::new()),
-        long_term_store: None,
+        long_term_store: Some(durable.clone()),
         hooks: None,
     });
     legacy
@@ -162,7 +163,7 @@ async fn enrolls_new_tasks_without_retroactively_adopting_existing_ones() {
     let engine = TaskEngine::new(TaskEngineOptions {
         short_term_store: store,
         broadcast: Arc::new(MemoryBroadcastProvider::new()),
-        long_term_store: None,
+        long_term_store: Some(durable.clone()),
         hooks: None,
     })
     .with_cleanup_config(config())

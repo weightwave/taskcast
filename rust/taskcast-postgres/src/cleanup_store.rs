@@ -221,3 +221,10 @@ pub(crate) async fn delete_batch(
         complete: !related,
     })
 }
+
+pub(crate) async fn ready(pool: &PgPool, claim: &CleanupClaim) -> Result<bool, BoxError> {
+    let mut tx = pool.begin().await?;
+    let ready = locked(&mut tx, claim).await?.is_some() && settled(&mut tx, &claim.task_id).await?;
+    tx.commit().await?;
+    Ok(ready)
+}

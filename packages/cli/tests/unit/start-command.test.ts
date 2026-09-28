@@ -1178,6 +1178,13 @@ describe('runStart', () => {
     onSpy.mockRestore()
   })
 
+  it('passes the resolved cleanup config and environment override to the engine', async () => {
+    const { TaskEngine } = await import('@taskcast/core')
+    const rules = [{ target: 'events' as const, trigger: { afterMs: 1000 } }]
+    await runStart({ broadcast: {}, shortTermStore: {}, longTermStore: {}, port: 3721, config: { cleanup: { enabled: false, rules } }, env: { TASKCAST_CLEANUP_ENABLED: 'true' }, verbose: false, playground: false })
+    expect(TaskEngine).toHaveBeenCalledWith(expect.objectContaining({ cleanup: { enabled: true, rules } }))
+  })
+
   it('calls performAutoMigrateIfEnabled with sql + postgresUrl + env when postgres is configured', async () => {
     const { performAutoMigrateIfEnabled } = await import('../../src/auto-migrate.js')
     const mockPostgres = {} as ReturnType<typeof import('postgres').default>

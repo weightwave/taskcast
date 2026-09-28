@@ -652,6 +652,7 @@ export interface CleanupBatchResult { deletedEvents: number; complete: boolean }
 
 export interface LongTermStore {
   readonly supportsTerminalCleanup?: boolean
+  canCleanupTask?(claim: CleanupClaim): Promise<boolean>
   claimCleanupTasks?(limit: number, claimTtlMs: number): Promise<CleanupClaim[]>
   renewCleanupClaim?(claim: CleanupClaim, claimTtlMs: number): Promise<boolean>
   deferCleanupClaim?(claim: CleanupClaim, retryAfterMs: number): Promise<void>

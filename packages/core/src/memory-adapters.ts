@@ -807,6 +807,10 @@ export class MemoryLongTermStore implements LongTermStore {
     })
   }
 
+  async canCleanupTask(claim: CleanupClaim): Promise<boolean> {
+    return this.validCleanupClaim(claim) && this.cleanupSettled(claim.taskId)
+  }
+
   async renewCleanupClaim(claim: CleanupClaim, ttl: number): Promise<boolean> {
     this.cleanupBound(ttl)
     const current = this.cleanupClaims.get(claim.taskId)

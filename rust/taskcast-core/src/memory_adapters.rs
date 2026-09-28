@@ -319,6 +319,7 @@ impl Default for MemoryLongTermStore {
 #[async_trait]
 impl LongTermStore for MemoryLongTermStore {
     fn supports_terminal_cleanup(&self) -> bool { true }
+    async fn can_cleanup_task(&self, claim: &CleanupClaim) -> Result<bool, BoxError> { self.cleanup_ready(claim) }
     async fn claim_cleanup_tasks(&self, limit: u64, ttl: u64) -> Result<Vec<CleanupClaim>, BoxError> { self.cleanup_claim(limit, ttl) }
     async fn renew_cleanup_claim(&self, claim: &CleanupClaim, ttl: u64) -> Result<bool, BoxError> { self.cleanup_renew(claim, ttl) }
     async fn defer_cleanup_claim(&self, claim: &CleanupClaim, delay: u64) -> Result<(), BoxError> { self.cleanup_defer(claim, delay) }

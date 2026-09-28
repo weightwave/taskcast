@@ -46,6 +46,13 @@ export class PostgresCleanupStore {
     })
   }
 
+  async ready(claim: CleanupClaim): Promise<boolean> {
+    return this.sql.begin(async connection => {
+      const sql = connection as unknown as Sql
+      return Boolean(await this.locked(sql, claim)) && await this.settled(sql, claim.taskId)
+    })
+  }
+
   async renew(claim: CleanupClaim, ttl: number): Promise<boolean> {
     positive(ttl)
     const sql = this.sql

@@ -1,3 +1,4 @@
+import { CleanupCoordinator, emptyCleanupResult, type CleanupSweepResult } from './cleanup-coordinator.js'
 import { resolveTaskCleanupPolicy } from './cleanup-policy.js'
 import { ulid } from 'ulidx'
 import { canTransition, isTerminal, isSuspended } from './state-machine.js'
@@ -144,6 +145,7 @@ export interface StorageReleaseSweepResult {
 }
 
 export class TaskEngine {
+  private cleanupCoordinator?: CleanupCoordinator
   private cleanup: import('./cleanup-policy.js').ResolvedCleanupConfig
   private static readonly CREATION_CLAIM_TTL_MS = 30_000
   private shortTermStore: ShortTermStore
@@ -215,6 +217,11 @@ export class TaskEngine {
           }
         },
       })
+    }
+    if (this.cleanup.enabled) {
+      if (!this.storageCoordinator || !this.longTermStore) throw new StorageReleaseUnsupportedError('Terminal cleanup requires fenced hot and durable stores')
+      this.cleanupCoordinator = new CleanupCoordinator(this.shortTermStore, this.longTermStore,
+        taskId => this.releaseTaskStorageAtCurrentDurableIndex(taskId, Date.now()))
     }
   }
 
@@ -677,6 +684,12 @@ export class TaskEngine {
 
   supportsStorageRelease(): boolean {
     return this.storageCoordinator !== undefined
+  }
+
+  supportsCleanup(): boolean { return this.cleanupCoordinator !== undefined }
+
+  async sweepCleanup(limit = 100, eventBatchSize = 1000, claimTtlMs = 30_000): Promise<CleanupSweepResult> {
+    return this.cleanupCoordinator ? this.cleanupCoordinator.sweep(limit, eventBatchSize, claimTtlMs) : emptyCleanupResult()
   }
 
   supportsDurableTtl(): boolean {

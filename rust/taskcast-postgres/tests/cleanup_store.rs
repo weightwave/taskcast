@@ -193,6 +193,7 @@ async fn cleanup_claims_defer_dependencies_and_rollback_failed_batches() {
         .await
         .unwrap();
     assert!(!store.begin_task_cleanup(busy, 1, 0).await.unwrap());
+    assert!(!store.can_cleanup_task(busy).await.unwrap());
     store.defer_cleanup_claim(busy, 60000).await.unwrap();
     store.defer_cleanup_claim(&claims[1], 0).await.unwrap();
     let ready = store.claim_cleanup_tasks(1, 30000).await.unwrap().remove(0);
@@ -244,4 +245,31 @@ async fn cleanup_claims_defer_dependencies_and_rollback_failed_batches() {
         assert_eq!(count, 0);
     }
     store.pool().close().await;
+}
+
+#[tokio::test]
+async fn coordinates_real_archive_release_then_cleanup() {
+    use std::sync::Arc;
+    let container = Postgres::default().start().await.unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let pool = PgPoolOptions::new().max_connections(5).connect(&format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres")).await.unwrap();
+    let durable = Arc::new(PostgresLongTermStore::new(pool));
+    durable.migrate().await.unwrap();
+    let hot = Arc::new(MemoryShortTermStore::new());
+    let engine = TaskEngine::new(TaskEngineOptions { short_term_store: hot.clone(), long_term_store: Some(durable.clone()), broadcast: Arc::new(MemoryBroadcastProvider::new()), hooks: None }).with_cleanup_config(ResolvedCleanupConfig { enabled: true, rules: vec![serde_json::from_value(json!({"target":"events","trigger":{}})).unwrap()] }).unwrap();
+    let task = engine.create_task(CreateTaskInput::default()).await.unwrap();
+    engine.transition_task(&task.id,TaskStatus::Running,None).await.unwrap();
+    engine.publish_event(&task.id,PublishEventInput { r#type: "test".into(), level: Level::Info, data: json!("value"), series_id: None, series_mode: None, series_acc_field: None }).await.unwrap();
+    engine.transition_task(&task.id,TaskStatus::Completed,Some(TransitionPayload { result: Some(serde_json::from_value(json!({"kept":true})).unwrap()),..Default::default() })).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5),async { while durable.get_events(&task.id,None).await.unwrap().len() != 3 { tokio::task::yield_now().await; } }).await.unwrap();
+    let result = engine.sweep_cleanup(100,1000,30000).await.unwrap();
+    assert_eq!((result.completed,result.deleted_events,result.failed),(1,3,0));
+    assert!(hot.get_task(&task.id).await.unwrap().is_none());
+    let retained = durable.get_task(&task.id).await.unwrap().unwrap();
+    assert!(retained.history_expired_at.is_some());
+    assert_eq!(retained.result.unwrap()["kept"],true);
+    assert_eq!(durable.get_last_event_index(&task.id).await.unwrap(),2);
+    let receipts: i64 = sqlx::query_scalar("SELECT count(*) FROM taskcast_archive_batches WHERE task_id = $1").bind(&task.id).fetch_one(durable.pool()).await.unwrap();
+    assert_eq!(receipts,0);
+    durable.pool().close().await;
 }

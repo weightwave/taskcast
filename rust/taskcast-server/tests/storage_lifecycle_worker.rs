@@ -317,3 +317,22 @@ async fn samples_old_and_large_hot_tasks_without_payloads() {
     assert_eq!(result.hot_storage.large, 1);
     assert_eq!(result.hot_storage.failed, 0);
 }
+
+#[tokio::test]
+async fn enabled_history_cleanup_runs_in_the_existing_lifecycle_tick() {
+    let hot = Arc::new(MemoryShortTermStore::new());
+    let durable = Arc::new(MemoryLongTermStore::new());
+    let engine = Arc::new(TaskEngine::new(TaskEngineOptions { short_term_store: hot.clone(), long_term_store: Some(durable.clone()), broadcast: Arc::new(MemoryBroadcastProvider::new()), hooks: None })
+        .with_cleanup_config(taskcast_core::ResolvedCleanupConfig { enabled: true, rules: vec![serde_json::from_value(serde_json::json!({"target":"events", "trigger":{}})).unwrap()] }).unwrap());
+    engine.create_task(taskcast_core::CreateTaskInput { id: Some("cleanup".into()), ..Default::default() }).await.unwrap();
+    engine.transition_task("cleanup",TaskStatus::Running,None).await.unwrap();
+    engine.transition_task("cleanup",TaskStatus::Completed,None).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while durable.get_events("cleanup", None).await.unwrap().len() != 2 { tokio::task::yield_now().await; }
+    }).await.unwrap();
+    let worker = StorageLifecycleWorker::new(StorageLifecycleWorkerOptions { engine, short_term_store: hot.clone(), config: taskcast_core::resolve_storage_lifecycle_config(&taskcast_core::TaskcastConfig::default(), &std::collections::HashMap::new()).unwrap() });
+    let result = worker.tick().await.unwrap();
+    assert_eq!((result.cleanup.claimed,result.cleanup.completed,result.cleanup.deleted_events),(1,1,2));
+    assert!(hot.get_task("cleanup").await.unwrap().is_none());
+    assert!(durable.get_task("cleanup").await.unwrap().unwrap().history_expired_at.is_some());
+}
