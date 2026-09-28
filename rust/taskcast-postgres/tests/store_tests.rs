@@ -1590,7 +1590,15 @@ async fn completes_or_aborts_only_the_matching_pristine_creation_claim() {
         .unwrap());
     let mut running = make_task("task-1");
     running.status = TaskStatus::Running;
-    store.save_task(running).await.unwrap();
+    store
+        .save_task_with_context(
+            running,
+            Some(&taskcast_core::DurableWriteContext {
+                creation_token: "token-1".into(),
+            }),
+        )
+        .await
+        .unwrap();
     assert!(!store
         .abort_task_creation("task-1", "token-1")
         .await

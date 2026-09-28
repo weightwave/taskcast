@@ -30,7 +30,7 @@ export class PostgresCleanupStore {
           AND cleanup_due_at <= ${nowSql(sql)}
           AND (cleanup_next_attempt_at IS NULL OR cleanup_next_attempt_at <= ${nowSql(sql)})
           AND (cleanup_claim_until IS NULL OR cleanup_claim_until <= ${nowSql(sql)})
-        ORDER BY cleanup_due_at, id LIMIT ${limit} FOR UPDATE SKIP LOCKED
+        ORDER BY GREATEST(cleanup_due_at, COALESCE(cleanup_next_attempt_at, cleanup_due_at)), id LIMIT ${limit} FOR UPDATE SKIP LOCKED
       `
       const claims: CleanupClaim[] = []
       for (const row of rows) {

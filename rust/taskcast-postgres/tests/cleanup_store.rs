@@ -296,6 +296,24 @@ async fn explicit_restore_rotates_generation_and_never_enrolls_archived_markers(
     assert!(restored.history_expired_at.is_none());
     assert_ne!(store.get_task_storage_metadata("restore").await.unwrap().unwrap().creation_token, Some(ctx.creation_token.clone()));
     assert!(store.save_event_with_context(event("restore", 2), Some(&ctx)).await.is_err());
+    assert!(store.save_event(event("restore", 3)).await.is_err());
+    assert!(store.save_task(restored).await.is_err());
     assert!(store.claim_cleanup_tasks(1, 30000).await.unwrap().is_empty());
     assert_eq!(store.get_events("restore", None).await.unwrap().len(), 2);
+}
+
+
+#[tokio::test]
+async fn expired_retry_does_not_starve_untouched_due_tasks() {
+    let container = Postgres::default().start().await.unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let pool = PgPoolOptions::new().max_connections(5).connect(&format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres")).await.unwrap();
+    let store = PostgresLongTermStore::new(pool);
+    store.migrate().await.unwrap();
+    enroll(&store, "a-retry", "events", 1).await;
+    enroll(&store, "b-ready", "events", 1).await;
+    let first = store.claim_cleanup_tasks(1, 30000).await.unwrap().remove(0);
+    assert_eq!(first.task_id, "a-retry");
+    store.defer_cleanup_claim(&first, 0).await.unwrap();
+    assert_eq!(store.claim_cleanup_tasks(1, 30000).await.unwrap()[0].task_id, "b-ready");
 }

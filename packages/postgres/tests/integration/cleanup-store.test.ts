@@ -222,3 +222,30 @@ it('explicit overwrite restores expired history with a new generation and no aut
   expect(await engine.getEvents('restore')).toHaveLength(2)
   expect(await engine.sweepCleanup()).toMatchObject({ claimed: 0 })
 })
+
+
+it('puts a retried task behind untouched due tasks even after its retry delay expires', async () => {
+  await enrolled('a-retry')
+  await enrolled('b-ready')
+  const [first] = await store.claimCleanupTasks(1, 30_000)
+  expect(first!.taskId).toBe('a-retry')
+  await store.deferCleanupClaim(first!, 0)
+  expect((await store.claimCleanupTasks(1, 30_000))[0]!.taskId).toBe('b-ready')
+})
+
+
+it('rejects unscoped writes captured by a legacy task before overwrite import', async () => {
+  const hot = new MemoryShortTermStore()
+  const engine = new TaskEngine({ shortTermStore: hot, longTermStore: store, broadcast: new MemoryBroadcastProvider() })
+  const task = await engine.createTask({}) // old generated-ID path has no creation token
+  await engine.transitionTask(task.id, 'running')
+  await engine.transitionTask(task.id, 'completed', { result: { kept: true } })
+  await vi.waitFor(async () => expect(await store.getEvents(task.id)).toHaveLength(2))
+  expect((await store.getTaskStorageMetadata(task.id))?.creationToken).toBeUndefined()
+  const archive = await engine.exportTaskArchive(task.id)
+  await engine.importTaskArchive(archive, { overwrite: true })
+  await expect(store.saveEvent(event(task.id, 2))).rejects.toThrow()
+  await expect(store.saveTask({ ...archive.task, result: { corrupt: true } })).rejects.toThrow()
+  expect(await engine.getEvents(task.id)).toHaveLength(2)
+  expect((await engine.getTask(task.id))?.result).toEqual({ kept: true })
+})

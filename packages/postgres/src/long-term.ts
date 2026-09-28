@@ -109,7 +109,7 @@ export class PostgresLongTermStore implements LongTermStore {
   private async guardWrite(sql: PostgresClient, taskId: string, context?: DurableWriteContext, enrolled = false): Promise<void> {
     const [row] = await sql`SELECT creation_token, cleanup_policy_version, history_expired_at FROM taskcast_tasks WHERE id = ${taskId} FOR UPDATE`
     if (row?.['history_expired_at'] != null || (context && (!row || row['creation_token'] !== context.creationToken))
-      || (!context && (enrolled || row?.['cleanup_policy_version'] === 1))) {
+      || (!context && (enrolled || row?.['cleanup_policy_version'] === 1 || row?.['creation_token'] != null))) {
       throw new StorageFenceConflictError('Durable write belongs to missing, expired, or replaced task generation')
     }
   }

@@ -222,3 +222,81 @@ async fn competing_cleaners_only_complete_a_task_once() {
     assert_eq!(a.completed + b.completed, 1);
     assert!(durable.get_task("contended").await.unwrap().is_none());
 }
+
+#[tokio::test]
+async fn expired_retry_does_not_starve_untouched_due_tasks() {
+    let (engine, _, durable) = setup(true, CleanupTarget::Events);
+    complete(&engine, &durable, "a-retry", 0).await;
+    complete(&engine, &durable, "b-ready", 0).await;
+    let first = durable
+        .claim_cleanup_tasks(1, 30000)
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(first.task_id, "a-retry");
+    // Make the retry deadline strictly later than b-ready's millisecond timestamp,
+    // then let it expire: zero delay can tie when both tasks finish in one tick.
+    durable.defer_cleanup_claim(&first, 2).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+    assert_eq!(
+        durable.claim_cleanup_tasks(1, 30000).await.unwrap()[0].task_id,
+        "b-ready"
+    );
+}
+
+#[tokio::test]
+async fn enrolled_task_worker_claim_and_decline_preserve_creation_context() {
+    let (engine, hot, durable) = setup(true, CleanupTarget::Events);
+    let engine = Arc::new(engine);
+    let manager = WorkerManager::new(WorkerManagerOptions {
+        engine: engine.clone(),
+        short_term_store: hot,
+        long_term_store: Some(durable.clone()),
+        broadcast: Arc::new(MemoryBroadcastProvider::new()),
+        hooks: None,
+        defaults: None,
+    });
+    let worker = manager
+        .register_worker(WorkerRegistration {
+            worker_id: None,
+            match_rule: WorkerMatchRule::default(),
+            capacity: 1,
+            weight: None,
+            connection_mode: ConnectionMode::Pull,
+            metadata: None,
+        })
+        .await
+        .unwrap();
+    engine
+        .create_task(CreateTaskInput {
+            id: Some("worker-task".into()),
+            assign_mode: Some(AssignMode::Pull),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        manager.claim_task("worker-task", &worker.id).await.unwrap(),
+        ClaimResult::Claimed
+    ));
+    assert_eq!(
+        durable
+            .get_task("worker-task")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        TaskStatus::Assigned
+    );
+    manager
+        .decline_task(
+            "worker-task",
+            &worker.id,
+            Some(DeclineOptions { blacklist: true }),
+        )
+        .await
+        .unwrap();
+    let task = durable.get_task("worker-task").await.unwrap().unwrap();
+    assert_eq!(task.status, TaskStatus::Pending);
+    assert!(task.assigned_worker.is_none());
+}

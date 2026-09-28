@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { TaskEngine } from '../../src/engine.js'
+import { HistoryExpiredError, TaskEngine } from '../../src/engine.js'
 import { MemoryBroadcastProvider, MemoryLongTermStore, MemoryShortTermStore } from '../../src/memory-adapters.js'
 import type { CleanupRule } from '../../src/types.js'
 
@@ -24,6 +24,22 @@ describe('terminal cleanup lifecycle', () => {
     expect(await engine.sweepCleanup()).toEqual({ claimed: 0, completed: 0, deferred: 0, failed: 0, deletedEvents: 0 })
     expect(scan).not.toHaveBeenCalled()
     expect(() => new TaskEngine({ shortTermStore: new MemoryShortTermStore(), broadcast: new MemoryBroadcastProvider(), cleanup: { enabled: true, rules: [] } })).toThrow(/cleanup/i)
+    vi.spyOn(durable, 'claimCleanupTasks').mockRestore()
+    // An adapter declaring support must also implement the full cleanup contract.
+    Object.defineProperty(durable, 'beginTaskCleanup', { value: undefined })
+    expect(() => new TaskEngine({ shortTermStore: new MemoryShortTermStore(), longTermStore: durable, broadcast: new MemoryBroadcastProvider(), cleanup: { enabled: true, rules: [] } })).toThrow(/capabilities/)
+  })
+
+  it('keeps durable expiry authoritative over a stale terminal cache after cleanup is disabled', async () => {
+    const { engine, hot, durable } = setup()
+    await completed(engine, 'stale')
+    const cached = (await hot.getTask('stale'))!
+    expect(await engine.sweepCleanup()).toMatchObject({ completed: 1 })
+    await hot.saveTask(cached)
+    const disabled = new TaskEngine({ shortTermStore: hot, longTermStore: durable, broadcast: new MemoryBroadcastProvider() })
+    expect((await disabled.getTask('stale'))?.historyExpiredAt).toBeGreaterThan(0)
+    expect(await disabled.getEvents('stale')).toEqual([])
+    await expect(disabled.exportTaskArchive('stale')).rejects.toThrow(HistoryExpiredError)
   })
 
   it('releases hot storage before bounded durable cleanup and resumes cold tasks', async () => {
@@ -73,7 +89,11 @@ describe('terminal cleanup lifecycle', () => {
     await completed(engine, 'b-ready')
     await durable.saveDurableAssignment({ taskId: 'a-busy', workerId: 'w', assignedAt: Date.now(), cost: 1, status: 'running' })
     expect(await engine.sweepCleanup(1)).toMatchObject({ completed: 0, deferred: 1 })
-    expect(await engine.sweepCleanup(1)).toMatchObject({ completed: 1 })
+    // A real lifecycle tick can arrive after the busy task's retry deadline.
+    vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 6000)
+    try {
+      expect(await engine.sweepCleanup(1)).toMatchObject({ completed: 1 })
+    } finally { vi.restoreAllMocks() }
     expect((await durable.getTask('a-busy'))?.historyExpiredAt).toBeUndefined()
   })
 
@@ -133,4 +153,18 @@ describe('terminal cleanup lifecycle', () => {
       expect(remove).not.toHaveBeenCalled()
     }
   })
+})
+
+
+it('supports worker claim and decline with an enrolled task generation', async () => {
+  const { WorkerManager } = await import('../../src/worker-manager.js')
+  const { engine, hot, durable } = setup()
+  const manager = new WorkerManager({ engine, shortTermStore: hot, longTermStore: durable, broadcast: new MemoryBroadcastProvider() })
+  const worker = await manager.registerWorker({ matchRule: {}, capacity: 1, connectionMode: 'pull' })
+  await engine.createTask({ id: 'worker-task', assignMode: 'pull' })
+  expect(await manager.claimTask('worker-task', worker.id)).toMatchObject({ success: true })
+  expect((await durable.getTask('worker-task'))?.status).toBe('assigned')
+  await manager.declineTask('worker-task', worker.id, { blacklist: true })
+  expect((await durable.getTask('worker-task'))?.status).toBe('pending')
+  expect((await durable.getTask('worker-task'))?.assignedWorker).toBeUndefined()
 })

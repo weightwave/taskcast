@@ -798,7 +798,7 @@ export class MemoryLongTermStore implements LongTermStore {
       const due = events === null ? all : all === null ? events : Math.min(events, all)
       if (due === null || due > now) return []
       const target = prior?.inProgress ? prior.claim.target : all !== null && all <= now ? 'all' as const : 'events' as const
-      return [{ task, target, due, creation, prior }]
+      return [{ task, target, due: Math.max(due, this.cleanupRetry.get(task.id) ?? due), creation, prior }]
     }).sort((a, b) => a.due - b.due || a.task.id.localeCompare(b.task.id)).slice(0, limit)
     return candidates.map(({ task, target, creation, prior }) => {
       const claim: CleanupClaim = { taskId: task.id, creationToken: creation.token, claimToken: ulid(), target, completedAt: task.completedAt!, taskVersion: this.metadata.get(task.id)!.taskVersion }
@@ -892,7 +892,7 @@ export class MemoryLongTermStore implements LongTermStore {
   private guardWrite(taskId: string, context?: DurableWriteContext, enrolled = false): void {
     const task = this.tasks.get(taskId)
     if (task?.historyExpiredAt !== undefined || (context && (!task || this.creationClaims.get(taskId)?.token !== context.creationToken))
-      || (!context && (enrolled || task?.cleanupPolicyVersion === 1))) {
+      || (!context && (enrolled || task?.cleanupPolicyVersion === 1 || this.creationClaims.has(taskId)))) {
       throw new StorageFenceConflictError('Durable write belongs to missing, expired, or replaced task generation')
     }
   }

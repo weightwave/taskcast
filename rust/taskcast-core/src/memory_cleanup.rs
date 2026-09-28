@@ -67,7 +67,7 @@ impl MemoryLongTermStore {
                 CleanupTarget::Events
             };
             candidates.push((
-                due,
+                due.max(retry.get(&task.id).copied().unwrap_or(0) as f64),
                 CleanupClaim {
                     task_id: task.id.clone(),
                     creation_token: created.token.clone(),

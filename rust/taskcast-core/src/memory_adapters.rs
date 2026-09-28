@@ -244,7 +244,7 @@ impl MemoryLongTermStore {
         let claims = self.creation_claims.read().unwrap();
         if task.is_some_and(|t| t.history_expired_at.is_some())
             || context.is_some_and(|ctx| task.is_none() || claims.get(id).is_none_or(|c| c.token != ctx.creation_token))
-            || (context.is_none() && (enrolled || task.is_some_and(|t| t.cleanup_policy_version == Some(1)))) {
+            || (context.is_none() && (enrolled || task.is_some_and(|t| t.cleanup_policy_version == Some(1)) || claims.contains_key(id))) {
             return Err(Box::new(StorageFenceConflictError::new("Durable write belongs to missing, expired, or replaced task generation")));
         }
         Ok(())

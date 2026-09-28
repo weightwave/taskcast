@@ -54,7 +54,7 @@ pub(crate) async fn guard_write(
         .and_then(|r| r.get::<Option<String>, _>("creation_token"));
     if expired
         || context.is_some_and(|ctx| token.as_deref() != Some(ctx.creation_token.as_str()))
-        || (context.is_none() && requires_context)
+        || (context.is_none() && (requires_context || token.is_some()))
     {
         return Err(Box::new(StorageFenceConflictError::new(
             "Durable write belongs to missing, expired, or replaced task generation",
@@ -70,7 +70,7 @@ pub(crate) async fn claim(
 ) -> Result<Vec<CleanupClaim>, BoxError> {
     let (limit, ttl) = (bound(limit, false)?, bound(ttl, false)?);
     let mut tx = pool.begin().await?;
-    let rows = sqlx::query(&format!("SELECT *, {NOW} AS cleanup_now FROM taskcast_tasks WHERE cleanup_policy_version = 1 AND creation_token IS NOT NULL AND creation_completed_at IS NOT NULL AND status IN ('completed', 'failed', 'cancelled', 'timeout') AND completed_at IS NOT NULL AND cleanup_due_at <= {NOW} AND (cleanup_next_attempt_at IS NULL OR cleanup_next_attempt_at <= {NOW}) AND (cleanup_claim_until IS NULL OR cleanup_claim_until <= {NOW}) ORDER BY cleanup_due_at, id LIMIT $1 FOR UPDATE SKIP LOCKED")).bind(limit).fetch_all(&mut *tx).await?;
+    let rows = sqlx::query(&format!("SELECT *, {NOW} AS cleanup_now FROM taskcast_tasks WHERE cleanup_policy_version = 1 AND creation_token IS NOT NULL AND creation_completed_at IS NOT NULL AND status IN ('completed', 'failed', 'cancelled', 'timeout') AND completed_at IS NOT NULL AND cleanup_due_at <= {NOW} AND (cleanup_next_attempt_at IS NULL OR cleanup_next_attempt_at <= {NOW}) AND (cleanup_claim_until IS NULL OR cleanup_claim_until <= {NOW}) ORDER BY GREATEST(cleanup_due_at, COALESCE(cleanup_next_attempt_at, cleanup_due_at)), id LIMIT $1 FOR UPDATE SKIP LOCKED")).bind(limit).fetch_all(&mut *tx).await?;
     let mut claims = vec![];
     for row in rows {
         let task = PostgresLongTermStore::row_to_task(&row);
