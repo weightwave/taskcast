@@ -225,6 +225,9 @@ export interface SeriesLatestEntry {
 }
 
 export interface TaskArchiveRestoreData {
+  /** Internal fenced restore state; never read from an imported archive. */
+  storageEpoch?: number
+  expectedCreationToken?: string | null
   task: Task
   events: TaskArchiveEvent[]
   nextIndex: number

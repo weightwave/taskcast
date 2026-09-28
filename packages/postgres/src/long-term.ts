@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import type postgres from 'postgres'
 import {
   DependencyUnavailableError,
@@ -650,7 +651,10 @@ export class PostgresLongTermStore implements LongTermStore {
     options?: TaskArchiveImportOptions,
   ): Promise<boolean> {
     const taskId = data.task.id
-    const existing = await sql`SELECT id FROM ${sql(TASKS)} WHERE id = ${taskId}`
+    const existing = await sql`SELECT id, creation_token FROM ${sql(TASKS)} WHERE id = ${taskId} FOR UPDATE`
+    if (data.expectedCreationToken !== undefined && (existing[0]?.creation_token ?? null) !== data.expectedCreationToken) {
+      throw new StorageFenceConflictError('Archive restore generation changed')
+    }
     if (existing.length > 0 && options?.overwrite !== true) {
       throw new Error(`Task already exists: ${taskId}`)
     }
@@ -682,7 +686,15 @@ export class PostgresLongTermStore implements LongTermStore {
 
         await tx`DELETE FROM ${tx(EVENTS)} WHERE task_id = ${taskId}`
         await tx`DELETE FROM ${tx(TASKS)} WHERE id = ${taskId}`
-        await this.saveTaskWithClient(tx, data.task)
+        const task = { ...data.task }
+        delete task.cleanupPolicyVersion
+        delete task.cleanupResolvedAt
+        delete task.historyExpiredAt
+        await this.saveTaskWithClient(tx, task)
+        await tx`UPDATE ${tx(TASKS)} SET creation_token = ${randomUUID()},
+          creation_completed_at = FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT,
+          archive_watermark = ${data.nextIndex - 1}, storage_epoch = ${data.storageEpoch ?? 1}, storage_state = ${data.storageEpoch !== undefined ? 'cold' : 'hot'}
+          WHERE id = ${taskId}`
         for (const event of data.events) {
           await this.saveEventWithClient(tx, event, 'strict')
         }

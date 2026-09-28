@@ -36,6 +36,9 @@ pub enum EngineError {
     #[error("Task not found: {0}")]
     TaskNotFound(String),
 
+    #[error("Task history expired: {0}")]
+    HistoryExpired(String),
+
     #[error("Task already exists: {0}")]
     TaskConflict(String),
 
@@ -447,7 +450,12 @@ impl TaskEngine {
 
     pub async fn get_task(&self, task_id: &str) -> Result<Option<Task>, EngineError> {
         let from_short = self.short_term_store.get_task(task_id).await?;
-        if from_short.is_some() {
+        if let Some(ref task) = from_short {
+            if task.cleanup_policy_version == Some(1) && is_terminal(&task.status) {
+                if let Some(ref store) = self.long_term_store {
+                    if store.supports_terminal_cleanup() { return Ok(store.get_task(task_id).await?); }
+                }
+            }
             return Ok(from_short);
         }
         if let Some(ref long_term_store) = self.long_term_store {
@@ -929,7 +937,11 @@ impl TaskEngine {
             .await?
             .ok_or_else(|| EngineError::TaskNotFound(task_id.to_string()))?;
 
-        self.build_export_archive(&task).await
+        if task.history_expired_at.is_some() { return Err(EngineError::HistoryExpired(task_id.into())); }
+        let result = self.build_export_archive(&task).await;
+        let current = self.get_task(task_id).await?.ok_or_else(|| EngineError::TaskNotFound(task_id.into()))?;
+        if current.history_expired_at.is_some() { return Err(EngineError::HistoryExpired(task_id.into())); }
+        result
     }
 
     pub async fn import_task_archive(
@@ -944,6 +956,10 @@ impl TaskEngine {
 
         if existing.is_some() && !import_options.overwrite {
             return Err(EngineError::TaskConflict(task_id));
+        }
+
+        if self.storage_coordinator.is_some() && self.long_term_store.as_ref().is_some_and(|store| store.supports_task_archive_restore()) {
+            return self.import_archive_fenced(normalized, import_options).await;
         }
 
         if !self.short_term_store.supports_task_archive_restore() {
@@ -1001,7 +1017,76 @@ impl TaskEngine {
         })
     }
 
+    async fn import_archive_fenced(&self, archive: TaskArchive, options: TaskArchiveImportOptions) -> Result<TaskArchiveImportResult, EngineError> {
+        let hot = &self.short_term_store;
+        let durable = self.long_term_store.as_ref().unwrap();
+        let task_id = &archive.task.id;
+        let ttl = 30_000;
+        let lease = hot.acquire_storage_lock(task_id, &ulid::Ulid::new().to_string(), &format!("import:{}", ulid::Ulid::new()), ttl).await?
+            .ok_or_else(|| EngineError::Store(Box::new(StorageBusyError::new("Task storage is busy"))))?;
+        let operation = async {
+            let existing = self.get_task(task_id).await?;
+            if existing.is_some() && !options.overwrite { return Err(EngineError::TaskConflict(task_id.clone())); }
+            let mut data = build_task_archive_restore_data(&archive)?;
+            let before = durable.get_task_storage_metadata(task_id).await?;
+            let fence = hot.get_write_fence(task_id).await?;
+            let epoch = before.as_ref().map_or(0, |m| m.storage_epoch).max(fence.as_ref().map_or(0, |f| f.storage_epoch)) + 1;
+            data.storage_epoch = Some(epoch);
+            data.expected_creation_token = Some(before.as_ref().and_then(|m| m.creation_token.clone()).unwrap_or_default());
+            if hot.supports_task_archive_restore() { hot.validate_task_archive_restore(&data, Some(options)).await?; }
+            durable.validate_task_archive_restore(&data, Some(options)).await?;
+            durable.restore_task_archive(data.clone(), Some(options)).await?;
+            if let Some(fence) = fence {
+                hot.close_write_fence(&lease, fence.storage_epoch).await?;
+                hot.delete_task_storage_fenced(&lease, fence.storage_epoch).await?;
+            }
+            let metadata = durable.get_task_storage_metadata(task_id).await?.ok_or_else(|| EngineError::TaskNotFound(task_id.clone()))?;
+            if metadata.storage_state != crate::types::StorageState::Cold || metadata.storage_epoch != epoch { return Err(EngineError::Store(Box::new(StorageFenceConflictError::new("Archive import metadata changed")))); }
+            let next_epoch = epoch + 1;
+            hot.restore_hot_task_fenced(crate::types::RehydrateSnapshot {
+                task: data.task, archive_watermark: data.next_index as i64 - 1, max_event_index: data.next_index as i64 - 1,
+                replay_events: data.events, storage_epoch: epoch,
+                series_latest: data.series_latest.into_iter().map(|entry| DurableSeriesState {
+                    task_id: entry.task_id, series_id: entry.series_id, mode: entry.event.series_mode.clone().unwrap(), through_index: entry.event.index, event: entry.event,
+                }).collect(),
+            }, &lease, next_epoch).await?;
+            let mut next = metadata;
+            next.storage_state = crate::types::StorageState::Hot;
+            next.storage_epoch = next_epoch;
+            next.cold_at = None;
+            if !durable.compare_and_set_task_storage_metadata(crate::types::TaskStorageMetadataCas {
+                task_id: task_id.clone(), expected_storage_state: crate::types::StorageState::Cold, expected_storage_epoch: epoch, expected_release_generation: None, next,
+            }).await? { return Err(EngineError::Store(Box::new(StorageFenceConflictError::new("Archive import metadata changed")))); }
+            self.emit_locks.lock().unwrap().remove(task_id);
+            Ok(TaskArchiveImportResult { task_id: task_id.clone(), event_count: archive.events.len(), overwritten: existing.is_some() })
+        };
+        let heartbeat = async {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(ttl / 3)).await;
+                if !hot.renew_storage_lock(&lease, ttl).await? { return Err(EngineError::Store(Box::new(StorageFenceConflictError::new("Archive import lease was lost")))); }
+            }
+        };
+        tokio::pin!(operation);
+        tokio::pin!(heartbeat);
+        let result = tokio::select! { biased; result = &mut operation => result, result = &mut heartbeat => result };
+        let _ = hot.release_storage_lock(&lease).await;
+        result
+    }
+
     pub async fn get_events(
+        &self,
+        task_id: &str,
+        opts: Option<EventQueryOptions>,
+    ) -> Result<Vec<TaskEvent>, EngineError> {
+        let before = self.get_task(task_id).await?;
+        if before.as_ref().is_some_and(|t| t.history_expired_at.is_some()) { return Ok(vec![]); }
+        let events = self.read_events(task_id, opts).await?;
+        let after = self.get_task(task_id).await?;
+        if after.as_ref().is_some_and(|t| t.history_expired_at.is_some()) || (before.is_some() && after.is_none()) { return Ok(vec![]); }
+        Ok(events)
+    }
+
+    async fn read_events(
         &self,
         task_id: &str,
         opts: Option<EventQueryOptions>,
@@ -1131,6 +1216,19 @@ impl TaskEngine {
 
     /// Get the latest accumulated event for a series.
     pub async fn get_series_latest(
+        &self,
+        task_id: &str,
+        series_id: &str,
+    ) -> Result<Option<TaskEvent>, EngineError> {
+        let before = self.get_task(task_id).await?;
+        if before.as_ref().is_some_and(|t| t.history_expired_at.is_some()) { return Ok(None); }
+        let event = self.read_series_latest(task_id, series_id).await?;
+        let after = self.get_task(task_id).await?;
+        if after.as_ref().is_some_and(|t| t.history_expired_at.is_some()) || (before.is_some() && after.is_none()) { return Ok(None); }
+        Ok(event)
+    }
+
+    async fn read_series_latest(
         &self,
         task_id: &str,
         series_id: &str,

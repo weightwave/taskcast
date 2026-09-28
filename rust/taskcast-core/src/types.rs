@@ -594,6 +594,10 @@ pub struct SeriesLatestEntry {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskArchiveRestoreData {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_creation_token: Option<String>,
     pub task: Task,
     pub events: Vec<TaskEvent>,
     pub next_index: u64,

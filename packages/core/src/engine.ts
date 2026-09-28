@@ -39,12 +39,21 @@ import type {
 } from './types.js'
 import {
   StorageFenceConflictError,
+  StorageBusyError,
   StorageIntegrityError,
   StoragePreconditionError,
   StorageReleaseUnsupportedError,
 } from './types.js'
 
 // ─── Error Classes ──────────────────────────────────────────────────────────
+
+export class HistoryExpiredError extends Error {
+  readonly code = 'TASKCAST_HISTORY_EXPIRED'
+  constructor(taskId: string) {
+    super(`Task history expired: ${taskId}`)
+    this.name = 'HistoryExpiredError'
+  }
+}
 
 export class TaskConflictError extends Error {
   constructor(taskId: string) {
@@ -357,7 +366,13 @@ export class TaskEngine {
 
   async getTask(taskId: string): Promise<Task | null> {
     const fromShort = await this.shortTermStore.getTask(taskId)
-    if (fromShort) return fromShort
+    if (fromShort) {
+      // Terminal retention is durable authority, including after cleanup is disabled.
+      if (fromShort.cleanupPolicyVersion === 1 && isTerminal(fromShort.status) && this.longTermStore?.supportsTerminalCleanup) {
+        return this.longTermStore.getTask(taskId)
+      }
+      return fromShort
+    }
     return this.longTermStore?.getTask(taskId) ?? null
   }
 
@@ -729,7 +744,15 @@ export class TaskEngine {
     const task = await this.getTask(taskId)
     if (!task) throw new Error(`Task not found: ${taskId}`)
 
-    return this.buildExportArchive(task)
+    if (task.historyExpiredAt !== undefined) throw new HistoryExpiredError(taskId)
+    try {
+      return await this.buildExportArchive(task)
+    } finally {
+      // A cleanup may have started while archive chunks were being read.
+      const current = await this.getTask(taskId)
+      if (!current) throw new Error(`Task not found: ${taskId}`)
+      if (current.historyExpiredAt !== undefined) throw new HistoryExpiredError(taskId)
+    }
   }
 
   private async buildExportArchive(task: Task): Promise<TaskArchive> {
@@ -895,6 +918,10 @@ export class TaskEngine {
 
     if (existing && options?.overwrite !== true) throw new TaskConflictError(taskId)
 
+    if (this.storageCoordinator && this.longTermStore?.restoreTaskArchive) {
+      return this.importArchiveFenced(normalized, options)
+    }
+
     if (typeof this.shortTermStore.restoreTaskArchive !== 'function') {
       throw new Error('shortTermStore does not support restoreTaskArchive')
     }
@@ -930,11 +957,73 @@ export class TaskEngine {
     }
   }
 
+  private async importArchiveFenced(archive: TaskArchive, options?: TaskArchiveImportOptions): Promise<TaskArchiveImportResult> {
+    const hot = this.shortTermStore
+    const durable = this.longTermStore!
+    const taskId = archive.task.id
+    const ttl = 30_000
+    const lease = await hot.acquireStorageLock!(taskId, ulid(), `import:${ulid()}`, ttl)
+    if (!lease) throw new StorageBusyError('Task storage is busy')
+    let lost = false
+    let renewing = Promise.resolve()
+    const renew = async () => {
+      if (lost || !await hot.renewStorageLock!(lease, ttl)) {
+        lost = true
+        throw new StorageFenceConflictError('Archive import lease was lost')
+      }
+    }
+    const timer = setInterval(() => { renewing = renewing.then(renew).catch(() => { lost = true }) }, ttl / 3)
+    try {
+      const existing = await this.getTask(taskId)
+      if (existing && options?.overwrite !== true) throw new TaskConflictError(taskId)
+      const data = buildTaskArchiveRestoreData(archive)
+      const before = await durable.getTaskStorageMetadata!(taskId)
+      const fence = await hot.getWriteFence!(taskId)
+      data.storageEpoch = Math.max(before?.storageEpoch ?? 0, fence?.storageEpoch ?? 0) + 1
+      data.expectedCreationToken = before?.creationToken ?? null
+      await hot.validateTaskArchiveRestore?.(data, options)
+      await durable.validateTaskArchiveRestore?.(data, options)
+      await renew()
+      await durable.restoreTaskArchive!(data, options)
+      await renew()
+      if (fence) {
+        await hot.closeWriteFence!(lease, fence.storageEpoch)
+        await hot.deleteTaskStorageFenced!(lease, fence.storageEpoch)
+      }
+      const metadata = await durable.getTaskStorageMetadata!(taskId)
+      if (!metadata || metadata.storageState !== 'cold' || metadata.storageEpoch !== data.storageEpoch) throw new StorageFenceConflictError('Archive import metadata changed')
+      const nextEpoch = data.storageEpoch + 1
+      await renew()
+      await hot.restoreHotTaskFenced!({
+        task: data.task, archiveWatermark: data.nextIndex - 1, maxEventIndex: data.nextIndex - 1,
+        replayEvents: data.events, storageEpoch: data.storageEpoch,
+        seriesLatest: data.seriesLatest.map(entry => ({ ...entry, mode: entry.event.seriesMode as 'latest' | 'accumulate', throughIndex: entry.event.index })),
+      }, lease, nextEpoch)
+      await renew()
+      if (!await durable.compareAndSetTaskStorageMetadata!({ taskId, expectedStorageState: 'cold', expectedStorageEpoch: data.storageEpoch, expectedReleaseGeneration: null,
+        next: { ...metadata, storageState: 'hot', storageEpoch: nextEpoch, coldAt: null } })) throw new StorageFenceConflictError('Archive import metadata changed')
+      this._emitChains.delete(taskId)
+      return { taskId, eventCount: data.events.length, overwritten: existing !== null }
+    } finally {
+      clearInterval(timer)
+      await renewing
+      await hot.releaseStorageLock!(lease)
+    }
+  }
+
   async listTasks(filter: TaskFilter): Promise<Task[]> {
     return this.shortTermStore.listTasks(filter)
   }
 
   async getEvents(taskId: string, opts?: EventQueryOptions): Promise<TaskEvent[]> {
+    const before = await this.getTask(taskId)
+    if (before?.historyExpiredAt !== undefined) return []
+    const events = await this.readEvents(taskId, opts)
+    const after = await this.getTask(taskId)
+    return after?.historyExpiredAt !== undefined || (before && !after) ? [] : events
+  }
+
+  private async readEvents(taskId: string, opts?: EventQueryOptions): Promise<TaskEvent[]> {
     if (!this.longTermStore) {
       return this.shortTermStore.getEvents(taskId, opts)
     }
@@ -1011,6 +1100,14 @@ export class TaskEngine {
   }
 
   async getSeriesLatest(taskId: string, seriesId: string): Promise<TaskEvent | null> {
+    const before = await this.getTask(taskId)
+    if (before?.historyExpiredAt !== undefined) return null
+    const event = await this.readSeriesLatest(taskId, seriesId)
+    const after = await this.getTask(taskId)
+    return after?.historyExpiredAt !== undefined || (before && !after) ? null : event
+  }
+
+  private async readSeriesLatest(taskId: string, seriesId: string): Promise<TaskEvent | null> {
     if (
       !this.longTermStore ||
       this.longTermStore.supportsHotColdRelease !== true

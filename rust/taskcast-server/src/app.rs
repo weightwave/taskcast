@@ -796,7 +796,8 @@ pub fn create_app_with_runtime_health_and_routes(
             CorsLayer::new()
                 .allow_origin(Any)
                 .allow_methods(Any)
-                .allow_headers(Any),
+                .allow_headers(Any)
+                .expose_headers([axum::http::HeaderName::from_static("x-taskcast-history-expired")]),
         ),
         CorsConfig::AllowOrigins(origins) => {
             let origins: Vec<_> = origins.iter().filter_map(|o| o.parse().ok()).collect();
@@ -804,7 +805,8 @@ pub fn create_app_with_runtime_health_and_routes(
                 CorsLayer::new()
                     .allow_origin(origins)
                     .allow_methods(Any)
-                    .allow_headers(Any),
+                    .allow_headers(Any)
+                .expose_headers([axum::http::HeaderName::from_static("x-taskcast-history-expired")]),
             )
         }
     };

@@ -285,6 +285,13 @@ export function createSSERouter(engine: TaskEngine, subscriberCounts: Subscriber
         replayEvents = history
       }
 
+      const replayTask = await engine.getTask(taskId)
+      if (replayTask?.historyExpiredAt !== undefined) {
+        await stream.writeSSE({ event: 'taskcast.history_expired', data: JSON.stringify({ taskId, expiredAt: replayTask.historyExpiredAt }) })
+        await finish(replayTask.status)
+        return
+      }
+      if (!replayTask) { await finish(); return }
       const filtered = applyFilteredIndex(replayEvents, filter)
       const filterWithoutSince: SubscribeFilter = { ...filter }
       delete filterWithoutSince.since

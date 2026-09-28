@@ -20,6 +20,7 @@ import {
 } from '../schemas.js'
 import {
   TaskConflictError,
+  HistoryExpiredError,
   InvalidTaskArchiveError,
   InvalidTransitionError,
   findDependencyUnavailableError,
@@ -100,6 +101,7 @@ const exportArchiveRoute = createRoute({
   responses: {
     200: { description: 'Task archive', content: { 'application/json': { schema: TaskArchiveSchema } } },
     403: { description: 'Forbidden', content: { 'application/json': { schema: ErrorSchema } } },
+    409: { description: 'History expired (TASKCAST_HISTORY_EXPIRED)', content: { 'application/json': { schema: ErrorSchema.extend({ code: z.literal('TASKCAST_HISTORY_EXPIRED') }) } } },
     404: { description: 'Task not found', content: { 'application/json': { schema: ErrorSchema } } },
   },
 })
@@ -327,6 +329,7 @@ export function createTasksRouter(
       const archive = await engine.exportTaskArchive(taskId)
       return c.json(archive)
     } catch (err) {
+      if (err instanceof HistoryExpiredError) return c.json({ error: err.message, code: err.code }, 409)
       const msg = err instanceof Error ? err.message : String(err)
       if (msg.toLowerCase().includes('not found')) return c.json({ error: msg }, 404)
       if (findDependencyUnavailableError(err)) return dependencyErrorResponse(c, err, 500)
@@ -470,6 +473,12 @@ export function createTasksRouter(
       )
     }
 
+    const current = await engine.getTask(taskId)
+    if (!current) return c.json({ error: 'Task not found' }, 404)
+    if (current.historyExpiredAt !== undefined) {
+      c.header('X-Taskcast-History-Expired', 'true')
+      return c.json([])
+    }
     return c.json(events)
   })
 

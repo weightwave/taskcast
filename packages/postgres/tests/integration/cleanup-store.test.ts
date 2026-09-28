@@ -199,3 +199,26 @@ describe('durable terminal cleanup', () => {
     await expect(store.deleteTaskCleanupBatch(claim!, -1)).rejects.toThrow()
   })
 })
+
+
+it('explicit overwrite restores expired history with a new generation and no automatic enrollment', async () => {
+  const hot = new MemoryShortTermStore()
+  const engine = new TaskEngine({ shortTermStore: hot, longTermStore: store, broadcast: new MemoryBroadcastProvider(), cleanup: { enabled: true, rules: [{ target: 'events', trigger: {} }] } })
+  await engine.createTask({ id: 'restore' })
+  await engine.transitionTask('restore', 'running')
+  await engine.transitionTask('restore', 'completed')
+  await vi.waitFor(async () => expect(await store.getEvents('restore')).toHaveLength(2))
+  const old = (await store.getTaskStorageMetadata('restore'))!
+  const archive = await engine.exportTaskArchive('restore')
+  expect(await engine.sweepCleanup()).toMatchObject({ completed: 1 })
+  await expect(engine.importTaskArchive(archive)).rejects.toThrow(/exists/)
+  archive.task.historyExpiredAt = 1 // untrusted server markers never enroll restored archives
+  await engine.importTaskArchive(archive, { overwrite: true })
+  expect((await engine.getTask('restore'))).toMatchObject({ status: 'completed', cleanup: archive.task.cleanup })
+  expect((await engine.getTask('restore'))?.cleanupPolicyVersion).toBeUndefined()
+  expect((await engine.getTask('restore'))?.historyExpiredAt).toBeUndefined()
+  expect((await store.getTaskStorageMetadata('restore'))?.creationToken).not.toBe(old.creationToken)
+  await expect(store.saveEvent(event('restore', 2), { creationToken: old.creationToken! })).rejects.toThrow()
+  expect(await engine.getEvents('restore')).toHaveLength(2)
+  expect(await engine.sweepCleanup()).toMatchObject({ claimed: 0 })
+})

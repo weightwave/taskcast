@@ -336,6 +336,19 @@ pub async fn sse_events(
             history.clone()
         };
 
+        match engine.get_task(&task_id_clone).await {
+            Ok(Some(current)) if current.history_expired_at.is_some() => {
+                let event = Event::default().event("taskcast.history_expired").data(
+                    serde_json::json!({"taskId": task_id_clone, "expiredAt": current.history_expired_at}).to_string());
+                let _ = tx.send(Ok(event)).await;
+                let _ = tx.send(Ok(done_sse_event(serde_json::to_value(&current.status).unwrap().as_str().unwrap()))).await;
+                unsub();
+                decrement_subscriber_count(&sub_counts, &task_id_clone).await;
+                return;
+            }
+            Ok(Some(_)) => {}
+            _ => { unsub(); decrement_subscriber_count(&sub_counts, &task_id_clone).await; return; }
+        }
         let filtered = apply_filtered_index(&replay_events, &filter);
         let mut filter_without_since = filter.clone();
         filter_without_since.since = None;

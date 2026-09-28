@@ -273,3 +273,29 @@ async fn coordinates_real_archive_release_then_cleanup() {
     assert_eq!(receipts,0);
     durable.pool().close().await;
 }
+
+
+#[tokio::test]
+async fn explicit_restore_rotates_generation_and_never_enrolls_archived_markers() {
+    let container = Postgres::default().start().await.unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let pool = PgPoolOptions::new().max_connections(5).connect(&format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres")).await.unwrap();
+    let store = PostgresLongTermStore::new(pool);
+    store.migrate().await.unwrap();
+    let (mut task, ctx) = enroll(&store, "restore", "events", 2).await;
+    let claim = store.claim_cleanup_tasks(1, 30000).await.unwrap().remove(0);
+    assert!(store.begin_task_cleanup(&claim, 1, 1).await.unwrap());
+    task.history_expired_at = Some(1.0);
+    let archive = TaskArchive { schema: "taskcast.taskArchive".into(), version: 1, exported_at: 1.0, task,
+        events: vec![event("restore", 0), event("restore", 1)] };
+    let data = build_task_archive_restore_data(&archive).unwrap();
+    assert!(store.restore_task_archive(data.clone(), None).await.is_err());
+    store.restore_task_archive(data, Some(TaskArchiveImportOptions { overwrite: true })).await.unwrap();
+    let restored = store.get_task("restore").await.unwrap().unwrap();
+    assert!(restored.cleanup_policy_version.is_none());
+    assert!(restored.history_expired_at.is_none());
+    assert_ne!(store.get_task_storage_metadata("restore").await.unwrap().unwrap().creation_token, Some(ctx.creation_token.clone()));
+    assert!(store.save_event_with_context(event("restore", 2), Some(&ctx)).await.is_err());
+    assert!(store.claim_cleanup_tasks(1, 30000).await.unwrap().is_empty());
+    assert_eq!(store.get_events("restore", None).await.unwrap().len(), 2);
+}

@@ -294,150 +294,38 @@ impl LongTermStore for PostgresLongTermStore {
         true
     }
 
+    fn supports_task_archive_restore(&self) -> bool { true }
+
+    async fn validate_task_archive_restore(&self, data: &taskcast_core::TaskArchiveRestoreData, options: Option<taskcast_core::TaskArchiveImportOptions>) -> Result<(), BoxError> {
+        let mut tx = self.pool.begin().await?;
+        validate_restore_pg(&mut tx, data, options).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn restore_task_archive(&self, mut data: taskcast_core::TaskArchiveRestoreData, options: Option<taskcast_core::TaskArchiveImportOptions>) -> Result<bool, BoxError> {
+        let mut tx = self.pool.begin().await?;
+        let overwritten = validate_restore_pg(&mut tx, &data, options).await?;
+        sqlx::query("DELETE FROM taskcast_tasks WHERE id = $1").bind(&data.task.id).execute(&mut *tx).await?;
+        data.task.cleanup_policy_version = None;
+        data.task.cleanup_resolved_at = None;
+        data.task.history_expired_at = None;
+        save_task_pg_tx(&mut tx, &data.task).await?;
+        sqlx::query("UPDATE taskcast_tasks SET creation_token = $5, creation_completed_at = FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT, storage_epoch = $2, storage_state = $3, archive_watermark = $4 WHERE id = $1")
+            .bind(&data.task.id).bind(data.storage_epoch.unwrap_or(1) as i64)
+            .bind(if data.storage_epoch.is_some() { "cold" } else { "hot" }).bind(data.next_index as i64 - 1).bind(ulid::Ulid::new().to_string()).execute(&mut *tx).await?;
+        for event in &data.events { if !insert_canonical_event_pg_tx(&mut tx, event).await? { return Err(integrity("Archive event conflicts with existing history")); } }
+        tx.commit().await?;
+        Ok(overwritten)
+    }
+
     async fn save_task(&self, task: Task) -> Result<(), BoxError> { self.save_task_with_context(task, None).await }
 
     async fn save_task_with_context(&self, task: Task, context: Option<&DurableWriteContext>) -> Result<(), BoxError> {
         self.observed(|| async move {
             let mut tx = self.pool.begin().await?;
             guard_write(&mut tx, &task.id, context, task.cleanup_policy_version == Some(1)).await?;
-            let params_json: Option<JsonValue> = task
-                .params
-                .as_ref()
-                .map(|p| serde_json::to_value(p).unwrap_or(JsonValue::Null));
-            let result_json: Option<JsonValue> = task
-                .result
-                .as_ref()
-                .map(|r| serde_json::to_value(r).unwrap_or(JsonValue::Null));
-            let error_json: Option<JsonValue> = task
-                .error
-                .as_ref()
-                .map(|e| serde_json::to_value(e).unwrap_or(JsonValue::Null));
-            let metadata_json: Option<JsonValue> = task
-                .metadata
-                .as_ref()
-                .map(|m| serde_json::to_value(m).unwrap_or(JsonValue::Null));
-            let auth_config_json: Option<JsonValue> = task
-                .auth_config
-                .as_ref()
-                .map(|a| serde_json::to_value(a).unwrap_or(JsonValue::Null));
-            let webhooks_json: Option<JsonValue> = task
-                .webhooks
-                .as_ref()
-                .map(|w| serde_json::to_value(w).unwrap_or(JsonValue::Null));
-            let cleanup_json: Option<JsonValue> = task
-                .cleanup
-                .as_ref()
-                .map(|c| serde_json::to_value(c).unwrap_or(JsonValue::Null));
-
-            let created_at = task.created_at as i64;
-            let updated_at = task.updated_at as i64;
-            let completed_at = task.completed_at.map(|v| v as i64);
-            let ttl = task.ttl.map(|v| v as i32);
-
-            let tags_json: Option<JsonValue> = task
-                .tags
-                .as_ref()
-                .map(|t| serde_json::to_value(t).unwrap_or(JsonValue::Null));
-            let assign_mode_str: Option<String> = task.assign_mode.as_ref().map(|m| {
-                serde_json::to_value(m)
-                    .ok()
-                    .and_then(|v| v.as_str().map(|s| s.to_string()))
-                    .unwrap_or_default()
-            });
-            let cost_i32: Option<i32> = task.cost.map(|c| c as i32);
-            let disconnect_policy_str: Option<String> = task.disconnect_policy.as_ref().map(|d| {
-                serde_json::to_value(d)
-                    .ok()
-                    .and_then(|v| v.as_str().map(|s| s.to_string()))
-                    .unwrap_or_default()
-            });
-
-            let sql = format!(
-                r#"
-            INSERT INTO {TASKS} (
-                id, type, status, params, result, error, metadata,
-                auth_config, webhooks, cleanup, created_at, updated_at, completed_at, ttl,
-                tags, assign_mode, cost, assigned_worker, disconnect_policy,
-                execution_deadline_at, task_version, cleanup_policy_version, cleanup_resolved_at, cleanup_due_at
-            ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                $15, $16, $17, $18, $19,
-                CASE
-                    WHEN $20
-                    THEN FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT
-                        + $21 * 1000
-                    ELSE NULL
-                END,
-                0, $22, $23, $24
-            )
-            ON CONFLICT (id) DO UPDATE SET
-                status = EXCLUDED.status,
-                result = EXCLUDED.result,
-                error = EXCLUDED.error,
-                metadata = EXCLUDED.metadata,
-                updated_at = EXCLUDED.updated_at,
-                completed_at = EXCLUDED.completed_at,
-                ttl = EXCLUDED.ttl,
-                tags = EXCLUDED.tags,
-                assign_mode = EXCLUDED.assign_mode,
-                cost = EXCLUDED.cost,
-                assigned_worker = EXCLUDED.assigned_worker,
-                disconnect_policy = EXCLUDED.disconnect_policy,
-                execution_deadline_at = CASE
-                    WHEN EXCLUDED.execution_deadline_at IS NULL THEN NULL
-                    WHEN {TASKS}.execution_deadline_at IS NULL
-                        OR {TASKS}.status = 'paused'
-                        OR {TASKS}.ttl IS DISTINCT FROM EXCLUDED.ttl
-                    THEN EXCLUDED.execution_deadline_at
-                    ELSE {TASKS}.execution_deadline_at
-                END,
-                cleanup_due_at = CASE WHEN {TASKS}.cleanup_policy_version = 1 THEN EXCLUDED.cleanup_due_at ELSE NULL END,
-                task_version = {TASKS}.task_version + 1,
-                ttl_claim_token = NULL,
-                ttl_claim_until = NULL
-            WHERE {TASKS}.status NOT IN ('completed', 'failed', 'timeout', 'cancelled')
-               OR {TASKS}.status = EXCLUDED.status
-            RETURNING id
-            "#
-            );
-
-            let status_str = serde_json::to_value(&task.status)
-                .map(|v| v.as_str().unwrap_or("pending").to_string())?;
-
-            let saved = sqlx::query(&sql)
-                .bind(&task.id)
-                .bind(&task.r#type)
-                .bind(&status_str)
-                .bind(&params_json)
-                .bind(&result_json)
-                .bind(&error_json)
-                .bind(&metadata_json)
-                .bind(&auth_config_json)
-                .bind(&webhooks_json)
-                .bind(&cleanup_json)
-                .bind(created_at)
-                .bind(updated_at)
-                .bind(completed_at)
-                .bind(ttl)
-                .bind(&tags_json)
-                .bind(&assign_mode_str)
-                .bind(cost_i32)
-                .bind(&task.assigned_worker)
-                .bind(&disconnect_policy_str)
-                .bind(has_execution_deadline(&task))
-                .bind(task.ttl.unwrap_or(0) as i64)
-            .bind(task.cleanup_policy_version.map(i32::from))
-            .bind(task.cleanup_resolved_at.map(|v| v as i64))
-            .bind(next_deadline(&task))
-                .fetch_optional(&mut *tx)
-                .await?;
-            if saved.is_none() {
-                return Err(Box::new(StorageFenceConflictError::new(format!(
-                    "Durable terminal task cannot be overwritten: {}",
-                    task.id
-                ))) as BoxError);
-            }
-
+            save_task_pg_tx(&mut tx, &task).await?;
             tx.commit().await?;
             Ok(())
         })
@@ -3491,4 +3379,159 @@ mod tests {
         let v = serde_json::to_value(&data).unwrap();
         assert_eq!(v["reason"], "timeout");
     }
+}
+
+async fn save_task_pg_tx(tx: &mut Transaction<'_ , Postgres>, task: &Task) -> Result<(), BoxError> {
+            let params_json: Option<JsonValue> = task
+                .params
+                .as_ref()
+                .map(|p| serde_json::to_value(p).unwrap_or(JsonValue::Null));
+            let result_json: Option<JsonValue> = task
+                .result
+                .as_ref()
+                .map(|r| serde_json::to_value(r).unwrap_or(JsonValue::Null));
+            let error_json: Option<JsonValue> = task
+                .error
+                .as_ref()
+                .map(|e| serde_json::to_value(e).unwrap_or(JsonValue::Null));
+            let metadata_json: Option<JsonValue> = task
+                .metadata
+                .as_ref()
+                .map(|m| serde_json::to_value(m).unwrap_or(JsonValue::Null));
+            let auth_config_json: Option<JsonValue> = task
+                .auth_config
+                .as_ref()
+                .map(|a| serde_json::to_value(a).unwrap_or(JsonValue::Null));
+            let webhooks_json: Option<JsonValue> = task
+                .webhooks
+                .as_ref()
+                .map(|w| serde_json::to_value(w).unwrap_or(JsonValue::Null));
+            let cleanup_json: Option<JsonValue> = task
+                .cleanup
+                .as_ref()
+                .map(|c| serde_json::to_value(c).unwrap_or(JsonValue::Null));
+
+            let created_at = task.created_at as i64;
+            let updated_at = task.updated_at as i64;
+            let completed_at = task.completed_at.map(|v| v as i64);
+            let ttl = task.ttl.map(|v| v as i32);
+
+            let tags_json: Option<JsonValue> = task
+                .tags
+                .as_ref()
+                .map(|t| serde_json::to_value(t).unwrap_or(JsonValue::Null));
+            let assign_mode_str: Option<String> = task.assign_mode.as_ref().map(|m| {
+                serde_json::to_value(m)
+                    .ok()
+                    .and_then(|v| v.as_str().map(|s| s.to_string()))
+                    .unwrap_or_default()
+            });
+            let cost_i32: Option<i32> = task.cost.map(|c| c as i32);
+            let disconnect_policy_str: Option<String> = task.disconnect_policy.as_ref().map(|d| {
+                serde_json::to_value(d)
+                    .ok()
+                    .and_then(|v| v.as_str().map(|s| s.to_string()))
+                    .unwrap_or_default()
+            });
+
+            let sql = format!(
+                r#"
+            INSERT INTO {TASKS} (
+                id, type, status, params, result, error, metadata,
+                auth_config, webhooks, cleanup, created_at, updated_at, completed_at, ttl,
+                tags, assign_mode, cost, assigned_worker, disconnect_policy,
+                execution_deadline_at, task_version, cleanup_policy_version, cleanup_resolved_at, cleanup_due_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+                $15, $16, $17, $18, $19,
+                CASE
+                    WHEN $20
+                    THEN FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT
+                        + $21 * 1000
+                    ELSE NULL
+                END,
+                0, $22, $23, $24
+            )
+            ON CONFLICT (id) DO UPDATE SET
+                status = EXCLUDED.status,
+                result = EXCLUDED.result,
+                error = EXCLUDED.error,
+                metadata = EXCLUDED.metadata,
+                updated_at = EXCLUDED.updated_at,
+                completed_at = EXCLUDED.completed_at,
+                ttl = EXCLUDED.ttl,
+                tags = EXCLUDED.tags,
+                assign_mode = EXCLUDED.assign_mode,
+                cost = EXCLUDED.cost,
+                assigned_worker = EXCLUDED.assigned_worker,
+                disconnect_policy = EXCLUDED.disconnect_policy,
+                execution_deadline_at = CASE
+                    WHEN EXCLUDED.execution_deadline_at IS NULL THEN NULL
+                    WHEN {TASKS}.execution_deadline_at IS NULL
+                        OR {TASKS}.status = 'paused'
+                        OR {TASKS}.ttl IS DISTINCT FROM EXCLUDED.ttl
+                    THEN EXCLUDED.execution_deadline_at
+                    ELSE {TASKS}.execution_deadline_at
+                END,
+                cleanup_due_at = CASE WHEN {TASKS}.cleanup_policy_version = 1 THEN EXCLUDED.cleanup_due_at ELSE NULL END,
+                task_version = {TASKS}.task_version + 1,
+                ttl_claim_token = NULL,
+                ttl_claim_until = NULL
+            WHERE {TASKS}.status NOT IN ('completed', 'failed', 'timeout', 'cancelled')
+               OR {TASKS}.status = EXCLUDED.status
+            RETURNING id
+            "#
+            );
+
+            let status_str = serde_json::to_value(&task.status)
+                .map(|v| v.as_str().unwrap_or("pending").to_string())?;
+
+            let saved = sqlx::query(&sql)
+                .bind(&task.id)
+                .bind(&task.r#type)
+                .bind(&status_str)
+                .bind(&params_json)
+                .bind(&result_json)
+                .bind(&error_json)
+                .bind(&metadata_json)
+                .bind(&auth_config_json)
+                .bind(&webhooks_json)
+                .bind(&cleanup_json)
+                .bind(created_at)
+                .bind(updated_at)
+                .bind(completed_at)
+                .bind(ttl)
+                .bind(&tags_json)
+                .bind(&assign_mode_str)
+                .bind(cost_i32)
+                .bind(&task.assigned_worker)
+                .bind(&disconnect_policy_str)
+                .bind(has_execution_deadline(task))
+                .bind(task.ttl.unwrap_or(0) as i64)
+            .bind(task.cleanup_policy_version.map(i32::from))
+            .bind(task.cleanup_resolved_at.map(|v| v as i64))
+            .bind(next_deadline(task))
+                .fetch_optional(&mut **tx)
+                .await?;
+            if saved.is_none() {
+                return Err(Box::new(StorageFenceConflictError::new(format!(
+                    "Durable terminal task cannot be overwritten: {}",
+                    task.id
+                ))) as BoxError);
+            }
+
+    Ok(())
+}
+
+async fn validate_restore_pg(tx: &mut Transaction<'_, Postgres>, data: &taskcast_core::TaskArchiveRestoreData, options: Option<taskcast_core::TaskArchiveImportOptions>) -> Result<bool, BoxError> {
+    let row = sqlx::query("SELECT creation_token FROM taskcast_tasks WHERE id = $1 FOR UPDATE").bind(&data.task.id).fetch_optional(&mut **tx).await?;
+    let current: Option<String> = row.as_ref().and_then(|r| r.get("creation_token"));
+    if data.expected_creation_token.as_ref().is_some_and(|token| token != &current.unwrap_or_default()) { return Err(Box::new(StorageFenceConflictError::new("Archive restore generation changed"))); }
+    if row.is_some() && !options.unwrap_or_default().overwrite { return Err(integrity("Task already exists")); }
+    for event in &data.events {
+        if sqlx::query("SELECT id FROM taskcast_events WHERE id = $1 AND task_id <> $2").bind(&event.id).bind(&data.task.id).fetch_optional(&mut **tx).await?.is_some() {
+            return Err(integrity("Archive event id conflicts with another task"));
+        }
+    }
+    Ok(row.is_some())
 }

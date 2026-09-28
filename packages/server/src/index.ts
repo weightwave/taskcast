@@ -551,7 +551,7 @@ export function createTaskcastApp(opts: TaskcastServerOptions): TaskcastApp {
   // CORS middleware
   if (opts.cors) {
     const origin = opts.cors === true ? '*' : opts.cors.origin
-    app.use('*', cors({ origin }))
+    app.use('*', cors({ origin, exposeHeaders: ['X-Taskcast-History-Expired'] }))
   }
 
   app.get('/', (c) => c.json({

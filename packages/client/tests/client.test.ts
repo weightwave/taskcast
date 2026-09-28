@@ -357,3 +357,17 @@ describe('TaskcastClient', () => {
     })
   })
 })
+
+
+it('notifies expiry before done without requiring the new callback', async () => {
+  const makeClient = () => new TaskcastClient({ baseUrl: 'http://test', fetch: vi.fn().mockResolvedValue(makeSSEResponse([
+    ...sseEvent('taskcast.history_expired', { taskId: 't', expiredAt: 123 }),
+    ...sseEvent('taskcast.done', { reason: 'failed' }),
+  ])) })
+  const calls: unknown[] = []
+  await makeClient().subscribe('t', { onEvent: vi.fn(), onHistoryExpired: info => calls.push(info), onDone: reason => calls.push(reason) })
+  expect(calls).toEqual([{ taskId: 't', expiredAt: 123 }, 'failed'])
+  const onDone = vi.fn()
+  await makeClient().subscribe('t', { onEvent: vi.fn(), onDone })
+  expect(onDone).toHaveBeenCalledWith('failed')
+})
