@@ -9,6 +9,9 @@ use taskcast_core::{
 
 fn make_task() -> Task {
     Task {
+        cleanup_policy_version: None,
+        cleanup_resolved_at: None,
+        history_expired_at: None,
         id: "task-1".to_string(),
         status: TaskStatus::Running,
         created_at: 1_000.0,

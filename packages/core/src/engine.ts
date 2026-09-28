@@ -1,3 +1,4 @@
+import { resolveTaskCleanupPolicy } from './cleanup-policy.js'
 import { ulid } from 'ulidx'
 import { canTransition, isTerminal, isSuspended } from './state-machine.js'
 import { processSeries } from './series.js'
@@ -81,6 +82,7 @@ export class InvalidTransitionError extends Error {
 }
 
 interface TaskEngineOptionsBase {
+  cleanup?: import('./cleanup-policy.js').ResolvedCleanupConfig
   broadcast: BroadcastProvider
   hooks?: TaskcastHooks
   storageLockTtlMs?: number
@@ -141,6 +143,7 @@ export interface StorageReleaseSweepResult {
 }
 
 export class TaskEngine {
+  private cleanup: import('./cleanup-policy.js').ResolvedCleanupConfig
   private static readonly CREATION_CLAIM_TTL_MS = 30_000
   private shortTermStore: ShortTermStore
   private longTermStore: LongTermStore | undefined
@@ -156,6 +159,7 @@ export class TaskEngine {
   private _emitChains = new Map<string, Promise<void>>()
 
   constructor(opts: TaskEngineOptions) {
+    this.cleanup = structuredClone(opts.cleanup ?? { enabled: false, rules: [] })
     if ('shortTerm' in opts && 'shortTermStore' in opts) {
       throw new Error('Cannot specify both shortTerm and shortTermStore')
     }
@@ -257,6 +261,7 @@ export class TaskEngine {
       ...(input.ttl !== undefined && { ttl: input.ttl }),
       ...(input.webhooks !== undefined && { webhooks: input.webhooks }),
       ...(input.cleanup !== undefined && { cleanup: input.cleanup }),
+      ...resolveTaskCleanupPolicy(input.type, input.cleanup, this.cleanup, now),
       ...(input.authConfig !== undefined && { authConfig: input.authConfig }),
       ...(input.tags !== undefined && { tags: input.tags }),
       ...(input.assignMode !== undefined && { assignMode: input.assignMode }),

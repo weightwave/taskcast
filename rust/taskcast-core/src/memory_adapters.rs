@@ -2482,6 +2482,9 @@ mod tests {
 
     fn make_task(id: &str) -> Task {
         Task {
+            cleanup_policy_version: None,
+            cleanup_resolved_at: None,
+            history_expired_at: None,
             id: id.to_string(),
             r#type: Some("test".to_string()),
             status: TaskStatus::Running,

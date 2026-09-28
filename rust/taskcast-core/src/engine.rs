@@ -129,6 +129,7 @@ struct ObservedHistory {
 }
 
 pub struct TaskEngine {
+    cleanup: crate::cleanup_policy::ResolvedCleanupConfig,
     short_term_store: Arc<dyn ShortTermStore>,
     broadcast: Arc<dyn BroadcastProvider>,
     long_term_store: Option<Arc<dyn LongTermStore>>,
@@ -224,6 +225,7 @@ impl TaskEngine {
             }
         });
         Self {
+            cleanup: crate::cleanup_policy::ResolvedCleanupConfig::default(),
             short_term_store: opts.short_term_store,
             broadcast: opts.broadcast,
             long_term_store: opts.long_term_store,
@@ -235,6 +237,17 @@ impl TaskEngine {
             storage_lifecycle_listeners,
             emit_locks,
         }
+    }
+
+    pub fn with_cleanup_config(
+        mut self,
+        cleanup: crate::cleanup_policy::ResolvedCleanupConfig,
+    ) -> Result<Self, crate::config::ConfigError> {
+        if cleanup.enabled {
+            crate::cleanup_policy::validate_cleanup_rules(&cleanup.rules)?;
+        }
+        self.cleanup = cleanup;
+        Ok(self)
     }
 
     /// Register a callback that fires whenever a task transitions status.
@@ -286,7 +299,17 @@ impl TaskEngine {
         }
 
         let now = now_millis();
+        let resolved_cleanup = crate::cleanup_policy::resolve_task_cleanup_policy(
+            input.r#type.as_deref(),
+            input.cleanup.as_ref(),
+            &self.cleanup,
+            now,
+        )
+        .map_err(|err| EngineError::InvalidInput(err.to_string()))?;
         let task = Task {
+            cleanup_policy_version: resolved_cleanup.as_ref().map(|p| p.cleanup_policy_version),
+            cleanup_resolved_at: resolved_cleanup.as_ref().map(|p| p.cleanup_resolved_at),
+            history_expired_at: None,
             id,
             status: TaskStatus::Pending,
             created_at: now,
@@ -296,7 +319,7 @@ impl TaskEngine {
             metadata: input.metadata,
             ttl: input.ttl,
             webhooks: input.webhooks,
-            cleanup: input.cleanup,
+            cleanup: resolved_cleanup.map(|p| p.cleanup).or(input.cleanup),
             auth_config: input.auth_config,
             result: None,
             error: None,
@@ -2940,6 +2963,9 @@ mod tests {
         let long_term_store = Arc::new(MockLongTermStore::new());
         // Save directly to long_term_store, bypassing short_term_store
         let task = Task {
+            cleanup_policy_version: None,
+            cleanup_resolved_at: None,
+            history_expired_at: None,
             id: "lt-only".to_string(),
             status: TaskStatus::Completed,
             created_at: 1000.0,

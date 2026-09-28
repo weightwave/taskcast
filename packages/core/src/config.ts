@@ -53,6 +53,7 @@ export interface TaskcastConfig {
     }
   }
   cleanup?: {
+    enabled?: boolean
     rules?: unknown[]
   }
   workers?: {

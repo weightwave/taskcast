@@ -113,6 +113,9 @@ mod tests {
 
     fn make_task(status: TaskStatus) -> Task {
         Task {
+            cleanup_policy_version: None,
+            cleanup_resolved_at: None,
+            history_expired_at: None,
             id: "task_01".to_string(),
             r#type: Some("crawl".to_string()),
             status,

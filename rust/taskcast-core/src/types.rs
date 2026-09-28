@@ -366,6 +366,12 @@ pub struct Task {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cleanup: Option<CleanupConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub cleanup_policy_version: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cleanup_resolved_at: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub history_expired_at: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tags: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub assign_mode: Option<AssignMode>,
@@ -1782,6 +1788,9 @@ mod tests {
     #[test]
     fn task_minimal_serializes_with_correct_field_names() {
         let task = Task {
+            cleanup_policy_version: None,
+            cleanup_resolved_at: None,
+            history_expired_at: None,
             id: "task_01".to_string(),
             r#type: None,
             status: TaskStatus::Pending,
@@ -1832,6 +1841,9 @@ mod tests {
         params.insert("url".to_string(), json!("https://example.com"));
 
         let task = Task {
+            cleanup_policy_version: None,
+            cleanup_resolved_at: None,
+            history_expired_at: None,
             id: "task_02".to_string(),
             r#type: Some("crawl".to_string()),
             status: TaskStatus::Completed,
@@ -1943,6 +1955,9 @@ mod tests {
     #[test]
     fn task_roundtrip_serialization() {
         let task = Task {
+            cleanup_policy_version: None,
+            cleanup_resolved_at: None,
+            history_expired_at: None,
             id: "task_rt".to_string(),
             r#type: Some("test".to_string()),
             status: TaskStatus::Running,
@@ -2425,6 +2440,9 @@ mod tests {
     fn optional_fields_are_absent_not_null_in_json() {
         // This is critical: TypeScript omits undefined fields, so Rust must too
         let task = Task {
+            cleanup_policy_version: None,
+            cleanup_resolved_at: None,
+            history_expired_at: None,
             id: "t".to_string(),
             r#type: None,
             status: TaskStatus::Pending,
@@ -2517,6 +2535,9 @@ mod tests {
     #[test]
     fn cleanup_config_nested_serializes_correctly() {
         let task = Task {
+            cleanup_policy_version: None,
+            cleanup_resolved_at: None,
+            history_expired_at: None,
             id: "t".to_string(),
             r#type: None,
             status: TaskStatus::Pending,
@@ -2588,6 +2609,9 @@ mod tests {
     fn taskcast_hooks_default_impls_do_not_panic() {
         let hooks = NoopHooks;
         let task = Task {
+            cleanup_policy_version: None,
+            cleanup_resolved_at: None,
+            history_expired_at: None,
             id: "t".to_string(),
             r#type: None,
             status: TaskStatus::Failed,
@@ -2809,6 +2833,9 @@ mod tests {
     async fn stub_store_all_methods_return_ok() {
         let store = StubStore;
         let task = Task {
+            cleanup_policy_version: None,
+            cleanup_resolved_at: None,
+            history_expired_at: None,
             id: "x".to_string(),
             r#type: None,
             status: TaskStatus::Pending,

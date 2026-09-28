@@ -10,6 +10,9 @@ use taskcast_server::{StorageLifecycleWorker, StorageLifecycleWorkerOptions};
 
 fn task(id: &str, status: TaskStatus) -> Task {
     Task {
+        cleanup_policy_version: None,
+        cleanup_resolved_at: None,
+        history_expired_at: None,
         id: id.to_string(),
         r#type: None,
         status,

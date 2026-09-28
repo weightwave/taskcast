@@ -157,6 +157,9 @@ export interface Task {
   authConfig?: TaskAuthConfig
   webhooks?: WebhookConfig[]
   cleanup?: { rules: CleanupRule[] }
+  cleanupPolicyVersion?: 1
+  cleanupResolvedAt?: number
+  historyExpiredAt?: number
   tags?: string[]
   assignMode?: AssignMode
   cost?: number

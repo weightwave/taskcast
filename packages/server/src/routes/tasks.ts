@@ -32,6 +32,7 @@ import {
   collapseAccumulateSeries,
 } from '@taskcast/core'
 import type { TaskArchive, TaskEngine, CreateTaskInput, PublishEventInput, SinceCursor, TaskError, BlockedRequest, TaskFilter, TaskStatus, EventQueryOptions } from '@taskcast/core'
+import { CleanupPolicyError } from '@taskcast/core'
 
 // ─── Route Definitions ─────────────────────────────────────────────────────
 
@@ -278,6 +279,7 @@ export function createTasksRouter(
       return c.json(task, 201)
     } catch (err) {
       if (err instanceof TaskConflictError) return c.json({ error: err.message }, 409)
+      if (err instanceof CleanupPolicyError) return c.json({ error: err.message }, 400)
       const msg = err instanceof Error ? err.message : String(err)
       if (msg.includes('Invalid TTL') || msg.includes('Invalid cost')) return c.json({ error: msg }, 400)
       if (findDependencyUnavailableError(err)) return dependencyErrorResponse(c, err, 500)

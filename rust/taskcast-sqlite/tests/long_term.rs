@@ -71,6 +71,9 @@ async fn preserve_optional_fields_on_round_trip() {
 async fn handle_task_with_no_optional_fields() {
     let ctx = setup().await;
     let task = taskcast_core::types::Task {
+        cleanup_policy_version: None,
+        cleanup_resolved_at: None,
+        history_expired_at: None,
         id: "minimal".to_string(),
         r#type: None,
         status: TaskStatus::Pending,

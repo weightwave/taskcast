@@ -35,6 +35,9 @@ pub fn row_to_task(row: &SqliteRow) -> Task {
     let disconnect_policy_str: Option<String> = row.get("disconnect_policy");
 
     Task {
+        cleanup_policy_version: None,
+        cleanup_resolved_at: None,
+        history_expired_at: None,
         id: row.get("id"),
         r#type: row.get("type"),
         status,

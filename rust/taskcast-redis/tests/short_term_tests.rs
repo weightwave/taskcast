@@ -26,6 +26,9 @@ use testcontainers::GenericImage;
 
 fn make_task(id: &str) -> Task {
     Task {
+        cleanup_policy_version: None,
+        cleanup_resolved_at: None,
+        history_expired_at: None,
         id: id.to_string(),
         r#type: None,
         status: TaskStatus::Pending,
@@ -165,6 +168,9 @@ async fn preserve_optional_fields_on_round_trip() {
     let store = make_store(&redis_url).await;
 
     let task = Task {
+        cleanup_policy_version: None,
+        cleanup_resolved_at: None,
+        history_expired_at: None,
         id: "task-full".to_string(),
         r#type: Some("llm.chat".to_string()),
         status: TaskStatus::Completed,
@@ -228,6 +234,9 @@ async fn handle_task_with_no_optional_fields() {
     let store = make_store(&redis_url).await;
 
     let task = Task {
+        cleanup_policy_version: None,
+        cleanup_resolved_at: None,
+        history_expired_at: None,
         id: "task-minimal".to_string(),
         r#type: None,
         status: TaskStatus::Pending,

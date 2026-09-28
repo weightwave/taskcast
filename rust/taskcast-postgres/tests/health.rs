@@ -107,6 +107,9 @@ impl Error for CyclicError {
 
 fn make_recovery_task() -> Task {
     Task {
+        cleanup_policy_version: None,
+        cleanup_resolved_at: None,
+        history_expired_at: None,
         id: "task-postgres-recovered".to_string(),
         r#type: None,
         status: TaskStatus::Pending,

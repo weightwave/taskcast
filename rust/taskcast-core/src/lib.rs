@@ -1,6 +1,7 @@
 pub mod archive;
 pub mod canonical_history;
 pub mod cleanup;
+pub mod cleanup_policy;
 pub mod config;
 pub mod dependency;
 pub mod engine;
@@ -19,6 +20,7 @@ pub mod worker_matching;
 pub use archive::*;
 pub use canonical_history::*;
 pub use cleanup::*;
+pub use cleanup_policy::*;
 pub use config::*;
 pub use dependency::*;
 pub use engine::*;

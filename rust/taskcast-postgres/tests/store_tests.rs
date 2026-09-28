@@ -107,6 +107,9 @@ async fn setup() -> (
 
 fn make_task(id: &str) -> Task {
     Task {
+        cleanup_policy_version: None,
+        cleanup_resolved_at: None,
+        history_expired_at: None,
         id: id.to_string(),
         r#type: None,
         status: TaskStatus::Pending,
@@ -1682,6 +1685,9 @@ async fn preserve_optional_fields_on_round_trip() {
 async fn handle_task_with_no_optional_fields() {
     let (store, _container) = setup().await;
     let task = Task {
+        cleanup_policy_version: None,
+        cleanup_resolved_at: None,
+        history_expired_at: None,
         id: "minimal".to_string(),
         r#type: None,
         status: TaskStatus::Pending,

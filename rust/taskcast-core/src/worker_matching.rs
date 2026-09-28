@@ -74,6 +74,9 @@ mod tests {
 
     fn make_task(task_type: Option<&str>, tags: Option<Vec<&str>>) -> Task {
         Task {
+            cleanup_policy_version: None,
+            cleanup_resolved_at: None,
+            history_expired_at: None,
             id: "test-task".to_string(),
             r#type: task_type.map(|s| s.to_string()),
             status: TaskStatus::Pending,

@@ -69,6 +69,9 @@ async fn returns_working_adapters() {
 
     // Verify both adapters are usable
     let task = taskcast_core::types::Task {
+        cleanup_policy_version: None,
+        cleanup_resolved_at: None,
+        history_expired_at: None,
         id: "factory-1".to_string(),
         r#type: None,
         status: TaskStatus::Pending,
@@ -138,6 +141,9 @@ async fn imports_archive_through_paired_sqlite_adapters() {
         version: 1,
         exported_at: 5000.0,
         task: Task {
+            cleanup_policy_version: None,
+            cleanup_resolved_at: None,
+            history_expired_at: None,
             id: "archive-task".to_string(),
             r#type: None,
             status: TaskStatus::Running,
@@ -213,6 +219,9 @@ fn rich_archive(task_id: &str, event_id: &str) -> TaskArchive {
         version: 1,
         exported_at: 5000.0,
         task: Task {
+            cleanup_policy_version: None,
+            cleanup_resolved_at: None,
+            history_expired_at: None,
             id: task_id.to_string(),
             r#type: Some("archive.rich".to_string()),
             status: TaskStatus::Completed,

@@ -223,6 +223,8 @@ pub struct WebhookRetryConfig {
 #[serde(rename_all = "camelCase")]
 pub struct CleanupGlobalConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub rules: Option<Vec<serde_json::Value>>,
 }
 

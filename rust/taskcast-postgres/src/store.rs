@@ -173,6 +173,9 @@ impl PostgresLongTermStore {
             disconnect_policy_str.and_then(|s| serde_json::from_value(JsonValue::String(s)).ok());
 
         Task {
+            cleanup_policy_version: None,
+            cleanup_resolved_at: None,
+            history_expired_at: None,
             id: row.get("id"),
             r#type: row.get("type"),
             status,
