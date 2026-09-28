@@ -66,6 +66,7 @@ async fn seed_and_release(
     hot.save_task(make_task()).await.unwrap();
     durable.save_task(make_task()).await.unwrap();
     let token = HotWriteToken {
+        creation_token: None,
         task_id: "task-1".to_string(),
         storage_epoch: 1,
     };
@@ -148,6 +149,7 @@ async fn reads_stay_cold_and_a_write_restores_only_the_bounded_replay_window() {
             "task-1",
             make_event(1_006),
             &HotWriteToken {
+                creation_token: None,
                 task_id: "task-1".to_string(),
                 storage_epoch: 1,
             },
@@ -163,6 +165,7 @@ async fn rehydration_continues_latest_and_accumulated_series() {
     hot.save_task(make_task()).await.unwrap();
     durable.save_task(make_task()).await.unwrap();
     let token = HotWriteToken {
+        creation_token: None,
         task_id: "task-1".to_string(),
         storage_epoch: 1,
     };

@@ -305,6 +305,7 @@ impl TtlCoordinator {
                 .await?
         } else {
             HotWriteToken {
+                creation_token: None,
                 task_id: projection.task.id.clone(),
                 storage_epoch: metadata.storage_epoch,
             }

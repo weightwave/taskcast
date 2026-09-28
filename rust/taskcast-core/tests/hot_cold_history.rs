@@ -64,6 +64,7 @@ impl LongTermStore for PagingLongTermStore {
         _task_id: &str,
     ) -> Result<Option<TaskStorageMetadata>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Some(TaskStorageMetadata {
+            creation_token: None,
             task_id: "task-1".to_string(),
             storage_state: taskcast_core::StorageState::Hot,
             storage_epoch: 1,
@@ -342,6 +343,7 @@ async fn accumulated_latest_is_identical_before_and_after_release() {
     hot.save_task(task()).await.unwrap();
     durable.save_task(task()).await.unwrap();
     let token = HotWriteToken {
+        creation_token: None,
         task_id: "task-1".to_string(),
         storage_epoch: 1,
     };

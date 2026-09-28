@@ -1778,6 +1778,7 @@ impl ShortTermStore for RedisShortTermStore {
             .await;
         Self::observe_fence_result(&conn, result)?;
         Ok(HotWriteToken {
+            creation_token: None,
             task_id,
             storage_epoch: next_epoch,
         })
@@ -1854,6 +1855,7 @@ impl ShortTermStore for RedisShortTermStore {
         }
         Ok(TerminalProjectionResult {
             token: HotWriteToken {
+                creation_token: None,
                 task_id: task_id.clone(),
                 storage_epoch: next_epoch,
             },

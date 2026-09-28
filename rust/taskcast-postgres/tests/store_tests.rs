@@ -517,6 +517,7 @@ async fn storage_coordinator_persists_integer_cold_timestamp_to_postgres() {
             task_id,
             make_event(task_id, 0),
             &HotWriteToken {
+                creation_token: None,
                 task_id: task_id.to_string(),
                 storage_epoch: 1,
             },

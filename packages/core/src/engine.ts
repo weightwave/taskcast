@@ -34,6 +34,7 @@ import type {
   StorageWriterRegistration,
   HotWriteToken,
   DurableSeriesState,
+  DurableWriteContext,
 } from './types.js'
 import {
   StorageFenceConflictError,
@@ -270,7 +271,7 @@ export class TaskEngine {
     }
     let durableIdentityClaimed = false
     let creationToken: string | null = null
-    if (input.id !== undefined && durable) {
+    if ((input.id !== undefined || task.cleanupPolicyVersion === 1) && durable) {
       if (canFenceCreation) {
         creationToken = ulid()
         durableIdentityClaimed = await durable.claimTaskCreation!(
@@ -478,9 +479,9 @@ export class TaskEngine {
         derivedEvents,
         initialWriteToken!,
       )
-      if (this.longTermStore) await this.longTermStore.saveTask(updated)
+      if (this.longTermStore) await this.longTermStore.saveTask(updated, durableContext(initialWriteToken!))
       for (const event of committed) {
-        await this.finishCommittedEvent(event)
+        await this.finishCommittedEvent(event, undefined, durableContext(initialWriteToken!))
       }
     } else {
       await this.shortTermStore.saveTask(updated)
@@ -1141,15 +1142,15 @@ export class TaskEngine {
           seriesAccField: input.seriesAccField,
         }),
       }
-      let initialStorageEpoch: number | null = null
+      let initialToken: HotWriteToken | undefined
       for (let attempt = 0; attempt < 3; attempt++) {
         const token = await this.storageCoordinator.ensureTaskHotForWrite(
           taskId,
           attempt === 0,
         )
-        if (initialStorageEpoch === null) {
-          initialStorageEpoch = token.storageEpoch
-        } else if (token.storageEpoch !== initialStorageEpoch) {
+        if (!initialToken) {
+          initialToken = token
+        } else if (token.storageEpoch !== initialToken.storageEpoch || token.creationToken !== initialToken.creationToken) {
           throw new StorageFenceConflictError(
             'Task storage epoch changed after the write mutation started',
           )
@@ -1160,7 +1161,7 @@ export class TaskEngine {
             raw,
             token,
           )
-          await this.finishCommittedEvent(result.event, result.accumulatedEvent)
+          await this.finishCommittedEvent(result.event, result.accumulatedEvent, durableContext(token))
           return result.event
         } catch (error) {
           if (!(error instanceof StorageFenceConflictError) || attempt === 2) {
@@ -1224,7 +1225,7 @@ export class TaskEngine {
         const token = attempt === 0
           ? initialToken
           : await coordinator.ensureTaskHotForWrite(task.id, false)
-        if (token.storageEpoch !== initialToken.storageEpoch) {
+        if (token.storageEpoch !== initialToken.storageEpoch || token.creationToken !== initialToken.creationToken) {
           throw new StorageFenceConflictError(
             'Task storage epoch changed after the write mutation started',
           )
@@ -1258,6 +1259,7 @@ export class TaskEngine {
   private async finishCommittedEvent(
     event: TaskEvent,
     accumulatedEvent?: TaskEvent,
+    context?: DurableWriteContext,
   ): Promise<void> {
     const broadcastEvent = accumulatedEvent
       ? { ...event, _accumulatedData: accumulatedEvent.data }
@@ -1266,13 +1268,13 @@ export class TaskEngine {
 
     if (this.longTermStore) {
       const storeEvent = accumulatedEvent ?? event
-      this.persistLongTermEvent(event, accumulatedEvent).catch((err) => {
+      this.persistLongTermEvent(event, accumulatedEvent, context).catch((err) => {
         this.hooks?.onEventDropped?.(storeEvent, String(err))
       })
     }
   }
 
-  private async persistLongTermEvent(event: TaskEvent, accumulatedEvent?: TaskEvent): Promise<void> {
+  private async persistLongTermEvent(event: TaskEvent, accumulatedEvent?: TaskEvent, context?: DurableWriteContext): Promise<void> {
     if (!this.longTermStore) return
 
     if (
@@ -1280,7 +1282,7 @@ export class TaskEngine {
       event.seriesMode === 'latest' &&
       typeof this.longTermStore.replaceLastSeriesEvent === 'function'
     ) {
-      await this.longTermStore.replaceLastSeriesEvent(event.taskId, event.seriesId, event)
+      await this.longTermStore.replaceLastSeriesEvent(event.taskId, event.seriesId, event, context)
       return
     }
 
@@ -1294,12 +1296,17 @@ export class TaskEngine {
         event.seriesId,
         event,
         event.seriesAccField ?? 'delta',
+        context,
       )
       return
     }
 
     // Compatibility fallback for older LongTermStore implementations.
-    await this.longTermStore.saveEvent(accumulatedEvent ?? event)
+    await this.longTermStore.saveEvent(accumulatedEvent ?? event, context)
   }
 
+}
+
+function durableContext(token: HotWriteToken): DurableWriteContext | undefined {
+  return token.creationToken === undefined ? undefined : { creationToken: token.creationToken }
 }

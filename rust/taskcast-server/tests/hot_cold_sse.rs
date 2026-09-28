@@ -201,6 +201,7 @@ async fn publish_during_cold_snapshot_is_delivered_exactly_once() {
             "cold-sse-race",
             running_event(),
             &HotWriteToken {
+                creation_token: None,
                 task_id: "cold-sse-race".to_string(),
                 storage_epoch: 1,
             },

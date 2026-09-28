@@ -9,6 +9,8 @@ use std::future::Future;
 use std::sync::Arc;
 
 use crate::classify_postgres_connectivity;
+use crate::cleanup_store::{self, guard_write, next_deadline};
+use taskcast_core::{CleanupClaim, CleanupBatchResult, DurableWriteContext};
 use taskcast_core::archive::{
     archive_event_record, compute_archive_batch_digest, compute_archive_source_digest,
     compute_archive_source_page_digest, compute_series_state_digest, durable_series_state_record,
@@ -143,7 +145,7 @@ impl PostgresLongTermStore {
     }
 
     /// Convert a database row into a `Task`.
-    fn row_to_task(row: &PgRow) -> Task {
+    pub(crate) fn row_to_task(row: &PgRow) -> Task {
         let status_str: String = row.get("status");
         let status: TaskStatus =
             serde_json::from_value(JsonValue::String(status_str)).unwrap_or(TaskStatus::Pending);
@@ -173,9 +175,9 @@ impl PostgresLongTermStore {
             disconnect_policy_str.and_then(|s| serde_json::from_value(JsonValue::String(s)).ok());
 
         Task {
-            cleanup_policy_version: None,
-            cleanup_resolved_at: None,
-            history_expired_at: None,
+            cleanup_policy_version: row.get::<Option<i32>,_>("cleanup_policy_version").map(|v| v as u8),
+            cleanup_resolved_at: row.get::<Option<i64>,_>("cleanup_resolved_at").map(|v| v as f64),
+            history_expired_at: row.get::<Option<i64>,_>("history_expired_at").map(|v| v as f64),
             id: row.get("id"),
             r#type: row.get("type"),
             status,
@@ -272,6 +274,13 @@ impl Error for BoxedSource {
 
 #[async_trait]
 impl LongTermStore for PostgresLongTermStore {
+    fn supports_terminal_cleanup(&self) -> bool { true }
+    async fn claim_cleanup_tasks(&self, limit: u64, ttl: u64) -> Result<Vec<CleanupClaim>, BoxError> { self.observed(|| cleanup_store::claim(&self.pool, limit, ttl)).await }
+    async fn renew_cleanup_claim(&self, claim: &CleanupClaim, ttl: u64) -> Result<bool, BoxError> { self.observed(|| cleanup_store::renew(&self.pool, claim, ttl)).await }
+    async fn defer_cleanup_claim(&self, claim: &CleanupClaim, delay: u64) -> Result<(), BoxError> { self.observed(|| cleanup_store::defer(&self.pool, claim, delay)).await }
+    async fn begin_task_cleanup(&self, claim: &CleanupClaim, epoch: u64, through: i64) -> Result<bool, BoxError> { self.observed(|| cleanup_store::begin(&self.pool, claim, epoch, through)).await }
+    async fn delete_task_cleanup_batch(&self, claim: &CleanupClaim, limit: u64) -> Result<CleanupBatchResult, BoxError> { self.observed(|| cleanup_store::delete_batch(&self.pool, claim, limit)).await }
+
     fn supports_hot_cold_release(&self) -> bool {
         true
     }
@@ -284,8 +293,12 @@ impl LongTermStore for PostgresLongTermStore {
         true
     }
 
-    async fn save_task(&self, task: Task) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn save_task(&self, task: Task) -> Result<(), BoxError> { self.save_task_with_context(task, None).await }
+
+    async fn save_task_with_context(&self, task: Task, context: Option<&DurableWriteContext>) -> Result<(), BoxError> {
         self.observed(|| async move {
+            let mut tx = self.pool.begin().await?;
+            guard_write(&mut tx, &task.id, context, task.cleanup_policy_version == Some(1)).await?;
             let params_json: Option<JsonValue> = task
                 .params
                 .as_ref()
@@ -344,7 +357,7 @@ impl LongTermStore for PostgresLongTermStore {
                 id, type, status, params, result, error, metadata,
                 auth_config, webhooks, cleanup, created_at, updated_at, completed_at, ttl,
                 tags, assign_mode, cost, assigned_worker, disconnect_policy,
-                execution_deadline_at, task_version
+                execution_deadline_at, task_version, cleanup_policy_version, cleanup_resolved_at, cleanup_due_at
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
                 $15, $16, $17, $18, $19,
@@ -354,7 +367,7 @@ impl LongTermStore for PostgresLongTermStore {
                         + $21 * 1000
                     ELSE NULL
                 END,
-                0
+                0, $22, $23, $24
             )
             ON CONFLICT (id) DO UPDATE SET
                 status = EXCLUDED.status,
@@ -377,6 +390,7 @@ impl LongTermStore for PostgresLongTermStore {
                     THEN EXCLUDED.execution_deadline_at
                     ELSE {TASKS}.execution_deadline_at
                 END,
+                cleanup_due_at = CASE WHEN {TASKS}.cleanup_policy_version = 1 THEN EXCLUDED.cleanup_due_at ELSE NULL END,
                 task_version = {TASKS}.task_version + 1,
                 ttl_claim_token = NULL,
                 ttl_claim_until = NULL
@@ -411,7 +425,10 @@ impl LongTermStore for PostgresLongTermStore {
                 .bind(&disconnect_policy_str)
                 .bind(has_execution_deadline(&task))
                 .bind(task.ttl.unwrap_or(0) as i64)
-                .fetch_optional(&self.pool)
+            .bind(task.cleanup_policy_version.map(i32::from))
+            .bind(task.cleanup_resolved_at.map(|v| v as i64))
+            .bind(next_deadline(&task))
+                .fetch_optional(&mut *tx)
                 .await?;
             if saved.is_none() {
                 return Err(Box::new(StorageFenceConflictError::new(format!(
@@ -420,6 +437,7 @@ impl LongTermStore for PostgresLongTermStore {
                 ))) as BoxError);
             }
 
+            tx.commit().await?;
             Ok(())
         })
         .await
@@ -475,7 +493,7 @@ impl LongTermStore for PostgresLongTermStore {
                 id, type, status, params, result, error, metadata,
                 auth_config, webhooks, cleanup, created_at, updated_at, completed_at, ttl,
                 tags, assign_mode, cost, assigned_worker, disconnect_policy,
-                execution_deadline_at, task_version
+                execution_deadline_at, task_version, cleanup_policy_version, cleanup_resolved_at, cleanup_due_at
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
                 $15, $16, $17, $18, $19,
@@ -485,7 +503,7 @@ impl LongTermStore for PostgresLongTermStore {
                         + $21 * 1000
                     ELSE NULL
                 END,
-                0
+                0, $22, $23, $24
             )
             ON CONFLICT (id) DO NOTHING
             "#
@@ -512,6 +530,9 @@ impl LongTermStore for PostgresLongTermStore {
             .bind(disconnect_policy)
             .bind(has_execution_deadline(&task))
             .bind(task.ttl.unwrap_or(0) as i64)
+            .bind(task.cleanup_policy_version.map(i32::from))
+            .bind(task.cleanup_resolved_at.map(|v| v as i64))
+            .bind(next_deadline(&task))
             .execute(&self.pool)
             .await?;
         Ok(result.rows_affected() == 1)
@@ -573,7 +594,7 @@ impl LongTermStore for PostgresLongTermStore {
                 auth_config, webhooks, cleanup, created_at, updated_at, completed_at, ttl,
                 tags, assign_mode, cost, assigned_worker, disconnect_policy,
                 creation_token, creation_claimed_at, creation_claim_expires_at,
-                creation_completed_at, execution_deadline_at, task_version
+                creation_completed_at, execution_deadline_at, task_version, cleanup_policy_version, cleanup_resolved_at, cleanup_due_at
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
                 $15, $16, $17, $18, $19, $20,
@@ -586,7 +607,7 @@ impl LongTermStore for PostgresLongTermStore {
                         + $23 * 1000
                     ELSE NULL
                 END,
-                0
+                0, $24, $25, $26
             )
             ON CONFLICT (id) DO UPDATE SET
                 type = EXCLUDED.type,
@@ -598,6 +619,9 @@ impl LongTermStore for PostgresLongTermStore {
                 auth_config = EXCLUDED.auth_config,
                 webhooks = EXCLUDED.webhooks,
                 cleanup = EXCLUDED.cleanup,
+                cleanup_policy_version = EXCLUDED.cleanup_policy_version,
+                cleanup_resolved_at = EXCLUDED.cleanup_resolved_at,
+                cleanup_due_at = EXCLUDED.cleanup_due_at,
                 created_at = EXCLUDED.created_at,
                 updated_at = EXCLUDED.updated_at,
                 completed_at = EXCLUDED.completed_at,
@@ -663,6 +687,9 @@ impl LongTermStore for PostgresLongTermStore {
             .bind(claim_ttl_ms as i64)
             .bind(has_execution_deadline(&task))
             .bind(task.ttl.unwrap_or(0) as i64)
+            .bind(task.cleanup_policy_version.map(i32::from))
+            .bind(task.cleanup_resolved_at.map(|v| v as i64))
+            .bind(next_deadline(&task))
             .execute(&self.pool)
             .await?;
         Ok(result.rows_affected() == 1)
@@ -743,11 +770,12 @@ impl LongTermStore for PostgresLongTermStore {
         .await
     }
 
-    async fn save_event(
-        &self,
-        event: TaskEvent,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn save_event(&self, event: TaskEvent) -> Result<(), BoxError> { self.save_event_with_context(event, None).await }
+
+    async fn save_event_with_context(&self, event: TaskEvent, context: Option<&DurableWriteContext>) -> Result<(), BoxError> {
         self.observed(|| async move {
+            let mut tx = self.pool.begin().await?;
+            guard_write(&mut tx, &event.task_id, context, false).await?;
         let sql = format!(
             r#"
             INSERT INTO {EVENTS} (
@@ -786,23 +814,22 @@ impl LongTermStore for PostgresLongTermStore {
             .bind(&event.series_id)
             .bind(&series_mode_str)
             .bind(&event.series_acc_field)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
 
-        Ok(())
+        tx.commit().await?;
+            Ok(())
         })
         .await
     }
 
-    async fn replace_last_series_event(
-        &self,
-        task_id: &str,
-        series_id: &str,
-        event: TaskEvent,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn replace_last_series_event(&self, task_id: &str, series_id: &str, event: TaskEvent) -> Result<(), BoxError> { self.replace_last_series_event_with_context(task_id, series_id, event, None).await }
+
+    async fn replace_last_series_event_with_context(&self, task_id: &str, series_id: &str, event: TaskEvent, context: Option<&DurableWriteContext>) -> Result<(), BoxError> {
         self.observed(|| async move {
             let mode = series_mode_to_string(&SeriesMode::Latest).unwrap();
             let mut tx = self.pool.begin().await?;
+            guard_write(&mut tx, task_id, context, false).await?;
             let archive_watermark = lock_task_for_series_write_pg_tx(&mut tx, task_id).await?;
             let committed = get_series_state_for_update_pg_tx(&mut tx, task_id, series_id).await?;
             if archive_watermark >= event.index as i64
@@ -876,17 +903,14 @@ impl LongTermStore for PostgresLongTermStore {
         .await
     }
 
-    async fn accumulate_series(
-        &self,
-        task_id: &str,
-        series_id: &str,
-        event: TaskEvent,
-        field: &str,
-    ) -> Result<TaskEvent, Box<dyn std::error::Error + Send + Sync>> {
+    async fn accumulate_series(&self, task_id: &str, series_id: &str, event: TaskEvent, field: &str) -> Result<TaskEvent, BoxError> { self.accumulate_series_with_context(task_id, series_id, event, field, None).await }
+
+    async fn accumulate_series_with_context(&self, task_id: &str, series_id: &str, event: TaskEvent, field: &str, context: Option<&DurableWriteContext>) -> Result<TaskEvent, BoxError> {
         self.observed(|| async move {
             let mode = series_mode_to_string(&SeriesMode::Accumulate).unwrap();
             let source_index = event.index;
             let mut tx = self.pool.begin().await?;
+            guard_write(&mut tx, task_id, context, false).await?;
             let archive_watermark = lock_task_for_series_write_pg_tx(&mut tx, task_id).await?;
             let committed = get_series_state_for_update_pg_tx(&mut tx, task_id, series_id).await?;
             if archive_watermark >= event.index as i64
@@ -975,7 +999,7 @@ impl LongTermStore for PostgresLongTermStore {
     ) -> Result<Option<TaskStorageMetadata>, Box<dyn std::error::Error + Send + Sync>> {
         let sql = format!(
             "SELECT id, storage_state, storage_epoch, active_release_generation, \
-             archive_watermark, last_event_at, cold_at, execution_deadline_at, task_version \
+             archive_watermark, last_event_at, cold_at, execution_deadline_at, task_version, creation_token \
              FROM {TASKS} WHERE id = $1"
         );
         let row = sqlx::query(&sql)
@@ -1114,7 +1138,8 @@ impl LongTermStore for PostgresLongTermStore {
             SET status = 'timeout', result = $1, error = $2, metadata = $3,
                 updated_at = $4, completed_at = $5, assigned_worker = NULL,
                 execution_deadline_at = NULL, task_version = task_version + 1,
-                ttl_claim_token = NULL, ttl_claim_until = NULL
+                ttl_claim_token = NULL, ttl_claim_until = NULL,
+                cleanup_due_at = CASE WHEN cleanup_policy_version = 1 THEN $7 ELSE NULL END
             WHERE id = $6
             "#
         );
@@ -1130,6 +1155,7 @@ impl LongTermStore for PostgresLongTermStore {
             .bind(task.updated_at as i64)
             .bind(task.completed_at.map(|value| value as i64))
             .bind(&claim.task_id)
+            .bind(next_deadline(&task))
             .execute(&mut *tx)
             .await?;
         insert_event_pg_tx(&mut tx, &event).await?;
@@ -1450,7 +1476,7 @@ impl LongTermStore for PostgresLongTermStore {
 
         let mut tx = self.pool.begin().await?;
         let task_sql = format!(
-            "SELECT storage_state, storage_epoch, active_release_generation, archive_watermark \
+            "SELECT storage_state, storage_epoch, active_release_generation, archive_watermark, history_expired_at \
              FROM {TASKS} WHERE id = $1 FOR UPDATE"
         );
         let task = sqlx::query(&task_sql)
@@ -1464,6 +1490,7 @@ impl LongTermStore for PostgresLongTermStore {
                 ))
             })?;
 
+        if task.get::<Option<i64>,_>("history_expired_at").is_some() { return Err(Box::new(StorageFenceConflictError::new("Task history has expired"))); }
         let existing_sql = format!(
             "SELECT * FROM {ARCHIVE_GENERATIONS} \
              WHERE task_id = $1 AND generation = $2 FOR UPDATE"
@@ -1553,7 +1580,7 @@ impl LongTermStore for PostgresLongTermStore {
 
         let mut tx = self.pool.begin().await?;
         let task_sql = format!(
-            "SELECT storage_state, storage_epoch, active_release_generation \
+            "SELECT storage_state, storage_epoch, active_release_generation, history_expired_at \
              FROM {TASKS} WHERE id = $1 FOR UPDATE"
         );
         let task_row = sqlx::query(&task_sql)
@@ -1561,6 +1588,7 @@ impl LongTermStore for PostgresLongTermStore {
             .fetch_optional(&mut *tx)
             .await?
             .ok_or_else(|| integrity(&format!("Archive task does not exist: {task_id}")))?;
+        if task_row.get::<Option<i64>,_>("history_expired_at").is_some() { return Err(Box::new(StorageFenceConflictError::new("Task history has expired"))); }
         let generation_sql = format!(
             "SELECT * FROM {ARCHIVE_GENERATIONS} \
              WHERE task_id = $1 AND generation = $2 FOR UPDATE"
@@ -1737,6 +1765,7 @@ impl LongTermStore for PostgresLongTermStore {
             .fetch_optional(&mut *tx)
             .await?
             .ok_or_else(|| integrity(&format!("Archive task does not exist: {task_id}")))?;
+        if task_row.get::<Option<i64>,_>("history_expired_at").is_some() { return Err(Box::new(StorageFenceConflictError::new("Task history has expired"))); }
         let generation_sql = format!(
             "SELECT * FROM {ARCHIVE_GENERATIONS} \
              WHERE task_id = $1 AND generation = $2 FOR UPDATE"
@@ -2035,6 +2064,7 @@ impl LongTermStore for PostgresLongTermStore {
             r#"
             SELECT GREATEST(
                 task.archive_watermark,
+                COALESCE(task.history_expired_through_index, -1),
                 COALESCE((SELECT MAX(event.idx) FROM {EVENTS} event WHERE event.task_id = task.id), -1),
                 COALESCE((SELECT MAX(series.through_index) FROM {SERIES_STATE} series WHERE series.task_id = task.id), -1)
             ) AS last_index
@@ -2619,6 +2649,7 @@ fn row_to_storage_metadata(
 ) -> Result<TaskStorageMetadata, Box<dyn std::error::Error + Send + Sync>> {
     let storage_state: String = row.get("storage_state");
     Ok(TaskStorageMetadata {
+        creation_token: row.get("creation_token"),
         task_id: row.get("id"),
         storage_state: serde_json::from_value(JsonValue::String(storage_state))
             .map_err(|_| integrity("Durable storage state is invalid"))?,
@@ -2760,7 +2791,8 @@ async fn update_task_pg_tx(
         UPDATE {TASKS}
         SET status = $1, result = $2, error = $3, metadata = $4,
             updated_at = $5, completed_at = $6, tags = $7, assign_mode = $8,
-            cost = $9, assigned_worker = $10, disconnect_policy = $11
+            cost = $9, assigned_worker = $10, disconnect_policy = $11,
+            cleanup_due_at = CASE WHEN cleanup_policy_version = 1 THEN $13 ELSE NULL END
         WHERE id = $12
         "#
     );
@@ -2799,6 +2831,7 @@ async fn update_task_pg_tx(
         .bind(&task.assigned_worker)
         .bind(disconnect_policy)
         .bind(&task.id)
+        .bind(next_deadline(task))
         .execute(&mut **tx)
         .await?;
     Ok(())

@@ -1,3 +1,4 @@
+mod cleanup_store;
 mod health;
 mod store;
 

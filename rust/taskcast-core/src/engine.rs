@@ -1,3 +1,4 @@
+use crate::types::DurableWriteContext;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -336,7 +337,7 @@ impl TaskEngine {
 
         let mut durable_identity_claimed = false;
         let mut creation_token = None;
-        if input.id.is_some() {
+        if input.id.is_some() || task.cleanup_policy_version == Some(1) {
             if let Some(ref long_term_store) = self.long_term_store {
                 if long_term_store.supports_task_creation_claims() {
                     let token = ulid::Ulid::new().to_string();
@@ -624,6 +625,7 @@ impl TaskEngine {
         }
 
         if self.storage_coordinator.is_some() {
+            let context = initial_write_token.as_ref().and_then(durable_context);
             let committed = self
                 .commit_task_events_for_mutation(
                     updated.clone(),
@@ -634,10 +636,10 @@ impl TaskEngine {
                 )
                 .await?;
             if let Some(ref long_term_store) = self.long_term_store {
-                long_term_store.save_task(updated.clone()).await?;
+                long_term_store.save_task_with_context(updated.clone(), context.as_ref()).await?;
             }
             for event in committed {
-                self.finish_committed_event(event, None).await?;
+                self.finish_committed_event(event, None, context.clone()).await?;
             }
         } else {
             self.short_term_store.save_task(updated.clone()).await?;
@@ -1465,7 +1467,7 @@ impl TaskEngine {
                 series_snapshot: None,
                 _accumulated_data: None,
             };
-            let mut initial_storage_epoch = None;
+            let mut initial_token: Option<HotWriteToken> = None;
             for attempt in 0..3 {
                 let token = if attempt == 0 {
                     coordinator.ensure_task_hot_for_write(task_id).await?
@@ -1474,15 +1476,15 @@ impl TaskEngine {
                         .ensure_task_hot_for_write_without_rehydrate(task_id)
                         .await?
                 };
-                match initial_storage_epoch {
-                    Some(epoch) if token.storage_epoch != epoch => {
+                match &initial_token {
+                    Some(initial) if token.storage_epoch != initial.storage_epoch || token.creation_token != initial.creation_token => {
                         return Err(EngineError::Store(Box::new(
                             StorageFenceConflictError::new(
                                 "Task storage epoch changed after the write mutation started",
                             ),
                         )));
                     }
-                    None => initial_storage_epoch = Some(token.storage_epoch),
+                    None => initial_token = Some(token.clone()),
                     Some(_) => {}
                 }
                 match self
@@ -1492,7 +1494,7 @@ impl TaskEngine {
                 {
                     Ok(series_result) => {
                         let event = series_result.event;
-                        self.finish_committed_event(event.clone(), series_result.accumulated_event)
+                        self.finish_committed_event(event.clone(), series_result.accumulated_event, durable_context(&token))
                             .await?;
                         return Ok(event);
                     }
@@ -1536,7 +1538,7 @@ impl TaskEngine {
                 .await?;
         }
 
-        self.finish_committed_event(event.clone(), series_result.accumulated_event)
+        self.finish_committed_event(event.clone(), series_result.accumulated_event, None)
             .await?;
 
         Ok(event)
@@ -1586,7 +1588,7 @@ impl TaskEngine {
                     .ensure_task_hot_for_write_without_rehydrate(&task.id)
                     .await?
             };
-            if token.storage_epoch != initial_token.storage_epoch {
+            if token.storage_epoch != initial_token.storage_epoch || token.creation_token != initial_token.creation_token {
                 return Err(EngineError::Store(Box::new(
                     StorageFenceConflictError::new(
                         "Task storage epoch changed after the write mutation started",
@@ -1626,6 +1628,7 @@ impl TaskEngine {
         &self,
         event: TaskEvent,
         accumulated_event: Option<TaskEvent>,
+        context: Option<DurableWriteContext>,
     ) -> Result<(), EngineError> {
         let broadcast_event = if let Some(ref accumulated) = accumulated_event {
             TaskEvent {
@@ -1648,7 +1651,7 @@ impl TaskEngine {
             let hooks = self.hooks.clone();
             tokio::spawn(async move {
                 if let Err(err) =
-                    persist_long_term_event(long_term_store, raw_event, accumulated_event).await
+                    persist_long_term_event(long_term_store, raw_event, accumulated_event, context).await
                 {
                     if let Some(hooks) = hooks {
                         hooks.on_event_dropped(&store_event, &err.to_string());
@@ -1660,10 +1663,15 @@ impl TaskEngine {
     }
 }
 
+fn durable_context(token: &HotWriteToken) -> Option<DurableWriteContext> {
+    token.creation_token.as_ref().map(|token| DurableWriteContext { creation_token: token.clone() })
+}
+
 async fn persist_long_term_event(
     long_term_store: Arc<dyn LongTermStore>,
     event: TaskEvent,
     accumulated_event: Option<TaskEvent>,
+    context: Option<DurableWriteContext>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if long_term_store.supports_series_compaction() {
         if let (Some(series_id), Some(series_mode)) =
@@ -1673,7 +1681,7 @@ async fn persist_long_term_event(
                 SeriesMode::Latest => {
                     let task_id = event.task_id.clone();
                     return long_term_store
-                        .replace_last_series_event(&task_id, &series_id, event)
+                        .replace_last_series_event_with_context(&task_id, &series_id, event, context.as_ref())
                         .await;
                 }
                 SeriesMode::Accumulate => {
@@ -1683,7 +1691,7 @@ async fn persist_long_term_event(
                         .clone()
                         .unwrap_or_else(|| "delta".to_string());
                     long_term_store
-                        .accumulate_series(&task_id, &series_id, event, &field)
+                        .accumulate_series_with_context(&task_id, &series_id, event, &field, context.as_ref())
                         .await?;
                     return Ok(());
                 }
@@ -1693,7 +1701,7 @@ async fn persist_long_term_event(
     }
 
     long_term_store
-        .save_event(accumulated_event.unwrap_or(event))
+        .save_event_with_context(accumulated_event.unwrap_or(event), context.as_ref())
         .await
 }
 

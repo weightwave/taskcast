@@ -10,6 +10,7 @@ use taskcast_core::{
 #[test]
 fn lifecycle_types_use_camel_case_wire_fields() {
     let metadata = TaskStorageMetadata {
+        creation_token: None,
         task_id: "task-1".into(),
         storage_state: taskcast_core::StorageState::Releasing,
         storage_epoch: 3,

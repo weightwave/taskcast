@@ -284,6 +284,7 @@ export interface SeriesResult {
 export type StorageState = 'hot' | 'releasing' | 'cold'
 
 export interface TaskStorageMetadata {
+  creationToken?: string
   taskId: string
   storageState: StorageState
   storageEpoch: number
@@ -296,6 +297,7 @@ export interface TaskStorageMetadata {
 }
 
 export interface HotWriteToken {
+  creationToken?: string
   taskId: string
   storageEpoch: number
 }
@@ -636,12 +638,30 @@ export interface ShortTermStore {
   listByStatus(statuses: TaskStatus[]): Promise<Task[]>
 }
 
+export type CleanupTargetV1 = 'events' | 'all'
+export interface CleanupClaim {
+  taskId: string
+  creationToken: string
+  claimToken: string
+  target: CleanupTargetV1
+  completedAt: number
+  taskVersion: number
+}
+export interface DurableWriteContext { creationToken: string }
+export interface CleanupBatchResult { deletedEvents: number; complete: boolean }
+
 export interface LongTermStore {
+  readonly supportsTerminalCleanup?: boolean
+  claimCleanupTasks?(limit: number, claimTtlMs: number): Promise<CleanupClaim[]>
+  renewCleanupClaim?(claim: CleanupClaim, claimTtlMs: number): Promise<boolean>
+  deferCleanupClaim?(claim: CleanupClaim, retryAfterMs: number): Promise<void>
+  beginTaskCleanup?(claim: CleanupClaim, storageEpoch: number, throughIndex: number): Promise<boolean>
+  deleteTaskCleanupBatch?(claim: CleanupClaim, eventLimit: number): Promise<CleanupBatchResult>
   /** True only for split-tier stores with a verifiable archive barrier. */
   readonly supportsHotColdRelease?: boolean
   /** True only when deadline claims and terminal projection are durable. */
   readonly supportsDurableTtl?: boolean
-  saveTask(task: Task): Promise<void>
+  saveTask(task: Task, context?: DurableWriteContext): Promise<void>
   /** Atomically claims a durable task identity. Returns false when it already exists. */
   createTaskIfAbsent?(task: Task): Promise<boolean>
   /** Claims an explicit task identity until its hot copy is created. */
@@ -651,11 +671,11 @@ export interface LongTermStore {
   /** Removes only the pristine identity owned by this creation token. */
   abortTaskCreation?(taskId: string, creationToken: string): Promise<boolean>
   getTask(taskId: string): Promise<Task | null>
-  saveEvent(event: TaskEvent): Promise<void>
+  saveEvent(event: TaskEvent, context?: DurableWriteContext): Promise<void>
   /** Optional series-aware durable write for latest-mode series. */
-  replaceLastSeriesEvent?(taskId: string, seriesId: string, event: TaskEvent): Promise<void>
+  replaceLastSeriesEvent?(taskId: string, seriesId: string, event: TaskEvent, context?: DurableWriteContext): Promise<void>
   /** Optional series-aware durable write for accumulate-mode series. Returns the accumulated event. */
-  accumulateSeries?(taskId: string, seriesId: string, event: TaskEvent, field: string): Promise<TaskEvent>
+  accumulateSeries?(taskId: string, seriesId: string, event: TaskEvent, field: string, context?: DurableWriteContext): Promise<TaskEvent>
   getEvents(taskId: string, opts?: EventQueryOptions): Promise<TaskEvent[]>
   /**
    * True when short-term archive restore writes the same durable storage this

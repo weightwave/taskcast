@@ -90,6 +90,13 @@ describe('generated-migrations', () => {
     expect(creationClaimMigration!.sql).toContain('creation_completed_at')
   })
 
+  it('includes retention without enrolling existing tasks', () => {
+    const migration = EMBEDDED_MIGRATIONS.find(m => m.filename === '006_terminal_retention.sql')!
+    expect(migration.sql).toContain('history_expired_through_index')
+    expect(migration.sql).toContain('cleanup_policy_version = 1')
+    expect(migration.sql).not.toMatch(/UPDATE\s+taskcast_tasks/i)
+  })
+
   it('001_initial.sql creates tables with IF NOT EXISTS', () => {
     const initialMigration = EMBEDDED_MIGRATIONS.find((m) => m.filename === '001_initial.sql')
     expect(initialMigration).toBeDefined()
