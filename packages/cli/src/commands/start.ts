@@ -1,8 +1,7 @@
 import { Command } from 'commander'
 import postgres from 'postgres'
 import { existsSync } from 'fs'
-import { join, dirname } from 'path'
-import { createRequire } from 'module'
+import { playgroundDistPath as distDir } from '../ui-assets.js'
 import {
   TaskEngine,
   WorkerManager,
@@ -480,9 +479,6 @@ async function runStartWithLifecycle(options: RunStartOptions, lifecycle: StartL
 
   if (options.playground) {
     try {
-      const require = createRequire(import.meta.url)
-      const pkgPath = require.resolve('@taskcast/playground/package.json')
-      const distDir = join(dirname(pkgPath), 'dist')
       if (existsSync(distDir)) {
         const { serveStatic } = await import('@hono/node-server/serve-static')
         lifecycle.checkpoint()
@@ -505,7 +501,7 @@ async function runStartWithLifecycle(options: RunStartOptions, lifecycle: StartL
       }
     } catch (error) {
       if (error instanceof StartupCancelledError) throw error
-      console.warn('[taskcast] @taskcast/playground not available, skipping playground UI.')
+      console.warn('[taskcast] Playground UI unavailable, skipping playground UI.')
     }
   }
 

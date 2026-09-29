@@ -104,15 +104,6 @@ vi.mock('@hono/node-server/serve-static', () => ({
   serveStatic: vi.fn().mockReturnValue(() => {}),
 }))
 
-// Mock module for createRequire
-vi.mock('module', async (importOriginal) => {
-  const actual = await importOriginal() as Record<string, unknown>
-  return {
-    ...actual,
-    createRequire: () => ({ resolve: vi.fn().mockReturnValue('/fake/playground/package.json') }),
-  }
-})
-
 // Mock fs for existsSync
 vi.mock('fs', async (importOriginal) => {
   const actual = await importOriginal() as Record<string, unknown>
@@ -1050,16 +1041,9 @@ describe('registerStartCommand', () => {
     ;(existsSync as ReturnType<typeof vi.fn>).mockReturnValue(true)
   })
 
-  it('warns when @taskcast/playground module not available', async () => {
-    // Make createRequire throw
-    const moduleImport = await import('module')
-    const origCreateRequire = moduleImport.createRequire
-    ;(moduleImport as any).createRequire = () => ({
-      resolve: () => { throw new Error('MODULE_NOT_FOUND') },
-    })
-
+  it('warns when playground assets cannot be read', async () => {
     const { existsSync } = await import('fs')
-    ;(existsSync as ReturnType<typeof vi.fn>).mockReturnValue(true)
+    ;(existsSync as ReturnType<typeof vi.fn>).mockImplementationOnce(() => { throw new Error('Cannot read assets') })
 
     const program = new Command()
     program.exitOverride()
@@ -1068,9 +1052,9 @@ describe('registerStartCommand', () => {
     await program.parseAsync(['node', 'test', 'start', '--playground'])
 
     // Should still warn — the catch block handles it
-    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('@taskcast/playground not available'))
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('Playground UI unavailable'))
 
-    ;(moduleImport as any).createRequire = origCreateRequire
+    ;(existsSync as ReturnType<typeof vi.fn>).mockReturnValue(true)
   })
 
   it('creates global config when source is none and user confirms', async () => {

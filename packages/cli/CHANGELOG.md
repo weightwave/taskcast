@@ -1,5 +1,17 @@
 # @taskcast/cli
 
+## 1.7.1
+
+### Patch Changes
+
+- 32278ac: Bundle the built Dashboard and Playground assets in the CLI package so fresh npm installations no longer depend on unpublished private workspace packages. Preserve the UI, Playground, and embedded Playground commands.
+  - @taskcast/core@1.7.1
+  - @taskcast/server@1.7.1
+  - @taskcast/server-sdk@1.7.1
+  - @taskcast/redis@1.7.1
+  - @taskcast/postgres@1.7.1
+  - @taskcast/sqlite@1.7.1
+
 ## 1.7.0
 
 ### Minor Changes

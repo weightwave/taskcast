@@ -1,5 +1,14 @@
 # @taskcast/playground
 
+## 0.3.17
+
+### Patch Changes
+
+- @taskcast/core@1.7.1
+- @taskcast/server@1.7.1
+- @taskcast/client@1.7.1
+- @taskcast/react@1.7.1
+
 ## 0.3.16
 
 ### Patch Changes

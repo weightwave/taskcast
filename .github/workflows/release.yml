@@ -109,9 +109,9 @@ jobs:
           LOCAL_VERSION=$(node -p "require('./packages/cli/package.json').version")
           echo "Local version: $LOCAL_VERSION"
 
-          # Retry up to 3 times (npm registry eventual consistency)
-          for i in 1 2 3; do
-            NPM_VERSION=$(npm view @taskcast/cli version 2>/dev/null || echo "")
+          # npm accepts uploads before making packages public; allow processing time.
+          for i in $(seq 1 30); do
+            NPM_VERSION=$(npm view "@taskcast/cli@$LOCAL_VERSION" version 2>/dev/null || echo "")
             if [ "$LOCAL_VERSION" = "$NPM_VERSION" ]; then
               echo "published=true" >> "$GITHUB_OUTPUT"
               echo "version=$LOCAL_VERSION" >> "$GITHUB_OUTPUT"
@@ -122,8 +122,8 @@ jobs:
             sleep 10
           done
 
-          echo "published=false" >> "$GITHUB_OUTPUT"
-          echo "Version $LOCAL_VERSION not found on npm after retries — publish may have failed"
+          echo "::error::Version $LOCAL_VERSION not found on npm after retries — publish is incomplete"
+          exit 1
 
   # ── Extract version from release output or dispatch input ────────────────
   get-version:

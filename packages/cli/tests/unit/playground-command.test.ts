@@ -1,22 +1,13 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { Command } from 'commander'
 
-// Mock module and createRequire
+// Mock filesystem access
 const mockExistsSync = vi.fn()
 vi.mock('fs', async (importOriginal) => {
   const actual = await importOriginal() as Record<string, unknown>
   return {
     ...actual,
     existsSync: (...args: unknown[]) => mockExistsSync(...args),
-  }
-})
-
-const mockResolve = vi.fn()
-vi.mock('module', async (importOriginal) => {
-  const actual = await importOriginal() as Record<string, unknown>
-  return {
-    ...actual,
-    createRequire: () => ({ resolve: mockResolve }),
   }
 })
 
@@ -64,7 +55,6 @@ describe('registerPlaygroundCommand', () => {
   })
 
   it('starts playground server when dist exists', async () => {
-    mockResolve.mockReturnValue('/fake/node_modules/@taskcast/playground/package.json')
     mockExistsSync.mockReturnValue(true)
     mockServe.mockImplementation((_opts: unknown, cb: () => void) => {
       cb()
@@ -81,7 +71,6 @@ describe('registerPlaygroundCommand', () => {
   })
 
   it('exits with 1 when dist directory does not exist', async () => {
-    mockResolve.mockReturnValue('/fake/node_modules/@taskcast/playground/package.json')
     mockExistsSync.mockReturnValue(false)
 
     const program = new Command()
@@ -94,8 +83,8 @@ describe('registerPlaygroundCommand', () => {
     expect(exitSpy).toHaveBeenCalledWith(1)
   })
 
-  it('exits with 1 when @taskcast/playground is not available', async () => {
-    mockResolve.mockImplementation(() => { throw new Error('Cannot find module') })
+  it('exits with 1 when playground assets cannot be read', async () => {
+    mockExistsSync.mockImplementationOnce(() => { throw new Error('Cannot read assets') })
 
     const program = new Command()
     program.exitOverride()
@@ -103,12 +92,11 @@ describe('registerPlaygroundCommand', () => {
 
     await program.parseAsync(['node', 'test', 'playground'])
 
-    expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('@taskcast/playground not available'))
+    expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('Playground UI unavailable'))
     expect(exitSpy).toHaveBeenCalledWith(1)
   })
 
   it('uses custom port', async () => {
-    mockResolve.mockReturnValue('/fake/node_modules/@taskcast/playground/package.json')
     mockExistsSync.mockReturnValue(true)
     mockServe.mockImplementation((_opts: unknown, cb: () => void) => {
       cb()

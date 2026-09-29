@@ -48,6 +48,9 @@ jobs:
       - name: Verify coverage runner
         run: node --test scripts/tests/coverage-runner.test.mjs
 
+      - name: Verify installable CLI package
+        run: node --test scripts/tests/cli-packaging.test.mjs
+
       - name: Test and enforce package coverage
         run: pnpm test:coverage
 
