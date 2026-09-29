@@ -13,6 +13,7 @@ enum Fault {
     None,
     ClaimLost,
     ClaimLostDuringWait,
+    WaitForClaimRenewal,
     CleanupStorageLost,
     MetadataUnavailable,
     ColdStateChanged,
@@ -97,6 +98,13 @@ impl LongTermStore for Durable {
     async fn can_cleanup_task(&self, claim: &CleanupClaim) -> Result<bool, BoxError> {
         if self.mode() == Fault::ClaimLostDuringWait {
             tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        // Keep the storage operation pending until the heartbeat actually renews
+        // the claim, instead of depending on a fixed scheduling delay.
+        if self.mode() == Fault::WaitForClaimRenewal {
+            while self.renewals.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
         }
         self.inner().can_cleanup_task(claim).await
     }
@@ -1069,6 +1077,48 @@ fn cleanup_deadline_checks_the_current_task_type_instead_of_only_the_enrolled_ru
     assert_eq!(cleanup_deadline(&task, CleanupTarget::Events), Some(1000.0));
 }
 
+#[test]
+fn cleanup_status_only_rules_apply_to_tasks_without_a_type_filter() {
+    let mut task = make_task("status-only");
+    task.status = TaskStatus::Completed;
+    task.completed_at = Some(1000.0);
+    task.cleanup_policy_version = Some(1);
+    task.cleanup = Some(
+        serde_json::from_value(json!({"rules":[{
+            "target":"events", "trigger":{"afterMs":200}, "match":{"status":["completed"]}
+        }]}))
+        .unwrap(),
+    );
+    assert_eq!(cleanup_deadline(&task, CleanupTarget::Events), Some(1200.0));
+    task.status = TaskStatus::Failed;
+    assert_eq!(cleanup_deadline(&task, CleanupTarget::Events), None);
+}
+
+#[tokio::test]
+async fn terminal_cache_remains_readable_with_a_legacy_durable_adapter() {
+    let hot = Arc::new(MemoryShortTermStore::new());
+    let durable = Arc::new(Legacy::default());
+    let mut cached = make_task("legacy-read");
+    cached.status = TaskStatus::Completed;
+    cached.completed_at = Some(1000.0);
+    cached.cleanup_policy_version = Some(1);
+    hot.save_task(cached.clone()).await.unwrap();
+    assert!(!durable.supports_terminal_cleanup());
+    assert!(durable.get_task(&cached.id).await.unwrap().is_none());
+    let engine = engine(hot.clone(), durable);
+    assert_eq!(
+        engine.get_task(&cached.id).await.unwrap(),
+        Some(cached.clone())
+    );
+    let hot_only = TaskEngine::new(TaskEngineOptions {
+        short_term_store: hot,
+        long_term_store: None,
+        broadcast: Arc::new(MemoryBroadcastProvider::new()),
+        hooks: None,
+    });
+    assert_eq!(hot_only.get_task(&cached.id).await.unwrap(), Some(cached));
+}
+
 #[tokio::test]
 async fn cleanup_bounds_are_rejected_before_claiming_or_deleting_tasks() {
     let (_, durable, engine) = fixture(1, true, false).await;
@@ -1158,6 +1208,29 @@ async fn cleanup_heartbeat_stops_a_blocked_operation_after_the_claim_is_lost() {
 }
 
 #[tokio::test]
+async fn cleanup_heartbeat_renews_a_claim_while_the_storage_operation_is_pending() {
+    let (_, durable, engine) = fixture(1, true, false).await;
+    durable.set(Fault::WaitForClaimRenewal);
+    let result = tokio::time::timeout(Duration::from_secs(2), engine.sweep_cleanup(1, 10, 300))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (result.completed, result.deleted_events, result.failed),
+        (1, 1, 0)
+    );
+    assert!(durable.renewals.load(Ordering::SeqCst) >= 2);
+    assert!(durable
+        .inner()
+        .get_task("task")
+        .await
+        .unwrap()
+        .unwrap()
+        .history_expired_at
+        .is_some());
+}
+
+#[tokio::test]
 async fn cleanup_preserves_store_and_engine_error_classification_during_archive_release() {
     for fault in [Fault::ReleasePrecondition, Fault::ReleaseMissing] {
         let (hot, durable, engine) = fixture(1, false, false).await;
@@ -1226,6 +1299,25 @@ async fn cleanup_batches_finish_archive_receipts_and_series_after_events_are_gon
     let retained = store.get_task("task").await.unwrap().unwrap();
     assert!(retained.history_expired_at.is_some());
     assert_eq!(retained.result.unwrap()["kept"], true);
+}
+
+#[tokio::test]
+async fn cleanup_completes_an_empty_archive_without_batch_receipts() {
+    let (_, durable, engine) = fixture(0, true, false).await;
+    let result = engine.sweep_cleanup(1, 1, 30000).await.unwrap();
+    assert_eq!(
+        (result.claimed, result.completed, result.deleted_events),
+        (1, 1, 0)
+    );
+    let retained = durable.inner().get_task("task").await.unwrap().unwrap();
+    assert!(retained.history_expired_at.is_some());
+    assert_eq!(retained.result.unwrap()["kept"], true);
+    assert!(durable
+        .inner()
+        .claim_cleanup_tasks(1, 30000)
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 #[tokio::test]

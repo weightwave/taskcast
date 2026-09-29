@@ -135,6 +135,14 @@ jobs:
           path: packages/playground/dist
       - name: Generate coverage
         run: cargo llvm-cov --workspace --fail-under-lines 90 --lcov --output-path lcov.info
+      - name: Save coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-coverage
+          path: rust/lcov.info
+          retention-days: 7
+          if-no-files-found: ignore
       - name: Upload to Codecov
         uses: codecov/codecov-action@v4
         with:

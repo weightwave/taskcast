@@ -21,6 +21,7 @@ async fn archive_restore_validation_rejects_conflicts_and_preserves_task_options
         .unwrap();
     let store = PostgresLongTermStore::new(pool);
     store.migrate().await.unwrap();
+    assert!(store.supports_task_archive_restore());
 
     let task: Task = serde_json::from_value(json!({
         "id": "restored", "status": "completed", "createdAt": 1000,

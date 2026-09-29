@@ -45,7 +45,8 @@ export class RetentionRuntime {
     await writeFile(config, JSON.stringify({
       auth: { mode: 'none' },
       cleanup: { enabled, rules: [{ target: 'events', match: { status: ['completed', 'cancelled'] }, trigger: { afterMs } }, { target: 'events', match: { status: ['failed'] }, trigger: { afterMs: 60_000 } }] },
-      storageLifecycle: { ttlSweepIntervalSeconds: 1 },
+      // A restart may leave a live claim; its expiry must fit within until's 20s deadline.
+      storageLifecycle: { ttlSweepIntervalSeconds: 1, storageLockTtlSeconds: 5 },
     }))
     const port = await availablePort()
     this.baseUrl = `http://127.0.0.1:${port}`
