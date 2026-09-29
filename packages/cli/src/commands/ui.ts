@@ -1,4 +1,5 @@
 import { Command } from 'commander'
+import { dashboardDistPath } from '../ui-assets.js'
 
 export function registerUiCommand(program: Command): void {
   program
@@ -9,7 +10,6 @@ export function registerUiCommand(program: Command): void {
     .option('-s, --server <url>', 'Taskcast server URL', 'http://localhost:3721')
     .option('--admin-token <token>', 'Admin token for auto-connect')
     .action(async (opts: { port: string; server: string; adminToken?: string }) => {
-      const { dashboardDistPath } = await import('@taskcast/dashboard-web/dist-path')
       const { Hono } = await import('hono')
       const { serve } = await import('@hono/node-server')
       const { existsSync, readFileSync, statSync } = await import('fs')

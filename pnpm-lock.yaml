@@ -36,12 +36,6 @@ importers:
       '@taskcast/core':
         specifier: workspace:*
         version: link:../core
-      '@taskcast/dashboard-web':
-        specifier: workspace:*
-        version: link:../dashboard-web
-      '@taskcast/playground':
-        specifier: workspace:*
-        version: link:../playground
       '@taskcast/postgres':
         specifier: workspace:*
         version: link:../postgres
@@ -70,6 +64,12 @@ importers:
         specifier: ^3.4.5
         version: 3.4.8
     devDependencies:
+      '@taskcast/dashboard-web':
+        specifier: workspace:*
+        version: link:../dashboard-web
+      '@taskcast/playground':
+        specifier: workspace:*
+        version: link:../playground
       testcontainers:
         specifier: ^10.13.0
         version: 10.28.0

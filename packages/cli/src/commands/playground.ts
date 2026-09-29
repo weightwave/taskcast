@@ -1,7 +1,6 @@
 import { Command } from 'commander'
 import { existsSync } from 'fs'
-import { join, dirname } from 'path'
-import { createRequire } from 'module'
+import { playgroundDistPath as distDir } from '../ui-assets.js'
 
 export function registerPlaygroundCommand(program: Command): void {
   program
@@ -11,9 +10,6 @@ export function registerPlaygroundCommand(program: Command): void {
     .action(async (options: { port: string }) => {
       const port = Number(options.port)
       try {
-        const require = createRequire(import.meta.url)
-        const pkgPath = require.resolve('@taskcast/playground/package.json')
-        const distDir = join(dirname(pkgPath), 'dist')
         if (!existsSync(distDir)) {
           console.error('[taskcast] Playground dist not found. Run `pnpm --filter @taskcast/playground build` first.')
           process.exit(1)
@@ -30,7 +26,7 @@ export function registerPlaygroundCommand(program: Command): void {
           console.log('[taskcast] Use "External" mode in the UI to connect to a remote server.')
         })
       } catch {
-        console.error('[taskcast] @taskcast/playground not available.')
+        console.error('[taskcast] Playground UI unavailable.')
         process.exit(1)
       }
     })

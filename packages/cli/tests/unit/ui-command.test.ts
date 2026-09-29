@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { Command } from 'commander'
 
 // Mock dashboard-web
-vi.mock('@taskcast/dashboard-web/dist-path', () => ({
+vi.mock('../../src/ui-assets.js', () => ({
   dashboardDistPath: '/fake/dashboard/dist',
 }))
 
