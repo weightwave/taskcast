@@ -196,5 +196,6 @@ jobs:
         env:
           TASKCAST_RUST_BINARY: ${{ github.workspace }}/rust/target/release/taskcast
           NO_PROXY: 127.0.0.1,localhost
-          no_proxy: 127.0.0.1,localhost
-        run: bash rust/tests/integration.sh
+        run: |
+          export no_proxy="$NO_PROXY"
+          bash rust/tests/integration.sh
