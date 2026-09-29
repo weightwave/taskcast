@@ -1238,72 +1238,72 @@ export class TaskEngine {
   }
 
   private async _emitInner(taskId: string, input: PublishEventInput): Promise<TaskEvent> {
-    if (this.storageCoordinator) {
-      const raw: Omit<TaskEvent, 'index'> = {
+    if (!this.storageCoordinator) {
+      const index = await this.shortTermStore.nextIndex(taskId)
+      const raw: TaskEvent = {
         id: ulid(),
         taskId,
+        index,
         timestamp: Date.now(),
         type: input.type,
         level: input.level,
         data: input.data,
         ...(input.seriesId !== undefined && { seriesId: input.seriesId }),
         ...(input.seriesMode !== undefined && { seriesMode: input.seriesMode }),
-        ...(input.seriesAccField !== undefined && {
-          seriesAccField: input.seriesAccField,
-        }),
+        ...(input.seriesAccField !== undefined && { seriesAccField: input.seriesAccField }),
       }
-      let initialToken: HotWriteToken | undefined
-      for (let attempt = 0; attempt < 3; attempt++) {
-        const token = await this.storageCoordinator.ensureTaskHotForWrite(
-          taskId,
-          attempt === 0,
-        )
-        if (!initialToken) {
-          initialToken = token
-        } else if (token.storageEpoch !== initialToken.storageEpoch || token.creationToken !== initialToken.creationToken) {
-          throw new StorageFenceConflictError(
-            'Task storage epoch changed after the write mutation started',
-          )
-        }
-        try {
-          const result = await this.shortTermStore.commitEventFenced!(
-            taskId,
-            raw,
-            token,
-          )
-          await this.finishCommittedEvent(result.event, result.accumulatedEvent, durableContext(token))
-          return result.event
-        } catch (error) {
-          if (!(error instanceof StorageFenceConflictError) || attempt === 2) {
-            throw error
-          }
-        }
+
+      const { event, accumulatedEvent, stored } = await processSeries(raw, this.shortTermStore)
+      if (!stored) {
+        await this.shortTermStore.appendEvent(taskId, event)
       }
-      throw new StorageFenceConflictError()
+
+      await this.finishCommittedEvent(event, accumulatedEvent)
+
+      return event
     }
 
-    const index = await this.shortTermStore.nextIndex(taskId)
-    const raw: TaskEvent = {
+    const raw: Omit<TaskEvent, 'index'> = {
       id: ulid(),
       taskId,
-      index,
       timestamp: Date.now(),
       type: input.type,
       level: input.level,
       data: input.data,
       ...(input.seriesId !== undefined && { seriesId: input.seriesId }),
       ...(input.seriesMode !== undefined && { seriesMode: input.seriesMode }),
-      ...(input.seriesAccField !== undefined && { seriesAccField: input.seriesAccField }),
+      ...(input.seriesAccField !== undefined && {
+        seriesAccField: input.seriesAccField,
+      }),
     }
-
-    const { event, accumulatedEvent, stored } = await processSeries(raw, this.shortTermStore)
-    if (!stored) {
-      await this.shortTermStore.appendEvent(taskId, event)
+    let initialToken: HotWriteToken | undefined
+    // Success returns; the catch rethrows the third failed attempt.
+    for (let attempt = 0; ; attempt++) {
+      const token = await this.storageCoordinator.ensureTaskHotForWrite(
+        taskId,
+        attempt === 0,
+      )
+      if (!initialToken) {
+        initialToken = token
+      } else if (token.storageEpoch !== initialToken.storageEpoch || token.creationToken !== initialToken.creationToken) {
+        throw new StorageFenceConflictError(
+          'Task storage epoch changed after the write mutation started',
+        )
+      }
+      try {
+        const result = await this.shortTermStore.commitEventFenced!(
+          taskId,
+          raw,
+          token,
+        )
+        await this.finishCommittedEvent(result.event, result.accumulatedEvent, durableContext(token))
+        return result.event
+      } catch (error) {
+        if (!(error instanceof StorageFenceConflictError) || attempt === 2) {
+          throw error
+        }
+      }
     }
-
-    await this.finishCommittedEvent(event, accumulatedEvent)
-
-    return event
   }
 
   private async commitTaskEventsForMutation(
@@ -1331,7 +1331,8 @@ export class TaskEngine {
         level: input.level,
         data: input.data,
       }))
-      for (let attempt = 0; attempt < 3; attempt++) {
+      // Success returns; the catch rethrows the third failed attempt.
+      for (let attempt = 0; ; attempt++) {
         const token = attempt === 0
           ? initialToken
           : await coordinator.ensureTaskHotForWrite(task.id, false)
@@ -1360,7 +1361,6 @@ export class TaskEngine {
           }
         }
       }
-      throw new StorageFenceConflictError()
     } finally {
       release()
     }

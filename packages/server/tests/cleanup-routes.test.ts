@@ -129,3 +129,22 @@ it('discards a history snapshot if expiry begins while it is being read', async 
   expect(await engine.getEvents('racing')).toEqual([])
   expect((await engine.getTask('racing'))?.historyExpiredAt).toBeGreaterThan(0)
 })
+
+it.each(['/events/history', '/events'])('handles a task deleted during replay at %s', async suffix => {
+  const engine = new TaskEngine({ shortTermStore: new MemoryShortTermStore(), broadcast: new MemoryBroadcastProvider() })
+  await engine.createTask({ id: 'removed-during-read' })
+  await engine.transitionTask('removed-during-read', 'cancelled')
+  vi.spyOn(engine, 'getEvents').mockImplementation(async () => {
+    vi.spyOn(engine, 'getTask').mockResolvedValue(null)
+    return []
+  })
+  const { app } = createTaskcastApp({ engine })
+  const response = await app.request('/tasks/removed-during-read' + suffix)
+  if (suffix === '/events/history') {
+    expect(response.status).toBe(404)
+    expect(await response.json()).toEqual({ error: 'Task not found' })
+  } else {
+    const body = await response.text()
+    expect(body).toBe('')
+  }
+})

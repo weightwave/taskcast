@@ -228,3 +228,32 @@ pub(crate) async fn ready(pool: &PgPool, claim: &CleanupClaim) -> Result<bool, B
     tx.commit().await?;
     Ok(ready)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn expired_history_only_leaves_the_whole_task_deadline() {
+        let mut task: Task = serde_json::from_value(json!({
+            "id": "retained-result", "status": "completed", "createdAt": 0,
+            "updatedAt": 1000, "completedAt": 1000, "cleanupPolicyVersion": 1,
+            "cleanup": { "rules": [
+                { "target": "events", "trigger": { "afterMs": 200 } },
+                { "target": "all", "trigger": { "afterMs": 500 } }
+            ] }
+        }))
+        .unwrap();
+
+        assert_eq!(next_deadline(&task), Some(1200));
+        task.history_expired_at = Some(1200.0);
+        assert_eq!(next_deadline(&task), Some(1500));
+        task.cleanup
+            .as_mut()
+            .unwrap()
+            .rules
+            .retain(|rule| rule.target == CleanupTarget::Events);
+        assert_eq!(next_deadline(&task), None);
+    }
+}

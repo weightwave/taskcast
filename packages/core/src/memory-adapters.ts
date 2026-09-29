@@ -442,6 +442,14 @@ export class MemoryShortTermStore implements ShortTermStore {
       throw new StorageFenceConflictError()
     }
 
+    const assignment = projection.assignment
+    const currentAssignment = assignment ? this.assignments.get(taskId) : undefined
+    if (currentAssignment && canonicalJson(currentAssignment) !== canonicalJson(assignment)) {
+      throw new StorageIntegrityError(
+        'Terminal projection conflicts with the hot assignment',
+      )
+    }
+
     const taskEvents = this.events.get(taskId) ?? []
     const existing = taskEvents.find(
       (event) => event.index === projection.event.index,
@@ -467,15 +475,8 @@ export class MemoryShortTermStore implements ShortTermStore {
 
     this.tasks.set(taskId, structuredClone(projection.task))
     this.bumpTaskRevision(taskId)
-    const assignment = projection.assignment
     if (assignment) {
-      const current = this.assignments.get(taskId)
-      if (current && canonicalJson(current) !== canonicalJson(assignment)) {
-        throw new StorageIntegrityError(
-          'Terminal projection conflicts with the hot assignment',
-        )
-      }
-      if (current) {
+      if (currentAssignment) {
         this.assignments.delete(taskId)
         const worker = this.workers.get(assignment.workerId)
         if (worker) {
@@ -867,7 +868,8 @@ export class MemoryLongTermStore implements LongTermStore {
     const deletedEvents = Math.min(limit, events.length)
     this.events.set(claim.taskId, events.slice(limit))
     if (events.length > limit) return { deletedEvents, complete: false }
-    this.series.set(claim.taskId, (this.series.get(claim.taskId) ?? []).slice(limit))
+    const remainingSeries = (this.series.get(claim.taskId) ?? []).slice(limit)
+    this.series.set(claim.taskId, remainingSeries)
     let batchBudget = limit; let generationBudget = limit
     for (const [key, generation] of this.generations) {
       if (generation.taskId !== claim.taskId) continue
@@ -879,7 +881,7 @@ export class MemoryLongTermStore implements LongTermStore {
     for (const [key, p] of this.terminalProjections) {
       if (p.projection.task.id === claim.taskId && p.projectedAt !== null && projectionBudget > 0) { this.terminalProjections.delete(key); projectionBudget-- }
     }
-    if ((this.series.get(claim.taskId)?.length ?? 0) > 0 || [...this.generations.values()].some(g => g.taskId === claim.taskId)
+    if (remainingSeries.length > 0 || [...this.generations.values()].some(g => g.taskId === claim.taskId)
       || [...this.terminalProjections.values()].some(p => p.projection.task.id === claim.taskId)) return { deletedEvents, complete: false }
     this.cleanupClaims.delete(claim.taskId); this.cleanupRetry.delete(claim.taskId)
     if (claim.target === 'all') {

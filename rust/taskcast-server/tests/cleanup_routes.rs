@@ -102,3 +102,41 @@ async fn expired_export_has_stable_conflict_code() {
     response.assert_status(axum_test::http::StatusCode::CONFLICT);
     assert_eq!(response.json::<Value>()["code"], "TASKCAST_HISTORY_EXPIRED");
 }
+
+// Model a durable task being removed after its history read has started.
+struct DeletedDuringReplay {
+    gone: std::sync::atomic::AtomicBool,
+    task: Task,
+}
+#[async_trait::async_trait]
+impl LongTermStore for DeletedDuringReplay {
+    async fn save_task(&self, _: Task) -> Result<(), BoxError> { unreachable!() }
+    async fn get_task(&self, _: &str) -> Result<Option<Task>, BoxError> {
+        Ok((!self.gone.load(std::sync::atomic::Ordering::SeqCst)).then(|| self.task.clone()))
+    }
+    async fn save_event(&self, _: TaskEvent) -> Result<(), BoxError> { unreachable!() }
+    async fn get_events(&self, _: &str, _: Option<EventQueryOptions>) -> Result<Vec<TaskEvent>, BoxError> {
+        self.gone.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(vec![])
+    }
+    async fn save_worker_event(&self, _: WorkerAuditEvent) -> Result<(), BoxError> { unreachable!() }
+    async fn get_worker_events(&self, _: &str, _: Option<EventQueryOptions>) -> Result<Vec<WorkerAuditEvent>, BoxError> { unreachable!() }
+}
+
+#[tokio::test]
+async fn sse_closes_when_whole_task_cleanup_wins_the_replay_race() {
+    let durable = Arc::new(DeletedDuringReplay {
+        gone: std::sync::atomic::AtomicBool::new(false),
+        task: serde_json::from_value(json!({"id":"racing", "status":"cancelled", "createdAt":1, "updatedAt":1, "completedAt":1})).unwrap(),
+    });
+    let engine = Arc::new(TaskEngine::new(TaskEngineOptions {
+        short_term_store: Arc::new(MemoryShortTermStore::new()), long_term_store: Some(durable),
+        broadcast: Arc::new(MemoryBroadcastProvider::new()), hooks: None,
+    }));
+    let (app, _) = create_app(engine, AuthMode::None, None, None, CorsConfig::Disabled);
+    let server = TestServer::new(app);
+    let response = server.get("/tasks/racing/events").await;
+    response.assert_status_ok();
+    assert!(!response.text().contains("taskcast.event"));
+    assert!(response.text().is_empty());
+}

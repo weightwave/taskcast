@@ -18,6 +18,8 @@ type ApiResult = {
 
 const repoRoot = resolve(import.meta.dirname, '../..')
 let rust: ChildProcess
+let rustOutput = ''
+let rustSpawnError: Error | undefined
 let rustBaseUrl: string
 let tsApp: ReturnType<typeof createTaskcastApp>
 
@@ -63,8 +65,11 @@ async function tsApi(path: string, init?: RequestInit): Promise<ApiResult> {
 
 async function waitForRust(): Promise<void> {
   for (let attempt = 0; attempt < 240; attempt++) {
-    if (rust.exitCode !== null) {
-      throw new Error(`Rust parity server exited with ${rust.exitCode}`)
+    if (rustSpawnError) {
+      throw new Error(`Rust parity server failed to spawn: ${rustSpawnError.message}\n${rustOutput}`)
+    }
+    if (rust.exitCode !== null || rust.signalCode !== null) {
+      throw new Error(`Rust parity server exited with ${rust.exitCode ?? rust.signalCode}\n${rustOutput}`)
     }
     try {
       if ((await rustApi('/health')).status === 200) return
@@ -73,7 +78,7 @@ async function waitForRust(): Promise<void> {
     }
     await new Promise((resolveWait) => setTimeout(resolveWait, 250))
   }
-  throw new Error('Rust parity server did not become ready')
+  throw new Error(`Rust parity server did not become ready\n${rustOutput}`)
 }
 
 const json = (body: unknown): RequestInit => ({
@@ -161,9 +166,10 @@ beforeAll(async () => {
 
   const port = await availablePort()
   rustBaseUrl = `http://127.0.0.1:${port}`
+  const parityBinary = process.env['TASKCAST_RUST_PARITY_BINARY']
   rust = spawn(
-    'cargo',
-    [
+    parityBinary ?? 'cargo',
+    parityBinary ? [] : [
       'run',
       '--quiet',
       '-p',
@@ -180,6 +186,10 @@ beforeAll(async () => {
       stdio: ['ignore', 'pipe', 'pipe'],
     },
   )
+  const captureOutput = (data: Buffer) => { rustOutput = (rustOutput + data.toString()).slice(-12_000) }
+  rust.stdout!.on('data', captureOutput)
+  rust.stderr!.on('data', captureOutput)
+  rust.on('error', error => { rustSpawnError = error })
   await waitForRust()
 }, 120_000)
 

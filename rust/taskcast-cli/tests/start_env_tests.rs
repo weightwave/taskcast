@@ -114,6 +114,39 @@ fn local_client() -> reqwest::Client {
     reqwest::Client::builder().no_proxy().build().unwrap()
 }
 
+async fn wait_for_server_ready(
+    port: u16,
+    handle: &mut tokio::task::JoinHandle<Result<(), String>>,
+) -> reqwest::Response {
+    let client = local_client();
+    let ready = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            tokio::select! {
+                result = &mut *handle => panic!("Server exited before becoming ready: {result:?}"),
+                response = client
+                    .get(format!("http://127.0.0.1:{port}/health"))
+                    .timeout(std::time::Duration::from_millis(250))
+                    .send() => {
+                    if let Ok(response) = response {
+                        if response.status().is_success() {
+                            return response;
+                        }
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    match ready {
+        Ok(response) => response,
+        Err(error) => {
+            handle.abort();
+            panic!("Server did not become ready on port {port}: {error}");
+        }
+    }
+}
+
 const TEST_RSA_PRIVATE_KEY: &str = r#"-----BEGIN PRIVATE KEY-----
 MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQC5OOCe0r9EjEoD
 rqN0UlG2vv6z0u8SRKxpATooDIlnWFmiSab39pH63UmHTHdr2INOl/EmjcGlBfHm
@@ -653,24 +686,20 @@ async fn auto_migrate_disabled_when_env_var_not_set() {
     let _env = EnvGuard::new(&[("TASKCAST_POSTGRES_URL", &pg_url)]);
 
     let port = find_available_port().await;
-    let handle = tokio::spawn(async move {
-        let _ = taskcast_cli::commands::start::run(StartArgs {
+    let mut handle = tokio::spawn(async move {
+        taskcast_cli::commands::start::run(StartArgs {
             port,
             ..Default::default()
         })
-        .await;
+        .await
+        .map_err(|error| error.to_string())
     });
 
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-    let res = local_client()
-        .get(format!("http://127.0.0.1:{port}/health"))
-        .send()
-        .await
-        .unwrap();
+    let res = wait_for_server_ready(port, &mut handle).await;
     assert!(res.status().is_success());
 
     handle.abort();
+    let _ = handle.await;
     drop(_env);
     drop(container);
 }
@@ -695,22 +724,16 @@ async fn auto_migrate_enabled_runs_migrations_on_startup() {
     ]);
 
     let port = find_available_port().await;
-    let handle = tokio::spawn(async move {
-        let _ = taskcast_cli::commands::start::run(StartArgs {
+    let mut handle = tokio::spawn(async move {
+        taskcast_cli::commands::start::run(StartArgs {
             port,
             ..Default::default()
         })
-        .await;
+        .await
+        .map_err(|error| error.to_string())
     });
 
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-    // Verify server started successfully
-    let res = local_client()
-        .get(format!("http://127.0.0.1:{port}/health"))
-        .send()
-        .await
-        .unwrap();
+    let res = wait_for_server_ready(port, &mut handle).await;
     assert!(res.status().is_success());
 
     // Verify that migrations were applied by checking that we can create a task
@@ -734,6 +757,7 @@ async fn auto_migrate_enabled_runs_migrations_on_startup() {
     );
 
     handle.abort();
+    let _ = handle.await;
     drop(_env);
     drop(container);
 }
@@ -758,24 +782,20 @@ async fn auto_migrate_disabled_when_env_var_is_false() {
     ]);
 
     let port = find_available_port().await;
-    let handle = tokio::spawn(async move {
-        let _ = taskcast_cli::commands::start::run(StartArgs {
+    let mut handle = tokio::spawn(async move {
+        taskcast_cli::commands::start::run(StartArgs {
             port,
             ..Default::default()
         })
-        .await;
+        .await
+        .map_err(|error| error.to_string())
     });
 
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-    let res = local_client()
-        .get(format!("http://127.0.0.1:{port}/health"))
-        .send()
-        .await
-        .unwrap();
+    let res = wait_for_server_ready(port, &mut handle).await;
     assert!(res.status().is_success());
 
     handle.abort();
+    let _ = handle.await;
     drop(_env);
     drop(container);
 }
@@ -800,24 +820,20 @@ async fn auto_migrate_enabled_with_case_insensitive_env_var() {
     ]);
 
     let port = find_available_port().await;
-    let handle = tokio::spawn(async move {
-        let _ = taskcast_cli::commands::start::run(StartArgs {
+    let mut handle = tokio::spawn(async move {
+        taskcast_cli::commands::start::run(StartArgs {
             port,
             ..Default::default()
         })
-        .await;
+        .await
+        .map_err(|error| error.to_string())
     });
 
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-    let res = local_client()
-        .get(format!("http://127.0.0.1:{port}/health"))
-        .send()
-        .await
-        .unwrap();
+    let res = wait_for_server_ready(port, &mut handle).await;
     assert!(res.status().is_success());
 
     handle.abort();
+    let _ = handle.await;
     drop(_env);
     drop(container);
 }

@@ -2165,6 +2165,22 @@ impl ShortTermStore for MemoryShortTermStore {
             return Err(Box::new(StorageFenceConflictError::default()));
         }
 
+        let mut assignments = self.assignments.write().unwrap();
+        let current_assignment = assignments
+            .iter()
+            .find(|candidate| candidate.task_id == *task_id)
+            .cloned();
+        if let Some(assignment) = &projection.assignment {
+            if current_assignment
+                .as_ref()
+                .is_some_and(|current| current != assignment)
+            {
+                return Err(Box::new(StorageIntegrityError::new(
+                    "Terminal projection conflicts with the hot assignment",
+                )));
+            }
+        }
+
         let mut events = self.events.write().unwrap();
         let task_events = events.entry(task_id.clone()).or_default();
         let existing = task_events
@@ -2208,17 +2224,7 @@ impl ShortTermStore for MemoryShortTermStore {
         drop(revisions);
 
         if let Some(assignment) = &projection.assignment {
-            let mut assignments = self.assignments.write().unwrap();
-            let current = assignments
-                .iter()
-                .find(|candidate| candidate.task_id == *task_id)
-                .cloned();
-            if current.as_ref().is_some_and(|current| current != assignment) {
-                return Err(Box::new(StorageIntegrityError::new(
-                    "Terminal projection conflicts with the hot assignment",
-                )));
-            }
-            if current.is_some() {
+            if current_assignment.is_some() {
                 assignments.retain(|candidate| candidate.task_id != *task_id);
                 drop(assignments);
                 if let Some(worker) = self

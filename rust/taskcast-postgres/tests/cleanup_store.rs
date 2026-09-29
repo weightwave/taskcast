@@ -67,6 +67,15 @@ async fn bounded_cleanup_preserves_results_fences_late_writes_and_resumes() {
     assert_eq!(claims.len(), 1);
     let claim = &claims[0];
     assert_eq!(claim.task_id, "large");
+    let mut invalid_target = claim.clone();
+    invalid_target.target = CleanupTarget::Task;
+    assert!(store.begin_task_cleanup(&invalid_target, 1, 1500).await.is_err());
+    assert!(store.begin_task_cleanup(claim, 1, -2).await.is_err());
+    sqlx::query("UPDATE taskcast_tasks SET archive_watermark = 1499 WHERE id = 'large'")
+        .execute(store.pool()).await.unwrap();
+    assert!(!store.begin_task_cleanup(claim, 1, 1499).await.unwrap());
+    sqlx::query("UPDATE taskcast_tasks SET archive_watermark = 1500 WHERE id = 'large'")
+        .execute(store.pool()).await.unwrap();
     assert!(!store.begin_task_cleanup(claim, 2, 1500).await.unwrap());
     assert!(store.begin_task_cleanup(claim, 1, 1500).await.unwrap());
     let first = store.delete_task_cleanup_batch(claim, 1000).await.unwrap();
@@ -212,6 +221,10 @@ async fn cleanup_claims_defer_dependencies_and_rollback_failed_batches() {
     .execute(store.pool())
     .await
     .unwrap();
+    for series_id in ["s1", "s2"] {
+        sqlx::query("INSERT INTO taskcast_series_state (task_id, series_id, mode, event, through_index, updated_at) VALUES ('b-ready', $1, 'latest', '{}'::jsonb, 0, 0)")
+            .bind(series_id).execute(store.pool()).await.unwrap();
+    }
     assert!(store.begin_task_cleanup(&ready, 1, 0).await.unwrap());
     sqlx::raw_sql("CREATE FUNCTION cleanup_test_failure() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected delete failure'; END; $$; CREATE TRIGGER cleanup_test_failure AFTER DELETE ON taskcast_events FOR EACH STATEMENT EXECUTE FUNCTION cleanup_test_failure();").execute(store.pool()).await.unwrap();
     assert!(store.delete_task_cleanup_batch(&ready, 1000).await.is_err());
@@ -228,6 +241,11 @@ async fn cleanup_claims_defer_dependencies_and_rollback_failed_batches() {
         .unwrap();
     assert!(store.delete_task_cleanup_batch(&ready, 1000).await.is_err());
     let retry = store.claim_cleanup_tasks(1, 30000).await.unwrap().remove(0);
+    let partial = store.delete_task_cleanup_batch(&retry, 1).await.unwrap();
+    assert_eq!(partial.deleted_events, 1);
+    assert!(!partial.complete);
+    store.defer_cleanup_claim(&retry, 0).await.unwrap();
+    let retry = store.claim_cleanup_tasks(1, 30000).await.unwrap().remove(0);
     assert!(
         store
             .delete_task_cleanup_batch(&retry, 1000)
@@ -235,7 +253,7 @@ async fn cleanup_claims_defer_dependencies_and_rollback_failed_batches() {
             .unwrap()
             .complete
     );
-    for table in ["taskcast_terminal_outbox", "taskcast_archive_generations"] {
+    for table in ["taskcast_terminal_outbox", "taskcast_archive_generations", "taskcast_series_state"] {
         let count: i64 = sqlx::query_scalar(&format!(
             "SELECT count(*) FROM {table} WHERE task_id = 'b-ready'"
         ))

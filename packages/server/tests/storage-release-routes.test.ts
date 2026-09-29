@@ -1,9 +1,10 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { SignJWT } from 'jose'
 import {
   MemoryBroadcastProvider,
   MemoryLongTermStore,
   MemoryShortTermStore,
+  StorageIntegrityError,
   TaskEngine,
 } from '@taskcast/core'
 import { createTaskcastApp } from '../src/index.js'
@@ -36,6 +37,25 @@ async function token(scope: string[]) {
 }
 
 describe('POST /tasks/:taskId/storage/release', () => {
+  it.each([
+    [new StorageIntegrityError('archive checksum mismatch'), 500, 'storage_integrity_error'],
+    [new Error('storage backend unavailable'), 503, 'storage_unavailable'],
+  ])('maps release failure %s to an actionable response', async (failure, status, code) => {
+    const { app, engine, stop } = makeReleaseApp()
+    await engine.createTask({ id: 'release-error' })
+    vi.spyOn(engine, 'releaseTaskStorage').mockRejectedValueOnce(failure)
+    try {
+      const response = await app.request('/tasks/release-error/storage/release', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ expectedLastEventIndex: -1, inactiveSince: Date.now() }),
+      })
+      expect(response.status).toBe(status)
+      expect(await response.json()).toMatchObject({ error: failure.message, code })
+    } finally {
+      stop()
+    }
+  })
+
   it('releases hot storage and is idempotent after the task is cold', async () => {
     const { app, engine, stop } = makeReleaseApp()
     await engine.createTask({ id: 'release-me' })

@@ -163,12 +163,16 @@ jobs:
           name: playground-dist
           path: packages/playground/dist
       - name: Build release
-        run: cargo build --release -p taskcast-cli
+        run: |
+          cargo build --release -p taskcast-cli
+          cargo build --release -p taskcast-server --example hot_cold_parity_server
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
           name: taskcast-linux-x86_64
-          path: rust/target/release/taskcast
+          path: |
+            rust/target/release/taskcast
+            rust/target/release/examples/hot_cold_parity_server
 
   integration:
     name: Integration Tests
@@ -191,10 +195,11 @@ jobs:
           name: taskcast-linux-x86_64
           path: rust/target/release/
       - name: Make binary executable
-        run: chmod +x rust/target/release/taskcast
+        run: chmod +x rust/target/release/taskcast rust/target/release/examples/hot_cold_parity_server
       - name: Run integration tests
         env:
           TASKCAST_RUST_BINARY: ${{ github.workspace }}/rust/target/release/taskcast
+          TASKCAST_RUST_PARITY_BINARY: ${{ github.workspace }}/rust/target/release/examples/hot_cold_parity_server
           NO_PROXY: 127.0.0.1,localhost
         run: |
           export no_proxy="$NO_PROXY"

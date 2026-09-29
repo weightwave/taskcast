@@ -37,6 +37,8 @@ function makeArchive(events: TaskEvent[]): TaskArchive {
 describe('normalizeTaskArchive', () => {
   it('rejects malformed archive envelope fields', () => {
     const malformedArchives = [
+      null,
+      { ...makeArchive([]), schema: 'unknown' },
       { ...makeArchive([]), exportedAt: Number.NaN },
       { ...makeArchive([]), events: undefined },
       { ...makeArchive([]), task: null },
@@ -49,6 +51,7 @@ describe('normalizeTaskArchive', () => {
 
   it('rejects missing or invalid task required fields', () => {
     const malformedTasks = [
+      { id: '' },
       { status: undefined },
       { status: 'unknown' },
       { createdAt: undefined },
@@ -70,6 +73,9 @@ describe('normalizeTaskArchive', () => {
     const baseEvent = makeEvent('event-1', 'task-1', 0)
     const { data: _data, ...eventWithoutData } = baseEvent
     const malformedEvents = [
+      null,
+      { ...baseEvent, taskId: '' },
+      { ...baseEvent, index: -1 },
       { ...baseEvent, id: undefined },
       { ...baseEvent, timestamp: undefined },
       { ...baseEvent, type: undefined },
@@ -183,6 +189,18 @@ describe('normalizeTaskArchive', () => {
 })
 
 describe('buildTaskArchiveRestoreData', () => {
+  it('keeps the newest non-text accumulate payload and ignores keep-all series state', () => {
+    const restore = buildTaskArchiveRestoreData(makeArchive([
+      { ...makeEvent('a', 'task-1', 0, 'not an object'), seriesId: 'stream', seriesMode: 'accumulate' },
+      { ...makeEvent('b', 'task-1', 1, { delta: 42 }), seriesId: 'stream', seriesMode: 'accumulate' },
+      { ...makeEvent('c', 'task-1', 2, null), seriesId: 'stream', seriesMode: 'accumulate' },
+      { ...makeEvent('audit', 'task-1', 3, {}), seriesId: 'audit', seriesMode: 'keep-all' },
+    ]))
+    expect(restore.seriesLatest).toHaveLength(1)
+    expect(restore.seriesLatest[0]?.event.id).toBe('c')
+    expect(restore.seriesLatest[0]?.event.data).toBeNull()
+  })
+
   it('sets nextIndex to max index plus one', () => {
     const restore = buildTaskArchiveRestoreData(
       makeArchive([

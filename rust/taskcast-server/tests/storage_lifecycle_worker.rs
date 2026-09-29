@@ -336,3 +336,16 @@ async fn enabled_history_cleanup_runs_in_the_existing_lifecycle_tick() {
     assert!(hot.get_task("cleanup").await.unwrap().is_none());
     assert!(durable.get_task("cleanup").await.unwrap().unwrap().history_expired_at.is_some());
 }
+
+#[tokio::test]
+async fn reports_cleanup_sweep_failure_without_stopping_the_tick() {
+    let hot = Arc::new(MemoryShortTermStore::new());
+    let engine = Arc::new(TaskEngine::new(TaskEngineOptions {
+        short_term_store: hot.clone(), long_term_store: Some(Arc::new(MemoryLongTermStore::new())),
+        broadcast: Arc::new(MemoryBroadcastProvider::new()), hooks: None,
+    }).with_cleanup_config(taskcast_core::ResolvedCleanupConfig { enabled: true, rules: vec![] }).unwrap());
+    let mut config = taskcast_core::resolve_storage_lifecycle_config(&taskcast_core::TaskcastConfig::default(), &std::collections::HashMap::new()).unwrap();
+    config.ttl_sweep_batch_size = 0;
+    let worker = StorageLifecycleWorker::new(StorageLifecycleWorkerOptions { engine, short_term_store: hot, config });
+    assert_eq!(worker.tick().await.unwrap().cleanup.failed, 1);
+}

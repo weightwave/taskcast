@@ -2,7 +2,12 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vites
 import postgres from 'postgres'
 import { GenericContainer, Wait, type StartedTestContainer } from 'testcontainers'
 import { join } from 'node:path'
-import { TaskEngine, MemoryShortTermStore, MemoryBroadcastProvider, type Task, type TaskEvent } from '@taskcast/core'
+import {
+  TaskEngine, MemoryShortTermStore, MemoryBroadcastProvider,
+  computeArchiveBatchDigest, computeArchiveSourceDigest,
+  computeArchiveSourcePageDigest, computeSeriesStateDigest,
+  type ArchiveBatch, type ArchiveGeneration, type Task, type TaskArchiveRestoreData, type TaskEvent,
+} from '@taskcast/core'
 import { PostgresLongTermStore } from '../../src/long-term.js'
 import { runMigrations } from '../../src/migration-runner.js'
 
@@ -118,6 +123,7 @@ describe('durable terminal cleanup', () => {
     expect(await store.beginTaskCleanup(claim, 1, 1)).toBe(false)
     await expect(store.deleteTaskCleanupBatch(stolen, 100)).rejects.toThrow()
     await store.saveEvent(event('claimed', 2), ctx)
+    expect(await store.beginTaskCleanup(claim, 1, 0)).toBe(false)
   })
 
   it('defers a blocked task so a later task can be claimed', async () => {
@@ -197,6 +203,67 @@ describe('durable terminal cleanup', () => {
     await enrolled('bounds')
     const [claim] = await store.claimCleanupTasks(1, 30_000)
     await expect(store.deleteTaskCleanupBatch(claim!, -1)).rejects.toThrow()
+    for (const invalid of [NaN, -1, 2_147_483_648]) {
+      await expect(store.deferCleanupClaim(claim!, invalid)).rejects.toThrow()
+    }
+    for (const invalid of [NaN, -2]) {
+      await expect(store.beginTaskCleanup(claim!, 1, invalid)).rejects.toThrow()
+    }
+  })
+
+  it('rejects archive writes after terminal cleanup expires history', async () => {
+    const { task } = await enrolled('archive-expired')
+    const [claim] = await store.claimCleanupTasks(1, 30_000)
+    expect(await store.beginTaskCleanup(claim!, 1, 0)).toBe(true)
+    expect((await store.deleteTaskCleanupBatch(claim!, 1)).complete).toBe(true)
+
+    const archivedEvent = event('archive-expired')
+    const pageDigest = await computeArchiveSourcePageDigest([archivedEvent])
+    const generation: ArchiveGeneration = {
+      taskId: task.id,
+      generation: 'late-generation',
+      storageEpoch: 1,
+      targetWatermark: 0,
+      manifest: {
+        priorWatermark: -1,
+        targetWatermark: 0,
+        sourceEntryCount: 1,
+        sourceDigest: await computeArchiveSourceDigest([pageDigest]),
+        seriesStateDigest: await computeSeriesStateDigest([]),
+        expectedBatchOrdinals: [0],
+      },
+      status: 'open',
+      createdAt: 1_000,
+      updatedAt: 1_000,
+    }
+    const batch: ArchiveBatch = {
+      receipt: {
+        taskId: task.id, generation: generation.generation, ordinal: 0,
+        previousBatchDigest: null,
+        batchDigest: await computeArchiveBatchDigest(null, [archivedEvent], []),
+        entryCount: 1, firstIndex: 0, lastIndex: 0,
+      },
+      events: [archivedEvent],
+      seriesLatest: [],
+    }
+    await expect(store.beginArchive(generation)).rejects.toThrow('history has expired')
+    await expect(store.archiveBatch(task.id, generation.generation, batch)).rejects.toThrow('history has expired')
+    await expect(store.finalizeArchive(task.id, generation.generation, task, [])).rejects.toThrow('history has expired')
+  })
+
+  it('validates the task generation before replacing a durable archive', async () => {
+    const { task, ctx } = await enrolled('restore-generation')
+    const data: TaskArchiveRestoreData = {
+      task,
+      events: [event(task.id)],
+      nextIndex: 1,
+      seriesLatest: [],
+      expectedCreationToken: ctx.creationToken,
+    }
+    await expect(store.validateTaskArchiveRestore(data, { overwrite: true })).resolves.toBeUndefined()
+    await expect(store.validateTaskArchiveRestore({
+      ...data, expectedCreationToken: 'stale-generation',
+    }, { overwrite: true })).rejects.toThrow('generation changed')
   })
 })
 

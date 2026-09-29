@@ -1,12 +1,12 @@
 # Terminal retention implementation and verification
 
-Implementation and the independent review fix pass are complete locally. **This branch is not ready to merge:** the full TypeScript coverage run exposes failing package thresholds. No thresholds were reduced, no files were excluded, and no remote CI, release, deployment or production cleanup was performed.
+Implementation and the independent review fix pass are complete. The full TypeScript package coverage gates now pass without lowered thresholds or added exclusions. Taskcast draft PR #67 and WonderAgent PR #244 are pushed; final remote CI and changed-line coverage are still being verified. No merge, release, deployment or production cleanup has been performed.
 
 ## Scope and revisions
 
 - Taskcast branch: `codex/terminal-retention`, base `20a09bb1933a5422673b9fe66622de534bfe591c`.
-- Implementation commits: `7e0c539`, `e9cd808`, `ecbd68b`, `d17aaa7`, `2b17a30`, plus the final fixes committed with this report.
-- Companion WonderAgent branch: `codex/taskcast-retention-design`; notification compaction commits `e76ba329` and `98fb7820`. Its independent review and affected tests were already complete; those unchanged results were reused.
+- Implementation commits: `7e0c539`, `e9cd808`, `ecbd68b`, `d17aaa7`, `2b17a30`, plus review fixes `f24d81d` and subsequent coverage/CI fixes recorded on PR #67.
+- Companion WonderAgent branch: `codex/taskcast-retention-design`; notification compaction commits `e76ba329` and `98fb7820`. The original independent review passed. For remote integration, the six relevant files were extracted onto current origin/dev as `codex/search-notification-compaction`; unrelated local dev history and its summary-test fixture were excluded. On this new base, API 179 and desktop 69 targeted tests, both typechecks and affected lint pass.
 - Taskcast cleanup remains disabled by default. New tasks snapshot type/status policies; task overrides replace defaults, and empty rules opt out. Old tasks and imported archives remain unenrolled.
 - TypeScript and Rust implement the same bounded events/all cleanup, durable expiry marker, REST/SSE semantics and protected archive overwrite. Search 24-hour/7-day policies are documented examples, not deployment changes.
 
@@ -21,16 +21,16 @@ The whole-branch reviewer assessed core requirements, actual usage and existing 
 
 ## Final verification
 
-Verified on Node 22.23.3 with pnpm 10.30.3 and isolated Docker databases. Rust network tests used `NO_PROXY=127.0.0.1,localhost`. All final feature source changes were present. Later changes were tests, this report and formatting only.
+Verified on Node 22.23.3 with pnpm 10.30.3 and isolated Docker databases. Rust network tests used `NO_PROXY=127.0.0.1,localhost`. The full TypeScript run included memory projection atomicity and bounded-retry fixes. Subsequent targeted package coverage and Rust regression runs include the final changed-line tests and integer TTL timestamp fix; unchanged package results were reused. CI fixture changes are verified separately below.
 
 | Check | Result |
 | --- | --- |
 | `pnpm build` | Passed |
 | `pnpm lint` | Passed |
-| Package tests through each existing coverage config | 2,249 tests passed across 12 packages; coverage gate failures listed below |
-| Core tests | 724 passed |
-| PostgreSQL tests | 157 passed, including cleanup and migration integration |
-| Server Redis integration | 2 passed with `TESTCONTAINERS=1`; these were skipped by the environment guard in the initial package run and then explicitly executed |
+| Package tests through each existing coverage config | 2,435 tests passed across all 12 package configs with TESTCONTAINERS=1; all configured coverage gates passed |
+| Core tests | 921 passed; 100% lines/functions, 97.13% branches |
+| PostgreSQL tests | 160 passed in the final package coverage run, including cleanup and migration integration |
+| Server Redis integration | Included in the final 531-test server coverage run, no skips |
 | Rust core `cargo test -p taskcast-core` | 682 passed |
 | Rust PostgreSQL `store_tests` and `cleanup_store` | 67 passed against isolated PostgreSQL |
 | `cargo build -p taskcast-cli` | Passed |
@@ -40,22 +40,17 @@ Verified on Node 22.23.3 with pnpm 10.30.3 and isolated Docker databases. Rust n
 
 The cross-process parity suite verifies all live notifications arrive while latest history compacts per entity, normal accumulate/keep-all semantics, policy snapshots, empty overrides, legacy opt-out, failed/timeout differences, events/all expiry, API/SSE/export behavior, late writes, overwrite and restart after partial deletion.
 
-### Coverage gates still blocking merge
+### Coverage and remote verification
 
-Every existing package configuration was executed independently so its actual threshold applies. Tests pass; these four coverage commands exit 1:
+The initial full TypeScript run exposed previously unenforced core/CLI/server/SQLite gates. Public-contract tests now cover recovery, archive restore, adapter rejection atomicity, lifecycle timers, HTTP/SSE failure paths and configuration boundaries. The final full run exits 0: core/server/SQLite have 100% lines/functions; CLI meets its configured 100% line requirement. No coverage thresholds or source exclusions changed.
 
-| Package | Lines | Functions | Branches | Failing requirements |
-| --- | ---: | ---: | ---: | --- |
-| core | 89.29% | 96.20% | 86.41% | 100% lines/functions, 90% branches |
-| cli | 99.34% | 96.11% | 94.50% | 100% lines |
-| server | 97.57% | 97.97% | 93.04% | 100% lines/functions |
-| sqlite | 96.06% | 98.21% | 97.44% | 100% lines/functions |
+The added tests found a real memory adapter bug: a conflicting worker assignment rejected terminal projection after task/events had already changed. TypeScript and Rust now validate before mutation; two regressions in each runtime failed before and pass after the fix, and the affected Rust suites total 10 passing tests.
 
-The new cleanup policy, coordinator and PostgreSQL cleanup module each have 100% line/function coverage. This does **not** establish 100% changed-line coverage across all modified existing files. Current reports also show uncovered unchanged storage/engine paths; SQLite source is unchanged by this branch. A baseline coverage run was not performed, so these numbers are not a measured before/after comparison.
+At pushed revision `524e281`, Rust coverage and Clippy, release build and all three E2E jobs pass. The TS job reflects the earlier coverage gaps, which are now fixed locally. Rust migration-readiness and parity-fixture startup failures are fixed locally: all four migration tests pass with bounded health polling, and both hot/cold parity tests pass using the prebuilt release fixture. Startup/exit diagnostic probes also report the real failure. Final remote confirmation is pending. Codecov changed-line coverage remains a separate merge gate and has not yet passed. Local package line coverage does not substitute for that combined TS/Rust check.
 
-Other package coverage commands exited 0. That does not imply every package is above 90%: existing configurations without package thresholds include Redis and dashboard-web. The configured Codecov project/patch gates and Rust coverage gate have not been verified remotely. Do not bypass them to merge.
+Further changed-line tests exercise concurrent deletion during REST/SSE replay, rejected imports after identity/epoch changes, adapter compatibility and cleanup lease failures. They exposed fractional Rust TTL completion timestamps that made an explicitly configured timeout cleanup rule ineligible. The TTL clock now uses integer milliseconds; the real timeout-to-cleanup regression and related core suites pass. A focused independent review of the five product-file changes found no blocking issues, including Rust assignment-lock ordering and three-attempt retry behavior. Final affected coverage: core 921, server 531, client 27, PostgreSQL 160 tests; all four commands exit 0. Together with the unchanged passing package results, this is 2,476 tests. Intersecting the final TypeScript LCOV with added product lines finds no zero-hit branches. Rust core affected suites pass 23 tests, server suites 10, PostgreSQL integration 8 plus one pure deadline unit test. Final affected product Clippy passes.
 
-The optional broader Rust `--all-targets` clippy run finds existing warnings in `proptest_filter.rs`, `series_collapse.rs` and `archive.rs`; the corresponding expressions were verified in base `20a09bb`. Earlier workspace clippy also found an unchanged macOS-only CLI warning. These are distinct from the passing affected product clippy command and from the Linux CI result, which remains unverified.
+The optional broader Rust `--all-targets` clippy run finds existing warnings in `proptest_filter.rs`, `series_collapse.rs` and `archive.rs`; the corresponding expressions were verified in base `20a09bb`. Earlier workspace clippy also found an unchanged macOS-only CLI warning. These are distinct from the passing affected product clippy command and from the passing Linux CI Clippy result at `524e281`.
 
 ## Implementation rulings and practical limits
 
@@ -67,13 +62,13 @@ The optional broader Rust `--all-targets` clippy run finds existing warnings in 
 6. Overwrite restore uses PostgreSQL transaction semantics plus the existing renewed storage lease and atomic hot restore. It rotates the creation token and removes enrollment. Cross-store failure recovery is an explicit retry; no distributed rollback system was added. A failed import may require retry before hot state is fully usable.
 7. Tokens are generated in adapters to avoid requiring an unavailable PostgreSQL UUID extension. Tokens remain opaque generation identities.
 8. The existing Rust integration job already includes the new parity suite. Its dependency path triggers were expanded; the separate E2E workflow was not duplicated.
-9. The root coverage entry now runs every package config once, preserving includes/excludes and thresholds. Previously unenforced gaps now block the gate. Remaining coverage work must be completed before merge; it is not waived by functional test success.
+9. The root coverage entry now runs every package config once, preserving includes/excludes and thresholds. Previously unenforced gaps now block the gate. The final local package run passes; the separate remote changed-line gate must also pass before merge.
 10. Terminal publish preserves the existing HTTP 400 contract. Only expired archive export introduces HTTP 409 with `TASKCAST_HISTORY_EXPIRED`.
 11. Existing same-state verification was reused rather than repeated at every commit. Detailed local command logs remain in this worktree's ignored `.superpowers/sdd/2026-09-28-taskcast-terminal-retention/` directory while coverage/CI verification is still pending.
 
 ## Remaining work before release
 
-- Bring the required coverage gates to green and run CI on the final pushed revision.
-- Obtain the intended merge/release/deployment instruction; neither repository was pushed or merged for this feature.
+- Complete changed-line coverage and CI verification on the final pushed revision.
+- Obtain the intended merge/release/deployment instruction. Taskcast PR #67 is pushed; no release or deployment is authorized by pushing.
 - Deploy migration 006 and all v3 writers before enabling cleanup in an approved environment.
 - Treat old-task enrollment and any production deletion as a separate, reviewed operation. This version contains no bulk legacy enrollment switch.
