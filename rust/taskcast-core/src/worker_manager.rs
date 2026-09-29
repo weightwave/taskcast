@@ -372,7 +372,26 @@ impl WorkerManager {
 
     // ─── Task Claim ────────────────────────────────────────────────────
 
+    async fn capture_durable_context(
+        &self,
+        task_id: &str,
+    ) -> ManagerResult<Option<crate::types::DurableWriteContext>> {
+        let Some(store) = self
+            .long_term_store
+            .as_ref()
+            .filter(|s| s.supports_hot_cold_release())
+        else {
+            return Ok(None);
+        };
+        Ok(store
+            .get_task_storage_metadata(task_id)
+            .await?
+            .and_then(|m| m.creation_token)
+            .map(|creation_token| crate::types::DurableWriteContext { creation_token }))
+    }
+
     pub async fn claim_task(&self, task_id: &str, worker_id: &str) -> ManagerResult<ClaimResult> {
+        let context = self.capture_durable_context(task_id).await?;
         let task = self.engine.get_task(task_id).await?;
         let Some(task) = task else {
             return Ok(ClaimResult::Failed {
@@ -396,7 +415,9 @@ impl WorkerManager {
         // Re-read the authoritative state after atomic claim
         let updated_task = self.short_term_store.get_task(task_id).await?.unwrap();
         if let Some(ref long_term_store) = self.long_term_store {
-            long_term_store.save_task(updated_task.clone()).await?;
+            long_term_store
+                .save_task_with_context(updated_task.clone(), context.as_ref())
+                .await?;
         }
 
         // Emit audit events
@@ -479,6 +500,7 @@ impl WorkerManager {
         worker_id: &str,
         opts: Option<DeclineOptions>,
     ) -> ManagerResult<()> {
+        let context = self.capture_durable_context(task_id).await?;
         let assignment = self.short_term_store.get_task_assignment(task_id).await?;
         let assignment = match assignment {
             Some(a) if a.worker_id == worker_id => a,
@@ -570,7 +592,9 @@ impl WorkerManager {
 
             self.short_term_store.save_task(task.clone()).await?;
             if let Some(ref long_term_store) = self.long_term_store {
-                long_term_store.save_task(task.clone()).await?;
+                long_term_store
+                    .save_task_with_context(task.clone(), context.as_ref())
+                    .await?;
             }
 
             if let Some(ref hooks) = self.hooks {

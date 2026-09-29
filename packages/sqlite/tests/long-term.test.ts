@@ -234,6 +234,23 @@ describe('SqliteLongTermStore', () => {
     })
   })
 
+  it('replaces accumulated data when either delta is not a string', async () => {
+    await store.saveTask(makeTask())
+    const first = { ...makeEvent('task-1', 0), seriesId: 'output', seriesMode: 'accumulate' as const, data: { text: 'hello' } }
+    const nullDelta = { ...makeEvent('task-1', 1), seriesId: 'output', seriesMode: 'accumulate' as const, data: null }
+    const fresh = { ...makeEvent('task-1', 2), seriesId: 'output', seriesMode: 'accumulate' as const, data: { text: 'fresh' } }
+    const numeric = { ...makeEvent('task-1', 3), seriesId: 'output', seriesMode: 'accumulate' as const, data: { text: 42 } }
+
+    await store.accumulateSeries('task-1', 'output', first, 'text')
+    await expect(store.accumulateSeries('task-1', 'output', nullDelta, 'text')).resolves.toEqual(nullDelta)
+    await expect(store.accumulateSeries('task-1', 'output', fresh, 'text')).resolves.toEqual(fresh)
+    await expect(store.accumulateSeries('task-1', 'output', numeric, 'text')).resolves.toEqual(numeric)
+    await expect(store.getEvents('task-1')).resolves.toMatchObject([{
+      data: { text: 42 },
+      seriesId: 'output',
+    }])
+  })
+
   it('should return empty array when no events exist', async () => {
     await store.saveTask(makeTask())
     const events = await store.getEvents('task-1')

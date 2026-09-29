@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import type postgres from 'postgres'
 import {
   DependencyUnavailableError,
@@ -16,6 +17,8 @@ import {
   type ArchiveSourceManifest,
   type AssignMode,
   type CleanupRule,
+  type CleanupClaim,
+  type DurableWriteContext,
   type DependencyObserver,
   type DisconnectPolicy,
   type DurableSeriesState,
@@ -38,6 +41,7 @@ import {
   type WorkerAuditEvent,
 } from '@taskcast/core'
 import { classifyPostgresConnectivity } from './health.js'
+import { PostgresCleanupStore, nextCleanupDeadline } from './cleanup-store.js'
 
 const TASKS = 'taskcast_tasks'
 const EVENTS = 'taskcast_events'
@@ -60,6 +64,15 @@ interface ArchiveSeriesCoverage {
 export class PostgresLongTermStore implements LongTermStore {
   readonly supportsHotColdRelease = true
   readonly supportsDurableTtl = true
+  readonly supportsTerminalCleanup = true
+
+  private cleanupStore() { return new PostgresCleanupStore(this.sql, row => this._rowToTask(row)) }
+  canCleanupTask(claim: CleanupClaim) { return this.observed(() => this.cleanupStore().ready(claim)) }
+  claimCleanupTasks(limit: number, ttl: number) { return this.observed(() => this.cleanupStore().claim(limit, ttl)) }
+  renewCleanupClaim(claim: CleanupClaim, ttl: number) { return this.observed(() => this.cleanupStore().renew(claim, ttl)) }
+  deferCleanupClaim(claim: CleanupClaim, delay: number) { return this.observed(() => this.cleanupStore().defer(claim, delay)) }
+  beginTaskCleanup(claim: CleanupClaim, epoch: number, through: number) { return this.observed(() => this.cleanupStore().begin(claim, epoch, through)) }
+  deleteTaskCleanupBatch(claim: CleanupClaim, limit: number) { return this.observed(() => this.cleanupStore().deleteBatch(claim, limit)) }
 
   constructor(
     private sql: ReturnType<typeof postgres>,
@@ -83,10 +96,22 @@ export class PostgresLongTermStore implements LongTermStore {
     }
   }
 
-  async saveTask(task: Task): Promise<void> {
+  async saveTask(task: Task, context?: DurableWriteContext): Promise<void> {
     return this.observed(async () => {
-      await this.saveTaskWithClient(this.sql, task)
+      await this.sql.begin(async connection => {
+        const tx = connection as unknown as PostgresClient
+        await this.guardWrite(tx, task.id, context, task.cleanupPolicyVersion === 1)
+        await this.saveTaskWithClient(tx, task)
+      })
     })
+  }
+
+  private async guardWrite(sql: PostgresClient, taskId: string, context?: DurableWriteContext, enrolled = false): Promise<void> {
+    const [row] = await sql`SELECT creation_token, cleanup_policy_version, history_expired_at FROM taskcast_tasks WHERE id = ${taskId} FOR UPDATE`
+    if (row?.['history_expired_at'] != null || (context && (!row || row['creation_token'] !== context.creationToken))
+      || (!context && (enrolled || row?.['cleanup_policy_version'] === 1 || row?.['creation_token'] != null))) {
+      throw new StorageFenceConflictError('Durable write belongs to missing, expired, or replaced task generation')
+    }
   }
 
   async createTaskIfAbsent(task: Task): Promise<boolean> {
@@ -106,7 +131,7 @@ export class PostgresLongTermStore implements LongTermStore {
     const rows = await this.sql`
       INSERT INTO ${this.sql(t)} (
         id, type, status, params, result, error, metadata,
-        auth_config, webhooks, cleanup, created_at, updated_at, completed_at, ttl,
+        auth_config, webhooks, cleanup, cleanup_policy_version, cleanup_resolved_at, cleanup_due_at, created_at, updated_at, completed_at, ttl,
         tags, assign_mode, cost, assigned_worker, disconnect_policy,
         creation_token, creation_claimed_at, creation_claim_expires_at,
         creation_completed_at, execution_deadline_at, task_version
@@ -119,6 +144,7 @@ export class PostgresLongTermStore implements LongTermStore {
         ${task.authConfig ? this.sql.json(task.authConfig as never) : null},
         ${task.webhooks ? this.sql.json(task.webhooks as never) : null},
         ${task.cleanup ? this.sql.json(task.cleanup as never) : null},
+        ${task.cleanupPolicyVersion ?? null}, ${task.cleanupResolvedAt ?? null}, ${nextCleanupDeadline(task)},
         ${task.createdAt}, ${task.updatedAt},
         ${task.completedAt ?? null}, ${task.ttl ?? null},
         ${task.tags ? this.sql.json(task.tags as never) : null},
@@ -148,6 +174,9 @@ export class PostgresLongTermStore implements LongTermStore {
         auth_config = EXCLUDED.auth_config,
         webhooks = EXCLUDED.webhooks,
         cleanup = EXCLUDED.cleanup,
+        cleanup_policy_version = EXCLUDED.cleanup_policy_version,
+        cleanup_resolved_at = EXCLUDED.cleanup_resolved_at,
+        cleanup_due_at = EXCLUDED.cleanup_due_at,
         created_at = EXCLUDED.created_at,
         updated_at = EXCLUDED.updated_at,
         completed_at = EXCLUDED.completed_at,
@@ -245,7 +274,7 @@ export class PostgresLongTermStore implements LongTermStore {
     const rows = await this.sql`
       INSERT INTO ${this.sql(t)} (
         id, type, status, params, result, error, metadata,
-        auth_config, webhooks, cleanup, created_at, updated_at, completed_at, ttl,
+        auth_config, webhooks, cleanup, cleanup_policy_version, cleanup_resolved_at, cleanup_due_at, created_at, updated_at, completed_at, ttl,
         tags, assign_mode, cost, assigned_worker, disconnect_policy, creation_token,
         execution_deadline_at, task_version
       ) VALUES (
@@ -257,6 +286,7 @@ export class PostgresLongTermStore implements LongTermStore {
         ${task.authConfig ? this.sql.json(task.authConfig as never) : null},
         ${task.webhooks ? this.sql.json(task.webhooks as never) : null},
         ${task.cleanup ? this.sql.json(task.cleanup as never) : null},
+        ${task.cleanupPolicyVersion ?? null}, ${task.cleanupResolvedAt ?? null}, ${nextCleanupDeadline(task)},
         ${task.createdAt}, ${task.updatedAt},
         ${task.completedAt ?? null}, ${task.ttl ?? null},
         ${task.tags ? this.sql.json(task.tags as never) : null},
@@ -284,7 +314,7 @@ export class PostgresLongTermStore implements LongTermStore {
     const rows = await sql`
       INSERT INTO ${sql(t)} (
         id, type, status, params, result, error, metadata,
-        auth_config, webhooks, cleanup, created_at, updated_at, completed_at, ttl,
+        auth_config, webhooks, cleanup, cleanup_policy_version, cleanup_resolved_at, cleanup_due_at, created_at, updated_at, completed_at, ttl,
         tags, assign_mode, cost, assigned_worker, disconnect_policy,
         execution_deadline_at, task_version
       ) VALUES (
@@ -296,6 +326,7 @@ export class PostgresLongTermStore implements LongTermStore {
         ${task.authConfig ? sql.json(task.authConfig as never) : null},
         ${task.webhooks ? sql.json(task.webhooks as never) : null},
         ${task.cleanup ? sql.json(task.cleanup as never) : null},
+        ${task.cleanupPolicyVersion ?? null}, ${task.cleanupResolvedAt ?? null}, ${nextCleanupDeadline(task)},
         ${task.createdAt}, ${task.updatedAt},
         ${task.completedAt ?? null}, ${task.ttl ?? null},
         ${task.tags ? sql.json(task.tags as never) : null},
@@ -332,6 +363,7 @@ export class PostgresLongTermStore implements LongTermStore {
           THEN EXCLUDED.execution_deadline_at
           ELSE ${sql(t)}.execution_deadline_at
         END,
+        cleanup_due_at = CASE WHEN ${sql(t)}.cleanup_policy_version = 1 THEN EXCLUDED.cleanup_due_at ELSE NULL END,
         task_version = ${sql(t)}.task_version + 1,
         ttl_claim_token = NULL,
         ttl_claim_until = NULL
@@ -358,16 +390,21 @@ export class PostgresLongTermStore implements LongTermStore {
     })
   }
 
-  async saveEvent(event: TaskEvent): Promise<void> {
+  async saveEvent(event: TaskEvent, context?: DurableWriteContext): Promise<void> {
     return this.observed(async () => {
-      await this.saveEventWithClient(this.sql, event, 'ignore')
+      await this.sql.begin(async connection => {
+        const tx = connection as unknown as PostgresClient
+        await this.guardWrite(tx, event.taskId, context)
+        await this.saveEventWithClient(tx, event, 'ignore')
+      })
     })
   }
 
-  async replaceLastSeriesEvent(taskId: string, seriesId: string, event: TaskEvent): Promise<void> {
+  async replaceLastSeriesEvent(taskId: string, seriesId: string, event: TaskEvent, context?: DurableWriteContext): Promise<void> {
     return this.observed(async () => {
       await this.sql.begin(async (sql) => {
         const tx = sql as unknown as PostgresClient
+        await this.guardWrite(tx, taskId, context)
         const archiveWatermark = await this.lockTaskForSeriesWrite(tx, taskId)
         const committed = await this.getSeriesStateForUpdate(tx, taskId, seriesId)
         if (archiveWatermark >= event.index || (committed?.throughIndex ?? -1) >= event.index) {
@@ -408,10 +445,11 @@ export class PostgresLongTermStore implements LongTermStore {
     })
   }
 
-  async accumulateSeries(taskId: string, seriesId: string, event: TaskEvent, field: string): Promise<TaskEvent> {
+  async accumulateSeries(taskId: string, seriesId: string, event: TaskEvent, field: string, context?: DurableWriteContext): Promise<TaskEvent> {
     return this.observed(async () => {
       return this.sql.begin(async (sql) => {
         const tx = sql as unknown as PostgresClient
+        await this.guardWrite(tx, taskId, context)
         const archiveWatermark = await this.lockTaskForSeriesWrite(tx, taskId)
         const committed = await this.getSeriesStateForUpdate(tx, taskId, seriesId)
         if (archiveWatermark >= event.index || (committed?.throughIndex ?? -1) >= event.index) {
@@ -613,7 +651,10 @@ export class PostgresLongTermStore implements LongTermStore {
     options?: TaskArchiveImportOptions,
   ): Promise<boolean> {
     const taskId = data.task.id
-    const existing = await sql`SELECT id FROM ${sql(TASKS)} WHERE id = ${taskId}`
+    const existing = await sql`SELECT id, creation_token FROM ${sql(TASKS)} WHERE id = ${taskId} FOR UPDATE`
+    if (data.expectedCreationToken !== undefined && (existing[0]?.creation_token ?? null) !== data.expectedCreationToken) {
+      throw new StorageFenceConflictError('Archive restore generation changed')
+    }
     if (existing.length > 0 && options?.overwrite !== true) {
       throw new Error(`Task already exists: ${taskId}`)
     }
@@ -645,7 +686,15 @@ export class PostgresLongTermStore implements LongTermStore {
 
         await tx`DELETE FROM ${tx(EVENTS)} WHERE task_id = ${taskId}`
         await tx`DELETE FROM ${tx(TASKS)} WHERE id = ${taskId}`
-        await this.saveTaskWithClient(tx, data.task)
+        const task = { ...data.task }
+        delete task.cleanupPolicyVersion
+        delete task.cleanupResolvedAt
+        delete task.historyExpiredAt
+        await this.saveTaskWithClient(tx, task)
+        await tx`UPDATE ${tx(TASKS)} SET creation_token = ${randomUUID()},
+          creation_completed_at = FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT,
+          archive_watermark = ${data.nextIndex - 1}, storage_epoch = ${data.storageEpoch ?? 1}, storage_state = ${data.storageEpoch !== undefined ? 'cold' : 'hot'}
+          WHERE id = ${taskId}`
         for (const event of data.events) {
           await this.saveEventWithClient(tx, event, 'strict')
         }
@@ -659,7 +708,7 @@ export class PostgresLongTermStore implements LongTermStore {
     const rows = await this.sql`
       SELECT id, storage_state, storage_epoch, active_release_generation,
              archive_watermark, last_event_at, cold_at, execution_deadline_at,
-             task_version
+             task_version, creation_token
       FROM ${this.sql(TASKS)}
       WHERE id = ${taskId}
     `
@@ -999,7 +1048,7 @@ export class PostgresLongTermStore implements LongTermStore {
     return this.sql.begin(async (sql) => {
       const tx = sql as unknown as PostgresClient
       const taskRows = await tx`
-        SELECT storage_state, storage_epoch, active_release_generation, archive_watermark
+        SELECT storage_state, storage_epoch, active_release_generation, archive_watermark, history_expired_at
         FROM ${tx(TASKS)}
         WHERE id = ${generation.taskId}
         FOR UPDATE
@@ -1007,6 +1056,7 @@ export class PostgresLongTermStore implements LongTermStore {
       const task = taskRows[0]
       if (!task) throw new StorageIntegrityError(`Archive task does not exist: ${generation.taskId}`)
 
+      if (task['history_expired_at'] != null) throw new StorageFenceConflictError('Task history has expired')
       const existingRows = await tx`
         SELECT *
         FROM ${tx(ARCHIVE_GENERATIONS)}
@@ -1077,7 +1127,7 @@ export class PostgresLongTermStore implements LongTermStore {
     return this.sql.begin(async (sql) => {
       const tx = sql as unknown as PostgresClient
       const taskRows = await tx`
-        SELECT storage_state, storage_epoch, active_release_generation
+        SELECT storage_state, storage_epoch, active_release_generation, history_expired_at
         FROM ${tx(TASKS)}
         WHERE id = ${taskId}
         FOR UPDATE
@@ -1086,6 +1136,7 @@ export class PostgresLongTermStore implements LongTermStore {
       if (!task) {
         throw new StorageIntegrityError(`Archive task does not exist: ${taskId}`)
       }
+      if (task['history_expired_at'] != null) throw new StorageFenceConflictError('Task history has expired')
       const generationRows = await tx`
         SELECT *
         FROM ${tx(ARCHIVE_GENERATIONS)}
@@ -1210,6 +1261,7 @@ export class PostgresLongTermStore implements LongTermStore {
       const taskRow = taskRows[0]
       if (!taskRow) throw new StorageIntegrityError(`Archive task does not exist: ${taskId}`)
 
+      if (taskRow['history_expired_at'] != null) throw new StorageFenceConflictError('Task history has expired')
       const generationRows = await tx`
         SELECT *
         FROM ${tx(ARCHIVE_GENERATIONS)}
@@ -1433,6 +1485,7 @@ export class PostgresLongTermStore implements LongTermStore {
     const rows = await this.sql`
       SELECT GREATEST(
         task.archive_watermark,
+        COALESCE(task.history_expired_through_index, -1),
         COALESCE((SELECT MAX(event.idx) FROM ${this.sql(EVENTS)} event WHERE event.task_id = task.id), -1),
         COALESCE((SELECT MAX(series.through_index) FROM ${this.sql(SERIES_STATE)} series WHERE series.task_id = task.id), -1)
       ) AS last_index
@@ -1745,6 +1798,9 @@ export class PostgresLongTermStore implements LongTermStore {
     if (row['auth_config'] != null) task.authConfig = row['auth_config'] as TaskAuthConfig
     if (row['webhooks'] != null) task.webhooks = row['webhooks'] as WebhookConfig[]
     if (row['cleanup'] != null) task.cleanup = row['cleanup'] as { rules: CleanupRule[] }
+    if (row['cleanup_policy_version'] === 1) task.cleanupPolicyVersion = 1
+    if (row['cleanup_resolved_at'] != null) task.cleanupResolvedAt = Number(row['cleanup_resolved_at'])
+    if (row['history_expired_at'] != null) task.historyExpiredAt = Number(row['history_expired_at'])
     if (row['completed_at'] != null) task.completedAt = Number(row['completed_at'])
     if (row['ttl'] != null) task.ttl = Number(row['ttl'])
     if (row['tags'] != null) task.tags = row['tags'] as string[]
@@ -2125,6 +2181,7 @@ function assertCanonicalJson(value: unknown): void {
 function rowToStorageMetadata(row: postgres.Row): TaskStorageMetadata {
   return {
     taskId: row['id'] as string,
+    ...(row['creation_token'] != null && { creationToken: String(row['creation_token']) }),
     storageState: row['storage_state'] as TaskStorageMetadata['storageState'],
     storageEpoch: Number(row['storage_epoch']),
     activeReleaseGeneration: (row['active_release_generation'] as string | null) ?? null,

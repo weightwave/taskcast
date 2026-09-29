@@ -546,7 +546,7 @@ pub async fn run(args: StartArgs) -> Result<(), Box<dyn std::error::Error>> {
         },
         storage_lifecycle.storage_lock_ttl_seconds * 1_000,
         storage_lifecycle.rehydrate_replay_events,
-    ));
+    ).with_cleanup_config(taskcast_core::resolve_cleanup_config(&file_config, &env)?)?);
 
     // 6. Create WorkerManager if workers enabled in config
     let workers_enabled = file_config

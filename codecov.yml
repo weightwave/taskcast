@@ -1,8 +1,13 @@
 coverage:
   status:
+    project:
+      default:
+        target: 90%
+        threshold: 0%
     patch:
       default:
-        target: auto
+        target: 100%
+        threshold: 0%
 
 ignore:
   - "rust/taskcast-cli/src/main.rs"

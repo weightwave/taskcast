@@ -404,3 +404,8 @@ const engine = new TaskEngine({
 - [REST API](../api/rest.md) — 完整 API 参考
 - [SSE 订阅](../api/sse.md) — SSE 协议详解
 - [认证与权限](../api/authentication.md) — 认证系统详解
+
+
+## 终态历史保留
+
+永久清理默认关闭，与 Redis 热数据释放独立。按任务类型设置保留期限、过期查询语义及上线步骤见 [终态历史保留](./retention.zh.md)。

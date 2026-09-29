@@ -299,6 +299,7 @@ async fn fenced_commit_and_close_are_linearizable_without_index_gaps() {
         .unwrap()
         .unwrap();
     let token = HotWriteToken {
+        creation_token: None,
         task_id: task.id.clone(),
         storage_epoch: 1,
     };
@@ -375,6 +376,7 @@ async fn concurrent_fenced_accumulation_loses_no_deltas() {
     let store =
         Arc::new(RedisShortTermStore::new(conn, Some("test")).with_legacy_series_writes(false));
     let token = HotWriteToken {
+        creation_token: None,
         task_id: task.id.clone(),
         storage_epoch: 1,
     };

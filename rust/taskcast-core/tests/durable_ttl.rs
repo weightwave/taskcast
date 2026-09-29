@@ -31,6 +31,9 @@ fn now_ms() -> f64 {
 fn make_task(id: &str, status: TaskStatus) -> Task {
     let now = now_ms();
     Task {
+        cleanup_policy_version: None,
+        cleanup_resolved_at: None,
+        history_expired_at: None,
         id: id.to_string(),
         r#type: None,
         status,

@@ -201,3 +201,7 @@ cleanup:
 - [Deployment Guide](./deployment.md) — Production environment configuration
 - [REST API](../api/rest.md) — Full API reference
 - [Authentication & Authorization](../api/authentication.md) — JWT authentication configuration
+
+## Terminal history retention
+
+Permanent cleanup is disabled by default and separate from Redis hot retention. See [terminal history retention](./retention.md) for per-task policies, expired-history behavior and rollout steps.

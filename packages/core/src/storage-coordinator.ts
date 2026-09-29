@@ -482,7 +482,7 @@ export class StorageCoordinator {
         fence.activeReleaseGeneration === null &&
         fence.storageEpoch === metadata.storageEpoch
       ) {
-        return { taskId, storageEpoch: fence.storageEpoch }
+        return { taskId, storageEpoch: fence.storageEpoch, ...(metadata.creationToken && { creationToken: metadata.creationToken }) }
       }
       if (
         fence?.acceptingWrites &&
@@ -500,7 +500,7 @@ export class StorageCoordinator {
             next: { ...metadata, storageEpoch: fence.storageEpoch },
           },
         )
-        if (repaired) return { taskId, storageEpoch: fence.storageEpoch }
+        if (repaired) return { taskId, storageEpoch: fence.storageEpoch, ...(metadata.creationToken && { creationToken: metadata.creationToken }) }
         continue
       }
       throw new StorageFenceConflictError(
@@ -622,13 +622,14 @@ export class StorageCoordinator {
           fence.activeReleaseGeneration === null &&
           fence.storageEpoch === metadata.storageEpoch
         ) {
-          return { taskId, storageEpoch: fence.storageEpoch }
+          return { taskId, storageEpoch: fence.storageEpoch, ...(metadata.creationToken && { creationToken: metadata.creationToken }) }
         }
         throw new StorageFenceConflictError(
           'Hot task write fence does not match durable metadata',
         )
       }
       if (
+        metadata.creationToken !== initial.creationToken ||
         metadata.storageEpoch !== initial.storageEpoch ||
         metadata.activeReleaseGeneration !== null
       ) {
@@ -667,7 +668,7 @@ export class StorageCoordinator {
             'Restored hot epoch lost its metadata recovery race',
           )
         }
-        return { taskId, storageEpoch: existingFence.storageEpoch }
+        return { taskId, storageEpoch: existingFence.storageEpoch, ...(metadata.creationToken && { creationToken: metadata.creationToken }) }
       }
       if (
         presence.task ||
@@ -699,6 +700,7 @@ export class StorageCoordinator {
       if (!task) {
         throw new StorageIntegrityError(`Durable task does not exist: ${taskId}`)
       }
+      if (task.historyExpiredAt !== undefined) throw new StorageFenceConflictError('Task history has expired')
       if (
         !Number.isSafeInteger(maxEventIndex) ||
         maxEventIndex < metadata.archiveWatermark ||
@@ -755,7 +757,7 @@ export class StorageCoordinator {
           },
         },
       )
-      if (installed) return token
+      if (installed) return { ...token, ...(metadata.creationToken && { creationToken: metadata.creationToken }) }
 
       const current = await durable.getTaskStorageMetadata.call(
         this.longTermStore,
@@ -763,10 +765,11 @@ export class StorageCoordinator {
       )
       if (
         current?.storageState === 'hot' &&
+        current.creationToken === metadata.creationToken &&
         current.storageEpoch === nextEpoch &&
         current.activeReleaseGeneration === null
       ) {
-        return token
+        return { ...token, ...(metadata.creationToken && { creationToken: metadata.creationToken }) }
       }
       await renew()
       await hot.closeWriteFence.call(this.shortTermStore, lease, nextEpoch)

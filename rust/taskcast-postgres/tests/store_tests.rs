@@ -107,6 +107,9 @@ async fn setup() -> (
 
 fn make_task(id: &str) -> Task {
     Task {
+        cleanup_policy_version: None,
+        cleanup_resolved_at: None,
+        history_expired_at: None,
         id: id.to_string(),
         r#type: None,
         status: TaskStatus::Pending,
@@ -514,6 +517,7 @@ async fn storage_coordinator_persists_integer_cold_timestamp_to_postgres() {
             task_id,
             make_event(task_id, 0),
             &HotWriteToken {
+                creation_token: None,
                 task_id: task_id.to_string(),
                 storage_epoch: 1,
             },
@@ -1586,7 +1590,15 @@ async fn completes_or_aborts_only_the_matching_pristine_creation_claim() {
         .unwrap());
     let mut running = make_task("task-1");
     running.status = TaskStatus::Running;
-    store.save_task(running).await.unwrap();
+    store
+        .save_task_with_context(
+            running,
+            Some(&taskcast_core::DurableWriteContext {
+                creation_token: "token-1".into(),
+            }),
+        )
+        .await
+        .unwrap();
     assert!(!store
         .abort_task_creation("task-1", "token-1")
         .await
@@ -1682,6 +1694,9 @@ async fn preserve_optional_fields_on_round_trip() {
 async fn handle_task_with_no_optional_fields() {
     let (store, _container) = setup().await;
     let task = Task {
+        cleanup_policy_version: None,
+        cleanup_resolved_at: None,
+        history_expired_at: None,
         id: "minimal".to_string(),
         r#type: None,
         status: TaskStatus::Pending,

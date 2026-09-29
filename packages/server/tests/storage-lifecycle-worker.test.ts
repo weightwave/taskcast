@@ -51,6 +51,21 @@ async function makeFixture() {
 }
 
 describe('StorageLifecycleWorker', () => {
+  it('runs enabled history cleanup in the existing lifecycle tick', async () => {
+    const hot = new MemoryShortTermStore()
+    const durable = new MemoryLongTermStore()
+    const engine = new TaskEngine({ shortTermStore: hot, longTermStore: durable, broadcast: new MemoryBroadcastProvider(), cleanup: { enabled: true, rules: [{ target: 'events', trigger: {} }] } })
+    await engine.createTask({ id: 'cleanup' })
+    await engine.transitionTask('cleanup', 'running')
+    await engine.transitionTask('cleanup', 'completed', { result: { kept: true } })
+    const logger = vi.fn()
+    const worker = new StorageLifecycleWorker({ engine, shortTermStore: hot, config, logger })
+    expect((await worker.tick())?.cleanup).toMatchObject({ claimed: 1, completed: 1, deletedEvents: 2 })
+    expect(await hot.getTask('cleanup')).toBeNull()
+    expect((await durable.getTask('cleanup'))?.result).toEqual({ kept: true })
+    expect(logger).toHaveBeenCalledWith(expect.objectContaining({ event: 'storage_lifecycle_tick', cleanup: expect.objectContaining({ completed: 1 }) }))
+  })
+
   it('sweeps durable TTL and retries a persisted release request in one bounded tick', async () => {
     const { hot, durable, engine } = await makeFixture()
     const overdue = makeTask('overdue', 'running', { ttl: 60 })
@@ -342,5 +357,65 @@ describe('StorageLifecycleWorker', () => {
       operation: 'terminal_retention_scan',
       error: 'redis unavailable',
     }))
+  })
+
+  it('records cleanup and individual terminal release failures without stopping the tick', async () => {
+    const { hot, durable, engine } = await makeFixture()
+    const task = makeTask('release-failure', 'completed', { updatedAt: Date.now() - 61_000 })
+    await hot.saveTask(task)
+    await durable.saveTask(task)
+    vi.spyOn(engine, 'supportsCleanup').mockReturnValue(true)
+    vi.spyOn(engine, 'sweepCleanup').mockRejectedValueOnce(new Error('cleanup unavailable'))
+    vi.spyOn(engine, 'releaseTaskStorageAtCurrentDurableIndex')
+      .mockRejectedValueOnce(new Error('release unavailable'))
+    const records: Array<Record<string, unknown>> = []
+    const worker = new StorageLifecycleWorker({
+      engine, shortTermStore: hot,
+      config: { ...config, hotRetentionEnabled: true },
+      logger: (record) => records.push(record),
+    })
+
+    await expect(worker.tick()).resolves.toMatchObject({
+      cleanup: { failed: 1 },
+      retention: { eligible: 1, failed: 1, released: 0 },
+    })
+    expect(records).toEqual(expect.arrayContaining([
+      expect.objectContaining({ operation: 'terminal_cleanup', error: 'cleanup unavailable' }),
+      expect.objectContaining({ operation: 'terminal_retention', taskId: task.id, error: 'release unavailable' }),
+    ]))
+    await expect(hot.getTask(task.id)).resolves.not.toBeNull()
+  })
+
+  it('uses the default structured logger for a lifecycle tick', async () => {
+    const { hot, engine } = await makeFixture()
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+    try {
+      const worker = new StorageLifecycleWorker({ engine, shortTermStore: hot, config })
+      await worker.tick()
+      expect(log.mock.calls.some(([line]) => {
+        const record = JSON.parse(String(line)) as Record<string, unknown>
+        return record.component === 'storage-lifecycle' && record.event === 'storage_lifecycle_tick'
+      })).toBe(true)
+    } finally {
+      log.mockRestore()
+    }
+  })
+
+  it('runs another bounded lifecycle tick at the configured interval', async () => {
+    vi.useFakeTimers()
+    const { hot, engine } = await makeFixture()
+    const sweep = vi.spyOn(engine, 'sweepDurableTtl')
+    const worker = new StorageLifecycleWorker({
+      engine, shortTermStore: hot, config, logger: () => {},
+    })
+    try {
+      worker.start()
+      await vi.waitFor(() => expect(sweep).toHaveBeenCalledTimes(1))
+      await vi.advanceTimersByTimeAsync(config.ttlSweepIntervalSeconds * 1_000)
+      expect(sweep).toHaveBeenCalledTimes(2)
+    } finally {
+      worker.stop()
+      vi.useRealTimers()
+    }
   })
 })

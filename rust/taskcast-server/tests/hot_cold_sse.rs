@@ -136,6 +136,9 @@ impl LongTermStore for BlockingHistoryStore {
 
 fn running_task() -> Task {
     Task {
+        cleanup_policy_version: None,
+        cleanup_resolved_at: None,
+        history_expired_at: None,
         id: "cold-sse-race".to_string(),
         status: TaskStatus::Running,
         created_at: 1_000.0,
@@ -198,6 +201,7 @@ async fn publish_during_cold_snapshot_is_delivered_exactly_once() {
             "cold-sse-race",
             running_event(),
             &HotWriteToken {
+                creation_token: None,
                 task_id: "cold-sse-race".to_string(),
                 storage_epoch: 1,
             },

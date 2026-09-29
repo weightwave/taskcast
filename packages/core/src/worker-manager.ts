@@ -217,7 +217,14 @@ export class WorkerManager {
 
   // ─── Task Claim ────────────────────────────────────────────────────────
 
+  private async captureDurableContext(taskId: string) {
+    const metadata = this.longTermStore?.supportsHotColdRelease
+      ? await this.longTermStore.getTaskStorageMetadata?.(taskId) : undefined
+    return metadata?.creationToken ? { creationToken: metadata.creationToken } : undefined
+  }
+
   async claimTask(taskId: string, workerId: string): Promise<ClaimResult> {
+    const context = await this.captureDurableContext(taskId)
     const task = await this.engine.getTask(taskId)
     if (!task) {
       return { success: false, reason: 'Task not found' }
@@ -235,7 +242,7 @@ export class WorkerManager {
     // claimTask atomically sets status to 'assigned' and assignedWorker on the
     // store.  Re-read to get the authoritative state, then persist to longTermStore.
     const updatedTask = (await this.shortTermStore.getTask(taskId))!
-    if (this.longTermStore) await this.longTermStore.saveTask(updatedTask)
+    if (this.longTermStore) await this.longTermStore.saveTask(updatedTask, context)
 
     // Emit audit events for the claim
     this.emitWorkerAudit('task_assigned', workerId, { taskId })
@@ -275,6 +282,7 @@ export class WorkerManager {
   // ─── Task Decline ──────────────────────────────────────────────────────
 
   async declineTask(taskId: string, workerId: string, opts?: DeclineOptions): Promise<void> {
+    const context = await this.captureDurableContext(taskId)
     const assignment = await this.shortTermStore.getTaskAssignment(taskId)
     if (!assignment || assignment.workerId !== workerId) return
 
@@ -315,7 +323,7 @@ export class WorkerManager {
       }
 
       await this.shortTermStore.saveTask(task)
-      if (this.longTermStore) await this.longTermStore.saveTask(task)
+      if (this.longTermStore) await this.longTermStore.saveTask(task, context)
 
       if (worker) {
         this.hooks?.onTaskDeclined?.(task, worker, blacklisted)

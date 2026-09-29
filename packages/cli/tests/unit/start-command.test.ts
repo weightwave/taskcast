@@ -1124,6 +1124,42 @@ describe('registerStartCommand', () => {
     expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('sqlite @ /tmp/my.db'))
   })
 
+  it('rejects explicit Redis storage without a connection URL', async () => {
+    const previous = process.env['TASKCAST_REDIS_URL']
+    delete process.env['TASKCAST_REDIS_URL']
+    const program = new Command()
+    program.exitOverride()
+    registerStartCommand(program)
+    try {
+      await expect(program.parseAsync(['node', 'test', 'start', '--storage', 'redis']))
+        .rejects.toMatchObject({ code: 1 })
+      expect(errorSpy).toHaveBeenCalledWith(
+        '[taskcast] storage mode redis requires TASKCAST_REDIS_URL or a configured Redis URL',
+      )
+    } finally {
+      if (previous === undefined) delete process.env['TASKCAST_REDIS_URL']
+      else process.env['TASKCAST_REDIS_URL'] = previous
+    }
+  })
+
+  it.each([
+    ['redis://invalid-url@', '<redacted>'],
+    ['not-a-url', 'not-a-url'],
+  ])('logs a safe Redis label for malformed URL %s', async (url, label) => {
+    const previous = process.env['TASKCAST_REDIS_URL']
+    process.env['TASKCAST_REDIS_URL'] = url
+    const program = new Command()
+    program.exitOverride()
+    registerStartCommand(program)
+    try {
+      await program.parseAsync(['node', 'test', 'start', '--storage', 'redis'])
+      expect(logSpy).toHaveBeenCalledWith(`[taskcast] Short-term store: redis @ ${label}`)
+    } finally {
+      if (previous === undefined) delete process.env['TASKCAST_REDIS_URL']
+      else process.env['TASKCAST_REDIS_URL'] = previous
+    }
+  })
+
   it('logs [taskcast] <msg> exactly once and exits 1 when runStart throws', async () => {
     // Regression test for R2-I1: the .action() wrapper must produce exactly
     // one "[taskcast] Auto-migration failed: ..." line when runStart throws
@@ -1176,6 +1212,13 @@ describe('runStart', () => {
     exitSpy.mockRestore()
     logSpy.mockRestore()
     onSpy.mockRestore()
+  })
+
+  it('passes the resolved cleanup config and environment override to the engine', async () => {
+    const { TaskEngine } = await import('@taskcast/core')
+    const rules = [{ target: 'events' as const, trigger: { afterMs: 1000 } }]
+    await runStart({ broadcast: {}, shortTermStore: {}, longTermStore: {}, port: 3721, config: { cleanup: { enabled: false, rules } }, env: { TASKCAST_CLEANUP_ENABLED: 'true' }, verbose: false, playground: false })
+    expect(TaskEngine).toHaveBeenCalledWith(expect.objectContaining({ cleanup: { enabled: true, rules } }))
   })
 
   it('calls performAutoMigrateIfEnabled with sql + postgresUrl + env when postgres is configured', async () => {
@@ -1448,6 +1491,31 @@ describe('runStart', () => {
         longTermStore: mockLongTermStore,
       }),
     )
+  })
+
+  it('passes a durable store to the worker manager when assignment is enabled', async () => {
+    const { WorkerManager } = await import('@taskcast/core')
+    const longTermStore = {} as NonNullable<RunStartOptions['longTermStore']>
+    await runStart({
+      broadcast: {}, shortTermStore: {}, longTermStore,
+      port: 3721, config: { workers: { enabled: true } },
+      verbose: false, playground: false,
+    })
+    expect(WorkerManager).toHaveBeenCalledWith(expect.objectContaining({ longTermStore }))
+  })
+
+  it('fails startup when the HTTP server is not created', async () => {
+    const { serve } = await import('@hono/node-server')
+    ;(serve as ReturnType<typeof vi.fn>).mockImplementationOnce(
+      (_options: unknown, onListening: () => void) => {
+        onListening()
+        return undefined
+      },
+    )
+    await expect(runStart({
+      broadcast: {}, shortTermStore: {}, port: 3721, config: {},
+      verbose: false, playground: false,
+    })).rejects.toThrow('HTTP server was not created')
   })
 
   it('registers SIGTERM and SIGINT handlers', async () => {
@@ -1829,6 +1897,32 @@ describe('startup signal lifecycle', () => {
       terminate: beforeTerm.size + 1,
     })
     expect(serverClose).toHaveBeenCalledTimes(1)
+    expect(closeDependencies).toHaveBeenCalledTimes(1)
+    expect(process.listeners('SIGINT')).toHaveLength(beforeInt.size)
+    expect(process.listeners('SIGTERM')).toHaveLength(beforeTerm.size)
+  })
+
+  it('reports a shutdown failure when the HTTP server throws while closing', async () => {
+    const closeFailure = new Error('close failed')
+    const closeDependencies = vi.fn().mockResolvedValue(undefined)
+    const { serve } = await import('@hono/node-server')
+    ;(serve as ReturnType<typeof vi.fn>).mockImplementationOnce(
+      (_options: unknown, listening: () => void) => {
+        listening()
+        return { close: () => { throw closeFailure } }
+      },
+    )
+
+    await runStart({
+      broadcast: {}, shortTermStore: {}, port: 3721, config: {},
+      verbose: false, playground: false, closeDependencies,
+    })
+    const terminate = addedSignalHandler('SIGTERM', beforeTerm)
+    expect(terminate).toBeDefined()
+    await expect(terminate!()).rejects.toBe(closeFailure)
+    await vi.waitFor(() => {
+      expect(errorSpy).toHaveBeenCalledWith('[taskcast] shutdown failed: close failed')
+    })
     expect(closeDependencies).toHaveBeenCalledTimes(1)
     expect(process.listeners('SIGINT')).toHaveLength(beforeInt.size)
     expect(process.listeners('SIGTERM')).toHaveLength(beforeTerm.size)

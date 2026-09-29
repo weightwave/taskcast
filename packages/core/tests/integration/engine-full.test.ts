@@ -1,8 +1,8 @@
-import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest'
+import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from 'vitest'
 import { Redis } from 'ioredis'
 import postgres from 'postgres'
 import { GenericContainer, Wait, type StartedTestContainer } from 'testcontainers'
-import { readFileSync } from 'fs'
+import { runMigrations } from '../../../postgres/src/migration-runner.js'
 import { join } from 'path'
 import { TaskEngine } from '../../src/engine.js'
 import { RedisBroadcastProvider } from '../../../redis/src/broadcast.js'
@@ -16,6 +16,9 @@ let pubClient: Redis
 let subClient: Redis
 let storeClient: Redis
 let sql: ReturnType<typeof postgres>
+let shortTermStore: RedisShortTermStore
+let longTermStore: PostgresLongTermStore
+let broadcast: RedisBroadcastProvider
 
 beforeAll(async () => {
   // Start Redis and Postgres in parallel
@@ -40,24 +43,11 @@ beforeAll(async () => {
   const pgPort = pgContainer.getMappedPort(5432)
   sql = postgres(`postgres://test:test@localhost:${pgPort}/testdb`)
 
-  // Run migrations
-  for (const filename of [
-    '001_initial.sql',
-    '002_workers.sql',
-    '003_storage_lifecycle.sql',
-    '004_archive_receipt_coverage.sql',
-    '005_task_creation_claim.sql',
-  ]) {
-    const migration = readFileSync(
-      join(import.meta.dirname, '../../../../migrations/postgres', filename),
-      'utf8',
-    )
-    await sql.unsafe(migration)
-  }
+  await runMigrations(sql, join(import.meta.dirname, '../../../../migrations/postgres'))
 
-  const broadcast = new RedisBroadcastProvider(pubClient, subClient)
-  const shortTermStore = new RedisShortTermStore(storeClient)
-  const longTermStore = new PostgresLongTermStore(sql)
+  broadcast = new RedisBroadcastProvider(pubClient, subClient)
+  shortTermStore = new RedisShortTermStore(storeClient)
+  longTermStore = new PostgresLongTermStore(sql)
 
   engine = new TaskEngine({ broadcast, shortTermStore: shortTermStore, longTermStore: longTermStore })
 }, 120000)
@@ -71,11 +61,53 @@ afterAll(async () => {
 })
 
 beforeEach(async () => {
+  vi.restoreAllMocks()
   await storeClient.flushall()
   await sql`TRUNCATE taskcast_events, taskcast_tasks CASCADE`
 })
 
 describe('Full stack: task lifecycle', () => {
+  it.each(['hot', 'expired'] as const)('restores %s history with a fresh generation and no automatic retention', async (state) => {
+    const retention = new TaskEngine({ broadcast, shortTermStore, longTermStore, cleanup: { enabled: true, rules: [{ target: 'events', trigger: {} }] } })
+    const task = await retention.createTask({ id: `restore-${state}` })
+    await retention.transitionTask(task.id, 'running')
+    await retention.publishEvent(task.id, { type: 'progress', level: 'info', data: 'latest', seriesId: 'progress', seriesMode: 'latest' })
+    await retention.transitionTask(task.id, 'completed', { result: { kept: true } })
+    await vi.waitFor(async () => expect(await longTermStore.getEvents(task.id)).toHaveLength(3))
+    const original = (await longTermStore.getTaskStorageMetadata(task.id))!
+    const archive = await retention.exportTaskArchive(task.id)
+    if (state === 'expired') {
+      expect(await retention.sweepCleanup()).toMatchObject({ completed: 1 })
+      await expect(retention.exportTaskArchive(task.id)).rejects.toThrow(/expired/)
+    }
+    await expect(retention.importTaskArchive(archive)).rejects.toThrow(/exists/)
+    archive.task.historyExpiredAt = 1
+    expect(await retention.importTaskArchive(archive, { overwrite: true })).toMatchObject({ taskId: task.id, eventCount: 3, overwritten: true })
+    const restored = (await retention.getTask(task.id))!
+    expect(restored.result).toEqual({ kept: true })
+    expect(restored.historyExpiredAt).toBeUndefined()
+    expect(restored.cleanupPolicyVersion).toBeUndefined()
+    expect(await retention.getEvents(task.id)).toHaveLength(3)
+    expect((await retention.getSeriesLatest(task.id, 'progress'))?.data).toBe('latest')
+    const current = (await longTermStore.getTaskStorageMetadata(task.id))!
+    expect(current.creationToken).not.toBe(original.creationToken)
+    expect(current.storageState).toBe('hot')
+    await expect(longTermStore.saveTask(restored, { creationToken: original.creationToken! })).rejects.toThrow()
+    await expect(longTermStore.saveTask(restored)).rejects.toThrow()
+    expect(await retention.sweepCleanup()).toMatchObject({ claimed: 0 })
+  })
+
+  it('releases the import lease after ownership loss and allows a subsequent retry', async () => {
+    const task = await engine.createTask({ id: 'import-lease' })
+    const archive = await engine.exportTaskArchive(task.id)
+    const restore = vi.spyOn(longTermStore, 'restoreTaskArchive')
+    vi.spyOn(shortTermStore, 'renewStorageLock').mockResolvedValueOnce(false)
+    await expect(engine.importTaskArchive(archive, { overwrite: true })).rejects.toThrow(/lease was lost/)
+    expect(restore).not.toHaveBeenCalled()
+    expect(await engine.importTaskArchive(archive, { overwrite: true })).toMatchObject({ overwritten: true, eventCount: 0 })
+    expect((await engine.getTask(task.id))?.status).toBe('pending')
+  })
+
   it('creates task, publishes events, completes, persists to Postgres', async () => {
     const task = await engine.createTask({ type: 'llm.chat', params: { prompt: 'hello' } })
     await engine.transitionTask(task.id, 'running')

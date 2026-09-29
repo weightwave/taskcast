@@ -305,6 +305,7 @@ impl TtlCoordinator {
                 .await?
         } else {
             HotWriteToken {
+                creation_token: None,
                 task_id: projection.task.id.clone(),
                 storage_epoch: metadata.storage_epoch,
             }
@@ -457,6 +458,5 @@ fn now_millis() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs_f64()
-        * 1000.0
+        .as_millis() as f64
 }

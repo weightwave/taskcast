@@ -68,6 +68,7 @@ describe('cross-compatibility: TS runner with sqlx-style pre-applied migrations'
       '003_storage_lifecycle.sql',
       '004_archive_receipt_coverage.sql',
       '005_task_creation_claim.sql',
+      '006_terminal_retention.sql',
     ])
   })
 

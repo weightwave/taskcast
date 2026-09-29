@@ -5,6 +5,13 @@ on:
     branches: [main, feature/*]
     paths:
       - 'rust/**'
+      - 'packages/core/**'
+      - 'packages/server/**'
+      - 'packages/redis/**'
+      - 'packages/postgres/**'
+      - 'packages/cli/**'
+      - 'migrations/**'
+      - 'codecov.yml'
       - 'packages/playground/**'
       - '.github/workflows/rust.yml'
       - 'pnpm-lock.yaml'
@@ -14,6 +21,13 @@ on:
     branches: [main]
     paths:
       - 'rust/**'
+      - 'packages/core/**'
+      - 'packages/server/**'
+      - 'packages/redis/**'
+      - 'packages/postgres/**'
+      - 'packages/cli/**'
+      - 'migrations/**'
+      - 'codecov.yml'
       - 'packages/playground/**'
       - '.github/workflows/rust.yml'
       - 'pnpm-lock.yaml'
@@ -120,13 +134,21 @@ jobs:
           name: playground-dist
           path: packages/playground/dist
       - name: Generate coverage
-        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+        run: cargo llvm-cov --workspace --fail-under-lines 90 --lcov --output-path lcov.info
+      - name: Save coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-coverage
+          path: rust/lcov.info
+          retention-days: 7
+          if-no-files-found: ignore
       - name: Upload to Codecov
         uses: codecov/codecov-action@v4
         with:
           files: rust/lcov.info
           flags: rust
-          fail_ci_if_error: false
+          fail_ci_if_error: true
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
@@ -149,12 +171,16 @@ jobs:
           name: playground-dist
           path: packages/playground/dist
       - name: Build release
-        run: cargo build --release -p taskcast-cli
+        run: |
+          cargo build --release -p taskcast-cli
+          cargo build --release -p taskcast-server --example hot_cold_parity_server
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
           name: taskcast-linux-x86_64
-          path: rust/target/release/taskcast
+          path: |
+            rust/target/release/taskcast
+            rust/target/release/examples/hot_cold_parity_server
 
   integration:
     name: Integration Tests
@@ -177,6 +203,12 @@ jobs:
           name: taskcast-linux-x86_64
           path: rust/target/release/
       - name: Make binary executable
-        run: chmod +x rust/target/release/taskcast
+        run: chmod +x rust/target/release/taskcast rust/target/release/examples/hot_cold_parity_server
       - name: Run integration tests
-        run: bash rust/tests/integration.sh
+        env:
+          TASKCAST_RUST_BINARY: ${{ github.workspace }}/rust/target/release/taskcast
+          TASKCAST_RUST_PARITY_BINARY: ${{ github.workspace }}/rust/target/release/examples/hot_cold_parity_server
+          NO_PROXY: 127.0.0.1,localhost
+        run: |
+          export no_proxy="$NO_PROXY"
+          bash rust/tests/integration.sh

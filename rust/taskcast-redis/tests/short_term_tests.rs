@@ -26,6 +26,9 @@ use testcontainers::GenericImage;
 
 fn make_task(id: &str) -> Task {
     Task {
+        cleanup_policy_version: None,
+        cleanup_resolved_at: None,
+        history_expired_at: None,
         id: id.to_string(),
         r#type: None,
         status: TaskStatus::Pending,
@@ -165,6 +168,9 @@ async fn preserve_optional_fields_on_round_trip() {
     let store = make_store(&redis_url).await;
 
     let task = Task {
+        cleanup_policy_version: None,
+        cleanup_resolved_at: None,
+        history_expired_at: None,
         id: "task-full".to_string(),
         r#type: Some("llm.chat".to_string()),
         status: TaskStatus::Completed,
@@ -228,6 +234,9 @@ async fn handle_task_with_no_optional_fields() {
     let store = make_store(&redis_url).await;
 
     let task = Task {
+        cleanup_policy_version: None,
+        cleanup_resolved_at: None,
+        history_expired_at: None,
         id: "task-minimal".to_string(),
         r#type: None,
         status: TaskStatus::Pending,
@@ -1479,6 +1488,7 @@ async fn storage_lifecycle_closes_writes_without_consuming_an_index_and_reopens(
     let store = make_store(&redis_url).await;
     store.save_task(make_task("task-1")).await.unwrap();
     let old_token = HotWriteToken {
+        creation_token: None,
         task_id: "task-1".to_string(),
         storage_epoch: 1,
     };
@@ -1534,6 +1544,7 @@ async fn storage_lifecycle_new_generation_adopts_a_closed_fence_for_recovery() {
             "task-1",
             make_event("task-1", 0),
             &HotWriteToken {
+                creation_token: None,
                 task_id: "task-1".to_string(),
                 storage_epoch: 1,
             },
@@ -1577,6 +1588,7 @@ async fn storage_lifecycle_commits_series_atomically_and_pages_sparse_history() 
     let store = make_store(&redis_url).await;
     store.save_task(make_task("task-1")).await.unwrap();
     let token = HotWriteToken {
+        creation_token: None,
         task_id: "task-1".to_string(),
         storage_epoch: 1,
     };
@@ -1676,6 +1688,7 @@ async fn storage_lifecycle_preserves_opaque_event_json() {
     let store = make_store(&redis_url).await;
     store.save_task(make_task("task-1")).await.unwrap();
     let token = HotWriteToken {
+        creation_token: None,
         task_id: "task-1".to_string(),
         storage_epoch: 1,
     };
@@ -1761,6 +1774,7 @@ async fn storage_lifecycle_preserves_accumulation_during_legacy_writer_rollout()
     .with_legacy_series_writes(false);
     compatible.save_task(make_task("task-1")).await.unwrap();
     let token = HotWriteToken {
+        creation_token: None,
         task_id: "task-1".to_string(),
         storage_epoch: 1,
     };
@@ -1850,6 +1864,7 @@ async fn storage_lifecycle_replaces_latest_event_from_legacy_writer_during_rollo
     .with_legacy_series_writes(true);
     compatible.save_task(make_task("task-1")).await.unwrap();
     let token = HotWriteToken {
+        creation_token: None,
         task_id: "task-1".to_string(),
         storage_epoch: 1,
     };
@@ -1933,6 +1948,7 @@ async fn storage_lifecycle_preserves_the_maximum_writable_safe_index() {
         .await
         .unwrap();
     let token = HotWriteToken {
+        creation_token: None,
         task_id: "task-1".to_string(),
         storage_epoch: 1,
     };
@@ -2001,6 +2017,7 @@ async fn storage_lifecycle_uses_fixed_keys_for_large_series_cardinality() {
     let store = make_store(&redis_url).await;
     store.save_task(make_task("task-1")).await.unwrap();
     let token = HotWriteToken {
+        creation_token: None,
         task_id: "task-1".to_string(),
         storage_epoch: 1,
     };
@@ -2069,6 +2086,7 @@ async fn storage_lifecycle_rejects_stale_delete_and_removes_all_task_keys() {
     let store = make_store(&redis_url).await;
     store.save_task(make_task("task-1")).await.unwrap();
     let token = HotWriteToken {
+        creation_token: None,
         task_id: "task-1".to_string(),
         storage_epoch: 1,
     };
@@ -2136,6 +2154,7 @@ async fn storage_lifecycle_isolates_wildcard_and_prefix_colliding_task_ids() {
                 task_id,
                 event,
                 &HotWriteToken {
+                    creation_token: None,
                     task_id: task_id.to_string(),
                     storage_epoch: 1,
                 },
@@ -2274,6 +2293,7 @@ async fn storage_lifecycle_commits_task_and_derived_events_atomically() {
     let store = make_store(&redis_url).await;
     store.save_task(make_task("task-1")).await.unwrap();
     let token = HotWriteToken {
+        creation_token: None,
         task_id: "task-1".to_string(),
         storage_epoch: 1,
     };
@@ -2349,6 +2369,7 @@ async fn storage_lifecycle_allows_only_one_transition_from_the_same_status() {
     let store = make_store(&redis_url).await;
     store.save_task(make_task("task-1")).await.unwrap();
     let token = HotWriteToken {
+        creation_token: None,
         task_id: "task-1".to_string(),
         storage_epoch: 1,
     };
@@ -2400,6 +2421,7 @@ async fn storage_lifecycle_rejects_stale_revision_after_same_status_reclaim() {
     let mut running = snapshot.task;
     running.status = TaskStatus::Running;
     let token = HotWriteToken {
+        creation_token: None,
         task_id: "task-1".to_string(),
         storage_epoch: 1,
     };

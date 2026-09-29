@@ -7,6 +7,39 @@ afterEach(() => {
 })
 
 describe('DependencyHealthRegistry', () => {
+  it('writes a structured transition with the default logger', () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      const health = new DependencyHealthRegistry()
+      health.register('redisCommand', async () => {})
+      health.observe({ dependency: 'redisCommand', state: 'unhealthy', errorKind: 'unavailable' })
+      expect(JSON.parse(String(error.mock.calls[0]?.[0]))).toMatchObject({
+        event: 'dependency_state_change', dependency: 'redisCommand', to: 'unhealthy',
+      })
+    } finally {
+      error.mockRestore()
+    }
+  })
+
+  it('summarizes an outage without optional retry metadata', () => {
+    const now = { value: 1_000 }
+    const records: Array<Record<string, unknown>> = []
+    const health = new DependencyHealthRegistry({
+      now: () => now.value,
+      logger: (record) => records.push(record),
+    })
+    health.register('postgres', async () => {})
+    health.observe({ dependency: 'postgres', state: 'unhealthy' })
+    now.value = 61_000
+    health.observe({ dependency: 'postgres', state: 'unhealthy' })
+    expect(records[1]).toMatchObject({
+      event: 'dependency_outage_summary', dependency: 'postgres', consecutiveFailures: 2,
+    })
+    expect(records[1]).not.toHaveProperty('attempt')
+    expect(records[1]).not.toHaveProperty('nextRetryMs')
+    expect(records[1]).not.toHaveProperty('errorKind')
+  })
+
   it('returns per-call outcomes while only the newest overlapping readiness mutates state', async () => {
     const records: Array<Record<string, unknown>> = []
     const releases: Array<{

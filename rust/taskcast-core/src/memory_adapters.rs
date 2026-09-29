@@ -1,3 +1,7 @@
+#[path = "memory_cleanup.rs"]
+mod cleanup;
+use cleanup::MemoryCleanupClaim;
+use crate::{BoxError, CleanupClaim, CleanupBatchResult, DurableWriteContext};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -196,6 +200,8 @@ impl Default for MemoryShortTermStore {
 // ─── MemoryLongTermStore ───────────────────────────────────────────────────
 
 pub struct MemoryLongTermStore {
+    cleanup_claims: RwLock<HashMap<String, MemoryCleanupClaim>>,
+    cleanup_retry: RwLock<HashMap<String, u128>>,
     lifecycle_guard: Mutex<()>,
     tasks: RwLock<HashMap<String, Task>>,
     events: RwLock<HashMap<String, Vec<TaskEvent>>>,
@@ -214,6 +220,8 @@ pub struct MemoryLongTermStore {
 impl MemoryLongTermStore {
     pub fn new() -> Self {
         Self {
+            cleanup_claims: RwLock::new(HashMap::new()),
+            cleanup_retry: RwLock::new(HashMap::new()),
             lifecycle_guard: Mutex::new(()),
             tasks: RwLock::new(HashMap::new()),
             events: RwLock::new(HashMap::new()),
@@ -228,6 +236,18 @@ impl MemoryLongTermStore {
             durable_assignments: RwLock::new(HashMap::new()),
             terminal_projections: RwLock::new(HashMap::new()),
         }
+    }
+
+    fn guard_cleanup_write(&self, id: &str, context: Option<&DurableWriteContext>, enrolled: bool) -> Result<(), BoxError> {
+        let tasks = self.tasks.read().unwrap();
+        let task = tasks.get(id);
+        let claims = self.creation_claims.read().unwrap();
+        if task.is_some_and(|t| t.history_expired_at.is_some())
+            || context.is_some_and(|ctx| task.is_none() || claims.get(id).is_none_or(|c| c.token != ctx.creation_token))
+            || (context.is_none() && (enrolled || task.is_some_and(|t| t.cleanup_policy_version == Some(1)) || claims.contains_key(id))) {
+            return Err(Box::new(StorageFenceConflictError::new("Durable write belongs to missing, expired, or replaced task generation")));
+        }
+        Ok(())
     }
 
     fn upsert_event(&self, event: TaskEvent) {
@@ -298,6 +318,14 @@ impl Default for MemoryLongTermStore {
 
 #[async_trait]
 impl LongTermStore for MemoryLongTermStore {
+    fn supports_terminal_cleanup(&self) -> bool { true }
+    async fn can_cleanup_task(&self, claim: &CleanupClaim) -> Result<bool, BoxError> { self.cleanup_ready(claim) }
+    async fn claim_cleanup_tasks(&self, limit: u64, ttl: u64) -> Result<Vec<CleanupClaim>, BoxError> { self.cleanup_claim(limit, ttl) }
+    async fn renew_cleanup_claim(&self, claim: &CleanupClaim, ttl: u64) -> Result<bool, BoxError> { self.cleanup_renew(claim, ttl) }
+    async fn defer_cleanup_claim(&self, claim: &CleanupClaim, delay: u64) -> Result<(), BoxError> { self.cleanup_defer(claim, delay) }
+    async fn begin_task_cleanup(&self, claim: &CleanupClaim, epoch: u64, through: i64) -> Result<bool, BoxError> { self.cleanup_begin(claim, epoch, through) }
+    async fn delete_task_cleanup_batch(&self, claim: &CleanupClaim, limit: u64) -> Result<CleanupBatchResult, BoxError> { self.cleanup_delete(claim, limit) }
+
     fn supports_hot_cold_release(&self) -> bool {
         true
     }
@@ -310,8 +338,11 @@ impl LongTermStore for MemoryLongTermStore {
         true
     }
 
-    async fn save_task(&self, task: Task) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn save_task(&self, task: Task) -> Result<(), BoxError> { self.save_task_with_context(task, None).await }
+
+    async fn save_task_with_context(&self, task: Task, context: Option<&DurableWriteContext>) -> Result<(), BoxError> {
         let _lifecycle = self.lifecycle_guard.lock().unwrap();
+        self.guard_cleanup_write(&task.id, context, task.cleanup_policy_version == Some(1))?;
         let task_id = task.id.clone();
         let now = MemoryShortTermStore::now_ms() as f64;
         let deadline = if has_memory_execution_deadline(&task) {
@@ -351,6 +382,7 @@ impl LongTermStore for MemoryLongTermStore {
             self.ttl_claims.write().unwrap().remove(&task_id);
         } else {
             metadata.insert(task_id.clone(), TaskStorageMetadata {
+                creation_token: None,
                 task_id,
                 storage_state: StorageState::Hot,
                 storage_epoch: 1,
@@ -389,6 +421,7 @@ impl LongTermStore for MemoryLongTermStore {
             .unwrap()
             .entry(task_id.clone())
             .or_insert(TaskStorageMetadata {
+                creation_token: None,
                 task_id,
                 storage_state: StorageState::Hot,
                 storage_epoch: 1,
@@ -436,6 +469,7 @@ impl LongTermStore for MemoryLongTermStore {
         self.metadata.write().unwrap().insert(
             task_id.clone(),
             TaskStorageMetadata {
+                creation_token: Some(creation_token.to_string()),
                 task_id: task_id.clone(),
                 storage_state: StorageState::Hot,
                 storage_epoch: 1,
@@ -508,11 +542,11 @@ impl LongTermStore for MemoryLongTermStore {
         Ok(self.tasks.read().unwrap().get(task_id).cloned())
     }
 
-    async fn save_event(
-        &self,
-        event: TaskEvent,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn save_event(&self, event: TaskEvent) -> Result<(), BoxError> { self.save_event_with_context(event, None).await }
+
+    async fn save_event_with_context(&self, event: TaskEvent, context: Option<&DurableWriteContext>) -> Result<(), BoxError> {
         let _lifecycle = self.lifecycle_guard.lock().unwrap();
+        self.guard_cleanup_write(&event.task_id, context, false)?;
         let task_id = event.task_id.clone();
         let timestamp = event.timestamp;
         self.upsert_event(event);
@@ -522,13 +556,11 @@ impl LongTermStore for MemoryLongTermStore {
         Ok(())
     }
 
-    async fn replace_last_series_event(
-        &self,
-        task_id: &str,
-        series_id: &str,
-        event: TaskEvent,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn replace_last_series_event(&self, task_id: &str, series_id: &str, event: TaskEvent) -> Result<(), BoxError> { self.replace_last_series_event_with_context(task_id, series_id, event, None).await }
+
+    async fn replace_last_series_event_with_context(&self, task_id: &str, series_id: &str, event: TaskEvent, context: Option<&DurableWriteContext>) -> Result<(), BoxError> {
         let _lifecycle = self.lifecycle_guard.lock().unwrap();
+        self.guard_cleanup_write(&event.task_id, context, false)?;
         let previous = self.series.read().unwrap().get(task_id).and_then(|states| {
             states
                 .iter()
@@ -582,14 +614,11 @@ impl LongTermStore for MemoryLongTermStore {
         Ok(())
     }
 
-    async fn accumulate_series(
-        &self,
-        task_id: &str,
-        series_id: &str,
-        event: TaskEvent,
-        field: &str,
-    ) -> Result<TaskEvent, Box<dyn std::error::Error + Send + Sync>> {
+    async fn accumulate_series(&self, task_id: &str, series_id: &str, event: TaskEvent, field: &str) -> Result<TaskEvent, BoxError> { self.accumulate_series_with_context(task_id, series_id, event, field, None).await }
+
+    async fn accumulate_series_with_context(&self, task_id: &str, series_id: &str, event: TaskEvent, field: &str, context: Option<&DurableWriteContext>) -> Result<TaskEvent, BoxError> {
         let _lifecycle = self.lifecycle_guard.lock().unwrap();
+        self.guard_cleanup_write(&event.task_id, context, false)?;
         let previous = self.series.read().unwrap().get(task_id).and_then(|states| {
             states
                 .iter()
@@ -777,6 +806,7 @@ impl LongTermStore for MemoryLongTermStore {
         generation: ArchiveGeneration,
     ) -> Result<ArchiveGeneration, Box<dyn std::error::Error + Send + Sync>> {
         let _lifecycle = self.lifecycle_guard.lock().unwrap();
+        if self.tasks.read().unwrap().get(&generation.task_id).is_some_and(|t| t.history_expired_at.is_some()) { return Err(Box::new(StorageFenceConflictError::new("Task history has expired"))); }
         let metadata = self.metadata.read().unwrap();
         let current = metadata.get(&generation.task_id).ok_or_else(|| {
             Box::new(StorageIntegrityError::new("Archive task does not exist"))
@@ -813,6 +843,7 @@ impl LongTermStore for MemoryLongTermStore {
         batch: ArchiveBatch,
     ) -> Result<ArchiveBatchReceipt, Box<dyn std::error::Error + Send + Sync>> {
         let _lifecycle = self.lifecycle_guard.lock().unwrap();
+        if self.tasks.read().unwrap().get(task_id).is_some_and(|t| t.history_expired_at.is_some()) { return Err(Box::new(StorageFenceConflictError::new("Task history has expired"))); }
         let expected_digest = compute_archive_batch_digest(
             batch.receipt.previous_batch_digest.as_deref(),
             &batch.events,
@@ -890,6 +921,7 @@ impl LongTermStore for MemoryLongTermStore {
         series_latest: Vec<DurableSeriesState>,
     ) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
         let _lifecycle = self.lifecycle_guard.lock().unwrap();
+        if self.tasks.read().unwrap().get(task_id).is_some_and(|t| t.history_expired_at.is_some()) { return Err(Box::new(StorageFenceConflictError::new("Task history has expired"))); }
         let key = (task_id.to_string(), generation.to_string());
         let archive = self
             .generations
@@ -1802,6 +1834,7 @@ impl ShortTermStore for MemoryShortTermStore {
         fence.storage_epoch = expected_epoch + 1;
         fence.active_release_generation = None;
         Ok(HotWriteToken {
+            creation_token: None,
             task_id: lease.task_id.clone(),
             storage_epoch: fence.storage_epoch,
         })
@@ -2098,6 +2131,7 @@ impl ShortTermStore for MemoryShortTermStore {
             },
         );
         Ok(HotWriteToken {
+            creation_token: None,
             task_id,
             storage_epoch: next_epoch,
         })
@@ -2129,6 +2163,22 @@ impl ShortTermStore for MemoryShortTermStore {
             || next_epoch != expected_epoch + 1
         {
             return Err(Box::new(StorageFenceConflictError::default()));
+        }
+
+        let mut assignments = self.assignments.write().unwrap();
+        let current_assignment = assignments
+            .iter()
+            .find(|candidate| candidate.task_id == *task_id)
+            .cloned();
+        if let Some(assignment) = &projection.assignment {
+            if current_assignment
+                .as_ref()
+                .is_some_and(|current| current != assignment)
+            {
+                return Err(Box::new(StorageIntegrityError::new(
+                    "Terminal projection conflicts with the hot assignment",
+                )));
+            }
         }
 
         let mut events = self.events.write().unwrap();
@@ -2174,17 +2224,7 @@ impl ShortTermStore for MemoryShortTermStore {
         drop(revisions);
 
         if let Some(assignment) = &projection.assignment {
-            let mut assignments = self.assignments.write().unwrap();
-            let current = assignments
-                .iter()
-                .find(|candidate| candidate.task_id == *task_id)
-                .cloned();
-            if current.as_ref().is_some_and(|current| current != assignment) {
-                return Err(Box::new(StorageIntegrityError::new(
-                    "Terminal projection conflicts with the hot assignment",
-                )));
-            }
-            if current.is_some() {
+            if current_assignment.is_some() {
                 assignments.retain(|candidate| candidate.task_id != *task_id);
                 drop(assignments);
                 if let Some(worker) = self
@@ -2210,6 +2250,7 @@ impl ShortTermStore for MemoryShortTermStore {
         fence.active_release_generation = None;
         Ok(TerminalProjectionResult {
             token: HotWriteToken {
+                creation_token: None,
                 task_id: task_id.clone(),
                 storage_epoch: next_epoch,
             },
@@ -2482,6 +2523,9 @@ mod tests {
 
     fn make_task(id: &str) -> Task {
         Task {
+            cleanup_policy_version: None,
+            cleanup_resolved_at: None,
+            history_expired_at: None,
             id: id.to_string(),
             r#type: Some("test".to_string()),
             status: TaskStatus::Running,

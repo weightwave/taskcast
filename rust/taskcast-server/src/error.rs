@@ -33,6 +33,9 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, message, detail) = match &self {
             AppError::Engine(e) => match e {
+                EngineError::HistoryExpired(task_id) => {
+                    return (StatusCode::CONFLICT, axum::Json(json!({"error": format!("Task history expired: {task_id}"), "code": "TASKCAST_HISTORY_EXPIRED"}))).into_response();
+                }
                 EngineError::TaskNotFound(msg) => (StatusCode::NOT_FOUND, msg.clone(), None),
                 EngineError::TaskConflict(msg) => (
                     StatusCode::CONFLICT,

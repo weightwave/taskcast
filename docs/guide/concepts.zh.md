@@ -201,3 +201,7 @@ cleanup:
 - [部署指南](./deployment.md) — 生产环境配置
 - [REST API](../api/rest.md) — 完整 API 参考
 - [认证与权限](../api/authentication.md) — JWT 认证配置
+
+## 终态历史保留
+
+永久清理默认关闭，与 Redis 热数据释放独立。按任务类型设置保留期限、过期查询语义及上线步骤见 [终态历史保留](./retention.zh.md)。

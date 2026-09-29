@@ -323,6 +323,24 @@ describe('SqliteShortTermStore', () => {
     expect(latest).toEqual(e1)
   })
 
+  it('accumulates string series data and keeps the latest event when data is not text', async () => {
+    await store.saveTask(makeTask())
+    const first = { ...makeEvent('task-1', 0), data: { text: 'hello ' } }
+    const second = { ...makeEvent('task-1', 1), data: { text: 'world', source: 'worker' } }
+    const nonText = { ...makeEvent('task-1', 2), data: { text: 42 } }
+    const nullData = { ...makeEvent('task-1', 3), data: null }
+    const afterNull = { ...makeEvent('task-1', 4), data: { text: 'fresh' } }
+
+    await expect(store.accumulateSeries('task-1', 'output', first, 'text')).resolves.toEqual(first)
+    await expect(store.accumulateSeries('task-1', 'output', second, 'text')).resolves.toMatchObject({
+      data: { text: 'hello world', source: 'worker' },
+    })
+    await expect(store.accumulateSeries('task-1', 'output', nonText, 'text')).resolves.toEqual(nonText)
+    await expect(store.accumulateSeries('task-1', 'output', nullData, 'text')).resolves.toEqual(nullData)
+    await expect(store.accumulateSeries('task-1', 'output', afterNull, 'text')).resolves.toEqual(afterNull)
+    await expect(store.getSeriesLatest('task-1', 'output')).resolves.toEqual(afterNull)
+  })
+
   // ─── restoreTaskArchive ────────────────────────────────────────────────
 
   it('should restore a task archive and continue indexes after imported events', async () => {

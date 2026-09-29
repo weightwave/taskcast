@@ -14,6 +14,9 @@ use taskcast_core::{
 
 fn make_task() -> Task {
     Task {
+        cleanup_policy_version: None,
+        cleanup_resolved_at: None,
+        history_expired_at: None,
         id: "task-1".to_string(),
         r#type: None,
         status: TaskStatus::Running,
@@ -170,6 +173,7 @@ async fn release_deletes_hot_storage_only_after_the_durable_watermark() {
     hot.save_task(make_task()).await.unwrap();
     durable.save_task(make_task()).await.unwrap();
     let token = HotWriteToken {
+        creation_token: None,
         task_id: "task-1".to_string(),
         storage_epoch: 1,
     };
@@ -450,6 +454,7 @@ async fn stale_task_mutation_is_rejected_after_same_status_worker_reclaim() {
     let mut running = snapshot.task;
     running.status = TaskStatus::Running;
     let token = HotWriteToken {
+        creation_token: None,
         task_id: "task-1".to_string(),
         storage_epoch: 1,
     };
@@ -599,6 +604,7 @@ async fn recovery_invalidates_a_stale_executor_and_reopens_retained_hot_storage(
     hot.save_task(make_task()).await.unwrap();
     durable.save_task(make_task()).await.unwrap();
     let token = HotWriteToken {
+        creation_token: None,
         task_id: "task-1".to_string(),
         storage_epoch: 1,
     };

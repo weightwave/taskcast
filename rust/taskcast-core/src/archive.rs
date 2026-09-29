@@ -93,7 +93,10 @@ pub fn validate_task_archive(archive: &TaskArchive) -> Result<TaskArchive, Archi
 pub fn build_task_archive_restore_data(
     archive: &TaskArchive,
 ) -> Result<TaskArchiveRestoreData, ArchiveError> {
-    let normalized = validate_task_archive(archive)?;
+    let mut normalized = validate_task_archive(archive)?;
+    normalized.task.cleanup_policy_version = None;
+    normalized.task.cleanup_resolved_at = None;
+    normalized.task.history_expired_at = None;
     let next_index = normalized
         .events
         .iter()
@@ -102,6 +105,8 @@ pub fn build_task_archive_restore_data(
         .map_or(0, |index| index + 1);
 
     Ok(TaskArchiveRestoreData {
+        storage_epoch: None,
+        expected_creation_token: None,
         task: normalized.task,
         events: normalized
             .events

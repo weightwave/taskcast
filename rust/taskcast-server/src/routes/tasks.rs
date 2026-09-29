@@ -231,6 +231,7 @@ pub async fn create_task(
     params(("task_id" = String, Path, description = "Task ID")),
     responses(
         (status = 200, description = "Task archive", body = taskcast_core::TaskArchive),
+        (status = 409, description = "History expired (TASKCAST_HISTORY_EXPIRED)"),
         (status = 404, description = "Task not found"),
         (status = 403, description = "Forbidden"),
     )
@@ -672,7 +673,11 @@ pub async fn get_event_history(
             .unwrap_or(events);
     }
 
-    Ok(axum::Json(events))
+    let current = engine.get_task(&task_id).await?.ok_or_else(|| AppError::NotFound("Task not found".into()))?;
+    if current.history_expired_at.is_some() {
+        return Ok(([ ("x-taskcast-history-expired", "true") ], axum::Json(Vec::<taskcast_core::TaskEvent>::new())).into_response());
+    }
+    Ok(axum::Json(events).into_response())
 }
 
 // ─── Resolve / Request Handlers ─────────────────────────────────────────────

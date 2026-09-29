@@ -62,8 +62,12 @@ export function normalizeTaskArchive(archive: TaskArchive): TaskArchive {
 
 export function buildTaskArchiveRestoreData(archive: TaskArchive): TaskArchiveRestoreData {
   const normalized = normalizeTaskArchive(archive)
+  const task = { ...normalized.task }
+  delete task.cleanupPolicyVersion
+  delete task.cleanupResolvedAt
+  delete task.historyExpiredAt
   return {
-    task: { ...normalized.task },
+    task,
     events: normalized.events.map(sanitizeTaskArchiveEvent),
     nextIndex: normalized.events.length,
     seriesLatest: buildSeriesLatest(normalized.events),

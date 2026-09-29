@@ -1,3 +1,5 @@
+import { CleanupCoordinator, emptyCleanupResult, type CleanupSweepResult } from './cleanup-coordinator.js'
+import { resolveTaskCleanupPolicy } from './cleanup-policy.js'
 import { ulid } from 'ulidx'
 import { canTransition, isTerminal, isSuspended } from './state-machine.js'
 import { processSeries } from './series.js'
@@ -33,15 +35,25 @@ import type {
   StorageWriterRegistration,
   HotWriteToken,
   DurableSeriesState,
+  DurableWriteContext,
 } from './types.js'
 import {
   StorageFenceConflictError,
+  StorageBusyError,
   StorageIntegrityError,
   StoragePreconditionError,
   StorageReleaseUnsupportedError,
 } from './types.js'
 
 // ─── Error Classes ──────────────────────────────────────────────────────────
+
+export class HistoryExpiredError extends Error {
+  readonly code = 'TASKCAST_HISTORY_EXPIRED'
+  constructor(taskId: string) {
+    super(`Task history expired: ${taskId}`)
+    this.name = 'HistoryExpiredError'
+  }
+}
 
 export class TaskConflictError extends Error {
   constructor(taskId: string) {
@@ -81,6 +93,7 @@ export class InvalidTransitionError extends Error {
 }
 
 interface TaskEngineOptionsBase {
+  cleanup?: import('./cleanup-policy.js').ResolvedCleanupConfig
   broadcast: BroadcastProvider
   hooks?: TaskcastHooks
   storageLockTtlMs?: number
@@ -141,6 +154,8 @@ export interface StorageReleaseSweepResult {
 }
 
 export class TaskEngine {
+  private cleanupCoordinator?: CleanupCoordinator
+  private cleanup: import('./cleanup-policy.js').ResolvedCleanupConfig
   private static readonly CREATION_CLAIM_TTL_MS = 30_000
   private shortTermStore: ShortTermStore
   private longTermStore: LongTermStore | undefined
@@ -156,6 +171,7 @@ export class TaskEngine {
   private _emitChains = new Map<string, Promise<void>>()
 
   constructor(opts: TaskEngineOptions) {
+    this.cleanup = structuredClone(opts.cleanup ?? { enabled: false, rules: [] })
     if ('shortTerm' in opts && 'shortTermStore' in opts) {
       throw new Error('Cannot specify both shortTerm and shortTermStore')
     }
@@ -211,6 +227,11 @@ export class TaskEngine {
         },
       })
     }
+    if (this.cleanup.enabled) {
+      if (!this.storageCoordinator || !this.longTermStore) throw new StorageReleaseUnsupportedError('Terminal cleanup requires fenced hot and durable stores')
+      this.cleanupCoordinator = new CleanupCoordinator(this.shortTermStore, this.longTermStore,
+        taskId => this.releaseTaskStorageAtCurrentDurableIndex(taskId, Date.now()))
+    }
   }
 
   addStorageLifecycleListener(
@@ -257,6 +278,7 @@ export class TaskEngine {
       ...(input.ttl !== undefined && { ttl: input.ttl }),
       ...(input.webhooks !== undefined && { webhooks: input.webhooks }),
       ...(input.cleanup !== undefined && { cleanup: input.cleanup }),
+      ...resolveTaskCleanupPolicy(input.type, input.cleanup, this.cleanup, now),
       ...(input.authConfig !== undefined && { authConfig: input.authConfig }),
       ...(input.tags !== undefined && { tags: input.tags }),
       ...(input.assignMode !== undefined && { assignMode: input.assignMode }),
@@ -265,7 +287,7 @@ export class TaskEngine {
     }
     let durableIdentityClaimed = false
     let creationToken: string | null = null
-    if (input.id !== undefined && durable) {
+    if ((input.id !== undefined || task.cleanupPolicyVersion === 1) && durable) {
       if (canFenceCreation) {
         creationToken = ulid()
         durableIdentityClaimed = await durable.claimTaskCreation!(
@@ -344,7 +366,13 @@ export class TaskEngine {
 
   async getTask(taskId: string): Promise<Task | null> {
     const fromShort = await this.shortTermStore.getTask(taskId)
-    if (fromShort) return fromShort
+    if (fromShort) {
+      // Terminal retention is durable authority, including after cleanup is disabled.
+      if (fromShort.cleanupPolicyVersion === 1 && isTerminal(fromShort.status) && this.longTermStore?.supportsTerminalCleanup) {
+        return this.longTermStore.getTask(taskId)
+      }
+      return fromShort
+    }
     return this.longTermStore?.getTask(taskId) ?? null
   }
 
@@ -473,9 +501,9 @@ export class TaskEngine {
         derivedEvents,
         initialWriteToken!,
       )
-      if (this.longTermStore) await this.longTermStore.saveTask(updated)
+      if (this.longTermStore) await this.longTermStore.saveTask(updated, durableContext(initialWriteToken!))
       for (const event of committed) {
-        await this.finishCommittedEvent(event)
+        await this.finishCommittedEvent(event, undefined, durableContext(initialWriteToken!))
       }
     } else {
       await this.shortTermStore.saveTask(updated)
@@ -673,6 +701,12 @@ export class TaskEngine {
     return this.storageCoordinator !== undefined
   }
 
+  supportsCleanup(): boolean { return this.cleanupCoordinator !== undefined }
+
+  async sweepCleanup(limit = 100, eventBatchSize = 1000, claimTtlMs = 30_000): Promise<CleanupSweepResult> {
+    return this.cleanupCoordinator ? this.cleanupCoordinator.sweep(limit, eventBatchSize, claimTtlMs) : emptyCleanupResult()
+  }
+
   supportsDurableTtl(): boolean {
     return this.ttlCoordinator !== undefined
   }
@@ -710,7 +744,15 @@ export class TaskEngine {
     const task = await this.getTask(taskId)
     if (!task) throw new Error(`Task not found: ${taskId}`)
 
-    return this.buildExportArchive(task)
+    if (task.historyExpiredAt !== undefined) throw new HistoryExpiredError(taskId)
+    try {
+      return await this.buildExportArchive(task)
+    } finally {
+      // A cleanup may have started while archive chunks were being read.
+      const current = await this.getTask(taskId)
+      if (!current) throw new Error(`Task not found: ${taskId}`)
+      if (current.historyExpiredAt !== undefined) throw new HistoryExpiredError(taskId)
+    }
   }
 
   private async buildExportArchive(task: Task): Promise<TaskArchive> {
@@ -876,6 +918,10 @@ export class TaskEngine {
 
     if (existing && options?.overwrite !== true) throw new TaskConflictError(taskId)
 
+    if (this.storageCoordinator && this.longTermStore?.restoreTaskArchive) {
+      return this.importArchiveFenced(normalized, options)
+    }
+
     if (typeof this.shortTermStore.restoreTaskArchive !== 'function') {
       throw new Error('shortTermStore does not support restoreTaskArchive')
     }
@@ -911,11 +957,73 @@ export class TaskEngine {
     }
   }
 
+  private async importArchiveFenced(archive: TaskArchive, options?: TaskArchiveImportOptions): Promise<TaskArchiveImportResult> {
+    const hot = this.shortTermStore
+    const durable = this.longTermStore!
+    const taskId = archive.task.id
+    const ttl = 30_000
+    const lease = await hot.acquireStorageLock!(taskId, ulid(), `import:${ulid()}`, ttl)
+    if (!lease) throw new StorageBusyError('Task storage is busy')
+    let lost = false
+    let renewing = Promise.resolve()
+    const renew = async () => {
+      if (lost || !await hot.renewStorageLock!(lease, ttl)) {
+        lost = true
+        throw new StorageFenceConflictError('Archive import lease was lost')
+      }
+    }
+    const timer = setInterval(() => { renewing = renewing.then(renew).catch(() => { lost = true }) }, ttl / 3)
+    try {
+      const existing = await this.getTask(taskId)
+      if (existing && options?.overwrite !== true) throw new TaskConflictError(taskId)
+      const data = buildTaskArchiveRestoreData(archive)
+      const before = await durable.getTaskStorageMetadata!(taskId)
+      const fence = await hot.getWriteFence!(taskId)
+      data.storageEpoch = Math.max(before?.storageEpoch ?? 0, fence?.storageEpoch ?? 0) + 1
+      data.expectedCreationToken = before?.creationToken ?? null
+      await hot.validateTaskArchiveRestore?.(data, options)
+      await durable.validateTaskArchiveRestore?.(data, options)
+      await renew()
+      await durable.restoreTaskArchive!(data, options)
+      await renew()
+      if (fence) {
+        await hot.closeWriteFence!(lease, fence.storageEpoch)
+        await hot.deleteTaskStorageFenced!(lease, fence.storageEpoch)
+      }
+      const metadata = await durable.getTaskStorageMetadata!(taskId)
+      if (!metadata || metadata.storageState !== 'cold' || metadata.storageEpoch !== data.storageEpoch) throw new StorageFenceConflictError('Archive import metadata changed')
+      const nextEpoch = data.storageEpoch + 1
+      await renew()
+      await hot.restoreHotTaskFenced!({
+        task: data.task, archiveWatermark: data.nextIndex - 1, maxEventIndex: data.nextIndex - 1,
+        replayEvents: data.events, storageEpoch: data.storageEpoch,
+        seriesLatest: data.seriesLatest.map(entry => ({ ...entry, mode: entry.event.seriesMode as 'latest' | 'accumulate', throughIndex: entry.event.index })),
+      }, lease, nextEpoch)
+      await renew()
+      if (!await durable.compareAndSetTaskStorageMetadata!({ taskId, expectedStorageState: 'cold', expectedStorageEpoch: data.storageEpoch, expectedReleaseGeneration: null,
+        next: { ...metadata, storageState: 'hot', storageEpoch: nextEpoch, coldAt: null } })) throw new StorageFenceConflictError('Archive import metadata changed')
+      this._emitChains.delete(taskId)
+      return { taskId, eventCount: data.events.length, overwritten: existing !== null }
+    } finally {
+      clearInterval(timer)
+      await renewing
+      await hot.releaseStorageLock!(lease)
+    }
+  }
+
   async listTasks(filter: TaskFilter): Promise<Task[]> {
     return this.shortTermStore.listTasks(filter)
   }
 
   async getEvents(taskId: string, opts?: EventQueryOptions): Promise<TaskEvent[]> {
+    const before = await this.getTask(taskId)
+    if (before?.historyExpiredAt !== undefined) return []
+    const events = await this.readEvents(taskId, opts)
+    const after = await this.getTask(taskId)
+    return after?.historyExpiredAt !== undefined || (before && !after) ? [] : events
+  }
+
+  private async readEvents(taskId: string, opts?: EventQueryOptions): Promise<TaskEvent[]> {
     if (!this.longTermStore) {
       return this.shortTermStore.getEvents(taskId, opts)
     }
@@ -992,6 +1100,14 @@ export class TaskEngine {
   }
 
   async getSeriesLatest(taskId: string, seriesId: string): Promise<TaskEvent | null> {
+    const before = await this.getTask(taskId)
+    if (before?.historyExpiredAt !== undefined) return null
+    const event = await this.readSeriesLatest(taskId, seriesId)
+    const after = await this.getTask(taskId)
+    return after?.historyExpiredAt !== undefined || (before && !after) ? null : event
+  }
+
+  private async readSeriesLatest(taskId: string, seriesId: string): Promise<TaskEvent | null> {
     if (
       !this.longTermStore ||
       this.longTermStore.supportsHotColdRelease !== true
@@ -1122,72 +1238,72 @@ export class TaskEngine {
   }
 
   private async _emitInner(taskId: string, input: PublishEventInput): Promise<TaskEvent> {
-    if (this.storageCoordinator) {
-      const raw: Omit<TaskEvent, 'index'> = {
+    if (!this.storageCoordinator) {
+      const index = await this.shortTermStore.nextIndex(taskId)
+      const raw: TaskEvent = {
         id: ulid(),
         taskId,
+        index,
         timestamp: Date.now(),
         type: input.type,
         level: input.level,
         data: input.data,
         ...(input.seriesId !== undefined && { seriesId: input.seriesId }),
         ...(input.seriesMode !== undefined && { seriesMode: input.seriesMode }),
-        ...(input.seriesAccField !== undefined && {
-          seriesAccField: input.seriesAccField,
-        }),
+        ...(input.seriesAccField !== undefined && { seriesAccField: input.seriesAccField }),
       }
-      let initialStorageEpoch: number | null = null
-      for (let attempt = 0; attempt < 3; attempt++) {
-        const token = await this.storageCoordinator.ensureTaskHotForWrite(
-          taskId,
-          attempt === 0,
-        )
-        if (initialStorageEpoch === null) {
-          initialStorageEpoch = token.storageEpoch
-        } else if (token.storageEpoch !== initialStorageEpoch) {
-          throw new StorageFenceConflictError(
-            'Task storage epoch changed after the write mutation started',
-          )
-        }
-        try {
-          const result = await this.shortTermStore.commitEventFenced!(
-            taskId,
-            raw,
-            token,
-          )
-          await this.finishCommittedEvent(result.event, result.accumulatedEvent)
-          return result.event
-        } catch (error) {
-          if (!(error instanceof StorageFenceConflictError) || attempt === 2) {
-            throw error
-          }
-        }
+
+      const { event, accumulatedEvent, stored } = await processSeries(raw, this.shortTermStore)
+      if (!stored) {
+        await this.shortTermStore.appendEvent(taskId, event)
       }
-      throw new StorageFenceConflictError()
+
+      await this.finishCommittedEvent(event, accumulatedEvent)
+
+      return event
     }
 
-    const index = await this.shortTermStore.nextIndex(taskId)
-    const raw: TaskEvent = {
+    const raw: Omit<TaskEvent, 'index'> = {
       id: ulid(),
       taskId,
-      index,
       timestamp: Date.now(),
       type: input.type,
       level: input.level,
       data: input.data,
       ...(input.seriesId !== undefined && { seriesId: input.seriesId }),
       ...(input.seriesMode !== undefined && { seriesMode: input.seriesMode }),
-      ...(input.seriesAccField !== undefined && { seriesAccField: input.seriesAccField }),
+      ...(input.seriesAccField !== undefined && {
+        seriesAccField: input.seriesAccField,
+      }),
     }
-
-    const { event, accumulatedEvent, stored } = await processSeries(raw, this.shortTermStore)
-    if (!stored) {
-      await this.shortTermStore.appendEvent(taskId, event)
+    let initialToken: HotWriteToken | undefined
+    // Success returns; the catch rethrows the third failed attempt.
+    for (let attempt = 0; ; attempt++) {
+      const token = await this.storageCoordinator.ensureTaskHotForWrite(
+        taskId,
+        attempt === 0,
+      )
+      if (!initialToken) {
+        initialToken = token
+      } else if (token.storageEpoch !== initialToken.storageEpoch || token.creationToken !== initialToken.creationToken) {
+        throw new StorageFenceConflictError(
+          'Task storage epoch changed after the write mutation started',
+        )
+      }
+      try {
+        const result = await this.shortTermStore.commitEventFenced!(
+          taskId,
+          raw,
+          token,
+        )
+        await this.finishCommittedEvent(result.event, result.accumulatedEvent, durableContext(token))
+        return result.event
+      } catch (error) {
+        if (!(error instanceof StorageFenceConflictError) || attempt === 2) {
+          throw error
+        }
+      }
     }
-
-    await this.finishCommittedEvent(event, accumulatedEvent)
-
-    return event
   }
 
   private async commitTaskEventsForMutation(
@@ -1215,11 +1331,12 @@ export class TaskEngine {
         level: input.level,
         data: input.data,
       }))
-      for (let attempt = 0; attempt < 3; attempt++) {
+      // Success returns; the catch rethrows the third failed attempt.
+      for (let attempt = 0; ; attempt++) {
         const token = attempt === 0
           ? initialToken
           : await coordinator.ensureTaskHotForWrite(task.id, false)
-        if (token.storageEpoch !== initialToken.storageEpoch) {
+        if (token.storageEpoch !== initialToken.storageEpoch || token.creationToken !== initialToken.creationToken) {
           throw new StorageFenceConflictError(
             'Task storage epoch changed after the write mutation started',
           )
@@ -1244,7 +1361,6 @@ export class TaskEngine {
           }
         }
       }
-      throw new StorageFenceConflictError()
     } finally {
       release()
     }
@@ -1253,6 +1369,7 @@ export class TaskEngine {
   private async finishCommittedEvent(
     event: TaskEvent,
     accumulatedEvent?: TaskEvent,
+    context?: DurableWriteContext,
   ): Promise<void> {
     const broadcastEvent = accumulatedEvent
       ? { ...event, _accumulatedData: accumulatedEvent.data }
@@ -1261,13 +1378,13 @@ export class TaskEngine {
 
     if (this.longTermStore) {
       const storeEvent = accumulatedEvent ?? event
-      this.persistLongTermEvent(event, accumulatedEvent).catch((err) => {
+      this.persistLongTermEvent(event, accumulatedEvent, context).catch((err) => {
         this.hooks?.onEventDropped?.(storeEvent, String(err))
       })
     }
   }
 
-  private async persistLongTermEvent(event: TaskEvent, accumulatedEvent?: TaskEvent): Promise<void> {
+  private async persistLongTermEvent(event: TaskEvent, accumulatedEvent?: TaskEvent, context?: DurableWriteContext): Promise<void> {
     if (!this.longTermStore) return
 
     if (
@@ -1275,7 +1392,7 @@ export class TaskEngine {
       event.seriesMode === 'latest' &&
       typeof this.longTermStore.replaceLastSeriesEvent === 'function'
     ) {
-      await this.longTermStore.replaceLastSeriesEvent(event.taskId, event.seriesId, event)
+      await this.longTermStore.replaceLastSeriesEvent(event.taskId, event.seriesId, event, context)
       return
     }
 
@@ -1289,12 +1406,17 @@ export class TaskEngine {
         event.seriesId,
         event,
         event.seriesAccField ?? 'delta',
+        context,
       )
       return
     }
 
     // Compatibility fallback for older LongTermStore implementations.
-    await this.longTermStore.saveEvent(accumulatedEvent ?? event)
+    await this.longTermStore.saveEvent(accumulatedEvent ?? event, context)
   }
 
+}
+
+function durableContext(token: HotWriteToken): DurableWriteContext | undefined {
+  return token.creationToken === undefined ? undefined : { creationToken: token.creationToken }
 }

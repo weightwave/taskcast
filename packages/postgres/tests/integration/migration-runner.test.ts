@@ -40,6 +40,7 @@ describe('migration runner integration', () => {
       '003_storage_lifecycle.sql',
       '004_archive_receipt_coverage.sql',
       '005_task_creation_claim.sql',
+      '006_terminal_retention.sql',
     ])
     expect(result.skipped).toEqual([])
 
@@ -109,13 +110,14 @@ describe('migration runner integration', () => {
       '003_storage_lifecycle.sql',
       '004_archive_receipt_coverage.sql',
       '005_task_creation_claim.sql',
+      '006_terminal_retention.sql',
     ])
   })
 
   it('writes _sqlx_migrations records with correct format', async () => {
     const rows = await sql`SELECT * FROM _sqlx_migrations ORDER BY version`
 
-    expect(rows).toHaveLength(5)
+    expect(rows).toHaveLength(6)
 
     // Verify migration 001
     const row1 = rows[0]!

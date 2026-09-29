@@ -62,11 +62,13 @@ import { TASKCAST_SERVER_VERSION, serverInfo } from './version.js'
 import type { AuthConfig } from './auth.js'
 import {
   findDependencyUnavailableError,
+  emptyCleanupResult,
   isTerminal,
   matchesWorkerRule,
 } from '@taskcast/core'
 import type {
   DurableTtlSweepResult,
+  CleanupSweepResult,
   ResolvedStorageLifecycleConfig,
   StorageReleaseSweepResult,
   Task,
@@ -136,7 +138,8 @@ export interface TaskcastApp {
   stop(): void
 }
 
-const STORAGE_PROTOCOL_VERSION = 2
+const STORAGE_PROTOCOL_VERSION = 3
+const RELEASE_STORAGE_PROTOCOL_VERSION = 2
 const STORAGE_WRITER_TTL_MS = 30_000
 const STORAGE_WRITER_HEARTBEAT_MS = 10_000
 
@@ -185,13 +188,13 @@ class StorageWriterHeartbeat implements StorageReleaseReadiness {
     } catch {
       return {
         releaseReady: false,
-        requiredStorageProtocolVersion: STORAGE_PROTOCOL_VERSION,
+        requiredStorageProtocolVersion: RELEASE_STORAGE_PROTOCOL_VERSION,
         activeWriterCount: 0,
         incompatibleWriterIds: [],
       }
     }
     const incompatibleWriterIds = writers
-      .filter((writer) => writer.storageProtocolVersion < STORAGE_PROTOCOL_VERSION)
+      .filter((writer) => writer.storageProtocolVersion < RELEASE_STORAGE_PROTOCOL_VERSION)
       .map((writer) => writer.instanceId)
       .sort()
     return {
@@ -200,7 +203,7 @@ class StorageWriterHeartbeat implements StorageReleaseReadiness {
         this.heartbeatError === null &&
         writers.some((writer) => writer.instanceId === this.instanceId) &&
         incompatibleWriterIds.length === 0,
-      requiredStorageProtocolVersion: STORAGE_PROTOCOL_VERSION,
+      requiredStorageProtocolVersion: RELEASE_STORAGE_PROTOCOL_VERSION,
       activeWriterCount: writers.length,
       incompatibleWriterIds,
     }
@@ -232,6 +235,7 @@ export interface StorageLifecycleWorkerOptions {
 }
 
 export interface StorageLifecycleTickResult {
+  cleanup: CleanupSweepResult
   ttl: DurableTtlSweepResult
   projection: DurableTtlSweepResult
   releaseRequests: StorageReleaseSweepResult
@@ -308,6 +312,7 @@ export class StorageLifecycleWorker {
     const startedAt = this.now()
     if (this.running) return null
     this.running = true
+    const cleanup = emptyCleanupResult()
     const ttl = emptyTtlResult()
     const projection = emptyTtlResult()
     const releaseRequests = emptyReleaseResult()
@@ -334,6 +339,11 @@ export class StorageLifecycleWorker {
           projection.failed += 1
           this.logError('terminal_projection', error)
         }
+      }
+
+      if (this.engine.supportsCleanup?.()) {
+        try { Object.assign(cleanup, await this.engine.sweepCleanup(limit, 1000, claimTtlMs)) }
+        catch (error) { cleanup.failed++; this.logError('terminal_cleanup', error) }
       }
 
       const releaseAttempted =
@@ -457,6 +467,7 @@ export class StorageLifecycleWorker {
         }
       }
       const result = {
+        cleanup,
         ttl,
         projection,
         releaseRequests,
@@ -540,7 +551,7 @@ export function createTaskcastApp(opts: TaskcastServerOptions): TaskcastApp {
   // CORS middleware
   if (opts.cors) {
     const origin = opts.cors === true ? '*' : opts.cors.origin
-    app.use('*', cors({ origin }))
+    app.use('*', cors({ origin, exposeHeaders: ['X-Taskcast-History-Expired'] }))
   }
 
   app.get('/', (c) => c.json({

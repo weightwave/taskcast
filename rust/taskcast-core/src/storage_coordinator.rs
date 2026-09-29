@@ -180,6 +180,7 @@ impl StorageCoordinator {
                 && fence.storage_epoch == metadata.storage_epoch
             {
                 return Ok(HotWriteToken {
+                    creation_token: metadata.creation_token.clone(),
                     task_id: task_id.to_string(),
                     storage_epoch: fence.storage_epoch,
                 });
@@ -198,12 +199,13 @@ impl StorageCoordinator {
                         expected_release_generation: None,
                         next: TaskStorageMetadata {
                             storage_epoch: fence.storage_epoch,
-                            ..metadata
+                            ..metadata.clone()
                         },
                     })
                     .await?;
                 if repaired {
                     return Ok(HotWriteToken {
+                        creation_token: metadata.creation_token.clone(),
                         task_id: task_id.to_string(),
                         storage_epoch: fence.storage_epoch,
                     });
@@ -310,6 +312,7 @@ impl StorageCoordinator {
                         && fence.storage_epoch == metadata.storage_epoch
                 }) {
                     return Ok(HotWriteToken {
+                        creation_token: metadata.creation_token.clone(),
                         task_id: task_id.to_string(),
                         storage_epoch: metadata.storage_epoch,
                     });
@@ -320,7 +323,7 @@ impl StorageCoordinator {
             }
             StorageState::Cold => {}
         }
-        if metadata.storage_epoch != initial.storage_epoch
+        if metadata.creation_token != initial.creation_token || metadata.storage_epoch != initial.storage_epoch
             || metadata.active_release_generation.is_some()
         {
             return Err(boxed(StorageFenceConflictError::new(
@@ -351,7 +354,7 @@ impl StorageCoordinator {
                         storage_state: StorageState::Hot,
                         storage_epoch,
                         cold_at: None,
-                        ..metadata
+                        ..metadata.clone()
                     },
                 })
                 .await?;
@@ -361,6 +364,7 @@ impl StorageCoordinator {
                 )));
             }
             return Ok(HotWriteToken {
+                creation_token: metadata.creation_token.clone(),
                 task_id: task_id.to_string(),
                 storage_epoch,
             });
@@ -401,6 +405,7 @@ impl StorageCoordinator {
                 "Durable task does not exist: {task_id}"
             )))
         })?;
+        if task.history_expired_at.is_some() { return Err(boxed(StorageFenceConflictError::new("Task history has expired"))); }
         if max_event_index < metadata.archive_watermark
             || replay_events.iter().any(|event| {
                 event.task_id != task_id
@@ -428,7 +433,7 @@ impl StorageCoordinator {
             ))
         })?;
         self.renew(lease, lease_lost).await?;
-        let token = self
+        let mut token = self
             .short_term_store
             .restore_hot_task_fenced(
                 RehydrateSnapshot {
@@ -460,6 +465,7 @@ impl StorageCoordinator {
                 },
             })
             .await?;
+        token.creation_token = metadata.creation_token.clone();
         if installed {
             return Ok(token);
         }
@@ -469,6 +475,7 @@ impl StorageCoordinator {
             .await?;
         if current.as_ref().is_some_and(|current| {
             current.storage_state == StorageState::Hot
+                && current.creation_token == metadata.creation_token
                 && current.storage_epoch == next_epoch
                 && current.active_release_generation.is_none()
         }) {

@@ -1,3 +1,4 @@
+use crate::BoxError;
 use async_trait::async_trait;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
@@ -366,6 +367,12 @@ pub struct Task {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cleanup: Option<CleanupConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub cleanup_policy_version: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cleanup_resolved_at: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub history_expired_at: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tags: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub assign_mode: Option<AssignMode>,
@@ -587,6 +594,10 @@ pub struct SeriesLatestEntry {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskArchiveRestoreData {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_creation_token: Option<String>,
     pub task: Task,
     pub events: Vec<TaskEvent>,
     pub next_index: u64,
@@ -606,6 +617,8 @@ pub enum StorageState {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskStorageMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creation_token: Option<String>,
     pub task_id: String,
     pub storage_state: StorageState,
     pub storage_epoch: u64,
@@ -620,6 +633,8 @@ pub struct TaskStorageMetadata {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct HotWriteToken {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creation_token: Option<String>,
     pub task_id: String,
     pub storage_epoch: u64,
 }
@@ -1227,8 +1242,36 @@ pub trait ShortTermStore: Send + Sync {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct CleanupClaim {
+    pub task_id: String,
+    pub creation_token: String,
+    pub claim_token: String,
+    pub target: CleanupTarget,
+    pub completed_at: f64,
+    pub task_version: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableWriteContext { pub creation_token: String }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleanupBatchResult { pub deleted_events: u64, pub complete: bool }
+
 #[async_trait]
 pub trait LongTermStore: Send + Sync {
+    fn supports_terminal_cleanup(&self) -> bool { false }
+    async fn can_cleanup_task(&self, _claim: &CleanupClaim) -> Result<bool, BoxError> { Err(Box::new(StorageReleaseUnsupportedError::default())) }
+    async fn claim_cleanup_tasks(&self, _limit: u64, _claim_ttl_ms: u64) -> Result<Vec<CleanupClaim>, BoxError> { Err(Box::new(StorageReleaseUnsupportedError::default())) }
+    async fn renew_cleanup_claim(&self, _claim: &CleanupClaim, _ttl: u64) -> Result<bool, BoxError> { Err(Box::new(StorageReleaseUnsupportedError::default())) }
+    async fn defer_cleanup_claim(&self, _claim: &CleanupClaim, _delay: u64) -> Result<(), BoxError> { Err(Box::new(StorageReleaseUnsupportedError::default())) }
+    async fn begin_task_cleanup(&self, _claim: &CleanupClaim, _epoch: u64, _through: i64) -> Result<bool, BoxError> { Err(Box::new(StorageReleaseUnsupportedError::default())) }
+    async fn delete_task_cleanup_batch(&self, _claim: &CleanupClaim, _limit: u64) -> Result<CleanupBatchResult, BoxError> { Err(Box::new(StorageReleaseUnsupportedError::default())) }
+    async fn save_task_with_context(&self, task: Task, _context: Option<&DurableWriteContext>) -> Result<(), BoxError> { self.save_task(task).await }
+    async fn save_event_with_context(&self, event: TaskEvent, _context: Option<&DurableWriteContext>) -> Result<(), BoxError> { self.save_event(event).await }
+    async fn replace_last_series_event_with_context(&self, task_id: &str, series_id: &str, event: TaskEvent, _context: Option<&DurableWriteContext>) -> Result<(), BoxError> { self.replace_last_series_event(task_id, series_id, event).await }
+    async fn accumulate_series_with_context(&self, task_id: &str, series_id: &str, event: TaskEvent, field: &str, _context: Option<&DurableWriteContext>) -> Result<TaskEvent, BoxError> { self.accumulate_series(task_id, series_id, event, field).await }
+
     /// True only for split-tier stores with a verifiable archive barrier.
     fn supports_hot_cold_release(&self) -> bool {
         false
@@ -1782,6 +1825,9 @@ mod tests {
     #[test]
     fn task_minimal_serializes_with_correct_field_names() {
         let task = Task {
+            cleanup_policy_version: None,
+            cleanup_resolved_at: None,
+            history_expired_at: None,
             id: "task_01".to_string(),
             r#type: None,
             status: TaskStatus::Pending,
@@ -1832,6 +1878,9 @@ mod tests {
         params.insert("url".to_string(), json!("https://example.com"));
 
         let task = Task {
+            cleanup_policy_version: None,
+            cleanup_resolved_at: None,
+            history_expired_at: None,
             id: "task_02".to_string(),
             r#type: Some("crawl".to_string()),
             status: TaskStatus::Completed,
@@ -1943,6 +1992,9 @@ mod tests {
     #[test]
     fn task_roundtrip_serialization() {
         let task = Task {
+            cleanup_policy_version: None,
+            cleanup_resolved_at: None,
+            history_expired_at: None,
             id: "task_rt".to_string(),
             r#type: Some("test".to_string()),
             status: TaskStatus::Running,
@@ -2425,6 +2477,9 @@ mod tests {
     fn optional_fields_are_absent_not_null_in_json() {
         // This is critical: TypeScript omits undefined fields, so Rust must too
         let task = Task {
+            cleanup_policy_version: None,
+            cleanup_resolved_at: None,
+            history_expired_at: None,
             id: "t".to_string(),
             r#type: None,
             status: TaskStatus::Pending,
@@ -2517,6 +2572,9 @@ mod tests {
     #[test]
     fn cleanup_config_nested_serializes_correctly() {
         let task = Task {
+            cleanup_policy_version: None,
+            cleanup_resolved_at: None,
+            history_expired_at: None,
             id: "t".to_string(),
             r#type: None,
             status: TaskStatus::Pending,
@@ -2588,6 +2646,9 @@ mod tests {
     fn taskcast_hooks_default_impls_do_not_panic() {
         let hooks = NoopHooks;
         let task = Task {
+            cleanup_policy_version: None,
+            cleanup_resolved_at: None,
+            history_expired_at: None,
             id: "t".to_string(),
             r#type: None,
             status: TaskStatus::Failed,
@@ -2809,6 +2870,9 @@ mod tests {
     async fn stub_store_all_methods_return_ok() {
         let store = StubStore;
         let task = Task {
+            cleanup_policy_version: None,
+            cleanup_resolved_at: None,
+            history_expired_at: None,
             id: "x".to_string(),
             r#type: None,
             status: TaskStatus::Pending,

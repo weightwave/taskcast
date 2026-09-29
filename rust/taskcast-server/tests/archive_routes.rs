@@ -337,6 +337,9 @@ impl LongTermStore for AccumulatedOnlyLongTermStore {
             return Ok(None);
         }
         Ok(Some(Task {
+            cleanup_policy_version: None,
+            cleanup_resolved_at: None,
+            history_expired_at: None,
             id: task_id.to_string(),
             r#type: Some("archive-test".to_string()),
             status: TaskStatus::Running,

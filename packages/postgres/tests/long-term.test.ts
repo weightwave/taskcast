@@ -120,7 +120,7 @@ describe('PostgresLongTermStore - tasks', () => {
   it('completes or aborts only the matching pristine creation claim', async () => {
     expect(await store.claimTaskCreation(makeTask(), 'token-1', 30_000)).toBe(true)
     expect(await store.abortTaskCreation('task-1', 'wrong-token')).toBe(false)
-    await store.saveTask({ ...makeTask(), status: 'running' })
+    await store.saveTask({ ...makeTask(), status: 'running' }, { creationToken: 'token-1' })
     expect(await store.abortTaskCreation('task-1', 'token-1')).toBe(false)
     expect(await store.completeTaskCreation('task-1', 'token-1')).toBe(true)
     expect(await store.completeTaskCreation('task-1', 'token-1')).toBe(true)

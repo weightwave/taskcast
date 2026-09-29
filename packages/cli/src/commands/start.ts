@@ -8,6 +8,7 @@ import {
   WorkerManager,
   loadConfigFile,
   resolveStorageLifecycleConfig,
+  resolveCleanupConfig,
   resolveAdminToken,
   MemoryBroadcastProvider,
   MemoryShortTermStore,
@@ -425,6 +426,7 @@ async function runStartWithLifecycle(options: RunStartOptions, lifecycle: StartL
   )
 
   const engineOpts: ConstructorParameters<typeof TaskEngine>[0] = {
+    cleanup: resolveCleanupConfig(options.config, options.env ?? process.env),
     shortTermStore: options.shortTermStore,
     broadcast: options.broadcast,
     storageLockTtlMs: storageLifecycle.storageLockTtlSeconds * 1_000,

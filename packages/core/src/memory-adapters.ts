@@ -1,3 +1,5 @@
+import { ulid } from 'ulidx'
+import { cleanupDeadline } from './cleanup-policy.js'
 import type {
   Task,
   TaskEvent,
@@ -33,8 +35,11 @@ import type {
   TerminalProjection,
   TerminalProjectionResult,
   TtlClaim,
+  CleanupClaim,
+  CleanupBatchResult,
+  DurableWriteContext,
 } from './types.js'
-import { StorageFenceConflictError, StorageIntegrityError } from './types.js'
+import { StorageFenceConflictError, StorageIntegrityError, StoragePreconditionError } from './types.js'
 import { TaskConflictError } from './engine.js'
 import {
   canonicalJson,
@@ -437,6 +442,14 @@ export class MemoryShortTermStore implements ShortTermStore {
       throw new StorageFenceConflictError()
     }
 
+    const assignment = projection.assignment
+    const currentAssignment = assignment ? this.assignments.get(taskId) : undefined
+    if (currentAssignment && canonicalJson(currentAssignment) !== canonicalJson(assignment)) {
+      throw new StorageIntegrityError(
+        'Terminal projection conflicts with the hot assignment',
+      )
+    }
+
     const taskEvents = this.events.get(taskId) ?? []
     const existing = taskEvents.find(
       (event) => event.index === projection.event.index,
@@ -462,15 +475,8 @@ export class MemoryShortTermStore implements ShortTermStore {
 
     this.tasks.set(taskId, structuredClone(projection.task))
     this.bumpTaskRevision(taskId)
-    const assignment = projection.assignment
     if (assignment) {
-      const current = this.assignments.get(taskId)
-      if (current && canonicalJson(current) !== canonicalJson(assignment)) {
-        throw new StorageIntegrityError(
-          'Terminal projection conflicts with the hot assignment',
-        )
-      }
-      if (current) {
+      if (currentAssignment) {
         this.assignments.delete(taskId)
         const worker = this.workers.get(assignment.workerId)
         if (worker) {
@@ -755,6 +761,9 @@ export class MemoryShortTermStore implements ShortTermStore {
 export class MemoryLongTermStore implements LongTermStore {
   readonly supportsHotColdRelease = true
   readonly supportsDurableTtl = true
+  readonly supportsTerminalCleanup = true
+  private cleanupClaims = new Map<string, { claim: CleanupClaim; until: number; inProgress: boolean }>()
+  private cleanupRetry = new Map<string, number>()
   private tasks = new Map<string, Task>()
   private events = new Map<string, TaskEvent[]>()
   private metadata = new Map<string, TaskStorageMetadata>()
@@ -774,7 +783,128 @@ export class MemoryLongTermStore implements LongTermStore {
     { token: string; claimedAt: number; expiresAt: number | null; completedAt: number | null }
   >()
 
-  async saveTask(task: Task): Promise<void> {
+  private cleanupBound(value: number, allowZero = false): void {
+    if (!Number.isSafeInteger(value) || value < (allowZero ? 0 : 1) || value > 2_147_483_647) throw new StoragePreconditionError('Invalid cleanup batch or lease bound')
+  }
+
+  async claimCleanupTasks(limit: number, ttl: number): Promise<CleanupClaim[]> {
+    this.cleanupBound(limit); this.cleanupBound(ttl)
+    const now = Date.now()
+    const candidates = [...this.tasks.values()].flatMap(task => {
+      const prior = this.cleanupClaims.get(task.id)
+      const creation = this.creationClaims.get(task.id)
+      if (!creation || creation.completedAt === null || (prior?.until ?? 0) > now || (this.cleanupRetry.get(task.id) ?? 0) > now) return []
+      const all = cleanupDeadline(task, 'all')
+      const events = task.historyExpiredAt === undefined || prior?.inProgress ? cleanupDeadline(task, 'events') : null
+      const due = events === null ? all : all === null ? events : Math.min(events, all)
+      if (due === null || due > now) return []
+      const target = prior?.inProgress ? prior.claim.target : all !== null && all <= now ? 'all' as const : 'events' as const
+      return [{ task, target, due: Math.max(due, this.cleanupRetry.get(task.id) ?? due), creation, prior }]
+    }).sort((a, b) => a.due - b.due || a.task.id.localeCompare(b.task.id)).slice(0, limit)
+    return candidates.map(({ task, target, creation, prior }) => {
+      const claim: CleanupClaim = { taskId: task.id, creationToken: creation.token, claimToken: ulid(), target, completedAt: task.completedAt!, taskVersion: this.metadata.get(task.id)!.taskVersion }
+      this.cleanupClaims.set(task.id, { claim, until: now + ttl, inProgress: prior?.inProgress ?? false })
+      return structuredClone(claim)
+    })
+  }
+
+  async canCleanupTask(claim: CleanupClaim): Promise<boolean> {
+    return this.validCleanupClaim(claim) && this.cleanupSettled(claim.taskId)
+  }
+
+  async renewCleanupClaim(claim: CleanupClaim, ttl: number): Promise<boolean> {
+    this.cleanupBound(ttl)
+    const current = this.cleanupClaims.get(claim.taskId)
+    if (!current || current.claim.claimToken !== claim.claimToken || current.claim.creationToken !== claim.creationToken || current.until <= Date.now()) return false
+    current.until = Date.now() + ttl
+    return true
+  }
+
+  async deferCleanupClaim(claim: CleanupClaim, delay: number): Promise<void> {
+    this.cleanupBound(delay, true)
+    const current = this.cleanupClaims.get(claim.taskId)
+    if (current?.claim.claimToken !== claim.claimToken || current.claim.creationToken !== claim.creationToken) return
+    current.until = 0
+    this.cleanupRetry.set(claim.taskId, Date.now() + delay)
+  }
+
+  private validCleanupClaim(claim: CleanupClaim): boolean {
+    const current = this.cleanupClaims.get(claim.taskId)
+    const task = this.tasks.get(claim.taskId)
+    return Boolean(current && current.until > Date.now() && current.claim.claimToken === claim.claimToken
+      && current.claim.target === claim.target && this.creationClaims.get(claim.taskId)?.token === claim.creationToken
+      && task?.cleanupPolicyVersion === 1 && task.completedAt === claim.completedAt && isMemoryTerminal(task.status)
+      && this.metadata.get(claim.taskId)?.taskVersion === claim.taskVersion)
+  }
+
+  private cleanupSettled(taskId: string): boolean {
+    return !this.durableAssignments.has(taskId)
+      && ![...this.terminalProjections.values()].some(p => p.projection.task.id === taskId && p.projectedAt === null)
+      && ![...this.generations.values()].some(g => g.taskId === taskId && g.status === 'open')
+  }
+
+  async beginTaskCleanup(claim: CleanupClaim, epoch: number, throughIndex: number): Promise<boolean> {
+    this.cleanupBound(epoch)
+    if (!Number.isSafeInteger(throughIndex) || throughIndex < -1) throw new StoragePreconditionError('Invalid cleanup watermark')
+    if (!this.validCleanupClaim(claim) || !this.cleanupSettled(claim.taskId)) return false
+    const metadata = this.metadata.get(claim.taskId)!
+    const task = this.tasks.get(claim.taskId)!
+    const due = cleanupDeadline(task, claim.target)
+    if (metadata.storageState !== 'cold' || metadata.storageEpoch !== epoch || metadata.activeReleaseGeneration !== null
+      || metadata.archiveWatermark !== throughIndex || due === null || due > Date.now()
+      || (this.events.get(claim.taskId) ?? []).some(e => e.index > throughIndex)
+      || (this.series.get(claim.taskId) ?? []).some(s => s.throughIndex > throughIndex)) return false
+    task.historyExpiredAt ??= Date.now()
+    this.cleanupClaims.get(claim.taskId)!.inProgress = true
+    return true
+  }
+
+  async deleteTaskCleanupBatch(claim: CleanupClaim, limit: number): Promise<CleanupBatchResult> {
+    this.cleanupBound(limit)
+    const task = this.tasks.get(claim.taskId)
+    if (!this.validCleanupClaim(claim) || !this.cleanupClaims.get(claim.taskId)?.inProgress || task?.historyExpiredAt === undefined
+      || this.metadata.get(claim.taskId)?.storageState !== 'cold' || !this.cleanupSettled(claim.taskId)) throw new StorageFenceConflictError('Cleanup claim or cold-state precondition was lost')
+    const events = this.events.get(claim.taskId) ?? []
+    const deletedEvents = Math.min(limit, events.length)
+    this.events.set(claim.taskId, events.slice(limit))
+    if (events.length > limit) return { deletedEvents, complete: false }
+    const remainingSeries = (this.series.get(claim.taskId) ?? []).slice(limit)
+    this.series.set(claim.taskId, remainingSeries)
+    let batchBudget = limit; let generationBudget = limit
+    for (const [key, generation] of this.generations) {
+      if (generation.taskId !== claim.taskId) continue
+      const batches = this.batches.get(key)
+      if (batches) for (const ordinal of batches.keys()) { if (batchBudget <= 0) break; batches.delete(ordinal); batchBudget-- }
+      if ((batches?.size ?? 0) === 0 && generationBudget > 0) { this.batches.delete(key); this.generations.delete(key); generationBudget-- }
+    }
+    let projectionBudget = limit
+    for (const [key, p] of this.terminalProjections) {
+      if (p.projection.task.id === claim.taskId && p.projectedAt !== null && projectionBudget > 0) { this.terminalProjections.delete(key); projectionBudget-- }
+    }
+    if (remainingSeries.length > 0 || [...this.generations.values()].some(g => g.taskId === claim.taskId)
+      || [...this.terminalProjections.values()].some(p => p.projection.task.id === claim.taskId)) return { deletedEvents, complete: false }
+    this.cleanupClaims.delete(claim.taskId); this.cleanupRetry.delete(claim.taskId)
+    if (claim.target === 'all') {
+      this.tasks.delete(claim.taskId); this.metadata.delete(claim.taskId); this.creationClaims.delete(claim.taskId)
+      this.events.delete(claim.taskId); this.series.delete(claim.taskId); this.releaseRequests.delete(claim.taskId); this.ttlClaims.delete(claim.taskId)
+    }
+    return { deletedEvents, complete: true }
+  }
+
+  private guardWrite(taskId: string, context?: DurableWriteContext, enrolled = false): void {
+    const task = this.tasks.get(taskId)
+    if (task?.historyExpiredAt !== undefined || (context && (!task || this.creationClaims.get(taskId)?.token !== context.creationToken))
+      || (!context && (enrolled || task?.cleanupPolicyVersion === 1 || this.creationClaims.has(taskId)))) {
+      throw new StorageFenceConflictError('Durable write belongs to missing, expired, or replaced task generation')
+    }
+  }
+
+  async saveTask(task: Task, context?: DurableWriteContext): Promise<void> {
+    this.guardWrite(task.id, context, task.cleanupPolicyVersion === 1)
+    this.saveTaskInternal(task)
+  }
+
+  private saveTaskInternal(task: Task): void {
     const existing = this.tasks.get(task.id)
     const metadata = this.metadata.get(task.id)
     if (
@@ -819,7 +949,7 @@ export class MemoryLongTermStore implements LongTermStore {
 
   async createTaskIfAbsent(task: Task): Promise<boolean> {
     if (this.tasks.has(task.id)) return false
-    await this.saveTask(task)
+    this.saveTaskInternal(task)
     return true
   }
 
@@ -844,6 +974,7 @@ export class MemoryLongTermStore implements LongTermStore {
     this.tasks.set(task.id, structuredClone(task))
     this.metadata.set(task.id, {
       taskId: task.id,
+      creationToken,
       storageState: 'hot',
       storageEpoch: 1,
       activeReleaseGeneration: null,
@@ -912,7 +1043,8 @@ export class MemoryLongTermStore implements LongTermStore {
     return structuredClone(this.tasks.get(taskId) ?? null)
   }
 
-  async saveEvent(event: TaskEvent): Promise<void> {
+  async saveEvent(event: TaskEvent, context?: DurableWriteContext): Promise<void> {
+    this.guardWrite(event.taskId, context)
     this.upsertEvent(event)
     const metadata = this.metadata.get(event.taskId)
     if (metadata) metadata.lastEventAt = event.timestamp
@@ -922,7 +1054,9 @@ export class MemoryLongTermStore implements LongTermStore {
     taskId: string,
     seriesId: string,
     event: TaskEvent,
+    context?: DurableWriteContext,
   ): Promise<void> {
+    this.guardWrite(taskId, context)
     const states = this.series.get(taskId) ?? []
     const existing = states.find((state) => state.seriesId === seriesId)
     const metadata = this.metadata.get(taskId)
@@ -971,7 +1105,9 @@ export class MemoryLongTermStore implements LongTermStore {
     seriesId: string,
     event: TaskEvent,
     field: string,
+    context?: DurableWriteContext,
   ): Promise<TaskEvent> {
+    this.guardWrite(taskId, context)
     const previous = (this.series.get(taskId) ?? []).find(
       (state) => state.seriesId === seriesId,
     )
@@ -1115,6 +1251,7 @@ export class MemoryLongTermStore implements LongTermStore {
   }
 
   async beginArchive(generation: ArchiveGeneration): Promise<ArchiveGeneration> {
+    if (this.tasks.get(generation.taskId)?.historyExpiredAt !== undefined) throw new StorageFenceConflictError("Task history has expired")
     const metadata = this.metadata.get(generation.taskId)
     if (
       !metadata ||
@@ -1156,6 +1293,7 @@ export class MemoryLongTermStore implements LongTermStore {
     if (expectedDigest !== batch.receipt.batchDigest) {
       throw new StorageIntegrityError('Archive batch digest mismatch')
     }
+    if (this.tasks.get(taskId)?.historyExpiredAt !== undefined) throw new StorageFenceConflictError('Task history has expired')
     const key = this.archiveKey(taskId, generation)
     const archive = this.generations.get(key)
     if (!archive || archive.status !== 'open') {
@@ -1198,6 +1336,7 @@ export class MemoryLongTermStore implements LongTermStore {
     task: Task,
     seriesLatest: DurableSeriesState[],
   ): Promise<number> {
+    if (this.tasks.get(taskId)?.historyExpiredAt !== undefined) throw new StorageFenceConflictError("Task history has expired")
     const key = this.archiveKey(taskId, generation)
     const archive = this.generations.get(key)
     if (!archive) throw new StorageIntegrityError('Archive generation is missing')

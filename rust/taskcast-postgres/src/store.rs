@@ -9,6 +9,8 @@ use std::future::Future;
 use std::sync::Arc;
 
 use crate::classify_postgres_connectivity;
+use crate::cleanup_store::{self, guard_write, next_deadline};
+use taskcast_core::{CleanupClaim, CleanupBatchResult, DurableWriteContext};
 use taskcast_core::archive::{
     archive_event_record, compute_archive_batch_digest, compute_archive_source_digest,
     compute_archive_source_page_digest, compute_series_state_digest, durable_series_state_record,
@@ -143,7 +145,7 @@ impl PostgresLongTermStore {
     }
 
     /// Convert a database row into a `Task`.
-    fn row_to_task(row: &PgRow) -> Task {
+    pub(crate) fn row_to_task(row: &PgRow) -> Task {
         let status_str: String = row.get("status");
         let status: TaskStatus =
             serde_json::from_value(JsonValue::String(status_str)).unwrap_or(TaskStatus::Pending);
@@ -173,6 +175,9 @@ impl PostgresLongTermStore {
             disconnect_policy_str.and_then(|s| serde_json::from_value(JsonValue::String(s)).ok());
 
         Task {
+            cleanup_policy_version: row.get::<Option<i32>,_>("cleanup_policy_version").map(|v| v as u8),
+            cleanup_resolved_at: row.get::<Option<i64>,_>("cleanup_resolved_at").map(|v| v as f64),
+            history_expired_at: row.get::<Option<i64>,_>("history_expired_at").map(|v| v as f64),
             id: row.get("id"),
             r#type: row.get("type"),
             status,
@@ -269,6 +274,14 @@ impl Error for BoxedSource {
 
 #[async_trait]
 impl LongTermStore for PostgresLongTermStore {
+    fn supports_terminal_cleanup(&self) -> bool { true }
+    async fn can_cleanup_task(&self, claim: &CleanupClaim) -> Result<bool, BoxError> { self.observed(|| cleanup_store::ready(&self.pool, claim)).await }
+    async fn claim_cleanup_tasks(&self, limit: u64, ttl: u64) -> Result<Vec<CleanupClaim>, BoxError> { self.observed(|| cleanup_store::claim(&self.pool, limit, ttl)).await }
+    async fn renew_cleanup_claim(&self, claim: &CleanupClaim, ttl: u64) -> Result<bool, BoxError> { self.observed(|| cleanup_store::renew(&self.pool, claim, ttl)).await }
+    async fn defer_cleanup_claim(&self, claim: &CleanupClaim, delay: u64) -> Result<(), BoxError> { self.observed(|| cleanup_store::defer(&self.pool, claim, delay)).await }
+    async fn begin_task_cleanup(&self, claim: &CleanupClaim, epoch: u64, through: i64) -> Result<bool, BoxError> { self.observed(|| cleanup_store::begin(&self.pool, claim, epoch, through)).await }
+    async fn delete_task_cleanup_batch(&self, claim: &CleanupClaim, limit: u64) -> Result<CleanupBatchResult, BoxError> { self.observed(|| cleanup_store::delete_batch(&self.pool, claim, limit)).await }
+
     fn supports_hot_cold_release(&self) -> bool {
         true
     }
@@ -281,142 +294,39 @@ impl LongTermStore for PostgresLongTermStore {
         true
     }
 
-    async fn save_task(&self, task: Task) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    fn supports_task_archive_restore(&self) -> bool { true }
+
+    async fn validate_task_archive_restore(&self, data: &taskcast_core::TaskArchiveRestoreData, options: Option<taskcast_core::TaskArchiveImportOptions>) -> Result<(), BoxError> {
+        let mut tx = self.pool.begin().await?;
+        validate_restore_pg(&mut tx, data, options).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn restore_task_archive(&self, mut data: taskcast_core::TaskArchiveRestoreData, options: Option<taskcast_core::TaskArchiveImportOptions>) -> Result<bool, BoxError> {
+        let mut tx = self.pool.begin().await?;
+        let overwritten = validate_restore_pg(&mut tx, &data, options).await?;
+        sqlx::query("DELETE FROM taskcast_tasks WHERE id = $1").bind(&data.task.id).execute(&mut *tx).await?;
+        data.task.cleanup_policy_version = None;
+        data.task.cleanup_resolved_at = None;
+        data.task.history_expired_at = None;
+        save_task_pg_tx(&mut tx, &data.task).await?;
+        sqlx::query("UPDATE taskcast_tasks SET creation_token = $5, creation_completed_at = FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT, storage_epoch = $2, storage_state = $3, archive_watermark = $4 WHERE id = $1")
+            .bind(&data.task.id).bind(data.storage_epoch.unwrap_or(1) as i64)
+            .bind(if data.storage_epoch.is_some() { "cold" } else { "hot" }).bind(data.next_index as i64 - 1).bind(ulid::Ulid::new().to_string()).execute(&mut *tx).await?;
+        for event in &data.events { if !insert_canonical_event_pg_tx(&mut tx, event).await? { return Err(integrity("Archive event conflicts with existing history")); } }
+        tx.commit().await?;
+        Ok(overwritten)
+    }
+
+    async fn save_task(&self, task: Task) -> Result<(), BoxError> { self.save_task_with_context(task, None).await }
+
+    async fn save_task_with_context(&self, task: Task, context: Option<&DurableWriteContext>) -> Result<(), BoxError> {
         self.observed(|| async move {
-            let params_json: Option<JsonValue> = task
-                .params
-                .as_ref()
-                .map(|p| serde_json::to_value(p).unwrap_or(JsonValue::Null));
-            let result_json: Option<JsonValue> = task
-                .result
-                .as_ref()
-                .map(|r| serde_json::to_value(r).unwrap_or(JsonValue::Null));
-            let error_json: Option<JsonValue> = task
-                .error
-                .as_ref()
-                .map(|e| serde_json::to_value(e).unwrap_or(JsonValue::Null));
-            let metadata_json: Option<JsonValue> = task
-                .metadata
-                .as_ref()
-                .map(|m| serde_json::to_value(m).unwrap_or(JsonValue::Null));
-            let auth_config_json: Option<JsonValue> = task
-                .auth_config
-                .as_ref()
-                .map(|a| serde_json::to_value(a).unwrap_or(JsonValue::Null));
-            let webhooks_json: Option<JsonValue> = task
-                .webhooks
-                .as_ref()
-                .map(|w| serde_json::to_value(w).unwrap_or(JsonValue::Null));
-            let cleanup_json: Option<JsonValue> = task
-                .cleanup
-                .as_ref()
-                .map(|c| serde_json::to_value(c).unwrap_or(JsonValue::Null));
-
-            let created_at = task.created_at as i64;
-            let updated_at = task.updated_at as i64;
-            let completed_at = task.completed_at.map(|v| v as i64);
-            let ttl = task.ttl.map(|v| v as i32);
-
-            let tags_json: Option<JsonValue> = task
-                .tags
-                .as_ref()
-                .map(|t| serde_json::to_value(t).unwrap_or(JsonValue::Null));
-            let assign_mode_str: Option<String> = task.assign_mode.as_ref().map(|m| {
-                serde_json::to_value(m)
-                    .ok()
-                    .and_then(|v| v.as_str().map(|s| s.to_string()))
-                    .unwrap_or_default()
-            });
-            let cost_i32: Option<i32> = task.cost.map(|c| c as i32);
-            let disconnect_policy_str: Option<String> = task.disconnect_policy.as_ref().map(|d| {
-                serde_json::to_value(d)
-                    .ok()
-                    .and_then(|v| v.as_str().map(|s| s.to_string()))
-                    .unwrap_or_default()
-            });
-
-            let sql = format!(
-                r#"
-            INSERT INTO {TASKS} (
-                id, type, status, params, result, error, metadata,
-                auth_config, webhooks, cleanup, created_at, updated_at, completed_at, ttl,
-                tags, assign_mode, cost, assigned_worker, disconnect_policy,
-                execution_deadline_at, task_version
-            ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                $15, $16, $17, $18, $19,
-                CASE
-                    WHEN $20
-                    THEN FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT
-                        + $21 * 1000
-                    ELSE NULL
-                END,
-                0
-            )
-            ON CONFLICT (id) DO UPDATE SET
-                status = EXCLUDED.status,
-                result = EXCLUDED.result,
-                error = EXCLUDED.error,
-                metadata = EXCLUDED.metadata,
-                updated_at = EXCLUDED.updated_at,
-                completed_at = EXCLUDED.completed_at,
-                ttl = EXCLUDED.ttl,
-                tags = EXCLUDED.tags,
-                assign_mode = EXCLUDED.assign_mode,
-                cost = EXCLUDED.cost,
-                assigned_worker = EXCLUDED.assigned_worker,
-                disconnect_policy = EXCLUDED.disconnect_policy,
-                execution_deadline_at = CASE
-                    WHEN EXCLUDED.execution_deadline_at IS NULL THEN NULL
-                    WHEN {TASKS}.execution_deadline_at IS NULL
-                        OR {TASKS}.status = 'paused'
-                        OR {TASKS}.ttl IS DISTINCT FROM EXCLUDED.ttl
-                    THEN EXCLUDED.execution_deadline_at
-                    ELSE {TASKS}.execution_deadline_at
-                END,
-                task_version = {TASKS}.task_version + 1,
-                ttl_claim_token = NULL,
-                ttl_claim_until = NULL
-            WHERE {TASKS}.status NOT IN ('completed', 'failed', 'timeout', 'cancelled')
-               OR {TASKS}.status = EXCLUDED.status
-            RETURNING id
-            "#
-            );
-
-            let status_str = serde_json::to_value(&task.status)
-                .map(|v| v.as_str().unwrap_or("pending").to_string())?;
-
-            let saved = sqlx::query(&sql)
-                .bind(&task.id)
-                .bind(&task.r#type)
-                .bind(&status_str)
-                .bind(&params_json)
-                .bind(&result_json)
-                .bind(&error_json)
-                .bind(&metadata_json)
-                .bind(&auth_config_json)
-                .bind(&webhooks_json)
-                .bind(&cleanup_json)
-                .bind(created_at)
-                .bind(updated_at)
-                .bind(completed_at)
-                .bind(ttl)
-                .bind(&tags_json)
-                .bind(&assign_mode_str)
-                .bind(cost_i32)
-                .bind(&task.assigned_worker)
-                .bind(&disconnect_policy_str)
-                .bind(has_execution_deadline(&task))
-                .bind(task.ttl.unwrap_or(0) as i64)
-                .fetch_optional(&self.pool)
-                .await?;
-            if saved.is_none() {
-                return Err(Box::new(StorageFenceConflictError::new(format!(
-                    "Durable terminal task cannot be overwritten: {}",
-                    task.id
-                ))) as BoxError);
-            }
-
+            let mut tx = self.pool.begin().await?;
+            guard_write(&mut tx, &task.id, context, task.cleanup_policy_version == Some(1)).await?;
+            save_task_pg_tx(&mut tx, &task).await?;
+            tx.commit().await?;
             Ok(())
         })
         .await
@@ -472,7 +382,7 @@ impl LongTermStore for PostgresLongTermStore {
                 id, type, status, params, result, error, metadata,
                 auth_config, webhooks, cleanup, created_at, updated_at, completed_at, ttl,
                 tags, assign_mode, cost, assigned_worker, disconnect_policy,
-                execution_deadline_at, task_version
+                execution_deadline_at, task_version, cleanup_policy_version, cleanup_resolved_at, cleanup_due_at
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
                 $15, $16, $17, $18, $19,
@@ -482,7 +392,7 @@ impl LongTermStore for PostgresLongTermStore {
                         + $21 * 1000
                     ELSE NULL
                 END,
-                0
+                0, $22, $23, $24
             )
             ON CONFLICT (id) DO NOTHING
             "#
@@ -509,6 +419,9 @@ impl LongTermStore for PostgresLongTermStore {
             .bind(disconnect_policy)
             .bind(has_execution_deadline(&task))
             .bind(task.ttl.unwrap_or(0) as i64)
+            .bind(task.cleanup_policy_version.map(i32::from))
+            .bind(task.cleanup_resolved_at.map(|v| v as i64))
+            .bind(next_deadline(&task))
             .execute(&self.pool)
             .await?;
         Ok(result.rows_affected() == 1)
@@ -570,7 +483,7 @@ impl LongTermStore for PostgresLongTermStore {
                 auth_config, webhooks, cleanup, created_at, updated_at, completed_at, ttl,
                 tags, assign_mode, cost, assigned_worker, disconnect_policy,
                 creation_token, creation_claimed_at, creation_claim_expires_at,
-                creation_completed_at, execution_deadline_at, task_version
+                creation_completed_at, execution_deadline_at, task_version, cleanup_policy_version, cleanup_resolved_at, cleanup_due_at
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
                 $15, $16, $17, $18, $19, $20,
@@ -583,7 +496,7 @@ impl LongTermStore for PostgresLongTermStore {
                         + $23 * 1000
                     ELSE NULL
                 END,
-                0
+                0, $24, $25, $26
             )
             ON CONFLICT (id) DO UPDATE SET
                 type = EXCLUDED.type,
@@ -595,6 +508,9 @@ impl LongTermStore for PostgresLongTermStore {
                 auth_config = EXCLUDED.auth_config,
                 webhooks = EXCLUDED.webhooks,
                 cleanup = EXCLUDED.cleanup,
+                cleanup_policy_version = EXCLUDED.cleanup_policy_version,
+                cleanup_resolved_at = EXCLUDED.cleanup_resolved_at,
+                cleanup_due_at = EXCLUDED.cleanup_due_at,
                 created_at = EXCLUDED.created_at,
                 updated_at = EXCLUDED.updated_at,
                 completed_at = EXCLUDED.completed_at,
@@ -660,6 +576,9 @@ impl LongTermStore for PostgresLongTermStore {
             .bind(claim_ttl_ms as i64)
             .bind(has_execution_deadline(&task))
             .bind(task.ttl.unwrap_or(0) as i64)
+            .bind(task.cleanup_policy_version.map(i32::from))
+            .bind(task.cleanup_resolved_at.map(|v| v as i64))
+            .bind(next_deadline(&task))
             .execute(&self.pool)
             .await?;
         Ok(result.rows_affected() == 1)
@@ -740,11 +659,12 @@ impl LongTermStore for PostgresLongTermStore {
         .await
     }
 
-    async fn save_event(
-        &self,
-        event: TaskEvent,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn save_event(&self, event: TaskEvent) -> Result<(), BoxError> { self.save_event_with_context(event, None).await }
+
+    async fn save_event_with_context(&self, event: TaskEvent, context: Option<&DurableWriteContext>) -> Result<(), BoxError> {
         self.observed(|| async move {
+            let mut tx = self.pool.begin().await?;
+            guard_write(&mut tx, &event.task_id, context, false).await?;
         let sql = format!(
             r#"
             INSERT INTO {EVENTS} (
@@ -783,23 +703,22 @@ impl LongTermStore for PostgresLongTermStore {
             .bind(&event.series_id)
             .bind(&series_mode_str)
             .bind(&event.series_acc_field)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
 
-        Ok(())
+        tx.commit().await?;
+            Ok(())
         })
         .await
     }
 
-    async fn replace_last_series_event(
-        &self,
-        task_id: &str,
-        series_id: &str,
-        event: TaskEvent,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn replace_last_series_event(&self, task_id: &str, series_id: &str, event: TaskEvent) -> Result<(), BoxError> { self.replace_last_series_event_with_context(task_id, series_id, event, None).await }
+
+    async fn replace_last_series_event_with_context(&self, task_id: &str, series_id: &str, event: TaskEvent, context: Option<&DurableWriteContext>) -> Result<(), BoxError> {
         self.observed(|| async move {
             let mode = series_mode_to_string(&SeriesMode::Latest).unwrap();
             let mut tx = self.pool.begin().await?;
+            guard_write(&mut tx, task_id, context, false).await?;
             let archive_watermark = lock_task_for_series_write_pg_tx(&mut tx, task_id).await?;
             let committed = get_series_state_for_update_pg_tx(&mut tx, task_id, series_id).await?;
             if archive_watermark >= event.index as i64
@@ -873,17 +792,14 @@ impl LongTermStore for PostgresLongTermStore {
         .await
     }
 
-    async fn accumulate_series(
-        &self,
-        task_id: &str,
-        series_id: &str,
-        event: TaskEvent,
-        field: &str,
-    ) -> Result<TaskEvent, Box<dyn std::error::Error + Send + Sync>> {
+    async fn accumulate_series(&self, task_id: &str, series_id: &str, event: TaskEvent, field: &str) -> Result<TaskEvent, BoxError> { self.accumulate_series_with_context(task_id, series_id, event, field, None).await }
+
+    async fn accumulate_series_with_context(&self, task_id: &str, series_id: &str, event: TaskEvent, field: &str, context: Option<&DurableWriteContext>) -> Result<TaskEvent, BoxError> {
         self.observed(|| async move {
             let mode = series_mode_to_string(&SeriesMode::Accumulate).unwrap();
             let source_index = event.index;
             let mut tx = self.pool.begin().await?;
+            guard_write(&mut tx, task_id, context, false).await?;
             let archive_watermark = lock_task_for_series_write_pg_tx(&mut tx, task_id).await?;
             let committed = get_series_state_for_update_pg_tx(&mut tx, task_id, series_id).await?;
             if archive_watermark >= event.index as i64
@@ -972,7 +888,7 @@ impl LongTermStore for PostgresLongTermStore {
     ) -> Result<Option<TaskStorageMetadata>, Box<dyn std::error::Error + Send + Sync>> {
         let sql = format!(
             "SELECT id, storage_state, storage_epoch, active_release_generation, \
-             archive_watermark, last_event_at, cold_at, execution_deadline_at, task_version \
+             archive_watermark, last_event_at, cold_at, execution_deadline_at, task_version, creation_token \
              FROM {TASKS} WHERE id = $1"
         );
         let row = sqlx::query(&sql)
@@ -1111,7 +1027,8 @@ impl LongTermStore for PostgresLongTermStore {
             SET status = 'timeout', result = $1, error = $2, metadata = $3,
                 updated_at = $4, completed_at = $5, assigned_worker = NULL,
                 execution_deadline_at = NULL, task_version = task_version + 1,
-                ttl_claim_token = NULL, ttl_claim_until = NULL
+                ttl_claim_token = NULL, ttl_claim_until = NULL,
+                cleanup_due_at = CASE WHEN cleanup_policy_version = 1 THEN $7 ELSE NULL END
             WHERE id = $6
             "#
         );
@@ -1127,6 +1044,7 @@ impl LongTermStore for PostgresLongTermStore {
             .bind(task.updated_at as i64)
             .bind(task.completed_at.map(|value| value as i64))
             .bind(&claim.task_id)
+            .bind(next_deadline(&task))
             .execute(&mut *tx)
             .await?;
         insert_event_pg_tx(&mut tx, &event).await?;
@@ -1447,7 +1365,7 @@ impl LongTermStore for PostgresLongTermStore {
 
         let mut tx = self.pool.begin().await?;
         let task_sql = format!(
-            "SELECT storage_state, storage_epoch, active_release_generation, archive_watermark \
+            "SELECT storage_state, storage_epoch, active_release_generation, archive_watermark, history_expired_at \
              FROM {TASKS} WHERE id = $1 FOR UPDATE"
         );
         let task = sqlx::query(&task_sql)
@@ -1461,6 +1379,7 @@ impl LongTermStore for PostgresLongTermStore {
                 ))
             })?;
 
+        if task.get::<Option<i64>,_>("history_expired_at").is_some() { return Err(Box::new(StorageFenceConflictError::new("Task history has expired"))); }
         let existing_sql = format!(
             "SELECT * FROM {ARCHIVE_GENERATIONS} \
              WHERE task_id = $1 AND generation = $2 FOR UPDATE"
@@ -1550,7 +1469,7 @@ impl LongTermStore for PostgresLongTermStore {
 
         let mut tx = self.pool.begin().await?;
         let task_sql = format!(
-            "SELECT storage_state, storage_epoch, active_release_generation \
+            "SELECT storage_state, storage_epoch, active_release_generation, history_expired_at \
              FROM {TASKS} WHERE id = $1 FOR UPDATE"
         );
         let task_row = sqlx::query(&task_sql)
@@ -1558,6 +1477,7 @@ impl LongTermStore for PostgresLongTermStore {
             .fetch_optional(&mut *tx)
             .await?
             .ok_or_else(|| integrity(&format!("Archive task does not exist: {task_id}")))?;
+        if task_row.get::<Option<i64>,_>("history_expired_at").is_some() { return Err(Box::new(StorageFenceConflictError::new("Task history has expired"))); }
         let generation_sql = format!(
             "SELECT * FROM {ARCHIVE_GENERATIONS} \
              WHERE task_id = $1 AND generation = $2 FOR UPDATE"
@@ -1734,6 +1654,7 @@ impl LongTermStore for PostgresLongTermStore {
             .fetch_optional(&mut *tx)
             .await?
             .ok_or_else(|| integrity(&format!("Archive task does not exist: {task_id}")))?;
+        if task_row.get::<Option<i64>,_>("history_expired_at").is_some() { return Err(Box::new(StorageFenceConflictError::new("Task history has expired"))); }
         let generation_sql = format!(
             "SELECT * FROM {ARCHIVE_GENERATIONS} \
              WHERE task_id = $1 AND generation = $2 FOR UPDATE"
@@ -2032,6 +1953,7 @@ impl LongTermStore for PostgresLongTermStore {
             r#"
             SELECT GREATEST(
                 task.archive_watermark,
+                COALESCE(task.history_expired_through_index, -1),
                 COALESCE((SELECT MAX(event.idx) FROM {EVENTS} event WHERE event.task_id = task.id), -1),
                 COALESCE((SELECT MAX(series.through_index) FROM {SERIES_STATE} series WHERE series.task_id = task.id), -1)
             ) AS last_index
@@ -2616,6 +2538,7 @@ fn row_to_storage_metadata(
 ) -> Result<TaskStorageMetadata, Box<dyn std::error::Error + Send + Sync>> {
     let storage_state: String = row.get("storage_state");
     Ok(TaskStorageMetadata {
+        creation_token: row.get("creation_token"),
         task_id: row.get("id"),
         storage_state: serde_json::from_value(JsonValue::String(storage_state))
             .map_err(|_| integrity("Durable storage state is invalid"))?,
@@ -2757,7 +2680,8 @@ async fn update_task_pg_tx(
         UPDATE {TASKS}
         SET status = $1, result = $2, error = $3, metadata = $4,
             updated_at = $5, completed_at = $6, tags = $7, assign_mode = $8,
-            cost = $9, assigned_worker = $10, disconnect_policy = $11
+            cost = $9, assigned_worker = $10, disconnect_policy = $11,
+            cleanup_due_at = CASE WHEN cleanup_policy_version = 1 THEN $13 ELSE NULL END
         WHERE id = $12
         "#
     );
@@ -2796,6 +2720,7 @@ async fn update_task_pg_tx(
         .bind(&task.assigned_worker)
         .bind(disconnect_policy)
         .bind(&task.id)
+        .bind(next_deadline(task))
         .execute(&mut **tx)
         .await?;
     Ok(())
@@ -3454,4 +3379,159 @@ mod tests {
         let v = serde_json::to_value(&data).unwrap();
         assert_eq!(v["reason"], "timeout");
     }
+}
+
+async fn save_task_pg_tx(tx: &mut Transaction<'_ , Postgres>, task: &Task) -> Result<(), BoxError> {
+            let params_json: Option<JsonValue> = task
+                .params
+                .as_ref()
+                .map(|p| serde_json::to_value(p).unwrap_or(JsonValue::Null));
+            let result_json: Option<JsonValue> = task
+                .result
+                .as_ref()
+                .map(|r| serde_json::to_value(r).unwrap_or(JsonValue::Null));
+            let error_json: Option<JsonValue> = task
+                .error
+                .as_ref()
+                .map(|e| serde_json::to_value(e).unwrap_or(JsonValue::Null));
+            let metadata_json: Option<JsonValue> = task
+                .metadata
+                .as_ref()
+                .map(|m| serde_json::to_value(m).unwrap_or(JsonValue::Null));
+            let auth_config_json: Option<JsonValue> = task
+                .auth_config
+                .as_ref()
+                .map(|a| serde_json::to_value(a).unwrap_or(JsonValue::Null));
+            let webhooks_json: Option<JsonValue> = task
+                .webhooks
+                .as_ref()
+                .map(|w| serde_json::to_value(w).unwrap_or(JsonValue::Null));
+            let cleanup_json: Option<JsonValue> = task
+                .cleanup
+                .as_ref()
+                .map(|c| serde_json::to_value(c).unwrap_or(JsonValue::Null));
+
+            let created_at = task.created_at as i64;
+            let updated_at = task.updated_at as i64;
+            let completed_at = task.completed_at.map(|v| v as i64);
+            let ttl = task.ttl.map(|v| v as i32);
+
+            let tags_json: Option<JsonValue> = task
+                .tags
+                .as_ref()
+                .map(|t| serde_json::to_value(t).unwrap_or(JsonValue::Null));
+            let assign_mode_str: Option<String> = task.assign_mode.as_ref().map(|m| {
+                serde_json::to_value(m)
+                    .ok()
+                    .and_then(|v| v.as_str().map(|s| s.to_string()))
+                    .unwrap_or_default()
+            });
+            let cost_i32: Option<i32> = task.cost.map(|c| c as i32);
+            let disconnect_policy_str: Option<String> = task.disconnect_policy.as_ref().map(|d| {
+                serde_json::to_value(d)
+                    .ok()
+                    .and_then(|v| v.as_str().map(|s| s.to_string()))
+                    .unwrap_or_default()
+            });
+
+            let sql = format!(
+                r#"
+            INSERT INTO {TASKS} (
+                id, type, status, params, result, error, metadata,
+                auth_config, webhooks, cleanup, created_at, updated_at, completed_at, ttl,
+                tags, assign_mode, cost, assigned_worker, disconnect_policy,
+                execution_deadline_at, task_version, cleanup_policy_version, cleanup_resolved_at, cleanup_due_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+                $15, $16, $17, $18, $19,
+                CASE
+                    WHEN $20
+                    THEN FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT
+                        + $21 * 1000
+                    ELSE NULL
+                END,
+                0, $22, $23, $24
+            )
+            ON CONFLICT (id) DO UPDATE SET
+                status = EXCLUDED.status,
+                result = EXCLUDED.result,
+                error = EXCLUDED.error,
+                metadata = EXCLUDED.metadata,
+                updated_at = EXCLUDED.updated_at,
+                completed_at = EXCLUDED.completed_at,
+                ttl = EXCLUDED.ttl,
+                tags = EXCLUDED.tags,
+                assign_mode = EXCLUDED.assign_mode,
+                cost = EXCLUDED.cost,
+                assigned_worker = EXCLUDED.assigned_worker,
+                disconnect_policy = EXCLUDED.disconnect_policy,
+                execution_deadline_at = CASE
+                    WHEN EXCLUDED.execution_deadline_at IS NULL THEN NULL
+                    WHEN {TASKS}.execution_deadline_at IS NULL
+                        OR {TASKS}.status = 'paused'
+                        OR {TASKS}.ttl IS DISTINCT FROM EXCLUDED.ttl
+                    THEN EXCLUDED.execution_deadline_at
+                    ELSE {TASKS}.execution_deadline_at
+                END,
+                cleanup_due_at = CASE WHEN {TASKS}.cleanup_policy_version = 1 THEN EXCLUDED.cleanup_due_at ELSE NULL END,
+                task_version = {TASKS}.task_version + 1,
+                ttl_claim_token = NULL,
+                ttl_claim_until = NULL
+            WHERE {TASKS}.status NOT IN ('completed', 'failed', 'timeout', 'cancelled')
+               OR {TASKS}.status = EXCLUDED.status
+            RETURNING id
+            "#
+            );
+
+            let status_str = serde_json::to_value(&task.status)
+                .map(|v| v.as_str().unwrap_or("pending").to_string())?;
+
+            let saved = sqlx::query(&sql)
+                .bind(&task.id)
+                .bind(&task.r#type)
+                .bind(&status_str)
+                .bind(&params_json)
+                .bind(&result_json)
+                .bind(&error_json)
+                .bind(&metadata_json)
+                .bind(&auth_config_json)
+                .bind(&webhooks_json)
+                .bind(&cleanup_json)
+                .bind(created_at)
+                .bind(updated_at)
+                .bind(completed_at)
+                .bind(ttl)
+                .bind(&tags_json)
+                .bind(&assign_mode_str)
+                .bind(cost_i32)
+                .bind(&task.assigned_worker)
+                .bind(&disconnect_policy_str)
+                .bind(has_execution_deadline(task))
+                .bind(task.ttl.unwrap_or(0) as i64)
+            .bind(task.cleanup_policy_version.map(i32::from))
+            .bind(task.cleanup_resolved_at.map(|v| v as i64))
+            .bind(next_deadline(task))
+                .fetch_optional(&mut **tx)
+                .await?;
+            if saved.is_none() {
+                return Err(Box::new(StorageFenceConflictError::new(format!(
+                    "Durable terminal task cannot be overwritten: {}",
+                    task.id
+                ))) as BoxError);
+            }
+
+    Ok(())
+}
+
+async fn validate_restore_pg(tx: &mut Transaction<'_, Postgres>, data: &taskcast_core::TaskArchiveRestoreData, options: Option<taskcast_core::TaskArchiveImportOptions>) -> Result<bool, BoxError> {
+    let row = sqlx::query("SELECT creation_token FROM taskcast_tasks WHERE id = $1 FOR UPDATE").bind(&data.task.id).fetch_optional(&mut **tx).await?;
+    let current: Option<String> = row.as_ref().and_then(|r| r.get("creation_token"));
+    if data.expected_creation_token.as_ref().is_some_and(|token| token != &current.unwrap_or_default()) { return Err(Box::new(StorageFenceConflictError::new("Archive restore generation changed"))); }
+    if row.is_some() && !options.unwrap_or_default().overwrite { return Err(integrity("Task already exists")); }
+    for event in &data.events {
+        if sqlx::query("SELECT id FROM taskcast_events WHERE id = $1 AND task_id <> $2").bind(&event.id).bind(&data.task.id).fetch_optional(&mut **tx).await?.is_some() {
+            return Err(integrity("Archive event id conflicts with another task"));
+        }
+    }
+    Ok(row.is_some())
 }

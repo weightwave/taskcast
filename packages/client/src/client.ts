@@ -6,6 +6,7 @@ export interface SubscribeOptions {
   onEvent: (envelope: SSEEnvelope) => void
   onDone: (reason: string) => void
   onError?: (err: Error) => void
+  onHistoryExpired?: (info: { taskId: string; expiredAt: number }) => void
 }
 
 export interface TaskcastClientOptions {
@@ -48,6 +49,11 @@ export class TaskcastClient {
         } catch {
           // ignore parse errors
         }
+      } else if (parseEvent.event === 'taskcast.history_expired') {
+        try {
+          const info = JSON.parse(parseEvent.data) as { taskId: string; expiredAt: number }
+          if (typeof info.taskId === 'string' && Number.isFinite(info.expiredAt)) opts.onHistoryExpired?.(info)
+        } catch { /* Ignore malformed notifications like other SSE messages. */ }
       } else if (parseEvent.event === 'taskcast.done') {
         try {
           const { reason } = JSON.parse(parseEvent.data) as { reason: string }

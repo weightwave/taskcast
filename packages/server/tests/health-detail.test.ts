@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import {
   TaskEngine,
   MemoryBroadcastProvider,
@@ -114,6 +114,34 @@ describe('GET /health/detail', () => {
     stop()
   })
 
+  it('reports unavailable writer discovery and blocks release without naming incompatible writers', async () => {
+    const shortTermStore = new MemoryShortTermStore()
+    const engine = new TaskEngine({
+      broadcast: new MemoryBroadcastProvider(), shortTermStore,
+      longTermStore: new MemoryLongTermStore(),
+    })
+    const { app, stop } = createTaskcastApp({ engine, shortTermStore, auth: { mode: 'none' } })
+    await engine.createTask({ id: 'writer-discovery-down' })
+    vi.spyOn(engine, 'listStorageWriters').mockRejectedValue(new Error('writer store unavailable'))
+    try {
+      const detail = await (await app.request('/health/detail')).json()
+      expect(detail.storage).toEqual({
+        releaseReady: false,
+        requiredStorageProtocolVersion: 2,
+        activeWriterCount: 0,
+        incompatibleWriterIds: [],
+      })
+      const response = await app.request('/tasks/writer-discovery-down/storage/release', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ expectedLastEventIndex: -1, inactiveSince: Date.now() }),
+      })
+      expect(response.status).toBe(503)
+      expect(await response.json()).toMatchObject({ code: 'storage_unavailable' })
+    } finally {
+      stop()
+    }
+  })
+
   it('uptime is a non-negative number', async () => {
     const engine = new TaskEngine({
       broadcast: new MemoryBroadcastProvider(),
@@ -225,6 +253,37 @@ describe('GET /health/detail', () => {
       broadcast: { provider: 'memory', status: 'ok' },
       shortTermStore: { provider: 'memory', status: 'ok' },
     })
+  })
+
+  it('marks Redis and PostgreSQL adapters unavailable when their dependencies fail', async () => {
+    const dependencyHealth = new DependencyHealthRegistry({ logger: () => {} })
+    for (const dependency of ['redisCommand', 'redisPubSub', 'postgres'] as const) {
+      dependencyHealth.register(dependency, async () => {})
+      dependencyHealth.observe({ dependency, state: 'unhealthy', errorKind: 'unavailable' })
+    }
+    const engine = new TaskEngine({
+      broadcast: new MemoryBroadcastProvider(), shortTermStore: new MemoryShortTermStore(),
+    })
+    const { app, stop } = createTaskcastApp({
+      engine, dependencyHealth,
+      effectiveAdapters: { broadcast: 'redis', shortTermStore: 'redis', longTermStore: 'postgres' },
+    })
+    try {
+      const response = await app.request('/health/detail')
+      expect(response.status).toBe(200)
+      const detail = await response.json()
+      expect(detail.ok).toBe(false)
+      expect(detail.adapters).toEqual({
+        broadcast: { provider: 'redis', status: 'error' },
+        shortTermStore: { provider: 'redis', status: 'error' },
+        longTermStore: { provider: 'postgres', status: 'error' },
+      })
+      dependencyHealth.observe({ dependency: 'postgres', state: 'healthy' })
+      const recovered = await (await app.request('/health/detail')).json()
+      expect(recovered.adapters.longTermStore).toEqual({ provider: 'postgres', status: 'ok' })
+    } finally {
+      stop()
+    }
   })
 
   it('keeps readiness degraded until PubSub restoration is acknowledged', async () => {

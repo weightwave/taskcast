@@ -5,6 +5,9 @@ use taskcast_core::{
 
 fn task() -> Task {
     Task {
+        cleanup_policy_version: None,
+        cleanup_resolved_at: None,
+        history_expired_at: None,
         id: "task-1".into(),
         r#type: Some("agent.session".into()),
         status: TaskStatus::Pending,
@@ -81,6 +84,7 @@ async fn fenced_commit_rejects_old_epoch_without_consuming_index() {
         .unwrap()
         .unwrap();
     let old_token = HotWriteToken {
+        creation_token: None,
         task_id: "task-1".into(),
         storage_epoch: 1,
     };
