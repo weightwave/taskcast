@@ -42,9 +42,14 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 24
+          # Match CI: better-sqlite3 11 can abort during GC on Node 24.
+          node-version: 22
           cache: pnpm
           registry-url: https://registry.npmjs.org
+
+      # Node 22 ships npm 10; trusted publishing requires npm >= 11.5.1.
+      - name: Install npm for trusted publishing
+        run: npm install --global npm@11.19.0
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
