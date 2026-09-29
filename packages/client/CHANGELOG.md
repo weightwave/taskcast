@@ -1,5 +1,16 @@
 # @taskcast/client
 
+## 1.7.0
+
+### Minor Changes
+
+- 9711098: Add opt-in terminal task retention with snapshotted per-task policies, bounded PostgreSQL cleanup, Redis release coordination, and fenced late-write protection in Node and Rust. Expired history is explicit in REST and SSE, and archive restore creates a fresh unenrolled generation. Existing tasks and deployments remain unchanged unless cleanup is enabled for newly created tasks.
+
+### Patch Changes
+
+- Updated dependencies [9711098]
+  - @taskcast/core@1.7.0
+
 ## 1.6.1
 
 ### Patch Changes

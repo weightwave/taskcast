@@ -1,5 +1,12 @@
 # @taskcast/sentry
 
+## 1.7.0
+
+### Patch Changes
+
+- Updated dependencies [9711098]
+  - @taskcast/core@1.7.0
+
 ## 1.6.1
 
 ### Patch Changes

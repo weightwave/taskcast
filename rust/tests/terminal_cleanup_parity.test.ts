@@ -112,6 +112,8 @@ describe('real Redis/PostgreSQL terminal retention parity', () => {
     expect((await runtime.request('/tasks/chunks/events', bulk)).status).toBe(201)
     await transition('chunks', 'cancelled')
     await until(async () => (await (await runtime.request('/tasks/chunks')).json()).historyExpiredAt > 0)
+    // The history marker commits before the first bounded delete batch.
+    await until(async () => Number((await sql`SELECT count(*) AS count FROM taskcast_events WHERE task_id = 'chunks'`)[0]!.count) <= 501)
     await runtime.stop()
     const [{ count }] = await sql`SELECT count(*)::int AS count FROM taskcast_events WHERE task_id = 'chunks'`
     expect(count).toBeGreaterThan(0)
