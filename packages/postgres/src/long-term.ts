@@ -809,9 +809,14 @@ export class PostgresLongTermStore implements LongTermStore {
       }
 
       const indexRows = await tx`
-        SELECT COALESCE(MAX(idx), -1) AS last_index
-        FROM ${tx(EVENTS)}
-        WHERE task_id = ${claim.taskId}
+        SELECT GREATEST(
+          task.archive_watermark,
+          COALESCE(task.history_expired_through_index, -1),
+          COALESCE((SELECT MAX(event.idx) FROM ${tx(EVENTS)} event WHERE event.task_id = task.id), -1),
+          COALESCE((SELECT MAX(series.through_index) FROM ${tx(SERIES_STATE)} series WHERE series.task_id = task.id), -1)
+        ) AS last_index
+        FROM ${tx(TASKS)} task
+        WHERE task.id = ${claim.taskId}
       `
       const lastIndex = Number(indexRows[0]!['last_index'])
       if (event.index !== lastIndex + 1) {

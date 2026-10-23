@@ -87,6 +87,65 @@ async function makeOverdue(task = makeTask()): Promise<TtlClaim> {
 }
 
 describe('PostgresLongTermStore durable TTL', () => {
+  it.each(['latest', 'archive', 'expired-history', 'events', 'empty'] as const)(
+    'appends timeout after the durable %s tail and rejects stale or skipped indexes',
+    async (tail) => {
+      const claim = await makeOverdue()
+      const event = (index: number): TaskEvent => ({
+        ...makeTimeoutEvent('ttl-task', index),
+        id: `progress-${index}`, type: 'progress', data: { revision: index },
+      })
+      if (tail === 'latest') {
+        for (const index of [0, 1, 2]) {
+          await store.replaceLastSeriesEvent('ttl-task', 'progress', {
+            ...event(index), seriesId: 'progress', seriesMode: 'latest',
+          })
+        }
+        expect((await store.getEvents('ttl-task')).map((entry) => entry.index)).toEqual([0])
+      } else if (tail === 'archive') {
+        // The archive boundary remains authoritative after its physical rows are gone.
+        await sql`UPDATE taskcast_tasks SET archive_watermark = 2 WHERE id = 'ttl-task'`
+      } else if (tail === 'expired-history') {
+        await sql`UPDATE taskcast_tasks SET history_expired_through_index = 2 WHERE id = 'ttl-task'`
+      } else if (tail === 'events') {
+        for (const index of [0, 1, 2]) await store.saveEvent(event(index))
+      }
+      const nextIndex = tail === 'empty' ? 0 : 3
+      expect(await store.getLastEventIndex('ttl-task')).toBe(nextIndex - 1)
+      const timeoutTask = makeTask('ttl-task', {
+        status: 'timeout', completedAt: 3_000, updatedAt: 3_000,
+      })
+      const badIndexes = nextIndex === 0 ? [1] : [0, 1, nextIndex - 1, nextIndex + 1]
+      for (const badIndex of badIndexes) {
+        await expect(store.terminalizeTtlClaim(
+          claim, timeoutTask, makeTimeoutEvent('ttl-task', badIndex), null,
+        )).rejects.toMatchObject({ code: 'storage_integrity_error' })
+        expect((await store.getTask('ttl-task'))?.status).toBe('running')
+        expect(await sql`SELECT * FROM taskcast_terminal_outbox`).toHaveLength(0)
+      }
+      const timeoutEvent = makeTimeoutEvent('ttl-task', nextIndex)
+      await expect(store.terminalizeTtlClaim(claim, timeoutTask, timeoutEvent, null))
+        .resolves.toMatchObject({ task: timeoutTask, event: timeoutEvent })
+      expect((await store.getEvents('ttl-task')).at(-1)).toEqual(timeoutEvent)
+      expect(await sql`SELECT * FROM taskcast_terminal_outbox`).toHaveLength(1)
+    },
+  )
+
+  it('allows only one concurrent claimant and one terminalization', async () => {
+    await makeOverdue()
+    await sql`UPDATE taskcast_tasks SET ttl_claim_until = 0 WHERE id = 'ttl-task'`
+    const claims = (await Promise.all([
+      store.claimOverdueTasks(1, 30_000), store.claimOverdueTasks(1, 30_000),
+    ])).flat()
+    expect(claims).toHaveLength(1)
+    const timeoutTask = makeTask('ttl-task', { status: 'timeout', completedAt: 3_000, updatedAt: 3_000 })
+    const results = await Promise.all([0, 1].map(() => store.terminalizeTtlClaim(
+      claims[0]!, timeoutTask, makeTimeoutEvent(), null,
+    )))
+    expect(results.filter(Boolean)).toHaveLength(1)
+    expect(await sql`SELECT * FROM taskcast_terminal_outbox`).toHaveLength(1)
+  })
+
   it('uses database time for absolute deadlines and suspends paused tasks', async () => {
     const before = Date.now()
     await store.saveTask(makeTask())

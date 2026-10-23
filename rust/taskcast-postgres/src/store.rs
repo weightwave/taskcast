@@ -1008,12 +1008,22 @@ impl LongTermStore for PostgresLongTermStore {
             )));
         }
 
-        let index_sql = format!("SELECT COALESCE(MAX(idx), -1) FROM {EVENTS} WHERE task_id = $1");
-        let last_index: i32 = sqlx::query_scalar(&index_sql)
+        let index_sql = format!(
+            r#"
+            SELECT GREATEST(
+                task.archive_watermark,
+                COALESCE(task.history_expired_through_index, -1),
+                COALESCE((SELECT MAX(event.idx) FROM {EVENTS} event WHERE event.task_id = task.id), -1),
+                COALESCE((SELECT MAX(series.through_index) FROM {SERIES_STATE} series WHERE series.task_id = task.id), -1)
+            ) AS last_index
+            FROM {TASKS} task WHERE task.id = $1
+            "#
+        );
+        let last_index: i64 = sqlx::query_scalar(&index_sql)
             .bind(&claim.task_id)
             .fetch_one(&mut *tx)
             .await?;
-        let expected_index = (i64::from(last_index) + 1) as u64;
+        let expected_index = (last_index + 1) as u64;
         if event.index != expected_index {
             return Err(integrity(&format!(
                 "TTL timeout event index is not contiguous for {}",
