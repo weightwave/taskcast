@@ -1,5 +1,17 @@
 # @taskcast/cli
 
+## 1.7.2
+
+### Patch Changes
+
+- Updated dependencies [3038bc7]
+  - @taskcast/postgres@1.7.2
+  - @taskcast/core@1.7.2
+  - @taskcast/server@1.7.2
+  - @taskcast/server-sdk@1.7.2
+  - @taskcast/redis@1.7.2
+  - @taskcast/sqlite@1.7.2
+
 ## 1.7.1
 
 ### Patch Changes
