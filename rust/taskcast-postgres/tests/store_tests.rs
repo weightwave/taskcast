@@ -222,6 +222,144 @@ async fn make_overdue(
 }
 
 #[tokio::test]
+async fn ttl_terminalization_uses_all_durable_tails_and_rejects_noncontiguous_indexes() {
+    for tail in ["latest", "archive", "expired-history", "events", "empty"] {
+        let (store, _container) = setup().await;
+        let claim = make_overdue(&store, make_ttl_task(tail), 30_000).await;
+        match tail {
+            "latest" => {
+                for index in 0..3 {
+                    let mut event = make_event(tail, index);
+                    event.series_id = Some("progress".to_string());
+                    event.series_mode = Some(SeriesMode::Latest);
+                    store
+                        .replace_last_series_event(tail, "progress", event)
+                        .await
+                        .unwrap();
+                }
+                let events = store.get_events(tail, None).await.unwrap();
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0].index, 0);
+            }
+            "archive" => {
+                // An archive boundary survives removal of its physical event rows.
+                sqlx::query("UPDATE taskcast_tasks SET archive_watermark = 2 WHERE id = $1")
+                    .bind(tail)
+                    .execute(store.pool())
+                    .await
+                    .unwrap();
+            }
+            "expired-history" => {
+                sqlx::query(
+                    "UPDATE taskcast_tasks SET history_expired_through_index = 2 WHERE id = $1",
+                )
+                .bind(tail)
+                .execute(store.pool())
+                .await
+                .unwrap();
+            }
+            "events" => {
+                for index in 0..3 {
+                    store.save_event(make_event(tail, index)).await.unwrap();
+                }
+            }
+            _ => {}
+        }
+        let next_index = if tail == "empty" { 0 } else { 3 };
+        assert_eq!(
+            store.get_last_event_index(tail).await.unwrap(),
+            next_index as i64 - 1
+        );
+        let mut timeout = make_ttl_task(tail);
+        timeout.status = TaskStatus::Timeout;
+        timeout.updated_at = 3_000.0;
+        timeout.completed_at = Some(3_000.0);
+        let bad_indexes = if next_index == 0 {
+            vec![1]
+        } else {
+            vec![0, 1, next_index - 1, next_index + 1]
+        };
+        for bad_index in bad_indexes {
+            let error = store
+                .terminalize_ttl_claim(
+                    claim.clone(),
+                    timeout.clone(),
+                    make_timeout_event(tail, bad_index),
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("not contiguous"),
+                "{tail}: {error}"
+            );
+            assert_eq!(
+                store.get_task(tail).await.unwrap().unwrap().status,
+                TaskStatus::Running
+            );
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM taskcast_terminal_outbox")
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+            assert_eq!(count, 0);
+        }
+        let event = make_timeout_event(tail, next_index);
+        let projection = store
+            .terminalize_ttl_claim(claim, timeout, event.clone(), None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(projection.event, event);
+        assert_eq!(
+            store.get_events(tail, None).await.unwrap().last(),
+            Some(&event)
+        );
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM taskcast_terminal_outbox")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+}
+
+#[tokio::test]
+async fn ttl_concurrent_claim_and_terminalization_have_one_winner() {
+    let (store, _container) = setup().await;
+    make_overdue(&store, make_ttl_task("ttl-concurrent"), 30_000).await;
+    sqlx::query("UPDATE taskcast_tasks SET ttl_claim_until = 0 WHERE id = 'ttl-concurrent'")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    let (first, second) = tokio::join!(
+        store.claim_overdue_tasks(1, 30_000),
+        store.claim_overdue_tasks(1, 30_000),
+    );
+    let claims: Vec<_> = first.unwrap().into_iter().chain(second.unwrap()).collect();
+    assert_eq!(claims.len(), 1);
+    let mut timeout = make_ttl_task("ttl-concurrent");
+    timeout.status = TaskStatus::Timeout;
+    timeout.updated_at = 3_000.0;
+    timeout.completed_at = Some(3_000.0);
+    let event = make_timeout_event("ttl-concurrent", 0);
+    let (first, second) = tokio::join!(
+        store.terminalize_ttl_claim(claims[0].clone(), timeout.clone(), event.clone(), None),
+        store.terminalize_ttl_claim(claims[0].clone(), timeout, event, None),
+    );
+    assert_eq!(
+        [first.unwrap(), second.unwrap()]
+            .iter()
+            .filter(|result| result.is_some())
+            .count(),
+        1
+    );
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM taskcast_terminal_outbox")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
 async fn ttl_deadline_uses_database_time_and_paused_tasks_are_suspended() {
     let (store, _container) = setup().await;
     let before = std::time::SystemTime::now()
