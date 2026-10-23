@@ -1,5 +1,12 @@
 # @taskcast/react
 
+## 1.7.2
+
+### Patch Changes
+
+- @taskcast/core@1.7.2
+- @taskcast/client@1.7.2
+
 ## 1.7.1
 
 ### Patch Changes
